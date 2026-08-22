@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use tracing::{info, warn};
-use lofty::file::TaggedFileExt;
+use lofty::prelude::*;
 use lofty::probe::Probe;
 
 /// 文档与元数据提取器 (整合 anydoc + exiftool-rs + lofty + kamadak-exif)

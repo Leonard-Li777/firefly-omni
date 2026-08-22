@@ -9,5 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 omni-core = { path = "../omni-core" }
+omni-vision = { path = "../omni-vision" }
 napi = "2.16"
 napi-derive = "2.16"
