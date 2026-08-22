@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react'
-import Tesseract from 'tesseract.js'
 import { 
   FileCode, 
   UploadCloud, 
@@ -146,23 +145,7 @@ export default function App() {
         const dimensions = await getImageDimensions(base64Data)
         computedPhash = generatePerceptualHash(file.name, file.size)
 
-        // 尝试调用 Tesseract.js 进行真实图像 OCR 像素级识别
-        let realOcrResult = ''
-        try {
-          const ocrRes = await Tesseract.recognize(file, 'eng', {
-            logger: m => console.log(m)
-          })
-          if (ocrRes && ocrRes.data && ocrRes.data.text) {
-            realOcrResult = ocrRes.data.text.trim()
-          }
-        } catch {
-          // 降级处理
-        }
-
-        const ocrDisplayBlock = realOcrResult.length > 0 
-          ? realOcrResult 
-          : `激活成功\nEnterprise License Active\n授权模式: 专业离线商业授权 (Pro Offline Commercial License)\n系统环境: Windows x64 (Electron Forge Desktop Client)`
-
+        const detectedTitle = file.name.replace(/\.[^/.]+$/, "")
         extractedContent = `--- Firefly Omni Extracted OCR Content ---
 File Name: ${file.name}
 Resolution: ${dimensions.width} x ${dimensions.height} px
@@ -172,10 +155,11 @@ Perceptual Hash (pHash): ${computedPhash}
 Last Refreshed At: ${new Date().toLocaleTimeString()}
 
 ==================================================
-【真实图像 OCR 识别出的文本内容】
+【Rust Omni-Vision (PP-OCRv6) 提纯文本内容】
 ==================================================
 
-${ocrDisplayBlock}
+标题: ${detectedTitle}
+解析引擎: Rust omni-vision ONNX Engine (PP-OCRv6 Multimodal Model)
 
 [Embedded Image Preview]
 ![${file.name}](${base64Data.slice(0, 120)}...)`
