@@ -1,0 +1,12 @@
+[package]
+name = "omni-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+omni-core = { path = "../omni-core" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

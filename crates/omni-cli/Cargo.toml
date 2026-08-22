@@ -1,0 +1,18 @@
+[package]
+name = "omni-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "firefly-omni"
+path = "src/main.rs"
+
+[dependencies]
+omni-core = { path = "../omni-core" }
+omni-server = { path = "../omni-server" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

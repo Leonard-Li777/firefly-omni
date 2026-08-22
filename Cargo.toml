@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/omni-core",
+    "crates/omni-extract",
+    "crates/omni-vision",
+    "crates/omni-server",
+    "crates/omni-cli",
+    "crates/omni-mcp",
+    "crates/omni-node",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Firefly Team <support@firefly.ai>"]
+license = "Apache-2.0"
+repository = "https://github.com/Leonard-Li777/firefly-omni"
+homepage = "https://github.com/Leonard-Li777/firefly-omni"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.38", features = ["full"] }
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+axum = { version = "0.7", features = ["macros", "multipart"] }
+tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+ort = "2.0.0-rc.9"
+image = "0.25"
