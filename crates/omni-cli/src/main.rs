@@ -34,7 +34,10 @@ async fn main() -> anyhow::Result<()> {
             omni_server::start_server(socket_addr).await?;
         }
         Some(Commands::Extract { file }) => {
-            println!("Extracting file: {}", file);
+            let config = omni_core::OmniConfig::default();
+            println!("🔍 [firefly-omni] 正在提取文件: {}", file);
+            let result = omni_extract::OmniExtractor::extract(file, &config).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         None => {
             println!("firefly-omni 🚀 运行成功。使用 --help 查看命令选项。");

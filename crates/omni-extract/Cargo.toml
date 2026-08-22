@@ -10,3 +10,8 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+lofty = "0.21"
+kamadak-exif = "0.6"
+exiftool-rs = "0.1"
+anydoc = { version = "0.1", optional = true }

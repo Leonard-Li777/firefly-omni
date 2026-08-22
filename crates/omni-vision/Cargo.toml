@@ -12,3 +12,4 @@ anyhow.workspace = true
 tracing.workspace = true
 ort.workspace = true
 image.workspace = true
+magika = { version = "0.1", optional = true }
