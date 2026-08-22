@@ -198,13 +198,19 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize) -> Result<(String
         .map(|_| "Estimated Pages: 5-10")
         .unwrap_or("Estimated Pages: 1");
 
-    // 从 PDF 流中抽取 Text String 括号块
+    // 从 PDF 流中抽取 Text String 括号块（严格清洗非可打印控制字符与乱码）
     let mut extracted_lines = Vec::new();
     let bracket_regex = regex::Regex::new(r"\(([^()\\\r\n]{3,200})\)").unwrap();
     for cap in bracket_regex.captures_iter(&full_str) {
         let text = cap[1].trim();
-        if text.len() > 3 && !text.starts_with('/') && !text.starts_with("Font") && text.chars().any(|c| c.is_alphanumeric() || c > '\u{4e00}') {
-            extracted_lines.push(text.to_string());
+        // 判定条件：长度 > 3，不含控制字符/乱码字符 (\u{FFFD}、NUL、非 ASCII 控制符)，且包含有效中英文或数字
+        let has_garbled = text.chars().any(|c| (c as u32) < 32 || (c as u32) >= 127 && !('\u{4e00}'..='\u{9fa5}').contains(&c));
+        let is_pdf_kw = text.starts_with('/') || text.starts_with("Font") || text.starts_with("MediaBox") || text.starts_with("ProcSet");
+
+        if !has_garbled && !is_pdf_kw && text.len() > 3 {
+            if text.chars().any(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fa5}').contains(&c)) {
+                extracted_lines.push(text.to_string());
+            }
         }
     }
 

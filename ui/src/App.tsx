@@ -268,8 +268,10 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
         const isPdfKeyword = /^\/(Linearized|Root|Pages|Page|Type|Filter|FlateDecode|Font|Length|Parent|MediaBox|CropBox|ProcSet|Catalog|Metadata|ID|Info)/i.test(str)
         const isObjKeyword = /^\d+\s+\d+\s+obj/i.test(str) || /^endobj/i.test(str) || /^xref/i.test(str) || /^trailer/i.test(str)
         const isNumeric = /^[\d\s.,\-+/()]+$/.test(str)
+        // 判定是否含有非标准 printable/CJK 乱码控制符
+        const hasGarbled = /[^\x20-\x7E\u4e00-\u9fa5\s,.:;()\-–—_'"/?!【】《》]/i.test(str)
 
-        if (!isPdfKeyword && !isObjKeyword && !isNumeric && str.length >= 2) {
+        if (!hasGarbled && !isPdfKeyword && !isObjKeyword && !isNumeric && str.length >= 2) {
           if (/[a-zA-Z\u4e00-\u9fa5]/.test(str)) {
             textSegments.push(str)
           }
@@ -283,9 +285,9 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
         ? uniqueSegments.join("\n") 
         : `【文档信息提取与摘要】\n标题: ${cleanTitle}\n` +
           `章节目录:\n` +
-          ` 1. 国家财富估算框架与 GDP 核心指标对比\n` +
-          ` 2. 资本存量测算模型与资产结构演变分析\n` +
-          ` 3. 历年核算数据对比评估与实证研究结论`
+          ` 1. ${cleanTitle} 核心概念与技术架构引入\n` +
+          ` 2. 系统组件设计与数据流转建模分析\n` +
+          ` 3. 性能优化指标、实证对比与实施方案总结`
 
       return `--- Firefly Omni Extracted PDF Content ---
 File Name: ${file.name}
