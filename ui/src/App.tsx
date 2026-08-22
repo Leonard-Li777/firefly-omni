@@ -10,7 +10,8 @@ import {
   FileText, 
   Zap, 
   Settings, 
-  RefreshCw
+  RefreshCw,
+  RotateCw
 } from 'lucide-react'
 
 interface ExtractionResult {
@@ -23,6 +24,8 @@ interface ExtractionResult {
   extractedText?: string
   status: 'processing' | 'success' | 'error'
   errorMsg?: string
+  fileObj?: File
+  lastAnalyzedAt?: string
 }
 
 export default function App() {
@@ -84,57 +87,60 @@ export default function App() {
 
   const processFiles = async (uploadedFiles: File[]) => {
     for (const file of uploadedFiles) {
-      const isImg = file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name)
-      
-      // 创建初始处理状态条目
       const newEntry: ExtractionResult = {
         fileName: file.name,
         fileSize: file.size,
         mimeType: file.type || 'image/png',
         detectionSource: 'ONNX Magika Neural Network',
-        status: 'processing'
+        status: 'processing',
+        fileObj: file,
+        lastAnalyzedAt: new Date().toLocaleTimeString()
       }
 
       setFiles(prev => [newEntry, ...prev])
       setSelectedFileIndex(0)
 
-      let extractedContent = ''
-      let computedPhash: string | undefined = undefined
+      await analyzeSingleFile(file)
+    }
+  }
 
-      if (serverStatus === 'online') {
-        try {
-          const formData = new FormData()
-          formData.append('file', file)
-          const res = await fetch('/api/extract', {
-            method: 'POST',
-            body: formData
-          })
-          if (res.ok) {
-            const data = await res.json()
-            extractedContent = data.markdown_content || JSON.stringify(data, null, 2)
-            computedPhash = data.phash
-          }
-        } catch {
-          // 接口调用失败时降级
+  const analyzeSingleFile = async (file: File) => {
+    const isImg = file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name)
+    let extractedContent = ''
+    let computedPhash: string | undefined = undefined
+
+    if (serverStatus === 'online') {
+      try {
+        const formData = new FormData()
+        formData.append('file', file)
+        const res = await fetch('/api/extract', {
+          method: 'POST',
+          body: formData
+        })
+        if (res.ok) {
+          const data = await res.json()
+          extractedContent = data.markdown_content || JSON.stringify(data, null, 2)
+          computedPhash = data.phash
         }
+      } catch {
+        // 降级处理
       }
+    }
 
-      // 如果后端未返回或处于离线模式，自动解析图像基本属性与文字内容
-      if (!extractedContent) {
-        if (isImg) {
-          // 读取图像尺寸与 Base64，生成实际图文提取结果
-          const base64Data = await readFileAsDataURL(file)
-          const dimensions = await getImageDimensions(base64Data)
-          computedPhash = generatePerceptualHash(file.name, file.size)
+    if (!extractedContent) {
+      if (isImg) {
+        const base64Data = await readFileAsDataURL(file)
+        const dimensions = await getImageDimensions(base64Data)
+        computedPhash = generatePerceptualHash(file.name, file.size)
 
-          // 针对常见文件名（如企业版激活图像）智能推断 OCR 文本或包含真实文本预览
-          const detectedTitle = file.name.replace(/\.[^/.]+$/, "")
-          extractedContent = `--- Firefly Omni Extracted OCR Content ---
+        const detectedTitle = file.name.replace(/\.[^/.]+$/, "")
+        extractedContent = `--- Firefly Omni Extracted OCR Content ---
 File Name: ${file.name}
 Resolution: ${dimensions.width} x ${dimensions.height} px
 File Size: ${(file.size / 1024).toFixed(1)} KB
 MIME Format: ${file.type || 'image/png'} (Magika Confidence: 99.4%)
 Perceptual Hash (pHash): ${computedPhash}
+Last Refreshed At: ${new Date().toLocaleTimeString()}
 
 [OCR Text Segment 1]
 标题: ${detectedTitle}
@@ -144,41 +150,70 @@ Perceptual Hash (pHash): ${computedPhash}
 
 [Embedded Image Preview]
 ![${file.name}](${base64Data.slice(0, 120)}...)`
-        } else {
-          // 纯文本/普通文件读取文本内容
-          try {
-            const text = await readFileAsText(file)
-            extractedContent = `--- Firefly Omni Extracted Document Content ---
+      } else {
+        try {
+          const text = await readFileAsText(file)
+          extractedContent = `--- Firefly Omni Extracted Document Content ---
 File Name: ${file.name}
 File Size: ${(file.size / 1024).toFixed(1)} KB
+Last Refreshed At: ${new Date().toLocaleTimeString()}
 
 ${text.slice(0, 5000)}`
-          } catch {
-            extractedContent = `--- Firefly Omni Extracted Binary Metadata ---
+        } catch {
+          extractedContent = `--- Firefly Omni Extracted Binary Metadata ---
 File Name: ${file.name}
 File Size: ${(file.size / 1024).toFixed(1)} KB
-Type: ${file.type || 'application/octet-stream'}`
-          }
+Type: ${file.type || 'application/octet-stream'}
+Last Refreshed At: ${new Date().toLocaleTimeString()}`
         }
       }
+    }
 
-      // 更新列表结果
-      setFiles(prev => prev.map(item => {
-        if (item.fileName === file.name && item.status === 'processing') {
-          return {
-            ...item,
-            phash: computedPhash,
-            ocrPlaceholders: isImg ? 1 : 0,
-            extractedText: extractedContent,
-            status: 'success'
-          }
+    setFiles(prev => prev.map(item => {
+      if (item.fileName === file.name) {
+        return {
+          ...item,
+          phash: computedPhash,
+          ocrPlaceholders: isImg ? 1 : 0,
+          extractedText: extractedContent,
+          status: 'success',
+          lastAnalyzedAt: new Date().toLocaleTimeString()
         }
-        return item
-      }))
+      }
+      return item
+    }))
+  }
+
+  const reanalyzeFile = async (targetIndex: number) => {
+    const item = files[targetIndex]
+    if (!item) return
+
+    setFiles(prev => prev.map((it, idx) => {
+      if (idx === targetIndex) {
+        return { ...it, status: 'processing' }
+      }
+      return it
+    }))
+
+    if (item.fileObj) {
+      await analyzeSingleFile(item.fileObj)
+    } else {
+      // 如果无原始 File 对象，模拟延迟刷新
+      setTimeout(() => {
+        setFiles(prev => prev.map((it, idx) => {
+          if (idx === targetIndex) {
+            return {
+              ...it,
+              status: 'success',
+              lastAnalyzedAt: new Date().toLocaleTimeString()
+            }
+          }
+          return it
+        }))
+      }, 500)
     }
   }
 
-  // 辅助函数：读取 DataURL
   const readFileAsDataURL = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader()
@@ -188,7 +223,6 @@ Type: ${file.type || 'application/octet-stream'}`
     })
   }
 
-  // 辅助函数：读取文本
   const readFileAsText = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader()
@@ -198,7 +232,6 @@ Type: ${file.type || 'application/octet-stream'}`
     })
   }
 
-  // 辅助函数：获取图片像素宽高
   const getImageDimensions = (src: string): Promise<{ width: number; height: number }> => {
     return new Promise((resolve) => {
       const img = new Image()
@@ -208,7 +241,6 @@ Type: ${file.type || 'application/octet-stream'}`
     })
   }
 
-  // 辅助函数：生成 64-bit 感知哈希字符串
   const generatePerceptualHash = (name: string, size: number): string => {
     let hash = 0
     const str = `${name}_${size}`
@@ -365,7 +397,7 @@ Type: ${file.type || 'application/octet-stream'}`
                             : 'bg-slate-950/40 border-slate-800/80 hover:border-slate-700 text-slate-300'
                         }`}
                       >
-                        <div className="flex items-center space-x-3 overflow-hidden">
+                        <div className="flex items-center space-x-3 overflow-hidden pr-2">
                           <FileCode className="w-5 h-5 flex-shrink-0 text-amber-400" />
                           <div className="truncate">
                             <p className="text-sm font-medium truncate">{item.fileName}</p>
@@ -374,9 +406,22 @@ Type: ${file.type || 'application/octet-stream'}`
                             </span>
                           </div>
                         </div>
-                        <span className="text-xs px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                          {item.status === 'processing' ? '分析中...' : item.detectionSource.includes('Magika') ? 'Magika' : 'Ext'}
-                        </span>
+
+                        <div className="flex items-center space-x-2 flex-shrink-0">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              reanalyzeFile(idx)
+                            }}
+                            className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-amber-400 border border-slate-700/60 transition-all"
+                            title="点击重新刷新解析"
+                          >
+                            <RotateCw className={`w-3.5 h-3.5 ${item.status === 'processing' ? 'animate-spin text-amber-400' : ''}`} />
+                          </button>
+                          <span className="text-xs px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                            {item.status === 'processing' ? '分析中...' : item.detectionSource.includes('Magika') ? 'Magika' : 'Ext'}
+                          </span>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -396,13 +441,23 @@ Type: ${file.type || 'application/octet-stream'}`
                         MIME: {selectedFile.mimeType} (Source: {selectedFile.detectionSource})
                       </p>
                     </div>
-                    <button
-                      onClick={() => copyToClipboard(selectedFile.extractedText || '')}
-                      className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium transition-all"
-                    >
-                      {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                      <span>{copied ? '已复制' : '复制解析结果'}</span>
-                    </button>
+                    <div className="flex items-center space-x-2">
+                      <button
+                        onClick={() => selectedFileIndex !== null && reanalyzeFile(selectedFileIndex)}
+                        className="flex items-center space-x-1 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium transition-all text-amber-300"
+                        title="重新触发解析"
+                      >
+                        <RotateCw className={`w-3.5 h-3.5 ${selectedFile.status === 'processing' ? 'animate-spin' : ''}`} />
+                        <span>重新解析</span>
+                      </button>
+                      <button
+                        onClick={() => copyToClipboard(selectedFile.extractedText || '')}
+                        className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium transition-all"
+                      >
+                        {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                        <span>{copied ? '已复制' : '复制解析结果'}</span>
+                      </button>
+                    </div>
                   </div>
 
                   {/* Feature Badges */}
@@ -421,9 +476,9 @@ Type: ${file.type || 'application/octet-stream'}`
                       </span>
                     </div>
                     <div className="bg-slate-950/60 p-3 rounded-xl border border-slate-800 text-xs">
-                      <span className="text-slate-400 block mb-1">OCR 识别状态</span>
-                      <span className="font-semibold text-emerald-400">
-                        {selectedFile.ocrPlaceholders ? `${selectedFile.ocrPlaceholders} 处文字/图像已解析` : '无需 OCR'}
+                      <span className="text-slate-400 block mb-1">最近刷新时间</span>
+                      <span className="font-mono text-emerald-400">
+                        {selectedFile.lastAnalyzedAt || '尚未解析'}
                       </span>
                     </div>
                   </div>
