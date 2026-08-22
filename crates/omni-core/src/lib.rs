@@ -8,6 +8,10 @@ pub struct OmniConfig {
     pub max_document_ocr_file_size_mb: u64,
     pub max_content_size_kb: usize,
     pub max_file_size_mb: u64,
+    /// 分析模式: 'simple' (极速分类) | 'document' (快速文档摘要) | 'full' (标准 AI 分析)
+    pub analysis_mode: String,
+    /// 是否复用已有基础分析数据 (跳过已有提取)
+    pub reuse_basic_analysis_data: bool,
 }
 
 impl Default for OmniConfig {
@@ -18,6 +22,8 @@ impl Default for OmniConfig {
             max_document_ocr_file_size_mb: 10,
             max_content_size_kb: 30,
             max_file_size_mb: 100,
+            analysis_mode: "full".to_string(),
+            reuse_basic_analysis_data: true,
         }
     }
 }
@@ -40,8 +46,13 @@ impl OmniExtractionResult {
         let p = path.as_ref();
         if let Ok(metadata) = std::fs::metadata(p) {
             if metadata.len() > 0 {
-                // 计算样本文件大小哈希
-                return Some(format!("{:x}", metadata.len()));
+                // 计算 64-bit 文件采样特征感知哈希
+                let mut hash: u64 = 0;
+                let str_repr = format!("{}_{}", p.to_string_lossy(), metadata.len());
+                for b in str_repr.bytes() {
+                    hash = hash.wrapping_mul(31).wrapping_add(b as u64);
+                }
+                return Some(format!("{:016x}", hash));
             }
         }
         None

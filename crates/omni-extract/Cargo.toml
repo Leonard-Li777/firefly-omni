@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 omni-core = { path = "../omni-core" }
+omni-vision = { path = "../omni-vision" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
@@ -14,4 +15,7 @@ tokio.workspace = true
 lofty = "0.21"
 kamadak-exif = "0.6"
 exiftool-rs = "0.1"
+image.workspace = true
+encoding_rs.workspace = true
+regex.workspace = true
 anydoc = { version = "0.1", optional = true }
