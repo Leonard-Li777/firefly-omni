@@ -90,6 +90,15 @@ impl OmniExtractor {
                 }
             }
             result.metadata["image"] = serde_json::Value::Object(img_meta);
+
+            // 调用 PP-OCRv6 执行图像文本识别
+            if config.enable_image_ocr {
+                if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text(p) {
+                    if !ocr_text.trim().is_empty() {
+                        result.markdown_content = ocr_text;
+                    }
+                }
+            }
         }
 
         // 3. 根据分析模式 (analysis_mode) 执行文本内容提取
