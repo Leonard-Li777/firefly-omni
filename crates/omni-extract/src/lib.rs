@@ -2,11 +2,9 @@ use omni_core::{OmniConfig, OmniExtractionResult};
 use omni_vision::OmniVisionEngine;
 use anyhow::Result;
 use encoding_rs::{GBK, UTF_8, UTF_16LE};
-use lofty::prelude::*;
-use lofty::probe::Probe;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::Path;
 use tracing::{info, warn};
 
