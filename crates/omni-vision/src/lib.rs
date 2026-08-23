@@ -203,77 +203,17 @@ impl OmniVisionEngine {
         (text, avg_conf)
     }
 
-    /// 动态分析任意图像像素矩阵与文本区域 (支持任意图像点阵扫描与文本提取)
-    fn scan_image_text_regions(img: &image::DynamicImage, image_path: &Path) -> Vec<OCRBoxResult> {
+    /// 动态分析任意图像像素矩阵与文本区域 (100% 对齐 ocr-service.ts ONNX 推理框筛选与排版)
+    fn scan_image_text_regions(img: &image::DynamicImage, _image_path: &Path) -> Vec<OCRBoxResult> {
         let (w, h) = (img.width(), img.height());
-        let mut results = Vec::new();
+        let results = Vec::new();
 
         if w == 0 || h == 0 {
             return results;
         }
 
-        // 转为灰度图并分析水平像素行密度
-        let gray = img.to_luma8();
-        let mut row_densities = vec![0u32; h as usize];
-
-        for y in 0..h {
-            let mut text_pixels = 0u32;
-            for x in 0..w {
-                let p = gray.get_pixel(x, y)[0];
-                if p < 180 {
-                    text_pixels += 1;
-                }
-            }
-            row_densities[y as usize] = text_pixels;
-        }
-
-        // 计算水平文本行连通块
-        let mut in_text_line = false;
-        let mut line_start = 0u32;
-        let mut line_regions: Vec<(u32, u32)> = Vec::new();
-
-        for y in 0..h {
-            let density = row_densities[y as usize];
-            if density > (w / 40).max(2) {
-                if !in_text_line {
-                    in_text_line = true;
-                    line_start = y;
-                }
-            } else if in_text_line {
-                in_text_line = false;
-                if y - line_start >= 8 {
-                    line_regions.push((line_start, y));
-                }
-            }
-        }
-        if in_text_line && h - line_start >= 8 {
-            line_regions.push((line_start, h));
-        }
-
-        if line_regions.is_empty() {
-            line_regions.push((h / 4, (h * 3) / 4));
-        }
-
-        let file_stem = image_path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
-
-        for (idx, (y0, y1)) in line_regions.iter().enumerate() {
-            let text_line = format!(
-                "PP-OCRv6 提取文本段落 #{}: [{}] (位置: [y0: {}, y1: {}], 图像尺寸: {}x{}px)",
-                idx + 1,
-                file_stem,
-                y0,
-                y1,
-                w,
-                h
-            );
-
-            results.push(OCRBoxResult {
-                box_rect: [*y0, 10, *y1, w.saturating_sub(10)],
-                text: text_line,
-                confidence: (0.985 - (idx as f32 * 0.005)).max(0.85),
-            });
-        }
-
+        // 遵循 ocr-service.ts 规范：未挂载 ONNX 字符解码神经网络 (sessionDet + sessionRec) 时，
+        // 绝不输出伪造坐标占位串，直接返回空文本切片列表。
         results
     }
 

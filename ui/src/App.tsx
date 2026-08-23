@@ -750,9 +750,12 @@ MIME Type: application/pdf
                               className="w-full flex-1 bg-slate-900/80 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-purple-200 focus:outline-none resize-none"
                             />
                           ) : (
-                            <div className="flex-1 flex flex-col items-center justify-center p-4 bg-slate-900/40 border border-slate-800 rounded-lg text-slate-500 text-xs text-center">
-                              <AlertCircle className="w-5 h-5 mb-1 opacity-40 text-purple-400" />
-                              (未检出 OCR 文字段落 / No OCR Text Detected)
+                            <div className="flex-1 flex flex-col items-center justify-center p-4 bg-slate-900/40 border border-slate-800 rounded-lg text-slate-500 text-xs text-center space-y-1">
+                              <AlertCircle className="w-5 h-5 opacity-40 text-purple-400" />
+                              <span className="font-semibold text-slate-400">(未检出 OCR 文字段落 / No OCR Text Detected)</span>
+                              <span className="text-[10px] text-slate-500 max-w-xs">
+                                真实字符解码依赖 Desktop 原生 ONNX PP-OCRv6 推理服务 (ocr-service.ts)。当未连接 ONNX CTC 张量解码会话时，遵循规范不填充模拟假文本。
+                              </span>
                             </div>
                           )}
                         </div>
