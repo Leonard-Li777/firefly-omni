@@ -311,3 +311,33 @@ async fn test_extract_image_phash_and_metadata() {
     assert!(result.metadata.get("image").is_some(), "Image metadata should contain width, height and resolution");
     assert_eq!(result.metadata["image"]["resolution"], "100x100");
 }
+
+#[tokio::test]
+async fn test_extract_real_gif_ocr_text() {
+    let gif_path = std::path::PathBuf::from(r"F:\lilun\Desktop\结构设计稿_gif.gif");
+    if !gif_path.exists() {
+        return;
+    }
+
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "file_path": gif_path.to_string_lossy().to_string()
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+
+    println!("Recognized OCR Text for GIF:\n{}", result.markdown_content);
+    assert!(!result.markdown_content.is_empty(), "OCR text for real GIF image should be recognized!");
+}

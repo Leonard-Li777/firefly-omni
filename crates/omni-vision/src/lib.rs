@@ -50,10 +50,30 @@ impl OmniVisionEngine {
             PathBuf::from("apps/desktop/build/extraResources/models/PP-OCRv6"),
             PathBuf::from("build/extraResources/models/PP-OCRv6"),
             PathBuf::from("../desktop/build/extraResources/models/PP-OCRv6"),
-            PathBuf::from("../../apps/desktop/build/extraResources/models/PP-OCRv6"),
+            PathBuf::from("../../desktop/build/extraResources/models/PP-OCRv6"),
+            PathBuf::from("../../../desktop/build/extraResources/models/PP-OCRv6"),
+            PathBuf::from("../../../apps/desktop/build/extraResources/models/PP-OCRv6"),
             PathBuf::from("models/PP-OCRv6"),
-            PathBuf::from("."),
         ];
+
+        // 动态向上遍历查找 workspace 根路径下的 PP-OCRv6 模型
+        if let Ok(mut current) = std::env::current_dir() {
+            for _ in 0..5 {
+                let target1 = current.join("apps/desktop/build/extraResources/models/PP-OCRv6");
+                if target1.exists() {
+                    candidates.push(target1);
+                }
+                let target2 = current.join("build/extraResources/models/PP-OCRv6");
+                if target2.exists() {
+                    candidates.push(target2);
+                }
+                if let Some(parent) = current.parent() {
+                    current = parent.to_path_buf();
+                } else {
+                    break;
+                }
+            }
+        }
 
         if let Ok(appdata) = std::env::var("APPDATA") {
             candidates.push(PathBuf::from(appdata).join("firefly-ai-folder/models/PP-OCRv6"));
@@ -64,7 +84,12 @@ impl OmniVisionEngine {
 
         for cand in candidates {
             if cand.exists() && cand.is_dir() {
-                return Some(cand);
+                if cand.join("PP-OCRv6_rec_small.onnx").exists()
+                    || cand.join("PP-OCRv6_rec_tiny.onnx").exists()
+                    || cand.join("ppocr_keys_v6_small.txt").exists()
+                {
+                    return Some(cand);
+                }
             }
         }
         None
@@ -218,6 +243,63 @@ impl OmniVisionEngine {
         results
     }
 
+    /// 分析图像像素密度并提取文本行区域 (y0, y1)
+    fn detect_image_line_regions(img: &image::DynamicImage) -> Vec<(u32, u32)> {
+        let (w, h) = (img.width(), img.height());
+        if w == 0 || h == 0 {
+            return Vec::new();
+        }
+
+        let gray = img.to_luma8();
+        let mut row_densities = vec![0u32; h as usize];
+
+        for y in 0..h {
+            let mut text_pixels = 0u32;
+            for x in 0..w {
+                let p = gray.get_pixel(x, y)[0];
+                if p < 200 {
+                    text_pixels += 1;
+                }
+            }
+            row_densities[y as usize] = text_pixels;
+        }
+
+        let mut line_regions = Vec::new();
+        let mut in_line = false;
+        let mut line_start = 0u32;
+        let min_density = (w / 50).max(2);
+
+        for y in 0..h {
+            let density = row_densities[y as usize];
+            if density > min_density {
+                if !in_line {
+                    in_line = true;
+                    line_start = y;
+                }
+            } else if in_line {
+                in_line = false;
+                if y - line_start >= 6 {
+                    line_regions.push((line_start.saturating_sub(2), (y + 2).min(h)));
+                }
+            }
+        }
+        if in_line && h - line_start >= 6 {
+            line_regions.push((line_start.saturating_sub(2), h));
+        }
+
+        if line_regions.is_empty() {
+            let strip_h = 48u32;
+            let mut curr = 0u32;
+            while curr < h {
+                let next = (curr + strip_h).min(h);
+                line_regions.push((curr, next));
+                curr = next;
+            }
+        }
+
+        line_regions
+    }
+
     /// 运行原生 ONNX Runtime (C++ 神经网络推理服务) 执行 PP-OCR 字符解码
     fn run_onnx_ocr_inference(
         img: &image::DynamicImage,
@@ -238,8 +320,7 @@ impl OmniVisionEngine {
             return None;
         }
 
-        // 初始化 ONNX Runtime 推理 Session
-        let mut builder = match Session::builder() {
+        let builder = match Session::builder() {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!("Failed to create Session builder: {}", e);
@@ -255,51 +336,61 @@ impl OmniVisionEngine {
             }
         };
 
-        // 缩放图像至 PP-OCR 识别标准输入尺寸 (H=48, W=320)
-        let resized = img.resize_exact(320, 48, image::imageops::FilterType::Triangle);
-        let rgb = resized.to_rgb8();
+        let line_regions = Self::detect_image_line_regions(img);
+        let (w, _h) = (img.width(), img.height());
+        let mut extracted_lines = Vec::new();
 
-        let mut tensor_data = Vec::with_capacity(1 * 3 * 48 * 320);
-        // NCHW 布局与归一化: (val / 255.0 - 0.5) / 0.5 = val / 127.5 - 1.0
-        for c in 0..3 {
-            for y in 0..48 {
-                for x in 0..320 {
-                    let pixel_val = rgb.get_pixel(x, y)[c as usize] as f32;
-                    tensor_data.push(pixel_val / 127.5 - 1.0);
+        for (_idx, (y0, y1)) in line_regions.iter().enumerate() {
+            let crop_h = y1 - y0;
+            if crop_h < 4 {
+                continue;
+            }
+
+            let cropped = img.crop_imm(0, *y0, w, crop_h);
+            let aspect = w as f32 / crop_h as f32;
+            let target_w = ((48.0 * aspect).round() as u32).clamp(64, 960);
+            let resized = cropped.resize_exact(target_w, 48, image::imageops::FilterType::Triangle);
+            let rgb = resized.to_rgb8();
+
+            let mut tensor_data = Vec::with_capacity(1 * 3 * 48 * target_w as usize);
+            for c in 0..3 {
+                for y in 0..48 {
+                    for x in 0..target_w {
+                        let pixel_val = rgb.get_pixel(x, y)[c as usize] as f32;
+                        tensor_data.push(pixel_val / 127.5 - 1.0);
+                    }
+                }
+            }
+
+            let array = match ndarray::Array4::from_shape_vec((1, 3, 48, target_w as usize), tensor_data) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+
+            let inputs_val = match inputs![array] {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+
+            let outputs = match session.run(inputs_val) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+
+            for (_name, value) in outputs.into_iter() {
+                if let Ok(tensor) = value.try_extract_tensor::<f32>() {
+                    let shape_vec: Vec<usize> = tensor.shape().iter().map(|&d| d as usize).collect();
+                    let (decoded_text, _conf) = Self::ctc_decode(tensor.as_slice().unwrap_or(&[]), &shape_vec, keys_map);
+                    let trimmed = decoded_text.trim();
+                    if !trimmed.is_empty() {
+                        extracted_lines.push(trimmed.to_string());
+                    }
                 }
             }
         }
 
-        let array = match ndarray::Array4::from_shape_vec((1, 3, 48, 320), tensor_data) {
-            Ok(a) => a,
-            Err(_) => return None,
-        };
-
-        let inputs_val = match inputs![array] {
-            Ok(i) => i,
-            Err(e) => {
-                tracing::warn!("Failed to prepare ONNX inputs: {}", e);
-                return None;
-            }
-        };
-
-        let outputs = match session.run(inputs_val) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!("ONNX PP-OCR inference run error: {}", e);
-                return None;
-            }
-        };
-
-        // 提取神经网络输出张量 Logits 并运行 CTC 贪心解码器
-        for (_name, value) in outputs.into_iter() {
-            if let Ok(tensor) = value.try_extract_tensor::<f32>() {
-                let shape_vec: Vec<usize> = tensor.shape().iter().map(|&d| d as usize).collect();
-                let (decoded_text, _conf) = Self::ctc_decode(tensor.as_slice().unwrap_or(&[]), &shape_vec, keys_map);
-                if !decoded_text.trim().is_empty() {
-                    return Some(decoded_text);
-                }
-            }
+        if !extracted_lines.is_empty() {
+            return Some(extracted_lines.join("\n"));
         }
 
         None
