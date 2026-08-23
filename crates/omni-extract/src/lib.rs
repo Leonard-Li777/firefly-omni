@@ -185,54 +185,29 @@ fn extract_plain_text(path: &Path, max_bytes: usize) -> Result<String> {
 }
 
 
-/// PDF 提纯解析器（使用 lopdf 自动处理 CMap/ToUnicode/FlateDecode，提取真实无乱码中英文）
+/// anydoc 原生文档提纯解析器 (支持 PDF/DOCX/PPTX/HTML/EPUB/XLSX/CSV 等格式毫秒级解析并输出 Markdown)
 fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize) -> Result<(String, serde_json::Value)> {
-    let doc = match lopdf::Document::load(path) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!("lopdf load failed for {}: {}, fallback to raw scan", path.display(), e);
-            return extract_pdf_fallback(path, max_bytes);
+    match anydoc::to_markdown(path) {
+        Ok(markdown) => {
+            let title_candidate = path.file_stem().unwrap_or_default().to_string_lossy();
+            let content_text = if !markdown.trim().is_empty() {
+                markdown
+            } else {
+                format!("Document Title: {}\nSummary: Anydoc parsed 0 text nodes.", title_candidate)
+            };
+
+            let truncated_content = truncate_string(&content_text, max_bytes);
+            let meta = serde_json::json!({
+                "extractor": "anydoc",
+            });
+
+            Ok((truncated_content, meta))
         }
-    };
-
-    let mut pdf_text = String::new();
-    let pages = doc.get_pages();
-    let page_count = pages.len();
-
-    // 逐页提取真实文本 (支持 ToUnicode 映射表与中文字符集)
-    for (page_num, _) in pages.iter() {
-        if let Ok(text) = doc.extract_text(&[*page_num]) {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                pdf_text.push_str(trimmed);
-                pdf_text.push('\n');
-            }
+        Err(e) => {
+            tracing::warn!("anydoc extract failed for {}: {}, fallback to basic scan", path.display(), e);
+            extract_pdf_fallback(path, max_bytes)
         }
     }
-
-    // 过滤结构噪点与空白空行
-    let lines: Vec<String> = pdf_text
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && l.len() >= 2 && !is_pdf_structural_noise(l))
-        .collect();
-
-    let title_candidate = path.file_stem().unwrap_or_default().to_string_lossy();
-    let content_text = if !lines.is_empty() {
-        lines.join("\n")
-    } else {
-        format!("PDF Document Title: {}\nSummary: PDF v{} parsed successfully. 0 text nodes found (page may contain scanned images).", title_candidate, doc.version)
-    };
-
-    let truncated_content = truncate_string(&content_text, max_bytes);
-
-    let pdf_meta = serde_json::json!({
-        "version": doc.version,
-        "page_count": page_count,
-        "extracted_lines": lines.len()
-    });
-
-    Ok((truncated_content, pdf_meta))
 }
 
 fn extract_pdf_fallback(path: &Path, max_bytes: usize) -> Result<(String, serde_json::Value)> {
@@ -256,15 +231,7 @@ fn extract_pdf_fallback(path: &Path, max_bytes: usize) -> Result<(String, serde_
     Ok((truncate_string(&content_text, max_bytes), pdf_meta))
 }
 
-fn is_pdf_structural_noise(line: &str) -> bool {
-    let noisy_keywords = ["Identity-H", "Adobe-GB1", "FontDescriptor", "CIDInit", "ProcSet", "MediaBox"];
-    for kw in noisy_keywords {
-        if line.contains(kw) || line.starts_with('/') {
-            return true;
-        }
-    }
-    false
-}
+
 
 
 
