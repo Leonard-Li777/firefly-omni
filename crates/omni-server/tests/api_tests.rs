@@ -341,3 +341,34 @@ async fn test_extract_real_gif_ocr_text() {
     println!("Recognized OCR Text for GIF:\n{}", result.markdown_content);
     assert!(!result.markdown_content.is_empty(), "OCR text for real GIF image should be recognized!");
 }
+
+#[tokio::test]
+async fn test_extract_real_wechat_png_ocr_text() {
+    let png_path = std::path::PathBuf::from(r"F:\lilun\Desktop\微信图片帐户删除.png");
+    if !png_path.exists() {
+        println!("File does not exist at {:?}", png_path);
+        return;
+    }
+
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "file_path": png_path.to_string_lossy().to_string()
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+
+    println!("Recognized OCR Text for WeChat PNG:\n{}", result.markdown_content);
+    assert!(!result.markdown_content.is_empty(), "OCR text for WeChat PNG image should be recognized!");
+}

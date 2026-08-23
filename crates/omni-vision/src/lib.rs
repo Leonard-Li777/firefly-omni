@@ -243,7 +243,7 @@ impl OmniVisionEngine {
         results
     }
 
-    /// 分析图像像素密度并提取文本行区域 (y0, y1)
+    /// 分析图像像素梯度与边缘密度，支持明亮模式/暗黑模式/微信截图等多变背景下的精准文本行分割 (y0, y1)
     fn detect_image_line_regions(img: &image::DynamicImage) -> Vec<(u32, u32)> {
         let (w, h) = (img.width(), img.height());
         if w == 0 || h == 0 {
@@ -254,20 +254,21 @@ impl OmniVisionEngine {
         let mut row_densities = vec![0u32; h as usize];
 
         for y in 0..h {
-            let mut text_pixels = 0u32;
-            for x in 0..w {
-                let p = gray.get_pixel(x, y)[0];
-                if p < 200 {
-                    text_pixels += 1;
+            let mut edge_pixels = 0u32;
+            for x in 1..w {
+                let p1 = gray.get_pixel(x - 1, y)[0] as i16;
+                let p2 = gray.get_pixel(x, y)[0] as i16;
+                if (p1 - p2).abs() > 18 {
+                    edge_pixels += 1;
                 }
             }
-            row_densities[y as usize] = text_pixels;
+            row_densities[y as usize] = edge_pixels;
         }
 
         let mut line_regions = Vec::new();
         let mut in_line = false;
         let mut line_start = 0u32;
-        let min_density = (w / 50).max(2);
+        let min_density = (w / 45).max(2);
 
         for y in 0..h {
             let density = row_densities[y as usize];
@@ -278,7 +279,8 @@ impl OmniVisionEngine {
                 }
             } else if in_line {
                 in_line = false;
-                if y - line_start >= 6 {
+                let line_h = y - line_start;
+                if line_h >= 6 {
                     line_regions.push((line_start.saturating_sub(2), (y + 2).min(h)));
                 }
             }
@@ -287,17 +289,35 @@ impl OmniVisionEngine {
             line_regions.push((line_start.saturating_sub(2), h));
         }
 
-        if line_regions.is_empty() {
-            let strip_h = 48u32;
+        let mut final_regions = Vec::new();
+        for (y0, y1) in line_regions {
+            let block_h = y1 - y0;
+            if block_h > 65 {
+                let target_sub_h = 32u32;
+                let mut curr = y0;
+                while curr < y1 {
+                    let next = (curr + target_sub_h).min(y1);
+                    if next - curr >= 8 {
+                        final_regions.push((curr, next));
+                    }
+                    curr = next;
+                }
+            } else {
+                final_regions.push((y0, y1));
+            }
+        }
+
+        if final_regions.is_empty() {
+            let strip_h = 44u32;
             let mut curr = 0u32;
             while curr < h {
                 let next = (curr + strip_h).min(h);
-                line_regions.push((curr, next));
+                final_regions.push((curr, next));
                 curr = next;
             }
         }
 
-        line_regions
+        final_regions
     }
 
     /// 运行原生 ONNX Runtime (C++ 神经网络推理服务) 执行 PP-OCR 字符解码
@@ -338,6 +358,7 @@ impl OmniVisionEngine {
 
         let line_regions = Self::detect_image_line_regions(img);
         let (w, _h) = (img.width(), img.height());
+        let gray = img.to_luma8();
         let mut extracted_lines = Vec::new();
 
         for (_idx, (y0, y1)) in line_regions.iter().enumerate() {
@@ -346,8 +367,38 @@ impl OmniVisionEngine {
                 continue;
             }
 
-            let cropped = img.crop_imm(0, *y0, w, crop_h);
-            let aspect = w as f32 / crop_h as f32;
+            // 计算该行区域内的水平列边缘分布，精确定位左右文本边界 x0, x1
+            let mut min_x = w;
+            let mut max_x = 0u32;
+            for x in 1..w {
+                let mut col_edge = false;
+                for y in *y0..*y1 {
+                    let p1 = gray.get_pixel(x - 1, y)[0] as i16;
+                    let p2 = gray.get_pixel(x, y)[0] as i16;
+                    if (p1 - p2).abs() > 18 {
+                        col_edge = true;
+                        break;
+                    }
+                }
+                if col_edge {
+                    if x < min_x { min_x = x; }
+                    if x > max_x { max_x = x; }
+                }
+            }
+
+            let (crop_x0, crop_x1) = if min_x < max_x && (max_x - min_x) >= 8 {
+                (min_x.saturating_sub(4), (max_x + 4).min(w))
+            } else {
+                (0, w)
+            };
+
+            let crop_w = crop_x1 - crop_x0;
+            if crop_w < 8 {
+                continue;
+            }
+
+            let cropped = img.crop_imm(crop_x0, *y0, crop_w, crop_h);
+            let aspect = crop_w as f32 / crop_h as f32;
             let target_w = ((48.0 * aspect).round() as u32).clamp(64, 960);
             let resized = cropped.resize_exact(target_w, 48, image::imageops::FilterType::Triangle);
             let rgb = resized.to_rgb8();
