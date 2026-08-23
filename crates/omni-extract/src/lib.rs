@@ -92,6 +92,19 @@ impl OmniExtractor {
                     img_meta.insert("exif".into(), serde_json::Value::Object(exif_map));
                 }
             }
+
+            // 如果 kamadak-exif 深度解析为空，尝试 exiftool-rs 补充元数据
+            if !img_meta.contains_key("exif") {
+                if let Ok(exif_result) = exiftool_rs::image_info(p) {
+                    let mut exif_map = serde_json::Map::new();
+                    for (k, v) in exif_result {
+                        exif_map.insert(k, v.to_string().into());
+                    }
+                    if !exif_map.is_empty() {
+                        img_meta.insert("exif".into(), serde_json::Value::Object(exif_map));
+                    }
+                }
+            }
             result.metadata["image"] = serde_json::Value::Object(img_meta);
 
             // 调用 PP-OCRv6 执行图像文本识别
