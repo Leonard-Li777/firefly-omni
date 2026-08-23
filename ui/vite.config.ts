@@ -8,7 +8,7 @@ export default defineConfig({
     port: 8199,
     proxy: {
       '/health': {
-        target: 'http://localhost:8080',
+        target: 'http://127.0.0.1:9190',
         changeOrigin: true,
         configure: (proxy) => {
           proxy.on('error', (_err, _req, res) => {
@@ -19,7 +19,7 @@ export default defineConfig({
         }
       },
       '/api': {
-        target: 'http://localhost:8080',
+        target: 'http://127.0.0.1:9190',
         changeOrigin: true,
         configure: (proxy) => {
           proxy.on('error', (_err, _req, res) => {

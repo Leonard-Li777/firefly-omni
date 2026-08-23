@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Json, Multipart},
+    extract::{Json, Multipart, State},
     routing::{get, post},
     Router,
 };
@@ -29,6 +29,7 @@ pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
         .route("/health", get(|| async { axum::Json(serde_json::json!({ "status": "ok", "server": "firefly-omni" })) }))
         .route("/api/config", get(get_config).post(update_config))
         .route("/api/extract", post(extract_file_handler))
+        .route("/api/extract/upload", post(extract_multipart_handler))
         .with_state(state);
 
     info!("firefly-omni Axum HTTP server starting on {}", addr);
@@ -38,14 +39,14 @@ pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
 }
 
 async fn get_config(
-    axum::extract::State(state): axum::extract::State<AppState>,
+    State(state): State<AppState>,
 ) -> Json<OmniConfig> {
     let cfg = state.config.lock().unwrap().clone();
     Json(cfg)
 }
 
 async fn update_config(
-    axum::extract::State(state): axum::extract::State<AppState>,
+    State(state): State<AppState>,
     Json(new_config): Json<OmniConfig>,
 ) -> Json<OmniConfig> {
     let mut cfg = state.config.lock().unwrap();
@@ -53,27 +54,48 @@ async fn update_config(
     Json(new_config)
 }
 
+/// 处理本地 JSON 文件路径提取请求: POST /api/extract { "file_path": "/path/to/file" }
 async fn extract_file_handler(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    mut multipart: Option<Multipart>,
+    State(state): State<AppState>,
+    Json(req): Json<ExtractRequest>,
 ) -> Json<OmniExtractionResult> {
     let cfg = state.config.lock().unwrap().clone();
-    
-    // 如果是 Web Multipart 上传
-    if let Some(ref mut mp) = multipart {
-        while let Ok(Some(field)) = mp.next_field().await {
-            let file_name = field.file_name().unwrap_or("temp_file").to_string();
-            if let Ok(bytes) = field.bytes().await {
-                let temp_dir = std::env::temp_dir();
-                let temp_path = temp_dir.join(&file_name);
-                if std::fs::write(&temp_path, &bytes).is_ok() {
-                    let path_str = temp_path.to_string_lossy().to_string();
-                    if let Ok(res) = OmniExtractor::extract(&path_str, &cfg).await {
-                        let _ = std::fs::remove_file(&temp_path);
-                        return Json(res);
-                    }
+    if !req.file_path.is_empty() {
+        if let Ok(res) = OmniExtractor::extract(&req.file_path, &cfg).await {
+            return Json(res);
+        }
+    }
+    Json(OmniExtractionResult {
+        file_path: req.file_path,
+        mime_type: "application/octet-stream".to_string(),
+        file_size: 0,
+        markdown_content: "Error: File extraction failed".to_string(),
+        metadata: serde_json::json!({}),
+        phash: None,
+        is_corrupted: true,
+    })
+}
+
+/// 处理 Web UI 前端拖拽文件二进制流上传请求: POST /api/extract/upload
+async fn extract_multipart_handler(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Json<OmniExtractionResult> {
+    let cfg = state.config.lock().unwrap().clone();
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let file_name = field.file_name().unwrap_or("omni_upload.tmp").to_string();
+        if let Ok(bytes) = field.bytes().await {
+            let temp_dir = std::env::temp_dir();
+            let temp_path = temp_dir.join(&file_name);
+            if std::fs::write(&temp_path, &bytes).is_ok() {
+                let path_str = temp_path.to_string_lossy().to_string();
+                if let Ok(mut res) = OmniExtractor::extract(&path_str, &cfg).await {
+                    res.file_path = file_name;
                     let _ = std::fs::remove_file(&temp_path);
+                    return Json(res);
                 }
+                let _ = std::fs::remove_file(&temp_path);
             }
         }
     }
@@ -82,9 +104,13 @@ async fn extract_file_handler(
         file_path: "unknown".to_string(),
         mime_type: "application/octet-stream".to_string(),
         file_size: 0,
-        markdown_content: "Error: Invalid request".to_string(),
+        markdown_content: "Error: Multipart file upload extraction failed".to_string(),
         metadata: serde_json::json!({}),
         phash: None,
         is_corrupted: true,
     })
 }
+
+
+
+

@@ -118,24 +118,32 @@ export default function App() {
     
     let extractedContent = ''
     let computedPhash: string | undefined = undefined
+    let realMimeType: string | undefined = undefined
 
-    if (serverStatus === 'online') {
-      try {
-        const formData = new FormData()
-        formData.append('file', file)
-        const res = await fetch('/api/extract', {
-          method: 'POST',
-          body: formData
-        })
-        if (res.ok) {
-          const data = await res.json()
-          extractedContent = data.markdown_content || JSON.stringify(data, null, 2)
-          computedPhash = data.phash
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      const res = await fetch('/api/extract/upload', {
+        method: 'POST',
+        body: formData
+      })
+
+      if (res.ok) {
+        const data = await res.json()
+        if (data.markdown_content && !data.markdown_content.startsWith('Error:')) {
+          extractedContent = data.markdown_content
+        } else if (data.metadata || data.phash) {
+          extractedContent = JSON.stringify(data, null, 2)
         }
-      } catch {
-        // 降级处理
+        computedPhash = data.phash
+        if (data.mime_type) {
+          realMimeType = data.mime_type
+        }
       }
+    } catch {
+      // 降级处理
     }
+
 
     if (!extractedContent) {
       if (isPdf) {
@@ -145,35 +153,14 @@ export default function App() {
         const dimensions = await getImageDimensions(base64Data)
         computedPhash = generatePerceptualHash(file.name, file.size)
 
-        const cleanTitle = file.name.replace(/\.[^/.]+$/, "").replace(/[_\-]/g, " ")
-        // 动态分析图像长宽比、像素尺寸与图文密度
-        const aspect = (dimensions.width / (dimensions.height || 1)).toFixed(2)
-        const lineCount = Math.min(8, Math.max(3, Math.floor(dimensions.height / 80)))
-        const ocrLinesList: string[] = []
-
-        ocrLinesList.push(`【图像文本识别段落 #1】: ${cleanTitle}`)
-        ocrLinesList.push(`【图像分辨率与坐标】: ${dimensions.width} x ${dimensions.height} px (宽高比 Aspect Ratio: ${aspect})`)
-        for (let i = 2; i <= lineCount; i++) {
-          ocrLinesList.push(`【PP-OCRv6 动态检测文本行 #${i}】: 图像点阵区域 y: ${i * 45}-${i * 45 + 30}px，检测框置信度 Confidence: ${(0.998 - i * 0.003).toFixed(3)}`)
-        }
-        const ocrLines = ocrLinesList.join('\n')
-
-        extractedContent = `--- Firefly Omni Extracted OCR Content ---
+        extractedContent = `--- Firefly Omni Offline Inspection Notice ---
 File Name: ${file.name}
 Resolution: ${dimensions.width} x ${dimensions.height} px
 File Size: ${(file.size / 1024).toFixed(1)} KB
-MIME Format: ${file.type || 'image/png'} (Magika Confidence: 99.6%)
 Perceptual Hash (pHash): ${computedPhash}
-Last Refreshed At: ${new Date().toLocaleTimeString()}
 
-==================================================
-【Rust Omni-Vision (PP-OCRv6) 真实识别出的文本段落】
-==================================================
-
-${ocrLines}
-
-[Embedded Image Preview]
-![${file.name}](${base64Data.slice(0, 120)}...)`
+[Notice] 未接收到 Rust 后端 omni-server (http://127.0.0.1:9190) 返回的真实 PP-OCRv6 识别结果。
+请确认火核后端服务已在后台运行 (命令: cargo run -p omni-cli -- serve)。`
       } else if (isOffice) {
         extractedContent = `--- Firefly Omni Extracted Office Archive Metadata ---
 File Name: ${file.name}
@@ -219,7 +206,8 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
       if (item.fileName === file.name) {
         return {
           ...item,
-          phash: computedPhash,
+          mimeType: realMimeType || item.mimeType,
+          phash: computedPhash || item.phash,
           ocrPlaceholders: isImg ? 1 : 0,
           extractedText: extractedContent,
           status: 'success',
@@ -229,6 +217,7 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
       return item
     }))
   }
+
 
   // 高阶 PDF 提纯解析器
   const parsePdfDocument = async (file: File): Promise<string> => {

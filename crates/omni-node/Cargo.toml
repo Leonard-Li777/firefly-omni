@@ -9,6 +9,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 omni-core = { path = "../omni-core" }
+omni-extract = { path = "../omni-extract" }
 omni-vision = { path = "../omni-vision" }
-napi = "2.16"
+napi = { version = "2.16", features = ["async", "serde-json"] }
 napi-derive = "2.16"
+tokio = { workspace = true }
+serde_json = { workspace = true }
+

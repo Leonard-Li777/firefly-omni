@@ -1,5 +1,6 @@
 use anyhow::Result;
 use omni_core::OmniExtractionResult;
+use omni_extract::OmniExtractor;
 use omni_vision::OmniVisionEngine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -74,6 +75,17 @@ async fn handle_request(req: &JsonRpcRequest) -> JsonRpcResponse {
             result: Some(json!({
                 "tools": [
                     {
+                        "name": "omni_extract_file",
+                        "description": "Extract structured metadata, MIME type, pHash, EXIF/Media tags, and Markdown text content from any file",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Absolute path to target file" }
+                            },
+                            "required": ["path"]
+                        }
+                    },
+                    {
                         "name": "omni_detect_mime",
                         "description": "Detect precise file MIME type using Google Magika neural network",
                         "inputSchema": {
@@ -142,6 +154,12 @@ async fn handle_request(req: &JsonRpcRequest) -> JsonRpcResponse {
 
 async fn handle_tool_call(name: &str, args: &Value) -> Result<Value> {
     match name {
+        "omni_extract_file" => {
+            let path_str = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
+            let config = omni_core::OmniConfig::default();
+            let res = OmniExtractor::extract(path_str, &config).await?;
+            Ok(serde_json::to_value(res)?)
+        }
         "omni_detect_mime" => {
             let path_str = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
             let mime = OmniVisionEngine::detect_mime_type(path_str)?;
@@ -160,3 +178,4 @@ async fn handle_tool_call(name: &str, args: &Value) -> Result<Value> {
         _ => Err(anyhow::anyhow!("Unknown tool name: {}", name)),
     }
 }
+
