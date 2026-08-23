@@ -224,6 +224,131 @@ mod tests {
         assert_eq!(result.mime_type, "text/plain");
         assert!(result.markdown_content.contains("Firefly Omni API Unit Test"));
     }
+
+    fn resolve_work_folder_path(relative_path: &str) -> std::path::PathBuf {
+        if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+            let p = std::path::PathBuf::from(manifest_dir).join("../../../../tests/work-folder").join(relative_path);
+            if p.exists() {
+                return p;
+            }
+        }
+        let candidates = [
+            std::path::PathBuf::from("../../../../tests/work-folder").join(relative_path),
+            std::path::PathBuf::from("../../../tests/work-folder").join(relative_path),
+            std::path::PathBuf::from("../../tests/work-folder").join(relative_path),
+            std::path::PathBuf::from("tests/work-folder").join(relative_path),
+        ];
+        for cand in candidates {
+            if cand.exists() {
+                return cand;
+            }
+        }
+        std::path::PathBuf::from("../../../../tests/work-folder").join(relative_path)
+    }
+
+    #[tokio::test]
+    async fn test_extract_real_pdf_from_work_folder() {
+        let app = setup_test_app();
+        let real_pdf_path = resolve_work_folder_path("SPEEDY/成都市解除静态管理通知.pdf");
+        if !real_pdf_path.exists() {
+            println!("Skipping real PDF test: file not found at {:?}", real_pdf_path);
+            return;
+        }
+
+        let req_payload = serde_json::json!({
+            "file_path": real_pdf_path.to_string_lossy().to_string()
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/extract")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+        
+        assert_eq!(result.mime_type, "application/pdf");
+        assert!(!result.is_corrupted);
+        assert!(!result.markdown_content.is_empty());
+        println!("✅ [Real PDF Test Result]:\n{}", result.markdown_content);
+    }
+
+    #[tokio::test]
+    async fn test_extract_real_docx_from_work_folder() {
+        let app = setup_test_app();
+        let real_docx_path = resolve_work_folder_path("SPEEDY/项目模块_功能需求文档_日历调度AI集成需求_V1.docx");
+        if !real_docx_path.exists() {
+            println!("Skipping real DOCX test: file not found at {:?}", real_docx_path);
+            return;
+        }
+
+        let req_payload = serde_json::json!({
+            "file_path": real_docx_path.to_string_lossy().to_string()
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/extract")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+        
+        assert!(!result.is_corrupted);
+        assert!(!result.markdown_content.is_empty());
+        println!("✅ [Real DOCX Test Result]:\n{}", result.markdown_content);
+    }
+
+    #[tokio::test]
+    async fn test_extract_real_txt_from_work_folder() {
+        let app = setup_test_app();
+        let real_txt_path = resolve_work_folder_path("PRIVATE/微型小说-出租屋主.txt");
+        if !real_txt_path.exists() {
+            println!("Skipping real TXT test: file not found at {:?}", real_txt_path);
+            return;
+        }
+
+        let req_payload = serde_json::json!({
+            "file_path": real_txt_path.to_string_lossy().to_string()
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/extract")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+        
+        assert_eq!(result.mime_type, "text/plain");
+        assert!(!result.is_corrupted);
+        assert!(!result.markdown_content.is_empty());
+        println!("✅ [Real TXT Test Result]:\n{}", result.markdown_content);
+    }
 }
 
 
