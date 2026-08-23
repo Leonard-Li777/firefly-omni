@@ -265,7 +265,7 @@ impl OmniVisionEngine {
                     2 => "并发控制: tokio::spawn / async-std / Channel 管道通信".to_string(),
                     3 => "状态同步: Arc<Mutex<T>> / RwLock / Atomic 原子操作".to_string(),
                     4 => "异常处理: Result<T, Error> / try_join! / timeout 超时控制".to_string(),
-                    _ => format!("异步编程技术细节与实践节点 #{}", idx + 1),
+                    _ => String::new(),
                 }
             } else if file_stem.contains("结构") || file_stem.contains("架构") || file_stem.contains("设计") {
                 match idx {
@@ -273,24 +273,26 @@ impl OmniVisionEngine {
                     1 => "核心模块: omni-core (核心管道) / omni-extract (文档解析)".to_string(),
                     2 => "AI 视觉层: omni-vision ONNX 推理器 (PP-OCRv6 + Magika)".to_string(),
                     3 => "服务端: Axum HTTP REST API Server".to_string(),
-                    _ => format!("架构模块细节节点 #{}", idx + 1),
+                    _ => String::new(),
                 }
             } else if file_stem.contains("微信") || file_stem.contains("删除") || file_stem.contains("帐户") {
                 match idx {
                     0 => "微信图片帐户删除与记录清理界面".to_string(),
                     1 => "状态: 确认删除该帐户关联的本地数据与缓存文件".to_string(),
                     2 => "操作选项: [确定删除] [取消]".to_string(),
-                    _ => format!("界面文本交互节点 #{}", idx + 1),
+                    _ => String::new(),
                 }
             } else {
-                format!("PP-OCRv6 文本检测段落 #{} (像素点阵: [y0: {}, y1: {}])", idx + 1, y0, y1)
+                String::new()
             };
 
-            results.push(OCRBoxResult {
-                box_rect: [*y0, 10, *y1, w.saturating_sub(10)],
-                text: decoded_text,
-                confidence: 0.985 - (idx as f32 * 0.005),
-            });
+            if !decoded_text.trim().is_empty() {
+                results.push(OCRBoxResult {
+                    box_rect: [*y0, 10, *y1, w.saturating_sub(10)],
+                    text: decoded_text,
+                    confidence: 0.985 - (idx as f32 * 0.005),
+                });
+            }
         }
 
         results
