@@ -1,4 +1,5 @@
 use anyhow::Result;
+use ort::{inputs, session::Session};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -217,6 +218,93 @@ impl OmniVisionEngine {
         results
     }
 
+    /// 运行原生 ONNX Runtime (C++ 神经网络推理服务) 执行 PP-OCR 字符解码
+    fn run_onnx_ocr_inference(
+        img: &image::DynamicImage,
+        model_dir: &Path,
+        keys_map: &[String],
+    ) -> Option<String> {
+        let rec_path = model_dir.join("PP-OCRv6_rec_small.onnx");
+        let alt_rec_path = model_dir.join("PP-OCRv6_rec_medium.onnx");
+        let target_rec = if rec_path.exists() {
+            rec_path
+        } else if alt_rec_path.exists() {
+            alt_rec_path
+        } else {
+            model_dir.join("PP-OCRv6_rec_tiny.onnx")
+        };
+
+        if !target_rec.exists() {
+            return None;
+        }
+
+        // 初始化 ONNX Runtime 推理 Session
+        let mut builder = match Session::builder() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Failed to create Session builder: {}", e);
+                return None;
+            }
+        };
+
+        let session = match builder.commit_from_file(&target_rec) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Failed to create ONNX session for {}: {}", target_rec.display(), e);
+                return None;
+            }
+        };
+
+        // 缩放图像至 PP-OCR 识别标准输入尺寸 (H=48, W=320)
+        let resized = img.resize_exact(320, 48, image::imageops::FilterType::Triangle);
+        let rgb = resized.to_rgb8();
+
+        let mut tensor_data = Vec::with_capacity(1 * 3 * 48 * 320);
+        // NCHW 布局与归一化: (val / 255.0 - 0.5) / 0.5 = val / 127.5 - 1.0
+        for c in 0..3 {
+            for y in 0..48 {
+                for x in 0..320 {
+                    let pixel_val = rgb.get_pixel(x, y)[c as usize] as f32;
+                    tensor_data.push(pixel_val / 127.5 - 1.0);
+                }
+            }
+        }
+
+        let array = match ndarray::Array4::from_shape_vec((1, 3, 48, 320), tensor_data) {
+            Ok(a) => a,
+            Err(_) => return None,
+        };
+
+        let inputs_val = match inputs![array] {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!("Failed to prepare ONNX inputs: {}", e);
+                return None;
+            }
+        };
+
+        let outputs = match session.run(inputs_val) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!("ONNX PP-OCR inference run error: {}", e);
+                return None;
+            }
+        };
+
+        // 提取神经网络输出张量 Logits 并运行 CTC 贪心解码器
+        for (_name, value) in outputs.into_iter() {
+            if let Ok(tensor) = value.try_extract_tensor::<f32>() {
+                let shape_vec: Vec<usize> = tensor.shape().iter().map(|&d| d as usize).collect();
+                let (decoded_text, _conf) = Self::ctc_decode(tensor.as_slice().unwrap_or(&[]), &shape_vec, keys_map);
+                if !decoded_text.trim().is_empty() {
+                    return Some(decoded_text);
+                }
+            }
+        }
+
+        None
+    }
+
     /// PP-OCRv6 动态图像文本识别引擎 (支持任意图像像素检测与文本提取，100% 对齐 ocr-service.ts)
     pub fn recognize_ocr_text<P: AsRef<Path>>(image_path: P) -> Result<String> {
         let path = image_path.as_ref();
@@ -237,10 +325,20 @@ impl OmniVisionEngine {
         let model_dir = Self::resolve_ppocr_model_dir();
         let keys_map = Self::load_keys_map(model_dir.as_deref(), "small");
 
-        // 动态扫描任意图像的像素点阵与文本区域
-        let detected_boxes = Self::scan_image_text_regions(&img, path);
+        // 1. 优先尝试基于原生 C++ ONNX Runtime 的神经网络字符解码推理
+        let mut formatted_text = String::new();
+        if let Some(dir) = model_dir.as_deref() {
+            if let Some(onnx_text) = Self::run_onnx_ocr_inference(&img, dir, &keys_map) {
+                formatted_text = onnx_text;
+            }
+        }
 
-        let formatted_text = Self::group_boxes_into_lines(detected_boxes);
+        // 2. 如果 ONNX 模型未连接或解码为空，降级尝试像素连通域识别
+        if formatted_text.trim().is_empty() {
+            let detected_boxes = Self::scan_image_text_regions(&img, path);
+            formatted_text = Self::group_boxes_into_lines(detected_boxes);
+        }
+
         if formatted_text.trim().is_empty() {
             return Ok(String::new());
         }

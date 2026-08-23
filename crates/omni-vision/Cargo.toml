@@ -11,4 +11,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 image.workspace = true
+ort = { version = "=2.0.0-rc.9", features = ["download-binaries"] }
+ort-sys = { version = "=2.0.0-rc.9", features = ["download-binaries", "ureq"] }
+ndarray = "0.16"
 magika = { version = "0.1", optional = true }
