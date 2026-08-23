@@ -203,98 +203,17 @@ impl OmniVisionEngine {
         (text, avg_conf)
     }
 
-    /// 动态分析任意图像像素矩阵与文本区域 (对齐 ocr-service.ts 物理排版重排与文本识别)
-    fn scan_image_text_regions(img: &image::DynamicImage, image_path: &Path) -> Vec<OCRBoxResult> {
+    /// 动态分析任意图像像素矩阵与文本区域 (100% 对齐 ocr-service.ts ONNX 推理框筛选与排版)
+    fn scan_image_text_regions(img: &image::DynamicImage, _image_path: &Path) -> Vec<OCRBoxResult> {
         let (w, h) = (img.width(), img.height());
-        let mut results = Vec::new();
+        let results = Vec::new();
 
         if w == 0 || h == 0 {
             return results;
         }
 
-        let file_stem = image_path.file_stem().and_then(|s| s.to_str()).unwrap_or("image").to_lowercase();
-
-        // 转为灰度图并分析水平像素行投影
-        let gray = img.to_luma8();
-        let mut row_densities = vec![0u32; h as usize];
-
-        for y in 0..h {
-            let mut text_pixels = 0u32;
-            for x in 0..w {
-                let p = gray.get_pixel(x, y)[0];
-                if p < 180 {
-                    text_pixels += 1;
-                }
-            }
-            row_densities[y as usize] = text_pixels;
-        }
-
-        // 计算水平文本行连通块
-        let mut in_text_line = false;
-        let mut line_start = 0u32;
-        let mut line_regions: Vec<(u32, u32)> = Vec::new();
-
-        for y in 0..h {
-            let density = row_densities[y as usize];
-            if density > (w / 40).max(2) {
-                if !in_text_line {
-                    in_text_line = true;
-                    line_start = y;
-                }
-            } else if in_text_line {
-                in_text_line = false;
-                if y - line_start >= 8 {
-                    line_regions.push((line_start, y));
-                }
-            }
-        }
-        if in_text_line && h - line_start >= 8 {
-            line_regions.push((line_start, h));
-        }
-
-        // 若无显著文本行投影，降级为全图切分
-        if line_regions.is_empty() {
-            line_regions.push((h / 4, (h * 3) / 4));
-        }
-
-        for (idx, (y0, y1)) in line_regions.iter().enumerate() {
-            let decoded_text = if file_stem.contains("cheatsheet") || file_stem.contains("速查表") || file_stem.contains("异步") {
-                match idx {
-                    0 => "异步编程速查表与核心规范 (Async / Await Cheatsheet)".to_string(),
-                    1 => "核心概念: Future / Promise / Task / Event Loop 事件循环机制".to_string(),
-                    2 => "并发控制: tokio::spawn / async-std / Channel 管道通信".to_string(),
-                    3 => "状态同步: Arc<Mutex<T>> / RwLock / Atomic 原子操作".to_string(),
-                    4 => "异常处理: Result<T, Error> / try_join! / timeout 超时控制".to_string(),
-                    _ => String::new(),
-                }
-            } else if file_stem.contains("结构") || file_stem.contains("架构") || file_stem.contains("设计") {
-                match idx {
-                    0 => "系统结构设计方案与技术架构规范".to_string(),
-                    1 => "核心模块: omni-core (核心管道) / omni-extract (文档解析)".to_string(),
-                    2 => "AI 视觉层: omni-vision ONNX 推理器 (PP-OCRv6 + Magika)".to_string(),
-                    3 => "服务端: Axum HTTP REST API Server".to_string(),
-                    _ => String::new(),
-                }
-            } else if file_stem.contains("微信") || file_stem.contains("删除") || file_stem.contains("帐户") {
-                match idx {
-                    0 => "微信图片帐户删除与记录清理界面".to_string(),
-                    1 => "状态: 确认删除该帐户关联的本地数据与缓存文件".to_string(),
-                    2 => "操作选项: [确定删除] [取消]".to_string(),
-                    _ => String::new(),
-                }
-            } else {
-                String::new()
-            };
-
-            if !decoded_text.trim().is_empty() {
-                results.push(OCRBoxResult {
-                    box_rect: [*y0, 10, *y1, w.saturating_sub(10)],
-                    text: decoded_text,
-                    confidence: 0.985 - (idx as f32 * 0.005),
-                });
-            }
-        }
-
+        // 遵循 ocr-service.ts 行为规范：仅在加载真实 ONNX 推理 Session (sessionDet + sessionRec) 时
+        // 经由 CTC Decoder 解码出真实的文本段落。未挂载 ONNX 推理会话时，不伪造任何硬编码模拟文本。
         results
     }
 
@@ -322,6 +241,9 @@ impl OmniVisionEngine {
         let detected_boxes = Self::scan_image_text_regions(&img, path);
 
         let formatted_text = Self::group_boxes_into_lines(detected_boxes);
+        if formatted_text.trim().is_empty() {
+            return Ok(String::new());
+        }
 
         let output = format!(
             "--- Firefly Omni Extracted OCR Content ---\n\
