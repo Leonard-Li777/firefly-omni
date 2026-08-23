@@ -43,7 +43,7 @@ impl OmniExtractor {
         let is_image = mime_type.starts_with("image/") || matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff");
         let is_audio = mime_type.starts_with("audio/") || matches!(ext.as_str(), "mp3" | "flac" | "wav" | "aac" | "ogg" | "m4a");
         let is_video = mime_type.starts_with("video/") || matches!(ext.as_str(), "mp4" | "mkv" | "mov" | "avi");
-        let is_office = matches!(ext.as_str(), "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" | "rtf" | "doc" | "ppt" | "xls" | "epub" | "fb2" | "mobi" | "html" | "htm");
+        let is_office = matches!(ext.as_str(), "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp" | "numbers" | "rtf" | "epub" | "fb2" | "mobi");
 
         let is_unknown_raw = !is_image && !is_audio && !is_video && !is_pdf && !is_office;
         let is_text_or_code = is_plain_text_or_code_ext(&ext) || mime_type.starts_with("text/") || mime_type.contains("json") || mime_type.contains("xml") || is_unknown_raw;
