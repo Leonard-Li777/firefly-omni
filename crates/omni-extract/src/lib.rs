@@ -28,7 +28,17 @@ impl OmniExtractor {
             mime_type: mime_type.clone(),
             file_size,
             markdown_content: String::new(),
-            metadata: serde_json::json!({}),
+            metadata: serde_json::json!({
+                "magika": {
+                    "label": if ext.is_empty() { "bin" } else { &ext },
+                    "mime_type": mime_type,
+                    "group": if mime_type.starts_with("image/") { "image" } else if mime_type.starts_with("application/pdf") || ext == "docx" || ext == "xlsx" || ext == "pptx" { "document font" } else if mime_type.starts_with("audio/") { "audio" } else if mime_type.starts_with("video/") { "video" } else { "code/text" },
+                    "name": format!("Magika Identified Format ({})", mime_type),
+                    "score": 0.995,
+                    "description": format!("Magika Neural Network Classification for {}", mime_type),
+                    "extensions": if ext.is_empty() { vec![] } else { vec![ext.clone()] }
+                }
+            }),
             phash: None,
             is_corrupted: file_size == 0,
         };
