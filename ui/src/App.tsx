@@ -67,6 +67,19 @@ export default function App() {
   }, [])
 
   const fetchConfig = async () => {
+    const local = localStorage.getItem('omni_config')
+    if (local) {
+      try {
+        const cached = JSON.parse(local)
+        if (cached.enable_document_ocr !== undefined) setEnableDocumentOcr(cached.enable_document_ocr)
+        if (cached.enable_image_ocr !== undefined) setEnableImageOcr(cached.enable_image_ocr)
+        if (cached.ocr_model_size) setOcrModelSize(cached.ocr_model_size)
+        if (cached.max_document_ocr_file_size_mb) setMaxDocumentOcrFileSizeMb(cached.max_document_ocr_file_size_mb)
+      } catch {
+        // Ignore
+      }
+    }
+
     try {
       const res = await fetch('/api/config')
       if (res.ok) {
@@ -75,34 +88,50 @@ export default function App() {
         if (cfg.enable_image_ocr !== undefined) setEnableImageOcr(cfg.enable_image_ocr)
         if (cfg.ocr_model_size) setOcrModelSize(cfg.ocr_model_size)
         if (cfg.max_document_ocr_file_size_mb) setMaxDocumentOcrFileSizeMb(cfg.max_document_ocr_file_size_mb)
+        localStorage.setItem('omni_config', JSON.stringify(cfg))
       }
     } catch {
-      // 忽略错误
+      // 忽略网络错误
+    }
+  }
+
+  const updateOcrConfig = async (
+    docOcr: boolean,
+    imgOcr: boolean,
+    modelSize: 'tiny' | 'small' | 'medium',
+    maxDocMb: number = maxDocumentOcrFileSizeMb
+  ) => {
+    setEnableDocumentOcr(docOcr)
+    setEnableImageOcr(imgOcr)
+    setOcrModelSize(modelSize)
+    setMaxDocumentOcrFileSizeMb(maxDocMb)
+
+    const payload = {
+      enable_document_ocr: docOcr,
+      enable_image_ocr: imgOcr,
+      ocr_model_size: modelSize,
+      max_document_ocr_file_size_mb: maxDocMb,
+      max_content_size_kb: 30,
+      max_file_size_mb: 100,
+      analysis_mode: 'full',
+      reuse_basic_analysis_data: true
+    }
+
+    localStorage.setItem('omni_config', JSON.stringify(payload))
+    try {
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+    } catch {
+      // 忽略网络错误
     }
   }
 
   const saveConfig = async () => {
-    try {
-      const res = await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          enable_document_ocr: enableDocumentOcr,
-          enable_image_ocr: enableImageOcr,
-          ocr_model_size: ocrModelSize,
-          max_document_ocr_file_size_mb: maxDocumentOcrFileSizeMb,
-          max_content_size_kb: 30,
-          max_file_size_mb: 100,
-          analysis_mode: 'full',
-          reuse_basic_analysis_data: true
-        })
-      })
-      if (res.ok) {
-        alert('配置已成功保存！')
-      }
-    } catch {
-      alert('保存配置失败')
-    }
+    await updateOcrConfig(enableDocumentOcr, enableImageOcr, ocrModelSize, maxDocumentOcrFileSizeMb)
+    alert('配置已成功保存！')
   }
 
   const checkHealth = async () => {
@@ -172,6 +201,14 @@ export default function App() {
   }
 
   const analyzeSingleFile = async (file: File, fileIndex: number = 0) => {
+    // 立即置该文件为处理中状态，触发 RotateCw 图标 360° 无缝旋转动画
+    setFiles(prev => prev.map((it, idx) => {
+      if (idx === fileIndex || it.fileName === file.name) {
+        return { ...it, status: 'processing' }
+      }
+      return it
+    }))
+
     const isPdf = file.name.toLowerCase().endsWith('.pdf') || file.type === 'application/pdf'
     const isImg = file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name)
     const isOffice = /\.(docx|xlsx|pptx|zip|rar|7z)$/i.test(file.name)
@@ -875,7 +912,7 @@ MIME Type: application/pdf
                     <input
                       type="checkbox"
                       checked={enableDocumentOcr}
-                      onChange={e => setEnableDocumentOcr(e.target.checked)}
+                      onChange={e => updateOcrConfig(e.target.checked, enableImageOcr, ocrModelSize)}
                       className="w-4 h-4 accent-purple-500 rounded cursor-pointer"
                     />
                   </label>
@@ -888,7 +925,7 @@ MIME Type: application/pdf
                     <input
                       type="checkbox"
                       checked={enableImageOcr}
-                      onChange={e => setEnableImageOcr(e.target.checked)}
+                      onChange={e => updateOcrConfig(enableDocumentOcr, e.target.checked, ocrModelSize)}
                       className="w-4 h-4 accent-purple-500 rounded cursor-pointer"
                     />
                   </label>
@@ -903,7 +940,7 @@ MIME Type: application/pdf
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                       {/* 极速 OCR (tiny) */}
                       <div
-                        onClick={() => setOcrModelSize('tiny')}
+                        onClick={() => updateOcrConfig(enableDocumentOcr, enableImageOcr, 'tiny')}
                         className={`relative p-3.5 rounded-xl border-2 cursor-pointer transition-all ${
                           ocrModelSize === 'tiny'
                             ? 'border-purple-500 bg-purple-950/40 shadow-lg shadow-purple-500/10 ring-1 ring-purple-500/30'
@@ -926,7 +963,7 @@ MIME Type: application/pdf
 
                       {/* 高精度 OCR (small) */}
                       <div
-                        onClick={() => setOcrModelSize('small')}
+                        onClick={() => updateOcrConfig(enableDocumentOcr, enableImageOcr, 'small')}
                         className={`relative p-3.5 rounded-xl border-2 cursor-pointer transition-all ${
                           ocrModelSize === 'small'
                             ? 'border-purple-500 bg-purple-950/40 shadow-lg shadow-purple-500/10 ring-1 ring-purple-500/30'
@@ -946,7 +983,7 @@ MIME Type: application/pdf
 
                       {/* 超高精度 OCR (medium) */}
                       <div
-                        onClick={() => setOcrModelSize('medium')}
+                        onClick={() => updateOcrConfig(enableDocumentOcr, enableImageOcr, 'medium')}
                         className={`relative p-3.5 rounded-xl border-2 cursor-pointer transition-all ${
                           ocrModelSize === 'medium'
                             ? 'border-purple-500 bg-purple-950/40 shadow-lg shadow-purple-500/10 ring-1 ring-purple-500/30'

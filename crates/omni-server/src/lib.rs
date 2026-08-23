@@ -41,9 +41,39 @@ pub fn create_app_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+fn get_config_file_path() -> PathBuf {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let dir = PathBuf::from(appdata).join("firefly-ai-folder");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("omni_config.json")
+    } else {
+        std::env::temp_dir().join("omni_config.json")
+    }
+}
+
+fn load_config_from_disk() -> OmniConfig {
+    let path = get_config_file_path();
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(cfg) = serde_json::from_str::<OmniConfig>(&content) {
+                return cfg;
+            }
+        }
+    }
+    OmniConfig::default()
+}
+
+fn save_config_to_disk(cfg: &OmniConfig) {
+    let path = get_config_file_path();
+    if let Ok(json) = serde_json::to_string_pretty(cfg) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
 pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
+    let initial_config = load_config_from_disk();
     let state = AppState {
-        config: Arc::new(Mutex::new(OmniConfig::default())),
+        config: Arc::new(Mutex::new(initial_config)),
     };
     let app = create_app_router(state);
 
@@ -66,6 +96,7 @@ async fn update_config(
 ) -> Json<OmniConfig> {
     let mut cfg = state.config.lock().unwrap();
     *cfg = new_config.clone();
+    save_config_to_disk(&new_config);
     Json(new_config)
 }
 

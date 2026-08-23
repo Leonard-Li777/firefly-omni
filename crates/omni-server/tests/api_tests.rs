@@ -372,3 +372,48 @@ async fn test_extract_real_wechat_png_ocr_text() {
     println!("Recognized OCR Text for WeChat PNG:\n{}", result.markdown_content);
     assert!(!result.markdown_content.is_empty(), "OCR text for WeChat PNG image should be recognized!");
 }
+
+#[tokio::test]
+async fn test_ocr_model_size_switch_and_config_persistence() {
+    let app = setup_test_app();
+
+    let update_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "enable_document_ocr": true,
+                    "enable_image_ocr": true,
+                    "ocr_model_size": "small",
+                    "max_document_ocr_file_size_mb": 10,
+                    "max_content_size_kb": 30,
+                    "max_file_size_mb": 100,
+                    "analysis_mode": "full",
+                    "reuse_basic_analysis_data": true
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(update_resp.status(), StatusCode::OK);
+
+    let get_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let get_body = axum::body::to_bytes(get_resp.into_body(), usize::MAX).await.unwrap();
+    let get_cfg: OmniConfig = serde_json::from_slice(&get_body).unwrap();
+    assert_eq!(get_cfg.ocr_model_size, "small");
+}
