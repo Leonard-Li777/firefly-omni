@@ -221,3 +221,57 @@ async fn test_extract_real_txt_from_work_folder() {
     assert!(!result.is_corrupted);
     assert!(result.markdown_content.contains("出租屋成了社会治安的永久性热点"));
 }
+
+#[tokio::test]
+async fn test_extract_epub_and_doc_documents() {
+    let app = setup_test_app();
+
+    // 1. 验证 .epub 扩展名文件提取
+    let temp_epub = std::env::temp_dir().join("test_book.epub");
+    std::fs::write(&temp_epub, b"PK\x03\x04Dummy Epub Zip Binary Content").unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "file_path": temp_epub.to_string_lossy().to_string()
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let _ = std::fs::remove_file(&temp_epub);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+    assert!(!result.markdown_content.contains("NUL byte detected"));
+
+    // 2. 验证 .doc 扩展名文件提取
+    let temp_doc = std::env::temp_dir().join("test_doc.doc");
+    std::fs::write(&temp_doc, b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\x00\x00Dummy OLE Binary Content\nHeader Line Text").unwrap();
+
+    let response2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "file_path": temp_doc.to_string_lossy().to_string()
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let _ = std::fs::remove_file(&temp_doc);
+    assert_eq!(response2.status(), StatusCode::OK);
+    let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX).await.unwrap();
+    let result2: OmniExtractionResult = serde_json::from_slice(&body2).unwrap();
+    assert!(!result2.markdown_content.contains("NUL byte detected"));
+}

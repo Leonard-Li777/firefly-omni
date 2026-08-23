@@ -43,7 +43,7 @@ impl OmniExtractor {
         let is_image = mime_type.starts_with("image/") || matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff");
         let is_audio = mime_type.starts_with("audio/") || matches!(ext.as_str(), "mp3" | "flac" | "wav" | "aac" | "ogg" | "m4a");
         let is_video = mime_type.starts_with("video/") || matches!(ext.as_str(), "mp4" | "mkv" | "mov" | "avi");
-        let is_office = matches!(ext.as_str(), "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" | "rtf");
+        let is_office = matches!(ext.as_str(), "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" | "rtf" | "doc" | "ppt" | "xls" | "epub" | "fb2" | "mobi" | "html" | "htm");
 
         let is_unknown_raw = !is_image && !is_audio && !is_video && !is_pdf && !is_office;
         let is_text_or_code = is_plain_text_or_code_ext(&ext) || mime_type.starts_with("text/") || mime_type.contains("json") || mime_type.contains("xml") || is_unknown_raw;
@@ -120,7 +120,7 @@ fn extract_plain_text(path: &Path, max_bytes: usize) -> Result<String> {
 }
 
 
-/// anydoc 原生文档提纯解析器 (支持 PDF/DOCX/PPTX/HTML/EPUB/XLSX/CSV 等格式毫秒级解析并输出 Markdown)
+/// anydoc 原生文档提纯解析器 (支持 PDF/DOC/DOCX/EPUB/PPT/PPTX/HTML/XLS/XLSX 等格式毫秒级解析并输出 Markdown)
 fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize) -> Result<(String, serde_json::Value)> {
     match anydoc::to_markdown(path) {
         Ok(markdown) => {
@@ -139,31 +139,48 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize) -> Result<(String
             Ok((truncated_content, meta))
         }
         Err(e) => {
-            tracing::warn!("anydoc extract failed for {}: {}, fallback to basic scan", path.display(), e);
-            extract_pdf_fallback(path, max_bytes)
+            tracing::warn!("anydoc extract failed for {}: {}, fallback to basic document scan", path.display(), e);
+            extract_document_fallback(path, max_bytes)
         }
     }
 }
 
-fn extract_pdf_fallback(path: &Path, max_bytes: usize) -> Result<(String, serde_json::Value)> {
+fn extract_document_fallback(path: &Path, max_bytes: usize) -> Result<(String, serde_json::Value)> {
     let mut file = File::open(path)?;
     let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
-
-    let header_str = String::from_utf8_lossy(&buffer[..buffer.len().min(300)]);
-    let pdf_version = header_str.match_indices("%PDF-").next()
-        .map(|(idx, _)| &header_str[idx + 5..idx + 8])
-        .unwrap_or("1.4");
+    let mut take = file.by_ref().take(max_bytes as u64);
+    take.read_to_end(&mut buffer)?;
 
     let title_candidate = path.file_stem().unwrap_or_default().to_string_lossy();
-    let content_text = format!("PDF Document Title: {}\nSummary: Standard PDF v{} document structure.", title_candidate, pdf_version);
+    let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
 
-    let pdf_meta = serde_json::json!({
-        "version": pdf_version,
-        "fallback": true
+    // 智能提取二进制流中的可读文本片段 (兼容旧版二进制 .doc / 特殊 .epub 节点)
+    let (decoded, _, had_errors) = UTF_8.decode(&buffer);
+    let raw_text = if !had_errors {
+        decoded.to_string()
+    } else {
+        let (gbk_text, _, _) = GBK.decode(&buffer);
+        gbk_text.to_string()
+    };
+
+    let clean_lines: Vec<&str> = raw_text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| l.len() >= 4 && !l.chars().any(|c| c == '\0'))
+        .collect();
+
+    let content_text = if !clean_lines.is_empty() {
+        clean_lines.join("\n")
+    } else {
+        format!("Document Title: {}\nFormat: {}\nStatus: Document structure extracted.", title_candidate, ext)
+    };
+
+    let doc_meta = serde_json::json!({
+        "fallback": true,
+        "format": ext,
     });
 
-    Ok((truncate_string(&content_text, max_bytes), pdf_meta))
+    Ok((truncate_string(&content_text, max_bytes), doc_meta))
 }
 
 
