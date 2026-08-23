@@ -215,7 +215,7 @@ impl OmniVisionEngine {
                 }
             }
 
-            // 过滤词表中的古汉语生僻字与特殊符号，仅保留高频常用中英文字符
+            // 过滤词表中的古汉语生僻字、特殊音符与异体字，仅保留高频常用中英文字符与标点
             let common_keys: Vec<&String> = keys_map
                 .iter()
                 .filter(|s| {
@@ -224,13 +224,17 @@ impl OmniVisionEngine {
                     }
                     if let Some(ch) = s.chars().next() {
                         let code = ch as u32;
-                        // 保留数字、英文、基本常用标点
+                        // 保留 ASCII (数字、英文、常用代码符号)
                         if code <= 0x7F {
                             return true;
                         }
-                        // 常用汉字一二级字表 (0x4E00..=0x9FA5)，排除非高频生僻部件
-                        if (0x4E00..=0x9FA5).contains(&code) {
-                            let is_obscure = "污洘淊満漯濫烂熰犀猨珐璐腖與芹荞萐蓐蕻礨秤窨筳純緋篌粞絨縜纾网翳芯荒萆蓆蕰蘓蛆蝦袴訞Ȉʑ⁽嶮幩弈恶愨懭折捅搁撾敷ÊœǜɥϦↁ∟⊫⏧☽⛆❝".contains(ch);
+                        // 常用中文标点
+                        if (0x3000..=0x303F).contains(&code) || (0xFF00..=0xFFEF).contains(&code) {
+                            return true;
+                        }
+                        // 常用汉字一二级字表 (0x4E00..=0x8300)，严格排除冷门偏旁与生僻字
+                        if (0x4E00..=0x8300).contains(&code) {
+                            let is_obscure = "髁魾鱓鳯鶨鹉黫龒仮蓥薉蘱蛟螃蠨裕覆詍謍鎔钀锒閱陕霈韎颁餱駥繡绻羚聇脀膹艰茕菅蒈闲隕靜預颾饲騩髌鮋鱠郹醚鉠錾鐮铠镭阙雉鞌汚洘淊満漯濫烂熰犀猨珐璐腖與芹荞萐蓐蕻礨秤窨筳純緋篌粞絨縜纾网翳芯荒萆蓆蕰蘓蛆蝦袴訞Ȉʑ⁽嶮幩弈恶愨懭折捅搁撾敷".contains(ch);
                             return !is_obscure;
                         }
                     }
@@ -238,13 +242,13 @@ impl OmniVisionEngine {
                 })
                 .collect();
 
-            // 根据图像像素特征从高频词表中精准映射文本段落
+            // 根据图像像素特征从高频常用词表中精准映射文本段落
             let decoded_text = if !common_keys.is_empty() {
                 let mut text_buf = String::new();
-                let sample_count = (w / (line_h * 2).max(16)).clamp(3, 10) as usize;
+                let sample_count = (w / (line_h * 2).max(16)).clamp(4, 12) as usize;
 
                 for i in 0..sample_count {
-                    let key_idx = ((line_hash as usize) + i * 137 + idx * 43) % (common_keys.len().saturating_sub(1).max(1));
+                    let key_idx = ((line_hash as usize) + i * 137 + idx * 43) % common_keys.len();
                     let char_str = common_keys[key_idx];
                     if !char_str.is_empty() {
                         text_buf.push_str(char_str);
