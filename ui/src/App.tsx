@@ -314,13 +314,34 @@ MIME Type: application/pdf
 
   const selectedFile = selectedFileIndex !== null ? files[selectedFileIndex] : null
 
-  // Extract metadata object helper
-  const getExifMetadata = (file: ExtractionResult | null) => {
-    if (!file?.apiResponse?.metadata) return null
+  // Flatten nested metadata helper (eliminates [object Object] rendering)
+  const getFlattenedExifMetadata = (file: ExtractionResult | null): Array<[string, string]> => {
+    if (!file?.apiResponse?.metadata) return []
     const meta = file.apiResponse.metadata
-    if (meta.image?.exif) return meta.image.exif
-    if (meta.exif) return meta.exif
-    return meta
+    const entries: Array<[string, string]> = []
+
+    const flatten = (obj: any, prefix = '') => {
+      if (!obj || typeof obj !== 'object') return
+      for (const [k, v] of Object.entries(obj)) {
+        if (prefix === '' && k === 'magika') continue // magika is rendered in Zone 1
+        const keyName = prefix ? `${prefix}.${k}` : k
+        if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+          flatten(v, keyName)
+        } else if (Array.isArray(v)) {
+          entries.push([keyName, JSON.stringify(v)])
+        } else {
+          entries.push([keyName, String(v)])
+        }
+      }
+    }
+
+    if (meta.image?.exif) {
+      flatten(meta.image.exif)
+    } else {
+      flatten(meta)
+    }
+
+    return entries
   }
 
   const getMagikaMetadata = (file: ExtractionResult | null) => {
@@ -647,19 +668,19 @@ MIME Type: application/pdf
                             ExifTool Metadata
                           </span>
                         </div>
-                        {getExifMetadata(selectedFile) ? (
+                        {getFlattenedExifMetadata(selectedFile).length > 0 ? (
                           <div className="space-y-1.5 text-xs overflow-y-auto max-h-[160px] pr-1">
-                            {Object.entries(getExifMetadata(selectedFile)!).map(([k, v]) => (
+                            {getFlattenedExifMetadata(selectedFile).map(([k, v]) => (
                               <div key={k} className="flex justify-between items-center bg-slate-900/60 px-2 py-1 rounded border border-slate-800/80 text-[11px]">
                                 <span className="text-slate-400 font-mono">{k}</span>
-                                <span className="font-mono text-sky-200 truncate max-w-[180px]">{String(v)}</span>
+                                <span className="font-mono text-sky-200 truncate max-w-[180px]" title={v}>{v}</span>
                               </div>
                             ))}
                           </div>
                         ) : (
                           <div className="flex-1 flex flex-col items-center justify-center py-6 text-slate-500 text-xs">
                             <AlertCircle className="w-6 h-6 mb-1 opacity-40 text-sky-400" />
-                            未包含 EXIF 图像元数据
+                            未包含 EXIF / 扩展元数据
                           </div>
                         )}
                       </div>
