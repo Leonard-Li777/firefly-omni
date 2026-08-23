@@ -115,7 +115,7 @@ impl OmniExtractor {
 
             // 调用 PP-OCRv6 执行动态图像文本识别
             if config.enable_image_ocr {
-                if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text(p) {
+                if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text_with_size(p, &config.ocr_model_size) {
                     if !ocr_text.trim().is_empty() {
                         result.markdown_content = ocr_text;
                     }

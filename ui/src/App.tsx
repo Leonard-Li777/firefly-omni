@@ -56,11 +56,54 @@ export default function App() {
   // Config state
   const [maxWorkers, setMaxWorkers] = useState(4)
   const [onnxProvider, setOnnxProvider] = useState('CPU')
-  const [ocrLanguage, setOcrLanguage] = useState('zh-CN + en')
+  const [enableDocumentOcr, setEnableDocumentOcr] = useState(true)
+  const [enableImageOcr, setEnableImageOcr] = useState(true)
+  const [ocrModelSize, setOcrModelSize] = useState<'tiny' | 'small' | 'medium'>('tiny')
+  const [maxDocumentOcrFileSizeMb, setMaxDocumentOcrFileSizeMb] = useState(10)
 
   useEffect(() => {
     checkHealth()
+    fetchConfig()
   }, [])
+
+  const fetchConfig = async () => {
+    try {
+      const res = await fetch('/api/config')
+      if (res.ok) {
+        const cfg = await res.json()
+        if (cfg.enable_document_ocr !== undefined) setEnableDocumentOcr(cfg.enable_document_ocr)
+        if (cfg.enable_image_ocr !== undefined) setEnableImageOcr(cfg.enable_image_ocr)
+        if (cfg.ocr_model_size) setOcrModelSize(cfg.ocr_model_size)
+        if (cfg.max_document_ocr_file_size_mb) setMaxDocumentOcrFileSizeMb(cfg.max_document_ocr_file_size_mb)
+      }
+    } catch {
+      // 忽略错误
+    }
+  }
+
+  const saveConfig = async () => {
+    try {
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enable_document_ocr: enableDocumentOcr,
+          enable_image_ocr: enableImageOcr,
+          ocr_model_size: ocrModelSize,
+          max_document_ocr_file_size_mb: maxDocumentOcrFileSizeMb,
+          max_content_size_kb: 30,
+          max_file_size_mb: 100,
+          analysis_mode: 'full',
+          reuse_basic_analysis_data: true
+        })
+      })
+      if (res.ok) {
+        alert('配置已成功保存！')
+      }
+    } catch {
+      alert('保存配置失败')
+    }
+  }
 
   const checkHealth = async () => {
     setServerStatus('checking')
@@ -815,23 +858,122 @@ MIME Type: application/pdf
                 </select>
               </div>
 
-              <div>
-                <label className="block text-slate-300 font-medium mb-2">
-                  OCR 语言与模型类型
-                </label>
-                <input
-                  type="text"
-                  value={ocrLanguage}
-                  onChange={e => setOcrLanguage(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-slate-200 focus:border-amber-500 focus:outline-none"
-                />
+              {/* OCR 识别与模型精度配置 */}
+              <div className="p-4 rounded-xl border border-slate-800 bg-slate-950/60 space-y-4">
+                <div className="flex items-center gap-2 border-b border-slate-800 pb-2.5">
+                  <Eye className="w-4 h-4 text-purple-400" />
+                  <span className="text-sm font-semibold text-slate-200">OCR 识别与模型切换 (PP-OCRv6)</span>
+                </div>
+
+                {/* 开关配置 */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <label className="flex items-center justify-between p-3 rounded-lg border border-slate-800 bg-slate-900/60 cursor-pointer hover:bg-slate-900/90 transition-all">
+                    <div>
+                      <span className="text-xs font-semibold text-slate-200 block">启用文档 OCR 文字识别</span>
+                      <span className="text-[11px] text-slate-400 block mt-0.5">识别 PDF 和 Office 内的包含图片段落</span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={enableDocumentOcr}
+                      onChange={e => setEnableDocumentOcr(e.target.checked)}
+                      className="w-4 h-4 accent-purple-500 rounded cursor-pointer"
+                    />
+                  </label>
+
+                  <label className="flex items-center justify-between p-3 rounded-lg border border-slate-800 bg-slate-900/60 cursor-pointer hover:bg-slate-900/90 transition-all">
+                    <div>
+                      <span className="text-xs font-semibold text-slate-200 block">启用图片 OCR 文字识别</span>
+                      <span className="text-[11px] text-slate-400 block mt-0.5">识别 PNG, JPG, GIF, WebP 画面文字</span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={enableImageOcr}
+                      onChange={e => setEnableImageOcr(e.target.checked)}
+                      className="w-4 h-4 accent-purple-500 rounded cursor-pointer"
+                    />
+                  </label>
+                </div>
+
+                {/* OCR 模型精度切换卡片 (对齐 Desktop 极速 / 高精度 / 超高精度) */}
+                {(enableDocumentOcr || enableImageOcr) && (
+                  <div className="pt-2 space-y-2">
+                    <label className="block text-xs font-medium text-slate-300">
+                      OCR 识别精度与神经网络模型切换
+                    </label>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                      {/* 极速 OCR (tiny) */}
+                      <div
+                        onClick={() => setOcrModelSize('tiny')}
+                        className={`relative p-3.5 rounded-xl border-2 cursor-pointer transition-all ${
+                          ocrModelSize === 'tiny'
+                            ? 'border-purple-500 bg-purple-950/40 shadow-lg shadow-purple-500/10 ring-1 ring-purple-500/30'
+                            : 'border-slate-800 bg-slate-900/50 hover:border-purple-500/50 hover:bg-slate-900/80'
+                        }`}
+                      >
+                        <div className="absolute top-0 right-0 text-[10px] font-bold bg-emerald-500 text-slate-950 px-2 py-0.5 rounded-bl-md">
+                          推荐
+                        </div>
+                        <div className="flex items-center space-x-2">
+                          <Zap className={`w-4 h-4 ${ocrModelSize === 'tiny' ? 'text-purple-400' : 'text-slate-400'}`} />
+                          <span className={`font-semibold text-xs ${ocrModelSize === 'tiny' ? 'text-purple-300' : 'text-slate-200'}`}>
+                            极速 OCR (Tiny)
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">
+                          PP-OCRv6 Tiny 模型，1秒内极速推理，适合绝大多数图片与文档场景。
+                        </p>
+                      </div>
+
+                      {/* 高精度 OCR (small) */}
+                      <div
+                        onClick={() => setOcrModelSize('small')}
+                        className={`relative p-3.5 rounded-xl border-2 cursor-pointer transition-all ${
+                          ocrModelSize === 'small'
+                            ? 'border-purple-500 bg-purple-950/40 shadow-lg shadow-purple-500/10 ring-1 ring-purple-500/30'
+                            : 'border-slate-800 bg-slate-900/50 hover:border-purple-500/50 hover:bg-slate-900/80'
+                        }`}
+                      >
+                        <div className="flex items-center space-x-2">
+                          <Check className={`w-4 h-4 ${ocrModelSize === 'small' ? 'text-purple-400' : 'text-slate-400'}`} />
+                          <span className={`font-semibold text-xs ${ocrModelSize === 'small' ? 'text-purple-300' : 'text-slate-200'}`}>
+                            高精度 OCR (Small)
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">
+                          PP-OCRv6 Small 模型，识别更准确，适合复杂截图、艺术字或微缩字体。
+                        </p>
+                      </div>
+
+                      {/* 超高精度 OCR (medium) */}
+                      <div
+                        onClick={() => setOcrModelSize('medium')}
+                        className={`relative p-3.5 rounded-xl border-2 cursor-pointer transition-all ${
+                          ocrModelSize === 'medium'
+                            ? 'border-purple-500 bg-purple-950/40 shadow-lg shadow-purple-500/10 ring-1 ring-purple-500/30'
+                            : 'border-slate-800 bg-slate-900/50 hover:border-purple-500/50 hover:bg-slate-900/80'
+                        }`}
+                      >
+                        <div className="flex items-center space-x-2">
+                          <ShieldCheck className={`w-4 h-4 ${ocrModelSize === 'medium' ? 'text-purple-400' : 'text-slate-400'}`} />
+                          <span className={`font-semibold text-xs ${ocrModelSize === 'medium' ? 'text-purple-300' : 'text-slate-200'}`}>
+                            超高精度 OCR (Medium)
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">
+                          PP-OCRv6 Medium 大模型，极致解码率，耗时稍长。
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div className="pt-4 border-t border-slate-800 flex justify-end">
                 <button
-                  onClick={() => alert('配置已成功保存！')}
-                  className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl transition-all shadow-lg shadow-amber-500/20"
+                  onClick={saveConfig}
+                  className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl transition-all shadow-lg shadow-amber-500/20 flex items-center gap-1.5"
                 >
+                  <Check className="w-4 h-4" />
                   保存配置
                 </button>
               </div>

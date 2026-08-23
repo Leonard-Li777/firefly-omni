@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct OmniConfig {
     pub enable_document_ocr: bool,
     pub enable_image_ocr: bool,
+    /// OCR 识别模型精度/尺寸 ('tiny' | 'small' | 'medium')
+    pub ocr_model_size: String,
     pub max_document_ocr_file_size_mb: u64,
     pub max_content_size_kb: usize,
     pub max_file_size_mb: u64,
@@ -19,6 +21,7 @@ impl Default for OmniConfig {
         Self {
             enable_document_ocr: true,
             enable_image_ocr: true,
+            ocr_model_size: "tiny".to_string(),
             max_document_ocr_file_size_mb: 10,
             max_content_size_kb: 30,
             max_file_size_mb: 100,

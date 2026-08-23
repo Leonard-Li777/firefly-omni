@@ -324,16 +324,21 @@ impl OmniVisionEngine {
     fn run_onnx_ocr_inference(
         img: &image::DynamicImage,
         model_dir: &Path,
+        model_size: &str,
         keys_map: &[String],
     ) -> Option<String> {
-        let rec_path = model_dir.join("PP-OCRv6_rec_small.onnx");
-        let alt_rec_path = model_dir.join("PP-OCRv6_rec_medium.onnx");
+        let size_str = if model_size.is_empty() { "small" } else { model_size };
+        let primary_name = format!("PP-OCRv6_rec_{}.onnx", size_str);
+        let rec_path = model_dir.join(&primary_name);
+        let alt_rec_path = model_dir.join("PP-OCRv6_rec_small.onnx");
+        let fallback_rec_path = model_dir.join("PP-OCRv6_rec_tiny.onnx");
+
         let target_rec = if rec_path.exists() {
             rec_path
         } else if alt_rec_path.exists() {
             alt_rec_path
         } else {
-            model_dir.join("PP-OCRv6_rec_tiny.onnx")
+            fallback_rec_path
         };
 
         if !target_rec.exists() {
@@ -367,7 +372,6 @@ impl OmniVisionEngine {
                 continue;
             }
 
-            // 计算该行区域内的水平列边缘分布，精确定位左右文本边界 x0, x1
             let mut min_x = w;
             let mut max_x = 0u32;
             for x in 1..w {
@@ -447,8 +451,8 @@ impl OmniVisionEngine {
         None
     }
 
-    /// PP-OCRv6 动态图像文本识别引擎 (支持任意图像像素检测与文本提取，100% 对齐 ocr-service.ts)
-    pub fn recognize_ocr_text<P: AsRef<Path>>(image_path: P) -> Result<String> {
+    /// PP-OCRv6 动态图像文本识别引擎 (支持指定 OCR 模型尺寸 'tiny' | 'small' | 'medium')
+    pub fn recognize_ocr_text_with_size<P: AsRef<Path>>(image_path: P, model_size: &str) -> Result<String> {
         let path = image_path.as_ref();
         if !path.exists() {
             return Ok(String::new());
@@ -462,15 +466,15 @@ impl OmniVisionEngine {
         let (w, h) = (img.width(), img.height());
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
 
-        info!("Executing Dynamic PP-OCRv6 recognition pipeline on {} ({}x{})", path.display(), w, h);
+        info!("Executing Dynamic PP-OCRv6 ({}) recognition pipeline on {} ({}x{})", model_size, path.display(), w, h);
 
         let model_dir = Self::resolve_ppocr_model_dir();
-        let keys_map = Self::load_keys_map(model_dir.as_deref(), "small");
+        let keys_map = Self::load_keys_map(model_dir.as_deref(), model_size);
 
         // 1. 优先尝试基于原生 C++ ONNX Runtime 的神经网络字符解码推理
         let mut formatted_text = String::new();
         if let Some(dir) = model_dir.as_deref() {
-            if let Some(onnx_text) = Self::run_onnx_ocr_inference(&img, dir, &keys_map) {
+            if let Some(onnx_text) = Self::run_onnx_ocr_inference(&img, dir, model_size, &keys_map) {
                 formatted_text = onnx_text;
             }
         }
@@ -489,6 +493,7 @@ impl OmniVisionEngine {
             "--- Firefly Omni Extracted OCR Content ---\n\
             File Name: {}\n\
             Resolution: {} x {} px\n\
+            Model Size: {}\n\
             Model Keys: {} (Dictionary Entries: {})\n\
             Pipeline: Dynamic Pixel Grid Detection + PP-OCRv6 CTC Decoder\n\
             Status: Dynamic Image Recognition Complete\n\n\
@@ -499,11 +504,17 @@ impl OmniVisionEngine {
             file_name,
             w,
             h,
+            if model_size.is_empty() { "small" } else { model_size },
             if model_dir.is_some() { "Loaded" } else { "Default" },
             keys_map.len(),
             formatted_text
         );
 
         Ok(output)
+    }
+
+    /// PP-OCRv6 动态图像文本识别引擎 默认重载
+    pub fn recognize_ocr_text<P: AsRef<Path>>(image_path: P) -> Result<String> {
+        Self::recognize_ocr_text_with_size(image_path, "tiny")
     }
 }
