@@ -40,13 +40,54 @@ pub struct OmniExtractionResult {
     pub is_corrupted: bool,
 }
 
+/// 查重扫描请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuplicateScanRequest {
+    pub paths: Vec<String>,
+    pub strategies: Option<Vec<String>>,
+    pub min_similarity: Option<u8>,
+    pub check_video: Option<bool>,
+}
+
+/// 查重文件项
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OmniDuplicateFileItem {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub modified_at: String,
+    pub fingerprint: String,
+    pub similarity_score: Option<f32>,
+}
+
+/// 查重聚合组
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OmniDuplicateGroup {
+    pub group_id: String,
+    pub strategy: String,
+    pub similarity_percentage: f32,
+    pub description: String,
+    pub files: Vec<OmniDuplicateFileItem>,
+    pub potential_freed_bytes: u64,
+}
+
+/// 查重扫描响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuplicateScanResponse {
+    pub success: bool,
+    pub total_scanned: usize,
+    pub duplicate_groups: Vec<OmniDuplicateGroup>,
+    pub total_redundant_files: usize,
+    pub total_freed_bytes: u64,
+    pub duration_ms: u64,
+}
+
 impl OmniExtractionResult {
     /// 计算图像感知哈希 (czkawka_core pHash)
     pub fn compute_phash<P: AsRef<std::path::Path>>(path: P) -> Option<String> {
         let p = path.as_ref();
         if let Ok(metadata) = std::fs::metadata(p) {
             if metadata.len() > 0 {
-                // 计算 64-bit 文件采样特征感知哈希
                 let mut hash: u64 = 0;
                 let str_repr = format!("{}_{}", p.to_string_lossy(), metadata.len());
                 for b in str_repr.bytes() {
@@ -67,3 +108,4 @@ impl OmniExtractionResult {
         true
     }
 }
+

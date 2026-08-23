@@ -1796,6 +1796,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "image",
  "omni-core",
  "omni-extract",
  "omni-vision",

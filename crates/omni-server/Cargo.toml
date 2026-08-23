@@ -18,3 +18,4 @@ anyhow.workspace = true
 
 [dev-dependencies]
 tower = { workspace = true }
+image = { workspace = true }

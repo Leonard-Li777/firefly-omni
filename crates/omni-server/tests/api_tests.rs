@@ -275,3 +275,39 @@ async fn test_extract_epub_and_doc_documents() {
     let result2: OmniExtractionResult = serde_json::from_slice(&body2).unwrap();
     assert!(!result2.markdown_content.contains("NUL byte detected"));
 }
+
+#[tokio::test]
+async fn test_extract_image_phash_and_metadata() {
+    let app = setup_test_app();
+
+    // 创建一幅 100x100 的纯色 PNG 图片用于测试
+    let temp_img = std::env::temp_dir().join("test_image_extraction.png");
+    let img = image::RgbImage::from_fn(100, 100, |x, y| {
+        if x > 50 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 255, 0]) }
+    });
+    img.save(&temp_img).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "file_path": temp_img.to_string_lossy().to_string()
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let _ = std::fs::remove_file(&temp_img);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+    
+    assert_eq!(result.mime_type, "image/png");
+    assert!(result.phash.is_some(), "Image pHash should be computed and non-null");
+    assert!(result.metadata.get("image").is_some(), "Image metadata should contain width, height and resolution");
+    assert_eq!(result.metadata["image"]["resolution"], "100x100");
+}

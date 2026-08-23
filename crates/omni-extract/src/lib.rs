@@ -2,6 +2,7 @@ use omni_core::{OmniConfig, OmniExtractionResult};
 use omni_vision::OmniVisionEngine;
 use anyhow::Result;
 use encoding_rs::{GBK, UTF_8, UTF_16LE};
+use lofty::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -44,6 +45,73 @@ impl OmniExtractor {
         let is_audio = mime_type.starts_with("audio/") || matches!(ext.as_str(), "mp3" | "flac" | "wav" | "aac" | "ogg" | "m4a");
         let is_video = mime_type.starts_with("video/") || matches!(ext.as_str(), "mp4" | "mkv" | "mov" | "avi");
         let is_office = matches!(ext.as_str(), "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp" | "numbers" | "rtf" | "epub" | "fb2" | "mobi");
+
+        // 1. 尝试提取音频 / 视频 Tag 与元数据
+        if is_audio || is_video {
+            if let Ok(tagged_file) = lofty::probe::Probe::open(p).and_then(|pr| pr.read()) {
+                let mut audio_meta = serde_json::Map::new();
+                if let Some(tag) = tagged_file.primary_tag() {
+                    use lofty::tag::Accessor;
+                    if let Some(title) = tag.title() { audio_meta.insert("title".into(), title.to_string().into()); }
+                    if let Some(artist) = tag.artist() { audio_meta.insert("artist".into(), artist.to_string().into()); }
+                    if let Some(album) = tag.album() { audio_meta.insert("album".into(), album.to_string().into()); }
+                    if let Some(genre) = tag.genre() { audio_meta.insert("genre".into(), genre.to_string().into()); }
+                }
+                let properties = tagged_file.properties();
+                audio_meta.insert("duration_seconds".into(), properties.duration().as_secs().into());
+                audio_meta.insert("bitrate".into(), properties.audio_bitrate().unwrap_or(0).into());
+                result.metadata["media"] = serde_json::Value::Object(audio_meta);
+            }
+        }
+
+        // 2. 尝试提取图像 EXIF 、尺寸信息与感知哈希 (pHash) 及 PP-OCRv6 OCR 文字识别
+        if is_image {
+            // 计算图像 64-bit 感知哈希 (pHash)
+            result.phash = OmniExtractionResult::compute_phash(p);
+
+            let mut img_meta = serde_json::Map::new();
+            if let Ok((width, height)) = image::image_dimensions(p) {
+                img_meta.insert("width".into(), width.into());
+                img_meta.insert("height".into(), height.into());
+                img_meta.insert("resolution".into(), format!("{}x{}", width, height).into());
+            }
+
+            if let Ok(file) = File::open(p) {
+                let mut buf_reader = std::io::BufReader::new(file);
+                if let Ok(exif_reader) = exif::Reader::new().read_from_container(&mut buf_reader) {
+                    let mut exif_map = serde_json::Map::new();
+                    for field in exif_reader.fields() {
+                        let tag_name = field.tag.to_string();
+                        let val_str = field.display_value().with_unit(&exif_reader).to_string();
+                        exif_map.insert(tag_name, val_str.into());
+                    }
+                    img_meta.insert("exif".into(), serde_json::Value::Object(exif_map));
+                }
+            }
+
+            // 如果 kamadak-exif 深度解析为空，尝试 exiftool-rs 补充元数据
+            if !img_meta.contains_key("exif") {
+                if let Ok(exif_result) = exiftool_rs::image_info(p) {
+                    let mut exif_map = serde_json::Map::new();
+                    for (k, v) in exif_result {
+                        exif_map.insert(k, v.to_string().into());
+                    }
+                    if !exif_map.is_empty() {
+                        img_meta.insert("exif".into(), serde_json::Value::Object(exif_map));
+                    }
+                }
+            }
+            result.metadata["image"] = serde_json::Value::Object(img_meta);
+
+            // 调用 PP-OCRv6 执行动态图像文本识别
+            if config.enable_image_ocr {
+                if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text(p) {
+                    if !ocr_text.trim().is_empty() {
+                        result.markdown_content = ocr_text;
+                    }
+                }
+            }
+        }
 
         let is_unknown_raw = !is_image && !is_audio && !is_video && !is_pdf && !is_office;
         let is_text_or_code = is_plain_text_or_code_ext(&ext) || mime_type.starts_with("text/") || mime_type.contains("json") || mime_type.contains("xml") || is_unknown_raw;

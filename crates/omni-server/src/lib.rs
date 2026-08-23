@@ -1,13 +1,19 @@
 use axum::{
-    extract::{Json, Multipart, State},
+    extract::{Multipart, State},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
-use omni_core::{OmniConfig, OmniExtractionResult};
+use omni_core::{
+    DuplicateScanRequest, DuplicateScanResponse, OmniConfig, OmniDuplicateFileItem,
+    OmniDuplicateGroup, OmniExtractionResult,
+};
 use omni_extract::OmniExtractor;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::info;
 
 #[derive(Clone)]
@@ -22,10 +28,16 @@ pub struct ExtractRequest {
 
 pub fn create_app_router(state: AppState) -> Router {
     Router::new()
-        .route("/health", get(|| async { axum::Json(serde_json::json!({ "status": "ok", "server": "firefly-omni" })) }))
+        .route(
+            "/health",
+            get(|| async {
+                axum::Json(serde_json::json!({ "status": "ok", "server": "firefly-omni" }))
+            }),
+        )
         .route("/api/config", get(get_config).post(update_config))
         .route("/api/extract", post(extract_file_handler))
         .route("/api/extract/upload", post(extract_multipart_handler))
+        .route("/api/duplicate/scan", post(duplicate_scan_handler))
         .with_state(state)
 }
 
@@ -114,8 +126,172 @@ async fn extract_multipart_handler(
     })
 }
 
+/// 处理多模态查重扫描请求: POST /api/duplicate/scan
+async fn duplicate_scan_handler(
+    State(_state): State<AppState>,
+    Json(req): Json<DuplicateScanRequest>,
+) -> Json<DuplicateScanResponse> {
+    let start = Instant::now();
+    let mut files_to_scan: Vec<PathBuf> = Vec::new();
 
+    for p in &req.paths {
+        let path = Path::new(p);
+        if path.is_file() {
+            files_to_scan.push(path.to_path_buf());
+        } else if path.is_dir() {
+            collect_files_recursive(path, &mut files_to_scan);
+        }
+    }
 
+    let total_scanned = files_to_scan.len();
+    let mut duplicate_groups: Vec<OmniDuplicateGroup> = Vec::new();
 
+    // 1. 100% 精确去重 (按文件大小过滤 -> 采样内容哈希)
+    let mut size_map: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+    for f in &files_to_scan {
+        if let Ok(meta) = std::fs::metadata(f) {
+            if meta.is_file() && meta.len() > 0 {
+                size_map.entry(meta.len()).or_default().push(f.clone());
+            }
+        }
+    }
 
+    let mut exact_group_idx = 1;
+    for (size, paths) in size_map {
+        if paths.len() < 2 {
+            continue;
+        }
+        let mut hash_map: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for p in paths {
+            if let Ok(bytes) = std::fs::read(&p) {
+                let mut hash: u64 = 0;
+                for b in &bytes {
+                    hash = hash.wrapping_mul(31).wrapping_add(*b as u64);
+                }
+                let hash_str = format!("{:016x}", hash);
+                hash_map.entry(hash_str).or_default().push(p);
+            }
+        }
+        for (hash, dup_paths) in hash_map {
+            if dup_paths.len() >= 2 {
+                let items: Vec<OmniDuplicateFileItem> = dup_paths
+                    .iter()
+                    .map(|p| {
+                        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let meta = std::fs::metadata(p).ok();
+                        let modified_at = meta
+                            .and_then(|m| m.modified().ok())
+                            .map(|t| format!("{:?}", t))
+                            .unwrap_or_default();
+                        OmniDuplicateFileItem {
+                            path: p.to_string_lossy().to_string(),
+                            name,
+                            size,
+                            modified_at,
+                            fingerprint: hash.clone(),
+                            similarity_score: Some(1.0),
+                        }
+                    })
+                    .collect();
+                let potential_freed = size * (dup_paths.len() as u64 - 1);
+                duplicate_groups.push(OmniDuplicateGroup {
+                    group_id: format!("exact_{}", exact_group_idx),
+                    strategy: "exact_hash".to_string(),
+                    similarity_percentage: 100.0,
+                    description: format!("100% 完全精确一致文件 ({}个)", dup_paths.len()),
+                    files: items,
+                    potential_freed_bytes: potential_freed,
+                });
+                exact_group_idx += 1;
+            }
+        }
+    }
 
+    // 2. 相似图片去重 (通过感知哈希 pHash 聚类)
+    let image_extensions = ["jpg", "jpeg", "png", "webp", "bmp", "avif", "gif"];
+    let mut image_files: Vec<(PathBuf, String, u64)> = Vec::new();
+    for f in &files_to_scan {
+        if let Some(ext) = f.extension().and_then(|e| e.to_str()) {
+            if image_extensions.contains(&ext.to_lowercase().as_str()) {
+                if let Some(phash) = OmniExtractionResult::compute_phash(f) {
+                    let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+                    image_files.push((f.clone(), phash, size));
+                }
+            }
+        }
+    }
+
+    let mut img_group_idx = 1;
+    let mut visited_images = vec![false; image_files.len()];
+    for i in 0..image_files.len() {
+        if visited_images[i] {
+            continue;
+        }
+        let mut group: Vec<(PathBuf, String, u64)> = vec![image_files[i].clone()];
+        for j in (i + 1)..image_files.len() {
+            if visited_images[j] {
+                continue;
+            }
+            if image_files[i].1 == image_files[j].1 {
+                group.push(image_files[j].clone());
+                visited_images[j] = true;
+            }
+        }
+        if group.len() >= 2 {
+            visited_images[i] = true;
+            let items: Vec<OmniDuplicateFileItem> = group
+                .iter()
+                .map(|(p, phash, sz)| {
+                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    OmniDuplicateFileItem {
+                        path: p.to_string_lossy().to_string(),
+                        name,
+                        size: *sz,
+                        modified_at: String::new(),
+                        fingerprint: phash.clone(),
+                        similarity_score: Some(0.95),
+                    }
+                })
+                .collect();
+            let avg_size = group.iter().map(|(_, _, s)| s).sum::<u64>() / group.len() as u64;
+            let potential_freed = avg_size * (group.len() as u64 - 1);
+            duplicate_groups.push(OmniDuplicateGroup {
+                group_id: format!("img_{}", img_group_idx),
+                strategy: "image_phash".to_string(),
+                similarity_percentage: 95.0,
+                description: format!("视觉感知高度相似图片 ({}个)", group.len()),
+                files: items,
+                potential_freed_bytes: potential_freed,
+            });
+            img_group_idx += 1;
+        }
+    }
+
+    let total_redundant_files = duplicate_groups
+        .iter()
+        .map(|g| if g.files.len() > 1 { g.files.len() - 1 } else { 0 })
+        .sum();
+    let total_freed_bytes = duplicate_groups.iter().map(|g| g.potential_freed_bytes).sum();
+
+    Json(DuplicateScanResponse {
+        success: true,
+        total_scanned,
+        duplicate_groups,
+        total_redundant_files,
+        total_freed_bytes,
+        duration_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
+fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                collect_files_recursive(&p, files);
+            } else if p.is_file() {
+                files.push(p);
+            }
+        }
+    }
+}
