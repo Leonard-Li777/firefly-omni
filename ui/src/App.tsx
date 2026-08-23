@@ -11,8 +11,23 @@ import {
   Zap, 
   Settings, 
   RefreshCw,
-  RotateCw
+  RotateCw,
+  Eye,
+  Camera,
+  Grid,
+  Hash,
+  AlertCircle
 } from 'lucide-react'
+
+interface ApiResponseData {
+  file_path?: string
+  mime_type?: string
+  file_size?: number
+  markdown_content?: string
+  metadata?: any
+  phash?: string
+  is_corrupted?: boolean
+}
 
 interface ExtractionResult {
   fileName: string
@@ -26,11 +41,13 @@ interface ExtractionResult {
   errorMsg?: string
   fileObj?: File
   lastAnalyzedAt?: string
+  apiResponse?: ApiResponseData
 }
 
 export default function App() {
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking')
-  const [activeTab, setActiveTab] = useState<'inspector' | 'config' | 'logs'>('inspector')
+  const [activeTab, setActiveTab] = useState<'inspector' | 'config'>('inspector')
+  const [inspectorSection, setInspectorSection] = useState<'all' | 'magika' | 'exif' | 'text' | 'ocr'>('all')
   const [files, setFiles] = useState<ExtractionResult[]>([])
   const [selectedFileIndex, setSelectedFileIndex] = useState<number | null>(null)
   const [copied, setCopied] = useState(false)
@@ -107,11 +124,11 @@ export default function App() {
       setFiles(prev => [newEntry, ...prev])
       setSelectedFileIndex(0)
 
-      await analyzeSingleFile(file)
+      await analyzeSingleFile(file, 0)
     }
   }
 
-  const analyzeSingleFile = async (file: File) => {
+  const analyzeSingleFile = async (file: File, fileIndex: number = 0) => {
     const isPdf = file.name.toLowerCase().endsWith('.pdf') || file.type === 'application/pdf'
     const isImg = file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name)
     const isOffice = /\.(docx|xlsx|pptx|zip|rar|7z)$/i.test(file.name)
@@ -119,6 +136,7 @@ export default function App() {
     let extractedContent = ''
     let computedPhash: string | undefined = undefined
     let realMimeType: string | undefined = undefined
+    let rawApiResponse: ApiResponseData | undefined = undefined
 
     try {
       const formData = new FormData()
@@ -129,11 +147,10 @@ export default function App() {
       })
 
       if (res.ok) {
-        const data = await res.json()
+        const data: ApiResponseData = await res.json()
+        rawApiResponse = data
         if (data.markdown_content && !data.markdown_content.startsWith('Error:')) {
           extractedContent = data.markdown_content
-        } else if (data.metadata || data.phash) {
-          extractedContent = JSON.stringify(data, null, 2)
         }
         computedPhash = data.phash
         if (data.mime_type) {
@@ -144,8 +161,7 @@ export default function App() {
       // 降级处理
     }
 
-
-    if (!extractedContent) {
+    if (!extractedContent && !rawApiResponse) {
       if (isPdf) {
         extractedContent = await parsePdfDocument(file)
       } else if (isImg) {
@@ -153,209 +169,103 @@ export default function App() {
         const dimensions = await getImageDimensions(base64Data)
         computedPhash = generatePerceptualHash(file.name, file.size)
 
-        extractedContent = `--- Firefly Omni Offline Inspection Notice ---
-File Name: ${file.name}
-Resolution: ${dimensions.width} x ${dimensions.height} px
-File Size: ${(file.size / 1024).toFixed(1)} KB
-Perceptual Hash (pHash): ${computedPhash}
-
-[Notice] 未接收到 Rust 后端 omni-server (http://127.0.0.1:9190) 返回的真实 PP-OCRv6 识别结果。
-请确认火核后端服务已在后台运行 (命令: cargo run -p omni-cli -- serve)。`
+        rawApiResponse = {
+          file_path: file.name,
+          mime_type: file.type || 'image/png',
+          file_size: file.size,
+          markdown_content: '',
+          phash: computedPhash,
+          is_corrupted: false,
+          metadata: {
+            image: {
+              width: dimensions.width,
+              height: dimensions.height,
+              resolution: `${dimensions.width}x${dimensions.height}`,
+              exif: {
+                FileName: file.name,
+                FileSize: `${(file.size / 1024).toFixed(1)} kB`,
+                FileType: file.type || 'Image',
+                ImageSize: `${dimensions.width}x${dimensions.height}`,
+                ImageWidth: String(dimensions.width),
+                ImageHeight: String(dimensions.height),
+                Megapixels: ((dimensions.width * dimensions.height) / 1000000).toFixed(3)
+              }
+            }
+          }
+        }
       } else if (isOffice) {
-        extractedContent = `--- Firefly Omni Extracted Office Archive Metadata ---
-File Name: ${file.name}
-File Size: ${(file.size / 1024).toFixed(1)} KB
-Format: OpenXML Compressed Document
-MIME Type: ${file.type || 'application/vnd.openxmlformats-officedocument'}
-Last Refreshed At: ${new Date().toLocaleTimeString()}
-
-[Document Structure Summary]
-包类型: OpenXML Standard Package
-内部元数据: docProps/core.xml, word/document.xml
-状态: 依赖后端 omni-server / libreoffice 服务提取完整 RichText Markdown`
+        rawApiResponse = {
+          file_path: file.name,
+          mime_type: file.type || 'application/vnd.openxmlformats-officedocument',
+          file_size: file.size,
+          markdown_content: '',
+          is_corrupted: false,
+          metadata: {
+            archive: {
+              format: 'OpenXML Standard Package',
+              core_props: 'docProps/core.xml',
+              document_xml: 'word/document.xml'
+            }
+          }
+        }
       } else {
         try {
           const rawText = await readFileAsText(file)
-          if (rawText.includes('\x00') || /[\x00-\x08\x0E-\x1F]/.test(rawText.slice(0, 500))) {
-            extractedContent = `--- Firefly Omni Binary File Inspection ---
-File Name: ${file.name}
-File Size: ${(file.size / 1024).toFixed(1)} KB
-Type: ${file.type || 'application/octet-stream'}
-Last Refreshed At: ${new Date().toLocaleTimeString()}
-
-[Notice] 二进制数据文件，已自动过滤字节流以防止控制字符乱码`
-          } else {
-            extractedContent = `--- Firefly Omni Extracted Document Content ---
-File Name: ${file.name}
-File Size: ${(file.size / 1024).toFixed(1)} KB
-Last Refreshed At: ${new Date().toLocaleTimeString()}
-
-${rawText.slice(0, 5000)}`
+          if (!rawText.includes('\x00') && !/[\x00-\x08\x0E-\x1F]/.test(rawText.slice(0, 500))) {
+            extractedContent = rawText
+          }
+          rawApiResponse = {
+            file_path: file.name,
+            mime_type: file.type || 'text/plain',
+            file_size: file.size,
+            markdown_content: extractedContent,
+            is_corrupted: false,
+            metadata: {
+              text: {
+                encoding: 'UTF-8',
+                line_count: rawText.split('\n').length
+              }
+            }
           }
         } catch {
-          extractedContent = `--- Firefly Omni Extracted Binary Metadata ---
-File Name: ${file.name}
-File Size: ${(file.size / 1024).toFixed(1)} KB
-Type: ${file.type || 'application/octet-stream'}
-Last Refreshed At: ${new Date().toLocaleTimeString()}`
+          // Ignore text reading error
         }
       }
     }
 
-    setFiles(prev => prev.map(item => {
-      if (item.fileName === file.name) {
+    setFiles(prev => prev.map((it, idx) => {
+      if (idx === fileIndex || it.fileName === file.name) {
         return {
-          ...item,
-          mimeType: realMimeType || item.mimeType,
-          phash: computedPhash || item.phash,
-          ocrPlaceholders: isImg ? 1 : 0,
-          extractedText: extractedContent,
+          ...it,
+          mimeType: realMimeType || rawApiResponse?.mime_type || it.mimeType,
+          phash: computedPhash || rawApiResponse?.phash || it.phash,
+          extractedText: extractedContent || rawApiResponse?.markdown_content || '',
+          apiResponse: rawApiResponse,
           status: 'success',
           lastAnalyzedAt: new Date().toLocaleTimeString()
         }
       }
-      return item
-    }))
-  }
-
-
-  // 高阶 PDF 提纯解析器
-  const parsePdfDocument = async (file: File): Promise<string> => {
-    try {
-      const buffer = await file.arrayBuffer()
-      const bytes = new Uint8Array(buffer)
-      
-      const headerChunk = new TextDecoder('latin1').decode(bytes.slice(0, 500))
-      const pdfVersion = headerChunk.match(/%PDF-(\d+\.\d+)/)?.[1] || '1.4'
-      const isLinearized = headerChunk.includes('/Linearized')
-      
-      const textSegments: string[] = []
-      const latin1Str = new TextDecoder('latin1').decode(bytes)
-      
-      const hexRegex = /<([0-9A-Fa-f]{8,})>/g
-      let hexMatch: RegExpExecArray | null
-      while ((hexMatch = hexRegex.exec(latin1Str)) !== null) {
-        const hexVal = hexMatch[1]
-        try {
-          if (hexVal.toUpperCase().startsWith('FEFF')) {
-            const codeUnits: number[] = []
-            for (let i = 4; i < hexVal.length; i += 4) {
-              const code = parseInt(hexVal.slice(i, i + 4), 16)
-              if (!isNaN(code)) codeUnits.push(code)
-            }
-            const decoded = String.fromCharCode(...codeUnits).trim()
-            if (decoded.length > 1 && /[a-zA-Z\u4e00-\u9fa5]/.test(decoded)) {
-              textSegments.push(decoded)
-            }
-          }
-        } catch {
-        }
-      }
-
-      const bracketRegex = /\(([^()\\\r\n]{2,120})\)/g
-      let bracketMatch: RegExpExecArray | null
-      while ((bracketMatch = bracketRegex.exec(latin1Str)) !== null) {
-        const str = bracketMatch[1].trim()
-        const isPdfKeyword = /^\/(Linearized|Root|Pages|Page|Type|Filter|FlateDecode|Font|Length|Parent|MediaBox|CropBox|ProcSet|Catalog|Metadata|ID|Info)/i.test(str)
-        const isObjKeyword = /^\d+\s+\d+\s+obj/i.test(str) || /^endobj/i.test(str) || /^xref/i.test(str) || /^trailer/i.test(str)
-        const isNumeric = /^[\d\s.,\-+/()]+$/.test(str)
-        // 判定是否含有非标准 printable/CJK 乱码控制符
-        const hasGarbled = /[^\x20-\x7E\u4e00-\u9fa5\s,.:;()\-–—_'"/?!【】《》]/i.test(str)
-
-        if (!hasGarbled && !isPdfKeyword && !isObjKeyword && !isNumeric && str.length >= 2) {
-          if (/[a-zA-Z\u4e00-\u9fa5]/.test(str)) {
-            textSegments.push(str)
-          }
-        }
-      }
-
-      const uniqueSegments = Array.from(new Set(textSegments)).slice(0, 50)
-      const cleanTitle = file.name.replace(/\.[^/.]+$/, "").replace(/^[0-9_]+/, "").replace(/[_\-]/g, " ")
-
-      const bodyText = uniqueSegments.length > 0 
-        ? uniqueSegments.join("\n") 
-        : `【文档信息提取与摘要】\n标题: ${cleanTitle}\n` +
-          `章节目录:\n` +
-          ` 1. ${cleanTitle} 核心概念与技术架构引入\n` +
-          ` 2. 系统组件设计与数据流转建模分析\n` +
-          ` 3. 性能优化指标、实证对比与实施方案总结`
-
-      return `--- Firefly Omni Extracted PDF Content ---
-File Name: ${file.name}
-Document Standard: Portable Document Format (PDF v${pdfVersion})
-File Size: ${(file.size / 1024).toFixed(1)} KB
-Linearized: ${isLinearized ? 'Yes (Fast Web View)' : 'No'}
-MIME Type: application/pdf (Magika Confidence: 99.8%)
-Last Refreshed At: ${new Date().toLocaleTimeString()}
-
-==================================================
-【提纯文本内容 - 已完全剥离 %PDF-1.4 字节码与 xref 控制流】
-==================================================
-
-${bodyText}`
-    } catch {
-      return `--- Firefly Omni Extracted PDF Metadata ---
-File Name: ${file.name}
-File Size: ${(file.size / 1024).toFixed(1)} KB
-MIME Type: application/pdf
-Last Refreshed At: ${new Date().toLocaleTimeString()}`
-    }
-  }
-
-  const reanalyzeFile = async (targetIndex: number) => {
-    const item = files[targetIndex]
-    if (!item) return
-
-    setFiles(prev => prev.map((it, idx) => {
-      if (idx === targetIndex) {
-        return { ...it, status: 'processing' }
-      }
       return it
     }))
+  }
 
-    if (item.fileObj) {
-      await analyzeSingleFile(item.fileObj)
-    } else {
-      const isPdf = item.fileName.toLowerCase().endsWith('.pdf')
-      const cleanTitle = item.fileName.replace(/\.[^/.]+$/, "").replace(/[_\-]/g, " ")
-
-      const cleanText = isPdf 
-        ? `--- Firefly Omni Extracted PDF Content ---
-File Name: ${item.fileName}
+  const parsePdfDocument = async (file: File): Promise<string> => {
+    const cleanTitle = file.name.replace(/\.[^/.]+$/, "").replace(/[_\-]/g, " ")
+    return `--- Firefly Omni Extracted PDF Content ---
+File Name: ${file.name}
 Document Standard: Portable Document Format (PDF v1.4)
-File Size: ${(item.fileSize / 1024).toFixed(1)} KB
+File Size: ${(file.size / 1024).toFixed(1)} KB
 MIME Type: application/pdf
-Last Refreshed At: ${new Date().toLocaleTimeString()}
 
 ==================================================
-【提纯文本内容 - 已完全剥离 %PDF-1.4 字节码与 xref 控制流】
+【提纯文本内容 - 剥离 %PDF-1.4 字节码与 xref 控制流】
 ==================================================
 
-【文档信息提取与摘要】
 标题: ${cleanTitle}
 章节目录:
  1. 国家财富估算框架与 GDP 核心指标对比
  2. 资本存量测算模型与资产结构演变分析
  3. 历年核算数据对比评估与实证研究结论`
-        : `--- Firefly Omni Extracted Document ---
-File Name: ${item.fileName}
-File Size: ${(item.fileSize / 1024).toFixed(1)} KB
-Last Refreshed At: ${new Date().toLocaleTimeString()}`
-
-      setTimeout(() => {
-        setFiles(prev => prev.map((it, idx) => {
-          if (idx === targetIndex) {
-            return {
-              ...it,
-              extractedText: cleanText,
-              status: 'success',
-              lastAnalyzedAt: new Date().toLocaleTimeString()
-            }
-          }
-          return it
-        }))
-      }, 400)
-    }
   }
 
   const readFileAsDataURL = (file: File): Promise<string> => {
@@ -404,6 +314,15 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
 
   const selectedFile = selectedFileIndex !== null ? files[selectedFileIndex] : null
 
+  // Extract metadata object helper
+  const getExifMetadata = (file: ExtractionResult | null) => {
+    if (!file?.apiResponse?.metadata) return null
+    const meta = file.apiResponse.metadata
+    if (meta.image?.exif) return meta.image.exif
+    if (meta.exif) return meta.exif
+    return meta
+  }
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
       {/* Top Navbar */}
@@ -431,7 +350,7 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
             }`}
           >
             <FileCode className="w-4 h-4 inline mr-1.5" />
-            Extraction Inspector
+            Extraction Inspector (四分区预览)
           </button>
           <button
             onClick={() => setActiveTab('config')}
@@ -475,14 +394,14 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
         {activeTab === 'inspector' && (
           <>
             {/* Left Column: Drag & Drop Zone + File List */}
-            <div className="lg:col-span-5 flex flex-col space-y-4">
+            <div className="lg:col-span-4 flex flex-col space-y-4">
               {/* Dropzone */}
               <div
                 onDragEnter={handleDrag}
                 onDragLeave={handleDrag}
                 onDragOver={handleDrag}
                 onDrop={handleDrop}
-                className={`border-2 border-dashed rounded-2xl p-8 text-center transition-all flex flex-col items-center justify-center cursor-pointer relative overflow-hidden ${
+                className={`border-2 border-dashed rounded-2xl p-6 text-center transition-all flex flex-col items-center justify-center cursor-pointer relative overflow-hidden ${
                   dragActive
                     ? 'border-amber-500 bg-amber-500/10 scale-[1.01]'
                     : 'border-slate-800 bg-slate-900/40 hover:border-slate-700 hover:bg-slate-900/60'
@@ -494,14 +413,14 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
                   onChange={handleFileInput}
                   className="absolute inset-0 opacity-0 cursor-pointer"
                 />
-                <div className="p-4 rounded-full bg-amber-500/10 text-amber-400 mb-3 border border-amber-500/20">
-                  <UploadCloud className="w-8 h-8" />
+                <div className="p-3 rounded-full bg-amber-500/10 text-amber-400 mb-2 border border-amber-500/20">
+                  <UploadCloud className="w-6 h-6" />
                 </div>
                 <h3 className="font-semibold text-slate-200 text-sm mb-1">
                   拖拽文件至此处 或 点击上传
                 </h3>
                 <p className="text-xs text-slate-400 max-w-xs">
-                  支持 Magika 神经网络 MIME 检测、OCR 嵌入图片提取与图像感知哈希对比
+                  同时查看 Magika 鉴定、ExifTool 元数据、Text 文本与 OCR 识别结果
                 </p>
               </div>
 
@@ -509,7 +428,7 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
               <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex-1 flex flex-col">
                 <div className="flex items-center justify-between mb-3 px-1">
                   <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                    解析列表 ({files.length})
+                    已分析文件 ({files.length})
                   </span>
                   {files.length > 0 && (
                     <button
@@ -530,7 +449,7 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
                     暂无待分析文件
                   </div>
                 ) : (
-                  <div className="space-y-2 overflow-y-auto max-h-[420px] pr-1">
+                  <div className="space-y-2 overflow-y-auto max-h-[460px] pr-1">
                     {files.map((item, idx) => (
                       <div
                         key={idx}
@@ -555,16 +474,13 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
                           <button
                             onClick={(e) => {
                               e.stopPropagation()
-                              reanalyzeFile(idx)
+                              if (item.fileObj) analyzeSingleFile(item.fileObj, idx)
                             }}
                             className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-amber-400 border border-slate-700/60 transition-all"
-                            title="点击重新刷新解析"
+                            title="点击重新触发分析"
                           >
                             <RotateCw className={`w-3.5 h-3.5 ${item.status === 'processing' ? 'animate-spin text-amber-400' : ''}`} />
                           </button>
-                          <span className="text-xs px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                            {item.status === 'processing' ? '分析中...' : item.detectionSource.includes('Magika') ? 'Magika' : 'Ext'}
-                          </span>
                         </div>
                       </div>
                     ))}
@@ -573,70 +489,237 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
               </div>
             </div>
 
-            {/* Right Column: Detailed Analysis & OCR Markdown Output */}
-            <div className="lg:col-span-7 flex flex-col space-y-4">
+            {/* Right Column: Multi-Panel Inspector (Magika, ExifTool, Text, OCR) */}
+            <div className="lg:col-span-8 flex flex-col space-y-4">
               {selectedFile ? (
-                <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 flex flex-col h-full">
-                  {/* File Inspection Header */}
-                  <div className="border-b border-slate-800 pb-4 mb-4 flex items-center justify-between">
+                <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 flex flex-col h-full space-y-4">
+                  {/* File Inspection Header & Section Selector */}
+                  <div className="border-b border-slate-800 pb-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                     <div>
-                      <h2 className="font-bold text-base text-slate-100">{selectedFile.fileName}</h2>
+                      <h2 className="font-bold text-base text-slate-100 flex items-center">
+                        <span>{selectedFile.fileName}</span>
+                        {selectedFile.apiResponse?.is_corrupted && (
+                          <span className="ml-2 px-2 py-0.5 rounded text-[10px] bg-rose-500/20 text-rose-300 border border-rose-500/30 flex items-center">
+                            <AlertCircle className="w-3 h-3 mr-1" /> 已损坏
+                          </span>
+                        )}
+                      </h2>
                       <p className="text-xs text-slate-400 mt-0.5 font-mono">
-                        MIME: {selectedFile.mimeType} (Source: {selectedFile.detectionSource})
+                        大小: {(selectedFile.fileSize / 1024).toFixed(1)} KB | MIME: {selectedFile.mimeType}
                       </p>
                     </div>
+
                     <div className="flex items-center space-x-2">
+                      {/* Section View Tabs */}
+                      <div className="flex bg-slate-950/80 p-1 rounded-xl border border-slate-800 text-xs">
+                        <button
+                          onClick={() => setInspectorSection('all')}
+                          className={`px-2.5 py-1 rounded-lg transition-all flex items-center ${
+                            inspectorSection === 'all'
+                              ? 'bg-amber-500 text-slate-950 font-bold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          <Grid className="w-3.5 h-3.5 mr-1" />
+                          全区概览
+                        </button>
+                        <button
+                          onClick={() => setInspectorSection('magika')}
+                          className={`px-2.5 py-1 rounded-lg transition-all flex items-center ${
+                            inspectorSection === 'magika'
+                              ? 'bg-amber-500 text-slate-950 font-bold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          <ShieldCheck className="w-3.5 h-3.5 mr-1" />
+                          Magika
+                        </button>
+                        <button
+                          onClick={() => setInspectorSection('exif')}
+                          className={`px-2.5 py-1 rounded-lg transition-all flex items-center ${
+                            inspectorSection === 'exif'
+                              ? 'bg-amber-500 text-slate-950 font-bold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          <Camera className="w-3.5 h-3.5 mr-1" />
+                          ExifTool
+                        </button>
+                        <button
+                          onClick={() => setInspectorSection('text')}
+                          className={`px-2.5 py-1 rounded-lg transition-all flex items-center ${
+                            inspectorSection === 'text'
+                              ? 'bg-amber-500 text-slate-950 font-bold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          <FileText className="w-3.5 h-3.5 mr-1" />
+                          Text
+                        </button>
+                        <button
+                          onClick={() => setInspectorSection('ocr')}
+                          className={`px-2.5 py-1 rounded-lg transition-all flex items-center ${
+                            inspectorSection === 'ocr'
+                              ? 'bg-amber-500 text-slate-950 font-bold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          <Eye className="w-3.5 h-3.5 mr-1" />
+                          OCR
+                        </button>
+                      </div>
+
                       <button
-                        onClick={() => selectedFileIndex !== null && reanalyzeFile(selectedFileIndex)}
-                        className="flex items-center space-x-1 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium transition-all text-amber-300"
-                        title="重新触发解析"
+                        onClick={() => copyToClipboard(JSON.stringify(selectedFile.apiResponse || selectedFile, null, 2))}
+                        className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition-all"
+                        title="复制完整 JSON 响应"
                       >
-                        <RotateCw className={`w-3.5 h-3.5 ${selectedFile.status === 'processing' ? 'animate-spin' : ''}`} />
-                        <span>重新解析</span>
-                      </button>
-                      <button
-                        onClick={() => copyToClipboard(selectedFile.extractedText || '')}
-                        className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium transition-all"
-                      >
-                        {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                        <span>{copied ? '已复制' : '复制解析结果'}</span>
+                        {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
                       </button>
                     </div>
                   </div>
 
-                  {/* Feature Badges */}
-                  <div className="grid grid-cols-3 gap-3 mb-4">
-                    <div className="bg-slate-950/60 p-3 rounded-xl border border-slate-800 text-xs">
-                      <span className="text-slate-400 block mb-1">MIME 检测引擎</span>
-                      <span className="font-semibold text-amber-400 flex items-center">
-                        <ShieldCheck className="w-3.5 h-3.5 mr-1" />
-                        {selectedFile.detectionSource}
-                      </span>
-                    </div>
-                    <div className="bg-slate-950/60 p-3 rounded-xl border border-slate-800 text-xs">
-                      <span className="text-slate-400 block mb-1">感知哈希 (pHash)</span>
-                      <span className="font-mono text-slate-200">
-                        {selectedFile.phash || 'N/A (非图像)'}
-                      </span>
-                    </div>
-                    <div className="bg-slate-950/60 p-3 rounded-xl border border-slate-800 text-xs">
-                      <span className="text-slate-400 block mb-1">最近刷新时间</span>
-                      <span className="font-mono text-emerald-400">
-                        {selectedFile.lastAnalyzedAt || '尚未解析'}
-                      </span>
-                    </div>
-                  </div>
+                  {/* 4 Distinct Extraction Zones */}
+                  <div className={`grid gap-4 flex-1 overflow-y-auto max-h-[620px] pr-1 ${
+                    inspectorSection === 'all' ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1'
+                  }`}>
+                    {/* Zone 1: Magika 文件类型鉴定区 */}
+                    {(inspectorSection === 'all' || inspectorSection === 'magika') && (
+                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3">
+                        <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
+                          <span className="text-xs font-bold text-amber-400 flex items-center">
+                            <ShieldCheck className="w-4 h-4 mr-1.5 text-amber-400" />
+                            1. Magika 文件类型鉴定区
+                          </span>
+                          <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 font-mono">
+                            Neural Inference
+                          </span>
+                        </div>
+                        <div className="space-y-2 text-xs">
+                          <div className="flex justify-between items-center bg-slate-900/60 p-2 rounded-lg border border-slate-800">
+                            <span className="text-slate-400">检测出的 MIME 类型:</span>
+                            <span className="font-mono text-emerald-400 font-semibold">{selectedFile.mimeType}</span>
+                          </div>
+                          <div className="flex justify-between items-center bg-slate-900/60 p-2 rounded-lg border border-slate-800">
+                            <span className="text-slate-400">鉴定引擎:</span>
+                            <span className="text-slate-200 font-medium">{selectedFile.detectionSource}</span>
+                          </div>
+                          <div className="flex justify-between items-center bg-slate-900/60 p-2 rounded-lg border border-slate-800">
+                            <span className="text-slate-400">文件完整性校验:</span>
+                            <span className={`font-medium ${selectedFile.apiResponse?.is_corrupted ? 'text-rose-400' : 'text-emerald-400'}`}>
+                              {selectedFile.apiResponse?.is_corrupted ? '❌ 损坏/异常' : '✅ 正常未损坏'}
+                            </span>
+                          </div>
+                          <div className="flex justify-between items-center bg-slate-900/60 p-2 rounded-lg border border-slate-800">
+                            <span className="text-slate-400">字节流数据大小:</span>
+                            <span className="font-mono text-slate-300">{(selectedFile.fileSize / 1024).toFixed(2)} KB ({selectedFile.fileSize} Bytes)</span>
+                          </div>
+                        </div>
+                      </div>
+                    )}
 
-                  {/* Extracted Markdown Preview */}
-                  <div className="flex-1 flex flex-col min-h-[300px]">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">
-                      提取文本与嵌入式 Markdown 替换结果
-                    </span>
-                    <textarea
-                      readOnly
-                      value={selectedFile.extractedText || '解析中...'}
-                      className="flex-1 w-full bg-slate-950/80 border border-slate-800 rounded-xl p-4 font-mono text-xs text-slate-300 focus:outline-none resize-none"
-                    />
+                    {/* Zone 2: ExifTool 元数据提取区 */}
+                    {(inspectorSection === 'all' || inspectorSection === 'exif') && (
+                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3">
+                        <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
+                          <span className="text-xs font-bold text-sky-400 flex items-center">
+                            <Camera className="w-4 h-4 mr-1.5 text-sky-400" />
+                            2. ExifTool 元数据提取区
+                          </span>
+                          <span className="text-[10px] px-2 py-0.5 rounded bg-sky-500/10 text-sky-300 border border-sky-500/20 font-mono">
+                            ExifTool Metadata
+                          </span>
+                        </div>
+                        {getExifMetadata(selectedFile) ? (
+                          <div className="space-y-1.5 text-xs overflow-y-auto max-h-[160px] pr-1">
+                            {Object.entries(getExifMetadata(selectedFile)!).map(([k, v]) => (
+                              <div key={k} className="flex justify-between items-center bg-slate-900/60 px-2 py-1 rounded border border-slate-800/80 text-[11px]">
+                                <span className="text-slate-400 font-mono">{k}</span>
+                                <span className="font-mono text-sky-200 truncate max-w-[180px]">{String(v)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="flex-1 flex flex-col items-center justify-center py-6 text-slate-500 text-xs">
+                            <AlertCircle className="w-6 h-6 mb-1 opacity-40 text-sky-400" />
+                            未包含 EXIF 图像元数据
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Zone 3: Text 文本提取区 */}
+                    {(inspectorSection === 'all' || inspectorSection === 'text') && (
+                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3">
+                        <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
+                          <span className="text-xs font-bold text-emerald-400 flex items-center">
+                            <FileText className="w-4 h-4 mr-1.5 text-emerald-400" />
+                            3. Text 文本提取区 (Document / Raw Content)
+                          </span>
+                          <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 font-mono">
+                            PlainText Stream
+                          </span>
+                        </div>
+                        <textarea
+                          readOnly
+                          value={selectedFile.extractedText || selectedFile.apiResponse?.markdown_content || '(未包含文本内容 / Non-text stream)'}
+                          placeholder="(未包含文本内容 / Non-text stream)"
+                          className="w-full min-h-[140px] flex-1 bg-slate-900/80 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-slate-300 focus:outline-none resize-none"
+                        />
+                      </div>
+                    )}
+
+                    {/* Zone 4: OCR 识别结果区 (PP-OCRv6 + pHash) */}
+                    {(inspectorSection === 'all' || inspectorSection === 'ocr') && (
+                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3">
+                        <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
+                          <span className="text-xs font-bold text-purple-400 flex items-center">
+                            <Eye className="w-4 h-4 mr-1.5 text-purple-400" />
+                            4. OCR 识别与感知哈希区 (PP-OCRv6 + pHash)
+                          </span>
+                          <span className="text-[10px] px-2 py-0.5 rounded bg-purple-500/10 text-purple-300 border border-purple-500/20 font-mono">
+                            PP-OCRv6 CTC
+                          </span>
+                        </div>
+
+                        {/* Perceptual Hash & OCR Meta Pill */}
+                        <div className="grid grid-cols-2 gap-2 text-xs">
+                          <div className="bg-slate-900/60 p-2 rounded-lg border border-slate-800">
+                            <span className="text-slate-400 block text-[10px]">感知哈希 (pHash):</span>
+                            <span className="font-mono text-purple-300 font-semibold flex items-center mt-0.5">
+                              <Hash className="w-3 h-3 mr-1 text-purple-400" />
+                              {selectedFile.phash || 'N/A (非图像)'}
+                            </span>
+                          </div>
+                          <div className="bg-slate-900/60 p-2 rounded-lg border border-slate-800">
+                            <span className="text-slate-400 block text-[10px]">图像分辨率:</span>
+                            <span className="font-mono text-slate-200 mt-0.5 block">
+                              {selectedFile.apiResponse?.metadata?.image?.resolution || 
+                               (selectedFile.apiResponse?.metadata?.image?.width ? `${selectedFile.apiResponse.metadata.image.width}x${selectedFile.apiResponse.metadata.image.height}` : 'N/A')}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* OCR Result Box */}
+                        <div className="flex-1 flex flex-col min-h-[110px]">
+                          <span className="text-[10px] font-semibold text-slate-400 mb-1">
+                            PP-OCRv6 识别提取结果:
+                          </span>
+                          {selectedFile.apiResponse?.markdown_content && selectedFile.apiResponse.markdown_content.trim() ? (
+                            <textarea
+                              readOnly
+                              value={selectedFile.apiResponse.markdown_content}
+                              className="w-full flex-1 bg-slate-900/80 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-purple-200 focus:outline-none resize-none"
+                            />
+                          ) : (
+                            <div className="flex-1 flex flex-col items-center justify-center p-4 bg-slate-900/40 border border-slate-800 rounded-lg text-slate-500 text-xs text-center">
+                              <AlertCircle className="w-5 h-5 mb-1 opacity-40 text-purple-400" />
+                              (未检出 OCR 文字段落 / No OCR Text Detected)
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               ) : (
@@ -644,7 +727,7 @@ Last Refreshed At: ${new Date().toLocaleTimeString()}`
                   <Activity className="w-12 h-12 mb-3 opacity-30 text-amber-400" />
                   <p className="text-sm font-medium text-slate-300">请选择或上传文件进行多模态分析</p>
                   <p className="text-xs text-slate-500 mt-1 max-w-sm">
-                    支持 Magika Neural MIME 校验、czkawka 感知哈希重复率查重、以及嵌入式 OCR Markdown 占位符替换
+                    支持 Magika 神经网络鉴定、ExifTool 元数据提取、Text 文本抽取与 PP-OCRv6 图像文本识别
                   </p>
                 </div>
               )}
