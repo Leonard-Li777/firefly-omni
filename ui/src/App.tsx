@@ -573,9 +573,9 @@ MIME Type: application/pdf
                         <div className="flex items-center space-x-3 overflow-hidden pr-2">
                           <FileCode className="w-5 h-5 flex-shrink-0 text-amber-400" />
                           <div className="truncate">
-                            <p className="text-sm font-medium truncate">{item.fileName}</p>
+                            <p className="text-sm font-medium truncate" title={item.fileName}>{item.fileName}</p>
                             <span className="text-xs text-slate-500">
-                              {(item.fileSize / 1024).toFixed(1)} KB • {item.mimeType}
+                              {(item.fileSize / 1024).toFixed(1)} KB
                             </span>
                           </div>
                         </div>

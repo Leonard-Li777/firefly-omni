@@ -334,13 +334,18 @@ fn find_exiftool_executable() -> Option<std::path::PathBuf> {
         }
     }
 
-    // 3. 查找可执行文件所在目录及其相对路径下的 resources/bin/{platform_dir}/
+    // 3. 查找可执行文件所在目录及其相对路径下的 build/extraResources/bin 与 extraResources/bin 目录
     if let Ok(exe_dir) = std::env::current_exe().map(|p| p.parent().unwrap_or(Path::new("")).to_path_buf()) {
         let exe_candidates = [
+            exe_dir.join(format!("build/extraResources/bin/exiftool/{}", exe_name)),
+            exe_dir.join(format!("build/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
+            exe_dir.join(format!("extraResources/bin/exiftool/{}", exe_name)),
+            exe_dir.join(format!("extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
             exe_dir.join(format!("resources/bin/{}/{}", platform_dir, exe_name)),
             exe_dir.join(format!("resources/bin/{}", exe_name)),
             exe_dir.join(exe_name),
-            exe_dir.join(format!("../resources/bin/{}/{}", platform_dir, exe_name)),
+            exe_dir.join(format!("../build/extraResources/bin/exiftool/{}", exe_name)),
+            exe_dir.join(format!("../extraResources/bin/exiftool/{}", exe_name)),
             exe_dir.join(format!("../resources/bin/{}", exe_name)),
         ];
         for cand in exe_candidates {
@@ -350,11 +355,19 @@ fn find_exiftool_executable() -> Option<std::path::PathBuf> {
         }
     }
 
-    // 4. 向上递归搜索 CWD / Monorepo resources/bin/{platform_dir}/
+    // 4. 向上递归搜索 CWD / Monorepo build/extraResources/bin
     if let Ok(cwd) = std::env::current_dir() {
         let mut curr: Option<&Path> = Some(cwd.as_path());
         while let Some(dir) = curr {
             let candidates = [
+                dir.join(format!("build/extraResources/bin/exiftool/{}", exe_name)),
+                dir.join(format!("build/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("apps/omni/build/extraResources/bin/exiftool/{}", exe_name)),
+                dir.join(format!("apps/omni/build/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("extraResources/bin/exiftool/{}", exe_name)),
+                dir.join(format!("extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("apps/omni/extraResources/bin/exiftool/{}", exe_name)),
+                dir.join(format!("apps/omni/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
                 dir.join(format!("resources/bin/{}/{}", platform_dir, exe_name)),
                 dir.join(format!("resources/bin/{}", exe_name)),
                 dir.join(format!("apps/omni/resources/bin/{}/{}", platform_dir, exe_name)),
