@@ -289,11 +289,11 @@ impl OmniExtractor {
     }
 }
 
-/// 查找系统或 Monorepo node_modules 中的 exiftool / exiftool.exe 可执行文件
+/// 查找原生解耦的 ExifTool 可执行文件 (优先包含 omni/resources/bin/exiftool.exe，完全解耦不依赖 Node.js desktop)
 fn find_exiftool_executable() -> Option<std::path::PathBuf> {
     use std::process::Command;
 
-    // 1. 尝试直接通过命令行 PATH 搜索
+    // 1. 优先查找系统 PATH 中的 exiftool
     if Command::new("exiftool").arg("-ver").output().map(|o| o.status.success()).unwrap_or(false) {
         return Some(std::path::PathBuf::from("exiftool"));
     }
@@ -301,37 +301,41 @@ fn find_exiftool_executable() -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from("exiftool.exe"));
     }
 
-    // 2. 向上递归搜索 Monorepo 与应用级 node_modules 中的 exiftool-vendored.exe
+    // 2. 查找 Rust omni 独立引擎自带的 resources/bin/exiftool.exe 或 APPDATA 本地目录
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let appdata_bin = Path::new(&appdata).join("firefly-ai-folder/bin/exiftool.exe");
+        if appdata_bin.exists() {
+            return Some(appdata_bin);
+        }
+    }
+
+    if let Ok(exe_dir) = std::env::current_exe().map(|p| p.parent().unwrap_or(Path::new("")).to_path_buf()) {
+        let exe_candidates = [
+            exe_dir.join("resources/bin/exiftool.exe"),
+            exe_dir.join("exiftool.exe"),
+            exe_dir.join("../resources/bin/exiftool.exe"),
+        ];
+        for cand in exe_candidates {
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+    }
+
     if let Ok(cwd) = std::env::current_dir() {
         let mut curr: Option<&Path> = Some(cwd.as_path());
         while let Some(dir) = curr {
             let candidates = [
-                dir.join("node_modules/exiftool-vendored.exe/bin/exiftool.exe"),
-                dir.join("apps/desktop/node_modules/exiftool-vendored.exe/bin/exiftool.exe"),
-                dir.join("packages/core-engine/node_modules/exiftool-vendored.exe/bin/exiftool.exe"),
+                dir.join("resources/bin/exiftool.exe"),
+                dir.join("apps/omni/resources/bin/exiftool.exe"),
+                dir.join("crates/omni-extract/bin/exiftool.exe"),
+                dir.join("bin/exiftool.exe"),
             ];
             for cand in candidates {
                 if cand.exists() {
                     return Some(cand);
                 }
             }
-
-            // 检查 pnpm 扁平化 node_modules 目录
-            let pnpm_dir = dir.join("node_modules/.pnpm");
-            if pnpm_dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(pnpm_dir) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with("exiftool-vendored.exe") {
-                            let exe = entry.path().join("node_modules/exiftool-vendored.exe/bin/exiftool.exe");
-                            if exe.exists() {
-                                return Some(exe);
-                            }
-                        }
-                    }
-                }
-            }
-
             curr = dir.parent();
         }
     }
@@ -346,7 +350,7 @@ fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_jso
 
     // 优先 1：调用 exiftool.exe CLI 获取全量真实属性
     if let Some(exe_path) = find_exiftool_executable() {
-        if let Ok(output) = Command::new(exe_path).arg("-json").arg(p).output() {
+        if let Ok(output) = Command::new(&exe_path).arg("-json").arg(p).output() {
             if output.status.success() {
                 if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
                     if let Some(arr) = json_val.as_array() {
