@@ -400,13 +400,19 @@ fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_jso
     use std::process::Command;
     let mut map = serde_json::Map::new();
 
+    let abs_path = if p.is_relative() {
+        std::env::current_dir().map(|cwd| cwd.join(p)).unwrap_or_else(|_| p.to_path_buf())
+    } else {
+        p.to_path_buf()
+    };
+
     // 优先 1：调用 exiftool.exe CLI 获取全量真实属性
     if let Some(exe_path) = find_exiftool_executable() {
         let mut cmd = Command::new(&exe_path);
         if let Some(parent) = exe_path.parent() {
             cmd.current_dir(parent);
         }
-        cmd.arg("-json").arg(p);
+        cmd.arg("-json").arg(&abs_path);
 
         if let Ok(output) = cmd.output() {
             if output.status.success() {

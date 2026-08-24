@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Multipart, State},
+    extract::{DefaultBodyLimit, Multipart, State},
     routing::{get, post},
     Json, Router,
 };
@@ -38,6 +38,7 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/api/extract", post(extract_file_handler))
         .route("/api/extract/upload", post(extract_multipart_handler))
         .route("/api/duplicate/scan", post(duplicate_scan_handler))
+        .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -106,20 +107,18 @@ async fn extract_file_handler(
     Json(req): Json<ExtractRequest>,
 ) -> Json<OmniExtractionResult> {
     let cfg = state.config.lock().unwrap().clone();
-    if !req.file_path.is_empty() {
-        if let Ok(res) = OmniExtractor::extract(&req.file_path, &cfg).await {
-            return Json(res);
-        }
+    match OmniExtractor::extract(&req.file_path, &cfg).await {
+        Ok(res) => Json(res),
+        Err(err) => Json(OmniExtractionResult {
+            file_path: req.file_path,
+            mime_type: "application/octet-stream".to_string(),
+            file_size: 0,
+            markdown_content: format!("Error: Extraction failed - {}", err),
+            metadata: serde_json::json!({}),
+            phash: None,
+            is_corrupted: true,
+        }),
     }
-    Json(OmniExtractionResult {
-        file_path: req.file_path,
-        mime_type: "application/octet-stream".to_string(),
-        file_size: 0,
-        markdown_content: "Error: File extraction failed".to_string(),
-        metadata: serde_json::json!({}),
-        phash: None,
-        is_corrupted: true,
-    })
 }
 
 /// 处理 Web UI 前端拖拽文件二进制流上传请求: POST /api/extract/upload
@@ -129,19 +128,28 @@ async fn extract_multipart_handler(
 ) -> Json<OmniExtractionResult> {
     let cfg = state.config.lock().unwrap().clone();
 
-    while let Ok(Some(field)) = multipart.next_field().await {
-        let file_name = field.file_name().unwrap_or("omni_upload.tmp").to_string();
-        if let Ok(bytes) = field.bytes().await {
-            let temp_dir = std::env::temp_dir();
-            let temp_path = temp_dir.join(&file_name);
-            if std::fs::write(&temp_path, &bytes).is_ok() {
-                let path_str = temp_path.to_string_lossy().to_string();
-                if let Ok(mut res) = OmniExtractor::extract(&path_str, &cfg).await {
-                    res.file_path = file_name;
-                    let _ = std::fs::remove_file(&temp_path);
-                    return Json(res);
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let file_name = field.file_name().unwrap_or("omni_upload.tmp").to_string();
+                if let Ok(bytes) = field.bytes().await {
+                    let temp_dir = std::env::temp_dir();
+                    let temp_path = temp_dir.join(&file_name);
+                    if std::fs::write(&temp_path, &bytes).is_ok() {
+                        let path_str = temp_path.to_string_lossy().to_string();
+                        if let Ok(mut res) = OmniExtractor::extract(&path_str, &cfg).await {
+                            res.file_path = file_name;
+                            let _ = std::fs::remove_file(&temp_path);
+                            return Json(res);
+                        }
+                        let _ = std::fs::remove_file(&temp_path);
+                    }
                 }
-                let _ = std::fs::remove_file(&temp_path);
+            }
+            Ok(None) => break,
+            Err(err) => {
+                tracing::error!("Axum Multipart parsing failed: {:?}", err);
+                break;
             }
         }
     }

@@ -509,3 +509,43 @@ async fn test_extract_tailwind_pdf_metadata() {
     let doc_meta = &result.metadata["document"];
     assert!(doc_meta.get("creator").is_some() || doc_meta.get("author").is_some() || doc_meta.get("producer").is_some(), "Tailwind PDF should have metadata!");
 }
+
+#[tokio::test]
+async fn test_upload_tailwind_pdf_multipart() {
+    let pdf_path = std::path::PathBuf::from(r"F:\lilun\Desktop\计算机科学_前端技术_TailwindCSS技术介绍.pdf");
+    if !pdf_path.exists() {
+        return;
+    }
+
+    let pdf_bytes = std::fs::read(&pdf_path).unwrap();
+    let file_name = "TailwindTest.pdf";
+
+    // 构建 multipart body
+    let boundary = "---------------------------1234567890";
+    let mut body_bytes = Vec::new();
+    body_bytes.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body_bytes.extend_from_slice(format!("Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n", file_name).as_bytes());
+    body_bytes.extend_from_slice(b"Content-Type: application/pdf\r\n\r\n");
+    body_bytes.extend_from_slice(&pdf_bytes);
+    body_bytes.extend_from_slice(format!("\r\n--{}--\r\n", boundary).as_bytes());
+
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract/upload")
+                .header("content-type", format!("multipart/form-data; boundary={}", boundary))
+                .body(Body::from(body_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+
+    println!("DEBUG METADATA FOR TAILWIND PDF MULTIPART UPLOAD:\n{:#?}", result.metadata);
+    assert!(result.metadata.get("exiftool").is_some(), "ExifTool metadata should be extracted on upload!");
+}
