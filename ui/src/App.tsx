@@ -20,7 +20,8 @@ import {
   AlertCircle,
   Layers,
   Music,
-  Video
+  Video,
+  XCircle
 } from 'lucide-react'
 
 interface ApiResponseData {
@@ -154,11 +155,24 @@ export default function App() {
     alert('配置已成功保存！')
   }
 
+  const [abortController, setAbortController] = useState<AbortController | null>(null)
+
+  const handleCancelScan = () => {
+    if (abortController) {
+      abortController.abort()
+      setAbortController(null)
+    }
+    setScanning(false)
+  }
+
   const handleRunCzkawkaScan = async () => {
     if (!scanPaths.trim()) {
       alert('请输入扫描目录或文件路径！')
       return
     }
+
+    const controller = new AbortController()
+    setAbortController(controller)
     setScanning(true)
     setScanError(null)
 
@@ -192,7 +206,8 @@ export default function App() {
           strategies,
           min_similarity: minSimilarity,
           check_video: strategyVideo
-        })
+        }),
+        signal: controller.signal
       })
 
       if (!response.ok || !response.body) {
@@ -267,9 +282,14 @@ export default function App() {
         }
       }
     } catch (err: any) {
-      setScanError(err.message || 'czkawka_core 实时流扫描失败。')
+      if (err.name === 'AbortError') {
+        console.log('czkawka_core 扫描已由用户中断')
+      } else {
+        setScanError(err.message || 'czkawka_core 实时流扫描失败。')
+      }
     } finally {
       setScanning(false)
+      setAbortController(null)
     }
   }
 
@@ -1256,24 +1276,37 @@ MIME Type: application/pdf
                   />
                 </div>
 
-                {/* Trigger Scan Button */}
-                <button
-                  onClick={handleRunCzkawkaScan}
-                  disabled={scanning}
-                  className="w-full py-3 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs rounded-xl shadow-lg shadow-amber-500/20 transition-all flex items-center justify-center space-x-2 disabled:opacity-50"
-                >
-                  {scanning ? (
-                    <>
-                      <RotateCw className="w-4 h-4 animate-spin" />
-                      <span>czkawka_core 引擎扫描中...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Zap className="w-4 h-4 fill-current" />
-                      <span>执行 czkawka_core 聚合扫描</span>
-                    </>
+                {/* Trigger / Cancel Scan Buttons */}
+                <div className="flex items-center gap-2.5">
+                  <button
+                    onClick={handleRunCzkawkaScan}
+                    disabled={scanning}
+                    className="flex-1 py-3 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs rounded-xl shadow-lg shadow-amber-500/20 transition-all flex items-center justify-center space-x-2 disabled:opacity-50"
+                  >
+                    {scanning ? (
+                      <>
+                        <RotateCw className="w-4 h-4 animate-spin" />
+                        <span>czkawka_core 引擎扫描中...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Zap className="w-4 h-4 fill-current" />
+                        <span>执行 czkawka_core 聚合扫描</span>
+                      </>
+                    )}
+                  </button>
+
+                  {scanning && (
+                    <button
+                      onClick={handleCancelScan}
+                      className="px-4 py-3 bg-rose-600/90 hover:bg-rose-500 text-white font-bold text-xs rounded-xl border border-rose-500/60 shadow-lg shadow-rose-500/20 transition-all flex items-center justify-center space-x-1.5 flex-shrink-0 animate-pulse"
+                      title="中断并取消当前扫描"
+                    >
+                      <XCircle className="w-4 h-4 text-white" />
+                      <span>取消扫描</span>
+                    </button>
                   )}
-                </button>
+                </div>
 
                 {scanError && (
                   <div className="p-3 bg-rose-950/40 border border-rose-800 rounded-xl text-rose-300 text-xs flex items-start space-x-2">
