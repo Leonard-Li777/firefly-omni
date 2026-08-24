@@ -17,7 +17,8 @@ import {
   Camera,
   Grid,
   Hash,
-  AlertCircle
+  AlertCircle,
+  Layers
 } from 'lucide-react'
 
 interface ApiResponseData {
@@ -47,12 +48,26 @@ interface ExtractionResult {
 
 export default function App() {
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking')
-  const [activeTab, setActiveTab] = useState<'inspector' | 'config'>('inspector')
+  const [activeTab, setActiveTab] = useState<'inspector' | 'czkawka' | 'config'>('inspector')
   const [inspectorSection, setInspectorSection] = useState<'all' | 'magika' | 'exif' | 'text' | 'ocr'>('all')
   const [files, setFiles] = useState<ExtractionResult[]>([])
   const [selectedFileIndex, setSelectedFileIndex] = useState<number | null>(null)
   const [copied, setCopied] = useState(false)
   const [dragActive, setDragActive] = useState(false)
+
+  // czkawka_core API test state
+  const [scanPaths, setScanPaths] = useState<string>('F:\\lilun\\Desktop')
+  const [strategyExact, setStrategyExact] = useState<boolean>(true)
+  const [strategyPhash, setStrategyPhash] = useState<boolean>(true)
+  const [minSimilarity, setMinSimilarity] = useState<number>(90)
+  const [scanning, setScanning] = useState<boolean>(false)
+  const [scanResult, setScanResult] = useState<any | null>(null)
+  const [scanError, setScanError] = useState<string | null>(null)
+
+  // Single file inspector for czkawka_core helpers
+  const [singleFilePath, setSingleFilePath] = useState<string>('F:\\lilun\\Desktop\\TailwindCSS技术介绍.pdf')
+  const [singleFileResult, setSingleFileResult] = useState<{ phash?: string; is_corrupted?: boolean; file_size?: number } | null>(null)
+  const [inspectingSingleFile, setInspectingSingleFile] = useState<boolean>(false)
 
   // Config state
   const [maxWorkers, setMaxWorkers] = useState(4)
@@ -133,6 +148,77 @@ export default function App() {
   const saveConfig = async () => {
     await updateOcrConfig(enableDocumentOcr, enableImageOcr, ocrModelSize, maxDocumentOcrFileSizeMb)
     alert('配置已成功保存！')
+  }
+
+  const handleRunCzkawkaScan = async () => {
+    if (!scanPaths.trim()) {
+      alert('请输入扫描目录或文件路径！')
+      return
+    }
+    setScanning(true)
+    setScanError(null)
+    const pathsArray = scanPaths
+      .split('\n')
+      .map(p => p.trim())
+      .filter(p => p.length > 0)
+
+    const strategies: string[] = []
+    if (strategyExact) strategies.push('exact_hash')
+    if (strategyPhash) strategies.push('image_phash')
+
+    try {
+      const res = await fetch('/api/duplicate/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          paths: pathsArray,
+          strategies,
+          min_similarity: minSimilarity
+        })
+      })
+
+      if (!res.ok) {
+        throw new Error(`HTTP error ${res.status}: ${res.statusText}`)
+      }
+      const data = await res.json()
+      setScanResult(data)
+    } catch (err: any) {
+      setScanError(err.message || 'czkawka_core 扫描请求失败，请检查后端 API 服务。')
+    } finally {
+      setScanning(false)
+    }
+  }
+
+  const handleInspectSingleFile = async () => {
+    if (!singleFilePath.trim()) return
+    setInspectingSingleFile(true)
+    try {
+      const res = await fetch('/api/extract', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file_path: singleFilePath })
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setSingleFileResult({
+          phash: data.phash,
+          is_corrupted: data.is_corrupted,
+          file_size: data.file_size
+        })
+      }
+    } catch {
+      // Ignore
+    } finally {
+      setInspectingSingleFile(false)
+    }
+  }
+
+  const formatBytes = (bytes: number): string => {
+    if (!bytes || bytes === 0) return '0 B'
+    const k = 1024
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
   }
 
   const checkHealth = async () => {
@@ -462,6 +548,17 @@ MIME Type: application/pdf
           >
             <FileCode className="w-4 h-4 inline mr-1.5" />
             Extraction Inspector (四分区预览)
+          </button>
+          <button
+            onClick={() => setActiveTab('czkawka')}
+            className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all ${
+              activeTab === 'czkawka'
+                ? 'bg-amber-500 text-slate-950 font-semibold shadow-md'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Layers className="w-4 h-4 inline mr-1.5" />
+            czkawka_core 集成测试
           </button>
           <button
             onClick={() => setActiveTab('config')}
@@ -928,6 +1025,357 @@ MIME Type: application/pdf
               )}
             </div>
           </>
+        )}
+
+        {activeTab === 'czkawka' && (
+          <div className="lg:col-span-12 grid grid-cols-1 lg:grid-cols-12 gap-6 min-h-0 overflow-y-auto">
+            {/* Left Column: API Controller & Single File Tester (4 cols) */}
+            <div className="lg:col-span-4 space-y-5 flex flex-col min-h-0">
+              {/* Card 1: API Scan Controller */}
+              <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                  <div className="flex items-center space-x-2">
+                    <div className="bg-amber-500/10 p-2 rounded-lg text-amber-400">
+                      <Layers className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h2 className="font-bold text-sm text-slate-100">czkawka_core 扫描 API 测试</h2>
+                      <span className="text-[11px] font-mono text-emerald-400">POST /api/duplicate/scan</span>
+                    </div>
+                  </div>
+                  <span className="text-[10px] font-bold px-2 py-0.5 bg-purple-500/20 text-purple-300 rounded border border-purple-500/30">
+                    Rust Native
+                  </span>
+                </div>
+
+                {/* Scan Path Input */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-xs font-semibold text-slate-300">
+                      扫描目录 / 文件路径 (支持多行)
+                    </label>
+                  </div>
+                  <textarea
+                    rows={3}
+                    value={scanPaths}
+                    onChange={e => setScanPaths(e.target.value)}
+                    placeholder="输入需要扫描的绝对路径，例如: F:\lilun\Desktop"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs font-mono text-slate-200 focus:border-amber-500 focus:outline-none resize-none"
+                  />
+                  {/* Preset Buttons */}
+                  <div className="flex gap-1.5 mt-2 flex-wrap">
+                    <button
+                      onClick={() => setScanPaths('F:\\lilun\\Desktop')}
+                      className="text-[10px] bg-slate-800/80 hover:bg-slate-800 text-slate-300 px-2 py-1 rounded border border-slate-700 transition-all"
+                    >
+                      📁 桌面 Preset
+                    </button>
+                    <button
+                      onClick={() => setScanPaths('D:\\workspace\\firefly-ai-folder')}
+                      className="text-[10px] bg-slate-800/80 hover:bg-slate-800 text-slate-300 px-2 py-1 rounded border border-slate-700 transition-all"
+                    >
+                      📁 项目 Root Preset
+                    </button>
+                  </div>
+                </div>
+
+                {/* Strategy Toggles */}
+                <div className="space-y-2 pt-1 border-t border-slate-800/80">
+                  <label className="text-xs font-semibold text-slate-300 block">
+                    czkawka_core 去重策略选择
+                  </label>
+                  <div className="space-y-2">
+                    <label className="flex items-center justify-between p-2.5 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <Hash className="w-4 h-4 text-amber-400" />
+                        <div>
+                          <span className="text-xs font-semibold text-slate-200 block">100% 精确哈希去重 (exact_hash)</span>
+                          <span className="text-[10px] text-slate-400">结合文件大小筛分与 Byte 采样哈希</span>
+                        </div>
+                      </div>
+                      <input
+                        type="checkbox"
+                        checked={strategyExact}
+                        onChange={e => setStrategyExact(e.target.checked)}
+                        className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
+                      />
+                    </label>
+
+                    <label className="flex items-center justify-between p-2.5 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <Camera className="w-4 h-4 text-purple-400" />
+                        <div>
+                          <span className="text-xs font-semibold text-slate-200 block">视觉感知哈希图片去重 (image_phash)</span>
+                          <span className="text-[10px] text-slate-400">基于 czkawka_core pHash 64位指纹</span>
+                        </div>
+                      </div>
+                      <input
+                        type="checkbox"
+                        checked={strategyPhash}
+                        onChange={e => setStrategyPhash(e.target.checked)}
+                        className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
+                      />
+                    </label>
+                  </div>
+                </div>
+
+                {/* Similarity threshold slider */}
+                <div className="pt-1">
+                  <div className="flex items-center justify-between text-xs mb-1">
+                    <span className="text-slate-300 font-medium">最小相似度阈值 (%)</span>
+                    <span className="font-mono text-amber-400 font-bold">{minSimilarity}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="50"
+                    max="100"
+                    value={minSimilarity}
+                    onChange={e => setMinSimilarity(Number(e.target.value))}
+                    className="w-full accent-amber-500 cursor-pointer h-1.5 bg-slate-950 rounded-lg"
+                  />
+                </div>
+
+                {/* Trigger Scan Button */}
+                <button
+                  onClick={handleRunCzkawkaScan}
+                  disabled={scanning}
+                  className="w-full py-3 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs rounded-xl shadow-lg shadow-amber-500/20 transition-all flex items-center justify-center space-x-2 disabled:opacity-50"
+                >
+                  {scanning ? (
+                    <>
+                      <RotateCw className="w-4 h-4 animate-spin" />
+                      <span>czkawka_core 引擎扫描中...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Zap className="w-4 h-4 fill-current" />
+                      <span>执行 czkawka_core 聚合扫描</span>
+                    </>
+                  )}
+                </button>
+
+                {scanError && (
+                  <div className="p-3 bg-rose-950/40 border border-rose-800 rounded-xl text-rose-300 text-xs flex items-start space-x-2">
+                    <AlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0 mt-0.5" />
+                    <span>{scanError}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Card 2: Single File czkawka_core Helper Inspector */}
+              <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-3">
+                <div className="flex items-center space-x-2 border-b border-slate-800 pb-2.5">
+                  <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                  <span className="text-xs font-bold text-slate-200">单文件 pHash & 坏文件 (Corrupted) 检测</span>
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-medium text-slate-400 block mb-1">
+                    目标文件绝对路径
+                  </label>
+                  <input
+                    type="text"
+                    value={singleFilePath}
+                    onChange={e => setSingleFilePath(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs font-mono text-slate-200 focus:border-amber-500 focus:outline-none"
+                  />
+                </div>
+
+                <button
+                  onClick={handleInspectSingleFile}
+                  disabled={inspectingSingleFile}
+                  className="w-full py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs rounded-lg border border-slate-700 transition-all flex items-center justify-center space-x-1.5"
+                >
+                  {inspectingSingleFile ? (
+                    <RotateCw className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Eye className="w-3.5 h-3.5" />
+                  )}
+                  <span>检测 pHash 与 破损状态</span>
+                </button>
+
+                {singleFileResult && (
+                  <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-1.5 text-xs font-mono">
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">czkawka pHash:</span>
+                      <span className="text-amber-400 font-bold">{singleFileResult.phash || 'N/A'}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">is_corrupted:</span>
+                      <span className={singleFileResult.is_corrupted ? "text-rose-400 font-bold" : "text-emerald-400 font-bold"}>
+                        {singleFileResult.is_corrupted ? "TRUE (文件破损/0字节)" : "FALSE (正常)"}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">File Size:</span>
+                      <span className="text-slate-300">{formatBytes(singleFileResult.file_size || 0)}</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Right Column: Scan Results & Analytics (8 cols) */}
+            <div className="lg:col-span-8 flex flex-col space-y-4 min-h-0">
+              {scanning ? (
+                <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-12 flex flex-col items-center justify-center text-center flex-1 min-h-0 space-y-4">
+                  <RotateCw className="w-12 h-12 text-amber-400 animate-spin opacity-80" />
+                  <div>
+                    <h3 className="font-bold text-slate-200 text-base">czkawka_core 正在并行遍历与哈希比对...</h3>
+                    <p className="text-xs text-slate-400 mt-1">遍历文件树中，计算采样 Hash 与 Image pHash 指纹...</p>
+                  </div>
+                </div>
+              ) : scanResult ? (
+                <div className="flex-1 min-h-0 flex flex-col space-y-4 overflow-y-auto pr-1">
+                  {/* Top Stats Cards Grid */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-3.5">
+                      <span className="text-[11px] font-medium text-slate-400 block">扫描文件总数</span>
+                      <span className="text-xl font-bold font-mono text-slate-100 mt-1 block">
+                        {scanResult.total_scanned}
+                      </span>
+                    </div>
+
+                    <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-3.5">
+                      <span className="text-[11px] font-medium text-slate-400 block">发现重复组</span>
+                      <span className="text-xl font-bold font-mono text-amber-400 mt-1 block">
+                        {scanResult.duplicate_groups?.length || 0}
+                      </span>
+                    </div>
+
+                    <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-3.5">
+                      <span className="text-[11px] font-medium text-slate-400 block">冗余副本数</span>
+                      <span className="text-xl font-bold font-mono text-purple-400 mt-1 block">
+                        {scanResult.total_redundant_files}
+                      </span>
+                    </div>
+
+                    <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-3.5">
+                      <span className="text-[11px] font-medium text-slate-400 block">预计可释放空间</span>
+                      <span className="text-xl font-bold font-mono text-emerald-400 mt-1 block">
+                        {formatBytes(scanResult.total_freed_bytes || 0)}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Duplicate Group List */}
+                  <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 flex-1 min-h-0 flex flex-col space-y-4">
+                    <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                      <div className="flex items-center space-x-2">
+                        <Copy className="w-4 h-4 text-amber-400" />
+                        <h3 className="font-bold text-sm text-slate-100">czkawka_core 重复组聚类列表</h3>
+                      </div>
+                      <span className="text-xs text-slate-400 font-mono">
+                        耗时: {scanResult.duration_ms} ms
+                      </span>
+                    </div>
+
+                    {scanResult.duplicate_groups?.length === 0 ? (
+                      <div className="p-8 text-center text-slate-500 text-xs">
+                        🎉 未在此路径下检测到重复文件或冗余副本
+                      </div>
+                    ) : (
+                      <div className="space-y-4 overflow-y-auto max-h-[420px] pr-1">
+                        {scanResult.duplicate_groups?.map((group: any, idx: number) => (
+                          <div
+                            key={group.group_id || idx}
+                            className="bg-slate-950/80 border border-slate-800/90 rounded-xl p-4 space-y-3"
+                          >
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center space-x-2">
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                  group.strategy === 'exact_hash'
+                                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                                    : 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
+                                }`}>
+                                  {group.strategy}
+                                </span>
+                                <span className="font-bold text-xs text-slate-200">
+                                  {group.description}
+                                </span>
+                              </div>
+                              <span className="text-xs font-bold text-emerald-400 font-mono">
+                                可释放: {formatBytes(group.potential_freed_bytes || 0)}
+                              </span>
+                            </div>
+
+                            {/* Files Table */}
+                            <div className="border border-slate-800/80 rounded-lg overflow-hidden">
+                              <table className="w-full text-left text-[11px] font-mono">
+                                <thead className="bg-slate-900 text-slate-400 border-b border-slate-800">
+                                  <tr>
+                                    <th className="py-1.5 px-3">文件名</th>
+                                    <th className="py-1.5 px-3">大小</th>
+                                    <th className="py-1.5 px-3">Fingerprint</th>
+                                    <th className="py-1.5 px-3 text-right">操作</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-800/50">
+                                  {group.files?.map((file: any, fIdx: number) => (
+                                    <tr key={fIdx} className="hover:bg-slate-900/50 text-slate-300">
+                                      <td className="py-2 px-3 font-semibold text-slate-200 break-all max-w-[280px]">
+                                        {file.name}
+                                        <span className="block text-[10px] text-slate-500 font-normal truncate">
+                                          {file.path}
+                                        </span>
+                                      </td>
+                                      <td className="py-2 px-3 whitespace-nowrap text-slate-400">
+                                        {formatBytes(file.size)}
+                                      </td>
+                                      <td className="py-2 px-3 whitespace-nowrap text-amber-400/90 text-[10px]">
+                                        {file.fingerprint ? file.fingerprint.slice(0, 12) : '-'}
+                                      </td>
+                                      <td className="py-2 px-3 text-right whitespace-nowrap">
+                                        <button
+                                          onClick={() => copyToClipboard(file.path)}
+                                          className="text-slate-400 hover:text-amber-400 p-1"
+                                          title="复制路径"
+                                        >
+                                          <Copy className="w-3.5 h-3.5" />
+                                        </button>
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Raw JSON Collapsible Response */}
+                  <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
+                        <FileCode className="w-3.5 h-3.5 text-amber-400" />
+                        API 原始 JSON 响应 Payload (Raw Output)
+                      </span>
+                      <button
+                        onClick={() => copyToClipboard(JSON.stringify(scanResult, null, 2))}
+                        className="text-[11px] text-slate-400 hover:text-slate-200 flex items-center space-x-1"
+                      >
+                        <Copy className="w-3 h-3" />
+                        <span>复制 JSON</span>
+                      </button>
+                    </div>
+                    <pre className="p-3 bg-slate-950 border border-slate-800 rounded-xl text-[11px] font-mono text-slate-300 max-h-48 overflow-y-auto">
+                      {JSON.stringify(scanResult, null, 2)}
+                    </pre>
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-12 flex flex-col items-center justify-center text-center flex-1 min-h-0 text-slate-500">
+                  <Layers className="w-12 h-12 mb-3 opacity-30 text-amber-400" />
+                  <p className="text-sm font-medium text-slate-300">czkawka_core API 测试控制台就绪</p>
+                  <p className="text-xs text-slate-500 mt-1 max-w-sm">
+                    输入目录路径并点击【执行 czkawka_core 聚合扫描】开始全量哈希与感知图片去重测试。
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
         )}
 
         {activeTab === 'config' && (
