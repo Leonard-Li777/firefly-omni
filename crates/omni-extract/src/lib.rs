@@ -289,31 +289,59 @@ impl OmniExtractor {
     }
 }
 
-/// 查找原生解耦的 ExifTool 可执行文件 (优先包含 omni/resources/bin/exiftool.exe，完全解耦不依赖 Node.js desktop)
+/// 查找三大平台 (Windows / macOS / Linux) 原生解耦的 ExifTool 可执行文件
 fn find_exiftool_executable() -> Option<std::path::PathBuf> {
     use std::process::Command;
 
-    // 1. 优先查找系统 PATH 中的 exiftool
-    if Command::new("exiftool").arg("-ver").output().map(|o| o.status.success()).unwrap_or(false) {
+    let is_win = cfg!(target_os = "windows");
+    let exe_name = if is_win { "exiftool.exe" } else { "exiftool" };
+    let platform_dir = match std::env::consts::OS {
+        "windows" => "win32",
+        "macos" => "darwin",
+        "linux" => "linux",
+        other => other,
+    };
+
+    // 1. 优先查找系统 PATH 中的 exiftool / exiftool.exe
+    if Command::new(exe_name).arg("-ver").output().map(|o| o.status.success()).unwrap_or(false) {
+        return Some(std::path::PathBuf::from(exe_name));
+    }
+    if is_win && Command::new("exiftool").arg("-ver").output().map(|o| o.status.success()).unwrap_or(false) {
         return Some(std::path::PathBuf::from("exiftool"));
     }
-    if Command::new("exiftool.exe").arg("-ver").output().map(|o| o.status.success()).unwrap_or(false) {
-        return Some(std::path::PathBuf::from("exiftool.exe"));
-    }
 
-    // 2. 查找 Rust omni 独立引擎自带的 resources/bin/exiftool.exe 或 APPDATA 本地目录
+    // 2. 查找 APPDATA / HOME 本地缓存目录中的 bin/{platform}/
     if let Ok(appdata) = std::env::var("APPDATA") {
-        let appdata_bin = Path::new(&appdata).join("firefly-ai-folder/bin/exiftool.exe");
-        if appdata_bin.exists() {
-            return Some(appdata_bin);
+        let candidates = [
+            Path::new(&appdata).join(format!("firefly-ai-folder/bin/{}/{}", platform_dir, exe_name)),
+            Path::new(&appdata).join(format!("firefly-ai-folder/bin/{}", exe_name)),
+        ];
+        for cand in candidates {
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let candidates = [
+            Path::new(&home).join(format!(".config/firefly-ai-folder/bin/{}/{}", platform_dir, exe_name)),
+            Path::new(&home).join(format!(".config/firefly-ai-folder/bin/{}", exe_name)),
+        ];
+        for cand in candidates {
+            if cand.exists() {
+                return Some(cand);
+            }
         }
     }
 
+    // 3. 查找可执行文件所在目录及其相对路径下的 resources/bin/{platform_dir}/
     if let Ok(exe_dir) = std::env::current_exe().map(|p| p.parent().unwrap_or(Path::new("")).to_path_buf()) {
         let exe_candidates = [
-            exe_dir.join("resources/bin/exiftool.exe"),
-            exe_dir.join("exiftool.exe"),
-            exe_dir.join("../resources/bin/exiftool.exe"),
+            exe_dir.join(format!("resources/bin/{}/{}", platform_dir, exe_name)),
+            exe_dir.join(format!("resources/bin/{}", exe_name)),
+            exe_dir.join(exe_name),
+            exe_dir.join(format!("../resources/bin/{}/{}", platform_dir, exe_name)),
+            exe_dir.join(format!("../resources/bin/{}", exe_name)),
         ];
         for cand in exe_candidates {
             if cand.exists() {
@@ -322,14 +350,18 @@ fn find_exiftool_executable() -> Option<std::path::PathBuf> {
         }
     }
 
+    // 4. 向上递归搜索 CWD / Monorepo resources/bin/{platform_dir}/
     if let Ok(cwd) = std::env::current_dir() {
         let mut curr: Option<&Path> = Some(cwd.as_path());
         while let Some(dir) = curr {
             let candidates = [
-                dir.join("resources/bin/exiftool.exe"),
-                dir.join("apps/omni/resources/bin/exiftool.exe"),
-                dir.join("crates/omni-extract/bin/exiftool.exe"),
-                dir.join("bin/exiftool.exe"),
+                dir.join(format!("resources/bin/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("resources/bin/{}", exe_name)),
+                dir.join(format!("apps/omni/resources/bin/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("apps/omni/resources/bin/{}", exe_name)),
+                dir.join(format!("crates/omni-extract/bin/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("crates/omni-extract/bin/{}", exe_name)),
+                dir.join(format!("bin/{}", exe_name)),
             ];
             for cand in candidates {
                 if cand.exists() {
