@@ -549,3 +549,35 @@ async fn test_upload_tailwind_pdf_multipart() {
     println!("DEBUG METADATA FOR TAILWIND PDF MULTIPART UPLOAD:\n{:#?}", result.metadata);
     assert!(result.metadata.get("exiftool").is_some(), "ExifTool metadata should be extracted on upload!");
 }
+
+#[tokio::test]
+async fn test_extract_exe_file_metadata() {
+    let exe_path = std::path::PathBuf::from(r"C:\Windows\explorer.exe");
+    if !exe_path.exists() {
+        println!("C:\\Windows\\explorer.exe does not exist");
+        return;
+    }
+
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "file_path": exe_path.to_string_lossy().to_string()
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+
+    println!("DEBUG METADATA FOR EXE FILE:\n{:#?}", result.metadata);
+    assert!(result.metadata.get("exiftool").is_some(), "ExifTool metadata should be present for .exe file");
+    assert!(result.metadata.get("executable").is_some(), "Executable metadata block should be present for .exe file");
+}

@@ -267,6 +267,51 @@ impl OmniExtractor {
             result.metadata["text"] = serde_json::Value::Object(text_meta);
         }
 
+        // 10. 提取 PE 可执行程序属性 (executable / exe)
+        let is_exe = matches!(ext.as_str(), "exe" | "dll" | "sys" | "so" | "dylib")
+            || mime_type.contains("x-msdownload")
+            || mime_type.contains("x-executable")
+            || mime_type.contains("application/vnd.microsoft.portable-executable")
+            || (mime_type.contains("application/octet-stream") && matches!(ext.as_str(), "exe" | "dll" | "sys"));
+
+        if is_exe || exiftool_map.contains_key("CompanyName") || exiftool_map.contains_key("FileDescription") {
+            let mut exe_meta = serde_json::Map::new();
+            if let Some(val) = exiftool_map.get("FileDescription").or_else(|| exiftool_map.get("Description")) {
+                exe_meta.insert("file_description".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("CompanyName").or_else(|| exiftool_map.get("Company")) {
+                exe_meta.insert("company_name".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("ProductName").or_else(|| exiftool_map.get("Product")) {
+                exe_meta.insert("product_name".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("FileVersion") {
+                exe_meta.insert("file_version".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("ProductVersion") {
+                exe_meta.insert("product_version".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("LegalCopyright").or_else(|| exiftool_map.get("Copyright")) {
+                exe_meta.insert("legal_copyright".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("OriginalFileName") {
+                exe_meta.insert("original_file_name".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("InternalName") {
+                exe_meta.insert("internal_name".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("PEType").or_else(|| exiftool_map.get("MachineType")) {
+                exe_meta.insert("pe_type".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("Subsystem") {
+                exe_meta.insert("subsystem".into(), val.clone());
+            }
+
+            if !exe_meta.is_empty() {
+                result.metadata["executable"] = serde_json::Value::Object(exe_meta);
+            }
+        }
+
         info!("Successfully extracted file information for {}", path_str);
         Ok(result)
     }
@@ -397,6 +442,8 @@ fn find_exiftool_executable() -> Option<std::path::PathBuf> {
                 dir.join(format!("crates/omni-extract/bin/{}/{}", platform_dir, exe_name)),
                 dir.join(format!("crates/omni-extract/bin/{}", exe_name)),
                 dir.join(format!("bin/{}", exe_name)),
+                dir.join("apps/desktop/node_modules/exiftool-vendored.exe/bin/exiftool.exe"),
+                dir.join("node_modules/exiftool-vendored.exe/bin/exiftool.exe"),
             ];
             for cand in candidates {
                 if cand.exists() {

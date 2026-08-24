@@ -608,6 +608,8 @@ MIME Type: application/pdf
 
     if (meta.exiftool) {
       flatten(meta.exiftool)
+    } else if (meta.executable) {
+      flatten(meta.executable)
     } else if (meta.image?.exif) {
       flatten(meta.image.exif)
     } else {
@@ -1006,6 +1008,49 @@ MIME Type: application/pdf
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">resolution (分辨率):</span>
                                   <span className="font-mono text-emerald-300">{String(selectedFile.apiResponse.metadata.video.resolution)}</span>
+                                </div>
+                              )}
+                            </>
+                          )}
+
+                          {/* 可执行程序 PE 元数据 (executable) */}
+                          {selectedFile.apiResponse?.metadata?.executable && (
+                            <>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">可执行程序 PE 元数据</div>
+                              {selectedFile.apiResponse.metadata.executable.file_description && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">file_description (程序描述):</span>
+                                  <span className="text-amber-300 font-medium truncate max-w-[200px]">{String(selectedFile.apiResponse.metadata.executable.file_description)}</span>
+                                </div>
+                              )}
+                              {selectedFile.apiResponse.metadata.executable.company_name && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">company_name (开发厂商):</span>
+                                  <span className="text-sky-300 truncate max-w-[200px]">{String(selectedFile.apiResponse.metadata.executable.company_name)}</span>
+                                </div>
+                              )}
+                              {selectedFile.apiResponse.metadata.executable.product_name && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">product_name (产品名称):</span>
+                                  <span className="text-emerald-300 truncate max-w-[200px]">{String(selectedFile.apiResponse.metadata.executable.product_name)}</span>
+                                </div>
+                              )}
+                              {selectedFile.apiResponse.metadata.executable.file_version && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">file_version (文件版本):</span>
+                                  <span className="font-mono text-purple-300">{String(selectedFile.apiResponse.metadata.executable.file_version)}</span>
+                                </div>
+                              )}
+                              {selectedFile.apiResponse.metadata.executable.legal_copyright && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">legal_copyright (版权信息):</span>
+                                  <span className="text-slate-300 text-[11px] truncate max-w-[200px]">{String(selectedFile.apiResponse.metadata.executable.legal_copyright)}</span>
+                                </div>
+                              )}
+                              {selectedFile.apiResponse.metadata.executable.pe_type && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">pe_type (PE 架构):</span>
+                                  <span className="font-mono text-cyan-300">{String(selectedFile.apiResponse.metadata.executable.pe_type)}</span>
                                 </div>
                               )}
                             </>
