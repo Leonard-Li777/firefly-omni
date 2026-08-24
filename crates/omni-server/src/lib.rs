@@ -1,5 +1,6 @@
 use axum::{
     extract::{DefaultBodyLimit, Multipart, State},
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Json, Router,
 };
@@ -38,6 +39,7 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/api/extract", post(extract_file_handler))
         .route("/api/extract/upload", post(extract_multipart_handler))
         .route("/api/duplicate/scan", post(duplicate_scan_handler))
+        .route("/api/duplicate/scan/stream", post(duplicate_scan_stream_handler))
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .with_state(state)
 }
@@ -467,4 +469,342 @@ fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
             }
         }
     }
+}
+
+/// 实时 SSE 流式查重扫描接口: POST /api/duplicate/scan/stream
+pub async fn duplicate_scan_stream_handler(
+    State(_state): State<AppState>,
+    Json(req): Json<DuplicateScanRequest>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
+
+    tokio::spawn(async move {
+        let start = Instant::now();
+        let mut files_to_scan: Vec<PathBuf> = Vec::new();
+
+        for p in &req.paths {
+            let path = Path::new(p);
+            if path.is_file() {
+                files_to_scan.push(path.to_path_buf());
+            } else if path.is_dir() {
+                collect_files_recursive(path, &mut files_to_scan);
+            }
+        }
+
+        let total_scanned = files_to_scan.len();
+
+        let _ = tx.send(Ok(Event::default()
+            .event("start")
+            .data(serde_json::json!({ "total_scanned": total_scanned }).to_string())));
+
+        let enabled_strategies = req.strategies.clone().unwrap_or_default();
+        let run_exact = enabled_strategies.is_empty() || enabled_strategies.iter().any(|s| s == "exact_hash");
+        let run_image = enabled_strategies.is_empty() || enabled_strategies.iter().any(|s| s == "image_phash");
+        let run_audio = enabled_strategies.is_empty() || enabled_strategies.iter().any(|s| s == "audio_hash");
+        let run_video = req.check_video == Some(true) || enabled_strategies.iter().any(|s| s == "video_phash");
+
+        let mut total_freed_bytes: u64 = 0;
+        let mut total_redundant_files: usize = 0;
+
+        // 1. 100% 精确去重 (实时上屏)
+        if run_exact {
+            let mut size_map: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+            for (idx, f) in files_to_scan.iter().enumerate() {
+                if idx % 50 == 0 {
+                    let _ = tx.send(Ok(Event::default()
+                        .event("progress")
+                        .data(serde_json::json!({
+                            "scanned": idx + 1,
+                            "total": total_scanned
+                        }).to_string())));
+                }
+                if let Ok(meta) = std::fs::metadata(f) {
+                    if meta.is_file() && meta.len() > 0 {
+                        size_map.entry(meta.len()).or_default().push(f.clone());
+                    }
+                }
+            }
+
+            let mut exact_group_idx = 1;
+            for (size, paths) in size_map {
+                if paths.len() < 2 {
+                    continue;
+                }
+                let mut hash_map: HashMap<String, Vec<PathBuf>> = HashMap::new();
+                for p in paths {
+                    if let Ok(bytes) = std::fs::read(&p) {
+                        let mut hash: u64 = 0;
+                        for b in &bytes {
+                            hash = hash.wrapping_mul(31).wrapping_add(*b as u64);
+                        }
+                        let hash_str = format!("{:016x}", hash);
+                        hash_map.entry(hash_str).or_default().push(p);
+                    }
+                }
+                for (hash, dup_paths) in hash_map {
+                    if dup_paths.len() >= 2 {
+                        let items: Vec<OmniDuplicateFileItem> = dup_paths
+                            .iter()
+                            .map(|p| {
+                                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                let meta = std::fs::metadata(p).ok();
+                                let modified_at = meta
+                                    .and_then(|m| m.modified().ok())
+                                    .map(|t| format!("{:?}", t))
+                                    .unwrap_or_default();
+                                OmniDuplicateFileItem {
+                                    path: p.to_string_lossy().to_string(),
+                                    name,
+                                    size,
+                                    modified_at,
+                                    fingerprint: hash.clone(),
+                                    similarity_score: Some(1.0),
+                                }
+                            })
+                            .collect();
+                        let potential_freed = size * (dup_paths.len() as u64 - 1);
+                        total_freed_bytes += potential_freed;
+                        total_redundant_files += dup_paths.len() - 1;
+
+                        let group = OmniDuplicateGroup {
+                            group_id: format!("exact_{}", exact_group_idx),
+                            strategy: "exact_hash".to_string(),
+                            similarity_percentage: 100.0,
+                            description: format!("100% 完全精确一致文件 ({}个)", dup_paths.len()),
+                            files: items,
+                            potential_freed_bytes: potential_freed,
+                        };
+
+                        let _ = tx.send(Ok(Event::default()
+                            .event("group")
+                            .data(serde_json::to_string(&group).unwrap())));
+
+                        exact_group_idx += 1;
+                    }
+                }
+            }
+        }
+
+        // 2. 相似图片去重 (实时上屏)
+        if run_image {
+            let image_extensions = ["jpg", "jpeg", "png", "webp", "bmp", "avif", "gif"];
+            let mut image_files: Vec<(PathBuf, String, u64)> = Vec::new();
+            for f in &files_to_scan {
+                if let Some(ext) = f.extension().and_then(|e| e.to_str()) {
+                    if image_extensions.contains(&ext.to_lowercase().as_str()) {
+                        if let Some(phash) = OmniExtractionResult::compute_phash(f) {
+                            let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+                            image_files.push((f.clone(), phash, size));
+                        }
+                    }
+                }
+            }
+
+            let mut img_group_idx = 1;
+            let mut visited_images = vec![false; image_files.len()];
+            for i in 0..image_files.len() {
+                if visited_images[i] {
+                    continue;
+                }
+                let mut group: Vec<(PathBuf, String, u64)> = vec![image_files[i].clone()];
+                for j in (i + 1)..image_files.len() {
+                    if visited_images[j] {
+                        continue;
+                    }
+                    if image_files[i].1 == image_files[j].1 {
+                        group.push(image_files[j].clone());
+                        visited_images[j] = true;
+                    }
+                }
+                if group.len() >= 2 {
+                    visited_images[i] = true;
+                    let items: Vec<OmniDuplicateFileItem> = group
+                        .iter()
+                        .map(|(p, phash, sz)| {
+                            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            OmniDuplicateFileItem {
+                                path: p.to_string_lossy().to_string(),
+                                name,
+                                size: *sz,
+                                modified_at: String::new(),
+                                fingerprint: phash.clone(),
+                                similarity_score: Some(0.95),
+                            }
+                        })
+                        .collect();
+                    let avg_size = group.iter().map(|(_, _, s)| s).sum::<u64>() / group.len() as u64;
+                    let potential_freed = avg_size * (group.len() as u64 - 1);
+                    total_freed_bytes += potential_freed;
+                    total_redundant_files += group.len() - 1;
+
+                    let dup_group = OmniDuplicateGroup {
+                        group_id: format!("img_{}", img_group_idx),
+                        strategy: "image_phash".to_string(),
+                        similarity_percentage: 95.0,
+                        description: format!("视觉感知高度相似图片 ({}个)", group.len()),
+                        files: items,
+                        potential_freed_bytes: potential_freed,
+                    };
+
+                    let _ = tx.send(Ok(Event::default()
+                        .event("group")
+                        .data(serde_json::to_string(&dup_group).unwrap())));
+
+                    img_group_idx += 1;
+                }
+            }
+        }
+
+        // 3. 音频去重 (实时上屏)
+        if run_audio {
+            let audio_extensions = ["mp3", "wav", "flac", "aac", "m4a", "ogg", "wma"];
+            let mut audio_files: Vec<(PathBuf, String, u64)> = Vec::new();
+            for f in &files_to_scan {
+                if let Some(ext) = f.extension().and_then(|e| e.to_str()) {
+                    if audio_extensions.contains(&ext.to_lowercase().as_str()) {
+                        if let Some(phash) = OmniExtractionResult::compute_phash(f) {
+                            let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+                            audio_files.push((f.clone(), phash, size));
+                        }
+                    }
+                }
+            }
+
+            let mut audio_group_idx = 1;
+            let mut visited_audio = vec![false; audio_files.len()];
+            for i in 0..audio_files.len() {
+                if visited_audio[i] {
+                    continue;
+                }
+                let mut group: Vec<(PathBuf, String, u64)> = vec![audio_files[i].clone()];
+                for j in (i + 1)..audio_files.len() {
+                    if visited_audio[j] {
+                        continue;
+                    }
+                    if audio_files[i].1 == audio_files[j].1 {
+                        group.push(audio_files[j].clone());
+                        visited_audio[j] = true;
+                    }
+                }
+                if group.len() >= 2 {
+                    visited_audio[i] = true;
+                    let items: Vec<OmniDuplicateFileItem> = group
+                        .iter()
+                        .map(|(p, phash, sz)| {
+                            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            OmniDuplicateFileItem {
+                                path: p.to_string_lossy().to_string(),
+                                name,
+                                size: *sz,
+                                modified_at: String::new(),
+                                fingerprint: phash.clone(),
+                                similarity_score: Some(0.95),
+                            }
+                        })
+                        .collect();
+                    let avg_size = group.iter().map(|(_, _, s)| s).sum::<u64>() / group.len() as u64;
+                    let potential_freed = avg_size * (group.len() as u64 - 1);
+                    total_freed_bytes += potential_freed;
+                    total_redundant_files += group.len() - 1;
+
+                    let dup_group = OmniDuplicateGroup {
+                        group_id: format!("audio_{}", audio_group_idx),
+                        strategy: "audio_hash".to_string(),
+                        similarity_percentage: 95.0,
+                        description: format!("同源/高度相似音频文件 ({}个)", group.len()),
+                        files: items,
+                        potential_freed_bytes: potential_freed,
+                    };
+
+                    let _ = tx.send(Ok(Event::default()
+                        .event("group")
+                        .data(serde_json::to_string(&dup_group).unwrap())));
+
+                    audio_group_idx += 1;
+                }
+            }
+        }
+
+        // 4. 视频画面去重 (实时上屏)
+        if run_video {
+            let video_extensions = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"];
+            let mut video_files: Vec<(PathBuf, String, u64)> = Vec::new();
+            for f in &files_to_scan {
+                if let Some(ext) = f.extension().and_then(|e| e.to_str()) {
+                    if video_extensions.contains(&ext.to_lowercase().as_str()) {
+                        if let Some(phash) = OmniExtractionResult::compute_phash(f) {
+                            let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+                            video_files.push((f.clone(), phash, size));
+                        }
+                    }
+                }
+            }
+
+            let mut video_group_idx = 1;
+            let mut visited_video = vec![false; video_files.len()];
+            for i in 0..video_files.len() {
+                if visited_video[i] {
+                    continue;
+                }
+                let mut group: Vec<(PathBuf, String, u64)> = vec![video_files[i].clone()];
+                for j in (i + 1)..video_files.len() {
+                    if visited_video[j] {
+                        continue;
+                    }
+                    if video_files[i].1 == video_files[j].1 {
+                        group.push(video_files[j].clone());
+                        visited_video[j] = true;
+                    }
+                }
+                if group.len() >= 2 {
+                    visited_video[i] = true;
+                    let items: Vec<OmniDuplicateFileItem> = group
+                        .iter()
+                        .map(|(p, phash, sz)| {
+                            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            OmniDuplicateFileItem {
+                                path: p.to_string_lossy().to_string(),
+                                name,
+                                size: *sz,
+                                modified_at: String::new(),
+                                fingerprint: phash.clone(),
+                                similarity_score: Some(0.90),
+                            }
+                        })
+                        .collect();
+                    let avg_size = group.iter().map(|(_, _, s)| s).sum::<u64>() / group.len() as u64;
+                    let potential_freed = avg_size * (group.len() as u64 - 1);
+                    total_freed_bytes += potential_freed;
+                    total_redundant_files += group.len() - 1;
+
+                    let dup_group = OmniDuplicateGroup {
+                        group_id: format!("video_{}", video_group_idx),
+                        strategy: "video_phash".to_string(),
+                        similarity_percentage: 90.0,
+                        description: format!("同源/画面相似视频文件 ({}个)", group.len()),
+                        files: items,
+                        potential_freed_bytes: potential_freed,
+                    };
+
+                    let _ = tx.send(Ok(Event::default()
+                        .event("group")
+                        .data(serde_json::to_string(&dup_group).unwrap())));
+
+                    video_group_idx += 1;
+                }
+            }
+        }
+
+        let _ = tx.send(Ok(Event::default()
+            .event("done")
+            .data(serde_json::json!({
+                "total_scanned": total_scanned,
+                "total_redundant_files": total_redundant_files,
+                "total_freed_bytes": total_freed_bytes,
+                "duration_ms": start.elapsed().as_millis() as u64
+            }).to_string())));
+    });
+
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }

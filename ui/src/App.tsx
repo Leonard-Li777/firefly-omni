@@ -161,6 +161,17 @@ export default function App() {
     }
     setScanning(true)
     setScanError(null)
+
+    // 初始化实时上屏结构
+    setScanResult({
+      success: true,
+      total_scanned: 0,
+      duplicate_groups: [],
+      total_redundant_files: 0,
+      total_freed_bytes: 0,
+      duration_ms: 0
+    })
+
     const pathsArray = scanPaths
       .split('\n')
       .map(p => p.trim())
@@ -173,7 +184,7 @@ export default function App() {
     if (strategyVideo) strategies.push('video_phash')
 
     try {
-      const res = await fetch('/api/duplicate/scan', {
+      const response = await fetch('/api/duplicate/scan/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -184,13 +195,79 @@ export default function App() {
         })
       })
 
-      if (!res.ok) {
-        throw new Error(`HTTP error ${res.status}: ${res.statusText}`)
+      if (!response.ok || !response.body) {
+        throw new Error(`HTTP error ${response.status}: ${response.statusText}`)
       }
-      const data = await res.json()
-      setScanResult(data)
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const parts = buffer.split('\n\n')
+        buffer = parts.pop() || ''
+
+        for (const part of parts) {
+          const lines = part.split('\n')
+          let eventName = ''
+          let eventData = ''
+
+          for (const line of lines) {
+            if (line.startsWith('event:')) {
+              eventName = line.replace('event:', '').trim()
+            } else if (line.startsWith('data:')) {
+              eventData += line.replace('data:', '').trim()
+            }
+          }
+
+          if (eventData) {
+            try {
+              const parsed = JSON.parse(eventData)
+              if (eventName === 'start') {
+                setScanResult((prev: any) => ({
+                  ...prev,
+                  total_scanned: parsed.total_scanned || 0
+                }))
+              } else if (eventName === 'progress') {
+                setScanResult((prev: any) => ({
+                  ...prev,
+                  total_scanned: parsed.scanned || prev?.total_scanned || 0
+                }))
+              } else if (eventName === 'group') {
+                // 实时上屏！把最新发现的重复组动态追加到界面列表顶部！
+                setScanResult((prev: any) => {
+                  const existingGroups = prev?.duplicate_groups || []
+                  const newGroups = [parsed, ...existingGroups]
+                  const newFreed = (prev?.total_freed_bytes || 0) + (parsed.potential_freed_bytes || 0)
+                  const newRedundant = (prev?.total_redundant_files || 0) + Math.max(0, (parsed.files?.length || 0) - 1)
+                  return {
+                    ...prev,
+                    duplicate_groups: newGroups,
+                    total_freed_bytes: newFreed,
+                    total_redundant_files: newRedundant
+                  }
+                })
+              } else if (eventName === 'done') {
+                setScanResult((prev: any) => ({
+                  ...prev,
+                  total_scanned: parsed.total_scanned,
+                  total_freed_bytes: parsed.total_freed_bytes,
+                  total_redundant_files: parsed.total_redundant_files,
+                  duration_ms: parsed.duration_ms
+                }))
+              }
+            } catch {
+              // Ignore parse error
+            }
+          }
+        }
+      }
     } catch (err: any) {
-      setScanError(err.message || 'czkawka_core 扫描请求失败，请检查后端 API 服务。')
+      setScanError(err.message || 'czkawka_core 实时流扫描失败。')
     } finally {
       setScanning(false)
     }
@@ -1147,7 +1224,7 @@ MIME Type: application/pdf
                           <div className="flex items-center gap-1.5">
                             <span className="text-xs font-semibold text-slate-200 block">视频画面指纹查重 (video_phash)</span>
                             <span className="text-[9px] font-bold text-rose-300 bg-rose-950/80 border border-rose-800/80 px-1.5 py-0.5 rounded">
-                              需手动勾选(开销较重)
+                              非常耗时
                             </span>
                           </div>
                           <span className="text-[10px] text-slate-400">支持 mp4, mkv, avi, mov, wmv, flv, webm</span>
@@ -1261,16 +1338,22 @@ MIME Type: application/pdf
 
             {/* Right Column: Scan Results & Analytics (8 cols) */}
             <div className="lg:col-span-8 flex flex-col space-y-4 min-h-0">
-              {scanning ? (
-                <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-12 flex flex-col items-center justify-center text-center flex-1 min-h-0 space-y-4">
-                  <RotateCw className="w-12 h-12 text-amber-400 animate-spin opacity-80" />
-                  <div>
-                    <h3 className="font-bold text-slate-200 text-base">czkawka_core 正在并行遍历与哈希比对...</h3>
-                    <p className="text-xs text-slate-400 mt-1">遍历文件树中，计算采样 Hash 与 Image pHash 指纹...</p>
-                  </div>
-                </div>
-              ) : scanResult ? (
+              {scanResult ? (
                 <div className="flex-1 min-h-0 flex flex-col space-y-4 overflow-y-auto pr-1">
+                  {/* Live Streaming Progress Banner */}
+                  {scanning && (
+                    <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 flex items-center justify-between">
+                      <div className="flex items-center space-x-2">
+                        <RotateCw className="w-4 h-4 text-amber-400 animate-spin" />
+                        <span className="text-xs font-bold text-amber-300">
+                          czkawka_core 正在实时流式上屏中... 已分析文件: {scanResult.total_scanned}
+                        </span>
+                      </div>
+                      <span className="text-[10px] text-amber-400 font-mono animate-pulse font-bold">
+                        LIVE SSE STREAMING
+                      </span>
+                    </div>
+                  )}
                   {/* Top Stats Cards Grid */}
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                     <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-3.5">
