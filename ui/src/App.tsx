@@ -254,12 +254,19 @@ export default function App() {
                   total_scanned: parsed.scanned !== undefined ? parsed.scanned : (parsed.total_scanned || prev?.total_scanned || 0)
                 }))
               } else if (eventName === 'group') {
-                // 实时上屏！把最新发现的重复组动态追加到界面列表顶部！
+                // 实时上屏！把最新发现的重复组动态追加或更新到界面列表！
                 setScanResult((prev: any) => {
-                  const existingGroups = prev?.duplicate_groups || []
-                  const newGroups = [parsed, ...existingGroups]
-                  const newFreed = (prev?.total_freed_bytes || 0) + (parsed.potential_freed_bytes || 0)
-                  const newRedundant = (prev?.total_redundant_files || 0) + Math.max(0, (parsed.files?.length || 0) - 1)
+                  const existingGroups: any[] = prev?.duplicate_groups || []
+                  const idx = existingGroups.findIndex(g => g.group_id === parsed.group_id)
+                  let newGroups: any[]
+                  if (idx >= 0) {
+                    newGroups = [...existingGroups]
+                    newGroups[idx] = parsed
+                  } else {
+                    newGroups = [parsed, ...existingGroups]
+                  }
+                  const newFreed = newGroups.reduce((acc, g) => acc + (g.potential_freed_bytes || 0), 0)
+                  const newRedundant = newGroups.reduce((acc, g) => acc + Math.max(0, (g.files?.length || 0) - 1), 0)
                   return {
                     ...prev,
                     duplicate_groups: newGroups,
