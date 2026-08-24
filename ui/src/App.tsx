@@ -18,7 +18,9 @@ import {
   Grid,
   Hash,
   AlertCircle,
-  Layers
+  Layers,
+  Music,
+  Video
 } from 'lucide-react'
 
 interface ApiResponseData {
@@ -59,6 +61,8 @@ export default function App() {
   const [scanPaths, setScanPaths] = useState<string>('F:\\lilun\\Desktop')
   const [strategyExact, setStrategyExact] = useState<boolean>(true)
   const [strategyPhash, setStrategyPhash] = useState<boolean>(true)
+  const [strategyAudio, setStrategyAudio] = useState<boolean>(true)
+  const [strategyVideo, setStrategyVideo] = useState<boolean>(false) // Default FALSE (requires explicit user opt-in)
   const [minSimilarity, setMinSimilarity] = useState<number>(90)
   const [scanning, setScanning] = useState<boolean>(false)
   const [scanResult, setScanResult] = useState<any | null>(null)
@@ -165,6 +169,8 @@ export default function App() {
     const strategies: string[] = []
     if (strategyExact) strategies.push('exact_hash')
     if (strategyPhash) strategies.push('image_phash')
+    if (strategyAudio) strategies.push('audio_hash')
+    if (strategyVideo) strategies.push('video_phash')
 
     try {
       const res = await fetch('/api/duplicate/scan', {
@@ -173,7 +179,8 @@ export default function App() {
         body: JSON.stringify({
           paths: pathsArray,
           strategies,
-          min_similarity: minSimilarity
+          min_similarity: minSimilarity,
+          check_video: strategyVideo
         })
       })
 
@@ -1116,6 +1123,43 @@ MIME Type: application/pdf
                         className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
                       />
                     </label>
+
+                    <label className="flex items-center justify-between p-2.5 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <Music className="w-4 h-4 text-cyan-400" />
+                        <div>
+                          <span className="text-xs font-semibold text-slate-200 block">音频同源与特征比对 (audio_hash)</span>
+                          <span className="text-[10px] text-slate-400">支持 mp3, wav, flac, aac, m4a, ogg</span>
+                        </div>
+                      </div>
+                      <input
+                        type="checkbox"
+                        checked={strategyAudio}
+                        onChange={e => setStrategyAudio(e.target.checked)}
+                        className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
+                      />
+                    </label>
+
+                    <label className="flex items-center justify-between p-2.5 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <Video className="w-4 h-4 text-rose-400" />
+                        <div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs font-semibold text-slate-200 block">视频画面指纹查重 (video_phash)</span>
+                            <span className="text-[9px] font-bold text-rose-300 bg-rose-950/80 border border-rose-800/80 px-1.5 py-0.5 rounded">
+                              需手动勾选(开销较重)
+                            </span>
+                          </div>
+                          <span className="text-[10px] text-slate-400">支持 mp4, mkv, avi, mov, wmv, flv, webm</span>
+                        </div>
+                      </div>
+                      <input
+                        type="checkbox"
+                        checked={strategyVideo}
+                        onChange={e => setStrategyVideo(e.target.checked)}
+                        className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
+                      />
+                    </label>
                   </div>
                 </div>
 
@@ -1286,6 +1330,10 @@ MIME Type: application/pdf
                                 <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
                                   group.strategy === 'exact_hash'
                                     ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                                    : group.strategy === 'audio_hash'
+                                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                                    : group.strategy === 'video_phash'
+                                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
                                     : 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
                                 }`}>
                                   {group.strategy}
