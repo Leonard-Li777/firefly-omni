@@ -517,4 +517,26 @@ impl OmniVisionEngine {
     pub fn recognize_ocr_text<P: AsRef<Path>>(image_path: P) -> Result<String> {
         Self::recognize_ocr_text_with_size(image_path, "tiny")
     }
+
+    /// 从内存图像 Byte 数组直接执行 PP-OCRv6 文本识别
+    pub fn recognize_ocr_image_bytes(bytes: &[u8], model_size: &str) -> Result<String> {
+        let img = match image::load_from_memory(bytes) {
+            Ok(i) => i,
+            Err(_) => return Ok(String::new()),
+        };
+
+        let model_dir = Self::resolve_ppocr_model_dir();
+        let keys_map = Self::load_keys_map(model_dir.as_deref(), model_size);
+
+        if let Some(dir) = model_dir.as_deref() {
+            if let Some(onnx_text) = Self::run_onnx_ocr_inference(&img, dir, model_size, &keys_map) {
+                if !onnx_text.trim().is_empty() {
+                    return Ok(onnx_text);
+                }
+            }
+        }
+
+        let detected_boxes = Self::scan_image_text_regions(&img, Path::new("memory_bytes"));
+        Ok(Self::group_boxes_into_lines(detected_boxes))
+    }
 }

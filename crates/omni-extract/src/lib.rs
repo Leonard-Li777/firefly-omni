@@ -103,7 +103,7 @@ impl OmniExtractor {
             let max_bytes = config.max_content_size_kb * 1024;
 
             if is_pdf || is_office {
-                if let Ok((doc_text, doc_meta)) = extract_pdf_content_and_meta(p, max_bytes) {
+                if let Ok((doc_text, doc_meta)) = extract_pdf_content_and_meta(p, max_bytes, config) {
                     result.markdown_content = doc_text;
                     result.metadata["document"] = doc_meta;
                 }
@@ -472,8 +472,17 @@ fn extract_plain_text(path: &Path, max_bytes: usize) -> Result<String> {
 }
 
 
-/// anydoc 原生文档提纯解析器 (支持 PDF/DOC/DOCX/EPUB/PPT/PPTX/HTML/XLS/XLSX 等格式毫秒级解析并输出 Markdown)
-fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize) -> Result<(String, serde_json::Value)> {
+/// anydoc 原生文档提纯解析器 (支持 PDF/DOC/DOCX/EPUB/PPT/PPTX/HTML/XLS/XLSX 等格式毫秒级解析并输出 Markdown，对于 DOCX 优先提取嵌入图片并执行 PP-OCRv6 原位替换)
+fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConfig) -> Result<(String, serde_json::Value)> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if ext == "docx" {
+        if let Ok((docx_text, docx_meta)) = extract_docx_with_embedded_image_ocr(path, max_bytes, config) {
+            if !docx_text.trim().is_empty() {
+                return Ok((docx_text, docx_meta));
+            }
+        }
+    }
+
     match anydoc::to_markdown(path) {
         Ok(markdown) => {
             let title_candidate = path.file_stem().unwrap_or_default().to_string_lossy();
@@ -495,6 +504,179 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize) -> Result<(String
             extract_document_fallback(path, max_bytes)
         }
     }
+}
+
+/// 解析 DOCX 文档中的嵌入图片，执行 PP-OCRv6 文字提取并在 word/document.xml 段落中精确定位原位替换
+fn extract_docx_with_embedded_image_ocr(path: &Path, max_bytes: usize, config: &OmniConfig) -> Result<(String, serde_json::Value)> {
+    let file = File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+
+    // 1. 读取 word/_rels/document.xml.rels 构建 rId -> Target 图像路径映射表
+    let mut rel_image_map = HashMap::new();
+    let mut rels_content = String::new();
+    if let Ok(mut rels_file) = archive.by_name("word/_rels/document.xml.rels") {
+        let _ = rels_file.read_to_string(&mut rels_content);
+    }
+
+    let rel_re = regex::Regex::new(r#"<Relationship\s+[^>]*Id="([^"]+)"[^>]*Target="([^"]+)""#).unwrap();
+    for cap in rel_re.captures_iter(&rels_content) {
+        let r_id = cap[1].to_string();
+        let target = cap[2].to_string();
+        let target_lower = target.to_lowercase();
+        if target_lower.contains("image") || target_lower.ends_with(".png") || target_lower.ends_with(".jpg") || target_lower.ends_with(".jpeg") || target_lower.ends_with(".webp") || target_lower.ends_with(".gif") {
+            rel_image_map.insert(r_id, target);
+        }
+    }
+
+    // 2. 遍历 ZIP 提取 word/media/ 下的所有嵌入图片，若开启 OCR 则执行 PP-OCRv6 识别
+    let mut image_ocr_map = HashMap::new();
+    if config.enable_document_ocr || config.enable_image_ocr {
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            let name = file.name().to_string();
+            let name_lower = name.to_lowercase();
+            if name_lower.starts_with("word/media/") || name_lower.starts_with("media/") {
+                let mut bytes = Vec::new();
+                if file.read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                    if let Ok(ocr_text) = omni_vision::OmniVisionEngine::recognize_ocr_image_bytes(&bytes, &config.ocr_model_size) {
+                        if !ocr_text.trim().is_empty() {
+                            let clean_name = name.trim_start_matches("word/").to_string();
+                            image_ocr_map.insert(name.clone(), ocr_text.clone());
+                            image_ocr_map.insert(clean_name.clone(), ocr_text.clone());
+                            if let Some(filename) = Path::new(&name).file_name().and_then(|n| n.to_str()) {
+                                image_ocr_map.insert(filename.to_string(), ocr_text.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 读取 anydoc 的基础 Markdown 成果（以备兜底）
+    let base_markdown = anydoc::to_markdown(path).unwrap_or_default();
+
+    // 4. 解析 word/document.xml，在段落 XML 流中找到图片位置并原位插入 OCR 文字
+    let mut doc_content = String::new();
+    if let Ok(mut doc_file) = archive.by_name("word/document.xml") {
+        let _ = doc_file.read_to_string(&mut doc_content);
+    }
+
+    let mut final_markdown = String::new();
+    if !doc_content.is_empty() {
+        use quick_xml::events::Event;
+        use quick_xml::reader::Reader;
+
+        let mut reader = Reader::from_str(&doc_content);
+        reader.config_mut().trim_text(true);
+
+        let mut buf = Vec::new();
+        let mut in_text = false;
+        let mut current_p_text = String::new();
+        let mut paragraph_lines = Vec::new();
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) => {
+                    let name_bytes = e.name().into_inner();
+                    let name_str = String::from_utf8_lossy(name_bytes);
+                    if name_str == "w:p" {
+                        current_p_text.clear();
+                    } else if name_str == "w:t" {
+                        in_text = true;
+                    }
+
+                    // 检查 r:embed 或 r:id 关联图片属性
+                    for attr in e.attributes().flatten() {
+                        let key_str = String::from_utf8_lossy(attr.key.into_inner());
+                        if key_str == "r:embed" || key_str == "r:id" {
+                            let r_id = String::from_utf8_lossy(&attr.value).to_string();
+                            if let Some(target_image) = rel_image_map.get(&r_id) {
+                                let filename_opt = Path::new(target_image).file_name().and_then(|f| f.to_str());
+                                if let Some(ocr_text) = image_ocr_map.get(target_image)
+                                    .or_else(|| image_ocr_map.get(&format!("word/{}", target_image)))
+                                    .or_else(|| filename_opt.and_then(|fn_str| image_ocr_map.get(fn_str)))
+                                {
+                                    if !ocr_text.trim().is_empty() {
+                                        let replacement = format!(
+                                            "\n\n> 📷 **[图片内提取文字]**\n> {}\n\n",
+                                            ocr_text.trim().replace('\n', "\n> ")
+                                        );
+                                        current_p_text.push_str(&replacement);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Event::Empty(e)) => {
+                    for attr in e.attributes().flatten() {
+                        let key_str = String::from_utf8_lossy(attr.key.into_inner());
+                        if key_str == "r:embed" || key_str == "r:id" {
+                            let r_id = String::from_utf8_lossy(&attr.value).to_string();
+                            if let Some(target_image) = rel_image_map.get(&r_id) {
+                                let filename_opt = Path::new(target_image).file_name().and_then(|f| f.to_str());
+                                if let Some(ocr_text) = image_ocr_map.get(target_image)
+                                    .or_else(|| image_ocr_map.get(&format!("word/{}", target_image)))
+                                    .or_else(|| filename_opt.and_then(|fn_str| image_ocr_map.get(fn_str)))
+                                {
+                                    if !ocr_text.trim().is_empty() {
+                                        let replacement = format!(
+                                            "\n\n> 📷 **[图片内提取文字]**\n> {}\n\n",
+                                            ocr_text.trim().replace('\n', "\n> ")
+                                        );
+                                        current_p_text.push_str(&replacement);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Event::Text(e)) => {
+                    if in_text {
+                        if let Ok(t) = e.unescape() {
+                            current_p_text.push_str(&t);
+                        }
+                    }
+                }
+                Ok(Event::End(e)) => {
+                    let name_bytes = e.name().into_inner();
+                    let name_str = String::from_utf8_lossy(name_bytes);
+                    if name_str == "w:p" {
+                        if !current_p_text.trim().is_empty() {
+                            paragraph_lines.push(current_p_text.trim().to_string());
+                        }
+                    } else if name_str == "w:t" {
+                        in_text = false;
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        if !paragraph_lines.is_empty() {
+            final_markdown = paragraph_lines.join("\n\n");
+        }
+    }
+
+    if final_markdown.is_empty() {
+        final_markdown = base_markdown;
+        if !image_ocr_map.is_empty() {
+            final_markdown = OmniExtractor::replace_embedded_image_ocr(&final_markdown, &image_ocr_map);
+        }
+    }
+
+    let truncated = truncate_string(&final_markdown, max_bytes);
+    let meta = serde_json::json!({
+        "extractor": "anydoc+docx_embedded_ocr",
+        "embedded_images_count": rel_image_map.len(),
+        "ocr_recognized_count": image_ocr_map.len()
+    });
+
+    Ok((truncated, meta))
 }
 
 fn extract_document_fallback(path: &Path, max_bytes: usize) -> Result<(String, serde_json::Value)> {
@@ -619,6 +801,21 @@ mod tests {
         let _ = std::fs::remove_file(&temp_path);
 
         assert!(res.markdown_content.contains("[Binary File] NUL byte detected"));
+    }
+
+    #[tokio::test]
+    async fn test_user_sync_space_docx() {
+        let docx_path = std::path::PathBuf::from(r"F:\lilun\Desktop\项目资料_新手教程_同步空间使用指南_V1.docx");
+        if !docx_path.exists() {
+            println!("User docx does not exist");
+            return;
+        }
+
+        let config = OmniConfig::default();
+        let res = OmniExtractor::extract(&docx_path, &config).await.unwrap();
+        println!("--- USER DOCX MARKDOWN CONTENT ---\n{}", res.markdown_content);
+        assert!(res.markdown_content.contains("📷 **[图片内提取文字]**"), "DOCX should contain in-place image OCR replacement!");
+        assert!(res.markdown_content.contains("网盘") || res.markdown_content.contains("历史版本"), "DOCX OCR should contain recognized image text!");
     }
 }
 
