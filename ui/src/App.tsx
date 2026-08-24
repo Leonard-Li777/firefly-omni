@@ -705,7 +705,7 @@ MIME Type: application/pdf
                             Neural Inference
                           </span>
                         </div>
-                        <div className="space-y-1.5 text-xs">
+                        <div className="space-y-1.5 text-xs overflow-y-auto max-h-[220px] pr-1">
                           <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                             <span className="text-slate-400">label (类型标识):</span>
                             <span className="font-mono text-amber-400 font-semibold">{getMagikaMetadata(selectedFile)?.label || selectedFile.fileName.split('.').pop() || 'bin'}</span>
@@ -726,14 +726,88 @@ MIME Type: application/pdf
                             <span className="text-slate-400">score (置信度得分):</span>
                             <span className="font-mono text-amber-300 font-semibold">{getMagikaMetadata(selectedFile)?.score ? `${(getMagikaMetadata(selectedFile)!.score * 100).toFixed(1)}%` : '99.5%'}</span>
                           </div>
-                          <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
-                            <span className="text-slate-400">description (深度说明):</span>
-                            <span className="text-slate-300 text-[11px] truncate max-w-[180px]">{getMagikaMetadata(selectedFile)?.description || selectedFile.detectionSource}</span>
-                          </div>
-                          <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
-                            <span className="text-slate-400">extensions (关联扩展名):</span>
-                            <span className="font-mono text-purple-300">{JSON.stringify(getMagikaMetadata(selectedFile)?.extensions || [selectedFile.fileName.split('.').pop()])}</span>
-                          </div>
+
+                          {/* 基础系统文件属性 (basic) */}
+                          {selectedFile.apiResponse?.metadata?.basic && (
+                            <>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">系统基础元数据</div>
+                              {selectedFile.apiResponse.metadata.basic.createdAt && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">createdAt (创建时间):</span>
+                                  <span className="font-mono text-slate-300">{new Date(selectedFile.apiResponse.metadata.basic.createdAt).toLocaleString()}</span>
+                                </div>
+                              )}
+                              {selectedFile.apiResponse.metadata.basic.modifiedAt && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">modifiedAt (修改时间):</span>
+                                  <span className="font-mono text-slate-300">{new Date(selectedFile.apiResponse.metadata.basic.modifiedAt).toLocaleString()}</span>
+                                </div>
+                              )}
+                            </>
+                          )}
+
+                          {/* 文档精细元数据 (document) */}
+                          {selectedFile.apiResponse?.metadata?.document && (
+                            <>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">文档结构元数据</div>
+                              {selectedFile.apiResponse.metadata.document.title && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">title (文档标题):</span>
+                                  <span className="text-amber-300 truncate max-w-[180px]">{String(selectedFile.apiResponse.metadata.document.title)}</span>
+                                </div>
+                              )}
+                              {selectedFile.apiResponse.metadata.document.author && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">author (作者/创建者):</span>
+                                  <span className="text-sky-300 truncate max-w-[180px]">{String(selectedFile.apiResponse.metadata.document.author)}</span>
+                                </div>
+                              )}
+                              {selectedFile.apiResponse.metadata.document.page_count !== undefined && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">page_count (总页数):</span>
+                                  <span className="font-mono text-emerald-300 font-bold">{String(selectedFile.apiResponse.metadata.document.page_count)} 页</span>
+                                </div>
+                              )}
+                              {selectedFile.apiResponse.metadata.document.word_count !== undefined && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">word_count (单词/词数):</span>
+                                  <span className="font-mono text-purple-300">{String(selectedFile.apiResponse.metadata.document.word_count)} 词</span>
+                                </div>
+                              )}
+                            </>
+                          )}
+
+                          {/* 音频/视频精细元数据 (audio / video) */}
+                          {selectedFile.apiResponse?.metadata?.audio && (
+                            <>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">音频媒体元数据</div>
+                              <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                <span className="text-slate-400">duration (时长):</span>
+                                <span className="font-mono text-amber-300">{selectedFile.apiResponse.metadata.audio.duration_formatted || `${selectedFile.apiResponse.metadata.audio.duration_seconds} 秒`}</span>
+                              </div>
+                              {selectedFile.apiResponse.metadata.audio.artist && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">artist (艺术家):</span>
+                                  <span className="text-sky-300">{String(selectedFile.apiResponse.metadata.audio.artist)}</span>
+                                </div>
+                              )}
+                            </>
+                          )}
+                          {selectedFile.apiResponse?.metadata?.video && (
+                            <>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">视频媒体元数据</div>
+                              <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                <span className="text-slate-400">duration (时长):</span>
+                                <span className="font-mono text-amber-300">{selectedFile.apiResponse.metadata.video.duration_formatted || `${selectedFile.apiResponse.metadata.video.duration_seconds} 秒`}</span>
+                              </div>
+                              {selectedFile.apiResponse.metadata.video.resolution && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">resolution (分辨率):</span>
+                                  <span className="font-mono text-emerald-300">{String(selectedFile.apiResponse.metadata.video.resolution)}</span>
+                                </div>
+                              )}
+                            </>
+                          )}
                         </div>
                       </div>
                     )}

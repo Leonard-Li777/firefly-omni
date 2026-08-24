@@ -49,89 +49,55 @@ impl OmniExtractor {
             return Ok(result);
         }
 
-        // 校验文件分类
+        // 1. 提取基础属性 (basic)
+        let mut basic_meta = serde_json::Map::new();
+        basic_meta.insert("size".into(), file_size.into());
+        basic_meta.insert("ext".into(), ext.clone().into());
+        if let Ok(created) = metadata.created() {
+            if let Ok(duration) = created.duration_since(std::time::UNIX_EPOCH) {
+                if let Some(dt) = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0) {
+                    basic_meta.insert("createdAt".into(), dt.to_rfc3339().into());
+                }
+            }
+        }
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                if let Some(dt) = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0) {
+                    basic_meta.insert("modifiedAt".into(), dt.to_rfc3339().into());
+                }
+            }
+        }
+        if let Ok(accessed) = metadata.accessed() {
+            if let Ok(duration) = accessed.duration_since(std::time::UNIX_EPOCH) {
+                if let Some(dt) = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0) {
+                    basic_meta.insert("accessedAt".into(), dt.to_rfc3339().into());
+                }
+            }
+        }
+        basic_meta.insert("is_readonly".into(), metadata.permissions().readonly().into());
+        result.metadata["basic"] = serde_json::Value::Object(basic_meta);
+
+        // 2. 尝试通过 exiftool-rs 全量提取所有文件格式的 ExifTool 元数据 (PDF, Office, 音视频, 图像等)
+        let mut exiftool_map = serde_json::Map::new();
+        if let Ok(exif_result) = exiftool_rs::image_info(p) {
+            for (k, v) in exif_result {
+                exiftool_map.insert(k.clone(), v.to_string().into());
+            }
+            if !exiftool_map.is_empty() {
+                result.metadata["exiftool"] = serde_json::Value::Object(exiftool_map.clone());
+            }
+        }
+
+        // 3. 校验文件分类
         let is_pdf = ext == "pdf" || mime_type == "application/pdf";
         let is_image = mime_type.starts_with("image/") || matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff");
         let is_audio = mime_type.starts_with("audio/") || matches!(ext.as_str(), "mp3" | "flac" | "wav" | "aac" | "ogg" | "m4a");
         let is_video = mime_type.starts_with("video/") || matches!(ext.as_str(), "mp4" | "mkv" | "mov" | "avi");
         let is_office = matches!(ext.as_str(), "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp" | "numbers" | "rtf" | "epub" | "fb2" | "mobi");
-
-        // 1. 尝试提取音频 / 视频 Tag 与元数据
-        if is_audio || is_video {
-            if let Ok(tagged_file) = lofty::probe::Probe::open(p).and_then(|pr| pr.read()) {
-                let mut audio_meta = serde_json::Map::new();
-                if let Some(tag) = tagged_file.primary_tag() {
-                    use lofty::tag::Accessor;
-                    if let Some(title) = tag.title() { audio_meta.insert("title".into(), title.to_string().into()); }
-                    if let Some(artist) = tag.artist() { audio_meta.insert("artist".into(), artist.to_string().into()); }
-                    if let Some(album) = tag.album() { audio_meta.insert("album".into(), album.to_string().into()); }
-                    if let Some(genre) = tag.genre() { audio_meta.insert("genre".into(), genre.to_string().into()); }
-                }
-                let properties = tagged_file.properties();
-                audio_meta.insert("duration_seconds".into(), properties.duration().as_secs().into());
-                audio_meta.insert("bitrate".into(), properties.audio_bitrate().unwrap_or(0).into());
-                result.metadata["media"] = serde_json::Value::Object(audio_meta);
-            }
-        }
-
-        // 1.5 尝试通过 exiftool-rs 全量提取所有文件格式的 ExifTool 元数据 (PDF, Office, 音视频, 图像等)
-        if let Ok(exif_result) = exiftool_rs::image_info(p) {
-            let mut exif_map = serde_json::Map::new();
-            for (k, v) in exif_result {
-                exif_map.insert(k, v.to_string().into());
-            }
-            if !exif_map.is_empty() {
-                result.metadata["exiftool"] = serde_json::Value::Object(exif_map);
-            }
-        }
-
-        // 2. 尝试提取图像 EXIF 、尺寸信息与感知哈希 (pHash) 及 PP-OCRv6 OCR 文字识别
-        if is_image {
-            // 计算图像 64-bit 感知哈希 (pHash)
-            result.phash = OmniExtractionResult::compute_phash(p);
-
-            let mut img_meta = serde_json::Map::new();
-            if let Ok((width, height)) = image::image_dimensions(p) {
-                img_meta.insert("width".into(), width.into());
-                img_meta.insert("height".into(), height.into());
-                img_meta.insert("resolution".into(), format!("{}x{}", width, height).into());
-            }
-
-            if let Ok(file) = File::open(p) {
-                let mut buf_reader = std::io::BufReader::new(file);
-                if let Ok(exif_reader) = exif::Reader::new().read_from_container(&mut buf_reader) {
-                    let mut exif_map = serde_json::Map::new();
-                    for field in exif_reader.fields() {
-                        let tag_name = field.tag.to_string();
-                        let val_str = field.display_value().with_unit(&exif_reader).to_string();
-                        exif_map.insert(tag_name, val_str.into());
-                    }
-                    img_meta.insert("exif".into(), serde_json::Value::Object(exif_map));
-                }
-            }
-
-            // 如果 kamadak-exif 深度解析为空，补充 exiftool 元数据到 image.exif
-            if !img_meta.contains_key("exif") {
-                if let Some(exiftool_val) = result.metadata.get("exiftool") {
-                    img_meta.insert("exif".into(), exiftool_val.clone());
-                }
-            }
-            result.metadata["image"] = serde_json::Value::Object(img_meta);
-
-            // 调用 PP-OCRv6 执行动态图像文本识别
-            if config.enable_image_ocr {
-                if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text_with_size(p, &config.ocr_model_size) {
-                    if !ocr_text.trim().is_empty() {
-                        result.markdown_content = ocr_text;
-                    }
-                }
-            }
-        }
-
         let is_unknown_raw = !is_image && !is_audio && !is_video && !is_pdf && !is_office;
         let is_text_or_code = is_plain_text_or_code_ext(&ext) || mime_type.starts_with("text/") || mime_type.contains("json") || mime_type.contains("xml") || is_unknown_raw;
 
-        // 3. 根据分析模式 (analysis_mode) 执行文本内容提取
+        // 4. 根据分析模式 (analysis_mode) 执行文本内容提取
         let mode = config.analysis_mode.to_lowercase();
         let should_extract_content = match mode.as_str() {
             "simple" => is_text_or_code,
@@ -151,6 +117,159 @@ impl OmniExtractor {
                     result.markdown_content = content;
                 }
             }
+        }
+
+        // 5. 补充文档精细元数据 (document)
+        if is_pdf || is_office {
+            let mut doc_meta = result.metadata.get("document").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            doc_meta.insert("extractor".into(), "anydoc".into());
+
+            if let Some(val) = exiftool_map.get("Title") { doc_meta.insert("title".into(), val.clone()); }
+            if let Some(val) = exiftool_map.get("Author").or_else(|| exiftool_map.get("Creator")) { doc_meta.insert("author".into(), val.clone()); }
+            if let Some(val) = exiftool_map.get("Subject") { doc_meta.insert("subject".into(), val.clone()); }
+            if let Some(val) = exiftool_map.get("Keywords") { doc_meta.insert("keywords".into(), val.clone()); }
+            if let Some(val) = exiftool_map.get("Creator") { doc_meta.insert("creator".into(), val.clone()); }
+            if let Some(val) = exiftool_map.get("Producer") { doc_meta.insert("producer".into(), val.clone()); }
+            if let Some(val) = exiftool_map.get("PageCount") {
+                if let Ok(n) = val.as_str().unwrap_or("").parse::<u64>() {
+                    doc_meta.insert("page_count".into(), n.into());
+                } else {
+                    doc_meta.insert("page_count".into(), val.clone());
+                }
+            }
+            if let Some(val) = exiftool_map.get("WordCount") {
+                if let Ok(n) = val.as_str().unwrap_or("").parse::<u64>() {
+                    doc_meta.insert("word_count".into(), n.into());
+                }
+            }
+            if let Some(val) = exiftool_map.get("CreateDate") { doc_meta.insert("creation_date".into(), val.clone()); }
+            if let Some(val) = exiftool_map.get("ModifyDate") { doc_meta.insert("modify_date".into(), val.clone()); }
+
+            if !result.markdown_content.is_empty() {
+                let lines = result.markdown_content.lines().count();
+                let words = result.markdown_content.split_whitespace().count();
+                let chars = result.markdown_content.chars().count();
+                doc_meta.insert("line_count".into(), lines.into());
+                if !doc_meta.contains_key("word_count") {
+                    doc_meta.insert("word_count".into(), words.into());
+                }
+                doc_meta.insert("char_count".into(), chars.into());
+            }
+
+            result.metadata["document"] = serde_json::Value::Object(doc_meta);
+        }
+
+        // 6. 提取图像 EXIF 、尺寸与 pHash 及 PP-OCRv6 文字识别
+        if is_image {
+            result.phash = OmniExtractionResult::compute_phash(p);
+
+            let mut img_meta = serde_json::Map::new();
+            if let Ok((width, height)) = image::image_dimensions(p) {
+                img_meta.insert("width".into(), width.into());
+                img_meta.insert("height".into(), height.into());
+                img_meta.insert("resolution".into(), format!("{}x{}", width, height).into());
+            } else if let (Some(w), Some(h)) = (exiftool_map.get("ImageWidth"), exiftool_map.get("ImageHeight")) {
+                img_meta.insert("width".into(), w.clone());
+                img_meta.insert("height".into(), h.clone());
+                img_meta.insert("resolution".into(), format!("{}x{}", w.as_str().unwrap_or(""), h.as_str().unwrap_or("")).into());
+            }
+
+            let mut camera_exif = serde_json::Map::new();
+            if let Ok(file) = File::open(p) {
+                let mut buf_reader = std::io::BufReader::new(file);
+                if let Ok(exif_reader) = exif::Reader::new().read_from_container(&mut buf_reader) {
+                    for field in exif_reader.fields() {
+                        let tag_name = field.tag.to_string();
+                        let val_str = field.display_value().with_unit(&exif_reader).to_string();
+                        camera_exif.insert(tag_name, val_str.into());
+                    }
+                }
+            }
+
+            if camera_exif.is_empty() && !exiftool_map.is_empty() {
+                for (k, v) in &exiftool_map {
+                    camera_exif.insert(k.clone(), v.clone());
+                }
+            }
+
+            if !camera_exif.is_empty() {
+                img_meta.insert("exif".into(), serde_json::Value::Object(camera_exif));
+            }
+            result.metadata["image"] = serde_json::Value::Object(img_meta);
+
+            if config.enable_image_ocr {
+                if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text_with_size(p, &config.ocr_model_size) {
+                    if !ocr_text.trim().is_empty() {
+                        result.markdown_content = ocr_text;
+                    }
+                }
+            }
+        }
+
+        // 7. 提取音频 Tag 与精细属性 (audio)
+        if is_audio {
+            let mut audio_meta = serde_json::Map::new();
+            if let Ok(tagged_file) = lofty::probe::Probe::open(p).and_then(|pr| pr.read()) {
+                if let Some(tag) = tagged_file.primary_tag() {
+                    use lofty::tag::Accessor;
+                    if let Some(title) = tag.title() { audio_meta.insert("title".into(), title.to_string().into()); }
+                    if let Some(artist) = tag.artist() { audio_meta.insert("artist".into(), artist.to_string().into()); }
+                    if let Some(album) = tag.album() { audio_meta.insert("album".into(), album.to_string().into()); }
+                    if let Some(genre) = tag.genre() { audio_meta.insert("genre".into(), genre.to_string().into()); }
+                    if let Some(track) = tag.track() { audio_meta.insert("track".into(), track.into()); }
+                    if let Some(year) = tag.year() { audio_meta.insert("year".into(), year.into()); }
+                }
+                let properties = tagged_file.properties();
+                let secs = properties.duration().as_secs();
+                audio_meta.insert("duration_seconds".into(), secs.into());
+                audio_meta.insert("duration_formatted".into(), format!("{:02}:{:02}", secs / 60, secs % 60).into());
+                audio_meta.insert("bitrate".into(), properties.audio_bitrate().unwrap_or(0).into());
+                if let Some(sr) = properties.sample_rate() { audio_meta.insert("sample_rate".into(), sr.into()); }
+                if let Some(ch) = properties.channels() { audio_meta.insert("channels".into(), ch.into()); }
+            }
+            if let Some(val) = exiftool_map.get("Title") { audio_meta.entry("title".to_string()).or_insert(val.clone()); }
+            if let Some(val) = exiftool_map.get("Artist") { audio_meta.entry("artist".to_string()).or_insert(val.clone()); }
+            if let Some(val) = exiftool_map.get("Album") { audio_meta.entry("album".to_string()).or_insert(val.clone()); }
+
+            result.metadata["audio"] = serde_json::Value::Object(audio_meta);
+        }
+
+        // 8. 提取视频精细属性 (video)
+        if is_video {
+            let mut video_meta = serde_json::Map::new();
+            if let Ok(tagged_file) = lofty::probe::Probe::open(p).and_then(|pr| pr.read()) {
+                let properties = tagged_file.properties();
+                let secs = properties.duration().as_secs();
+                video_meta.insert("duration_seconds".into(), secs.into());
+                video_meta.insert("duration_formatted".into(), format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60).into());
+            }
+            if let Some(val) = exiftool_map.get("CompressorName").or_else(|| exiftool_map.get("VideoCodec")) {
+                video_meta.insert("codec".into(), val.clone());
+            }
+            if let (Some(w), Some(h)) = (exiftool_map.get("ImageWidth"), exiftool_map.get("ImageHeight")) {
+                video_meta.insert("width".into(), w.clone());
+                video_meta.insert("height".into(), h.clone());
+                video_meta.insert("resolution".into(), format!("{} x {} px", w.as_str().unwrap_or(""), h.as_str().unwrap_or("")).into());
+            }
+            if let Some(val) = exiftool_map.get("VideoFrameRate").or_else(|| exiftool_map.get("FrameRate")) {
+                video_meta.insert("frame_rate".into(), val.clone());
+            }
+            result.metadata["video"] = serde_json::Value::Object(video_meta);
+        }
+
+        // 9. 提取文本与代码精细属性 (text)
+        if is_text_or_code {
+            let mut text_meta = serde_json::Map::new();
+            text_meta.insert("encoding".into(), "UTF-8 / Smart Detection".into());
+            if !result.markdown_content.is_empty() {
+                let lines = result.markdown_content.lines().count();
+                let words = result.markdown_content.split_whitespace().count();
+                let chars = result.markdown_content.chars().count();
+                text_meta.insert("line_count".into(), lines.into());
+                text_meta.insert("word_count".into(), words.into());
+                text_meta.insert("char_count".into(), chars.into());
+            }
+            result.metadata["text"] = serde_json::Value::Object(text_meta);
         }
 
         info!("Successfully extracted file information for {}", path_str);
