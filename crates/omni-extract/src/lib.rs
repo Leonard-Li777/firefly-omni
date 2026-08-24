@@ -271,6 +271,24 @@ impl OmniExtractor {
         Ok(result)
     }
 
+    /// 将 OCR 文字格式化为 100% 兼容 MarkItDown 与 react-markdown 的多行 Blockquote 块
+    pub fn format_markitdown_ocr_block(ocr_text: &str) -> String {
+        let trimmed = ocr_text.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+
+        let block_lines: Vec<String> = trimmed
+            .lines()
+            .map(|l| format!("> {}", l))
+            .collect();
+
+        format!(
+            "\n\n> 📷 **[图片内提取文字]**\n>\n{}\n\n",
+            block_lines.join("\n>\n")
+        )
+    }
+
     /// 嵌入图片 OCR 文字提取与 Markdown 原始占位符原位替换
     pub fn replace_embedded_image_ocr(markdown: &str, image_ocr_map: &HashMap<String, String>) -> String {
         let mut substituted = markdown.to_string();
@@ -279,10 +297,7 @@ impl OmniExtractor {
                 continue;
             }
             let pattern = format!("![{}]", img_name);
-            let replacement = format!(
-                "\n\n【📷 图片内提取文字】\n{}\n",
-                ocr_text.trim()
-            );
+            let replacement = Self::format_markitdown_ocr_block(ocr_text);
             substituted = substituted.replace(&pattern, &replacement);
         }
         substituted
@@ -598,10 +613,7 @@ fn extract_docx_with_embedded_image_ocr(path: &Path, max_bytes: usize, config: &
                                     .or_else(|| filename_opt.and_then(|fn_str| image_ocr_map.get(fn_str)))
                                 {
                                     if !ocr_text.trim().is_empty() {
-                                        let replacement = format!(
-                                            "\n\n【📷 图片内提取文字】\n{}\n\n",
-                                            ocr_text.trim()
-                                        );
+                                        let replacement = OmniExtractor::format_markitdown_ocr_block(ocr_text);
                                         current_p_text.push_str(&replacement);
                                     }
                                 }
@@ -621,10 +633,7 @@ fn extract_docx_with_embedded_image_ocr(path: &Path, max_bytes: usize, config: &
                                     .or_else(|| filename_opt.and_then(|fn_str| image_ocr_map.get(fn_str)))
                                 {
                                     if !ocr_text.trim().is_empty() {
-                                        let replacement = format!(
-                                            "\n\n【📷 图片内提取文字】\n{}\n\n",
-                                            ocr_text.trim()
-                                        );
+                                        let replacement = OmniExtractor::format_markitdown_ocr_block(ocr_text);
                                         current_p_text.push_str(&replacement);
                                     }
                                 }
@@ -756,9 +765,10 @@ mod tests {
         map.insert("img2.jpg".to_string(), "Line 1\nLine 2".to_string());
 
         let result = OmniExtractor::replace_embedded_image_ocr(markdown, &map);
-        assert!(result.contains("【📷 图片内提取文字】"));
+        assert!(result.contains("📷 **[图片内提取文字]**"));
         assert!(result.contains("识别结果一"));
-        assert!(result.contains("Line 1\nLine 2"));
+        assert!(result.contains("> Line 1"));
+        assert!(result.contains("> Line 2"));
     }
 
     #[tokio::test]
@@ -814,7 +824,7 @@ mod tests {
         let config = OmniConfig::default();
         let res = OmniExtractor::extract(&docx_path, &config).await.unwrap();
         println!("--- USER DOCX MARKDOWN CONTENT ---\n{}", res.markdown_content);
-        assert!(res.markdown_content.contains("【📷 图片内提取文字】"), "DOCX should contain in-place image OCR replacement!");
+        assert!(res.markdown_content.contains("📷 **[图片内提取文字]**"), "DOCX should contain in-place image OCR replacement!");
         assert!(res.markdown_content.contains("网盘") || res.markdown_content.contains("历史版本"), "DOCX OCR should contain recognized image text!");
     }
 }

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react'
+import ReactMarkdown from 'react-markdown'
 import { 
   FileCode, 
   UploadCloud, 
@@ -854,12 +855,9 @@ MIME Type: application/pdf
                             PlainText Stream
                           </span>
                         </div>
-                        <textarea
-                          readOnly
-                          value={selectedFile.extractedText || selectedFile.apiResponse?.markdown_content || '(未包含文本内容 / Non-text stream)'}
-                          placeholder="(未包含文本内容 / Non-text stream)"
-                          className="w-full min-h-0 flex-1 bg-slate-900/80 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-slate-300 focus:outline-none resize-none"
-                        />
+                        <div className="flex-1 min-h-0 overflow-y-auto pr-1 bg-slate-900/80 border border-slate-800 rounded-lg p-3 text-[13px] text-slate-300 leading-relaxed markdown-body">
+                          <ReactMarkdown>{selectedFile.extractedText || selectedFile.apiResponse?.markdown_content || '(未包含文本内容 / Non-text stream)'}</ReactMarkdown>
+                        </div>
                       </div>
                     )}
 
