@@ -474,3 +474,38 @@ async fn test_universal_exiftool_metadata_extraction() {
 
     assert!(result.metadata.get("exiftool").is_some(), "Universal ExifTool metadata should be extracted for all files!");
 }
+
+#[tokio::test]
+async fn test_extract_tailwind_pdf_metadata() {
+    let pdf_path = std::path::PathBuf::from(r"F:\lilun\Desktop\计算机科学_前端技术_TailwindCSS技术介绍.pdf");
+    if !pdf_path.exists() {
+        println!("Tailwind PDF does not exist at {:?}", pdf_path);
+        return;
+    }
+
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "file_path": pdf_path.to_string_lossy().to_string()
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+
+    println!("DEBUG METADATA FOR TAILWIND PDF:\n{:#?}", result.metadata);
+    println!("MARKDOWN CONTENT LEN: {}", result.markdown_content.len());
+    
+    assert!(result.metadata.get("document").is_some());
+    let doc_meta = &result.metadata["document"];
+    assert!(doc_meta.get("creator").is_some() || doc_meta.get("author").is_some() || doc_meta.get("producer").is_some(), "Tailwind PDF should have metadata!");
+}

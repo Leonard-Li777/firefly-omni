@@ -334,24 +334,31 @@ fn find_exiftool_executable() -> Option<std::path::PathBuf> {
         }
     }
 
-    // 3. 查找可执行文件所在目录及其相对路径下的 build/extraResources/bin 与 extraResources/bin 目录
+    // 3. 向上递归搜索可执行文件所在目录 (exe_dir)
     if let Ok(exe_dir) = std::env::current_exe().map(|p| p.parent().unwrap_or(Path::new("")).to_path_buf()) {
-        let exe_candidates = [
-            exe_dir.join(format!("build/extraResources/bin/exiftool/{}", exe_name)),
-            exe_dir.join(format!("build/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
-            exe_dir.join(format!("extraResources/bin/exiftool/{}", exe_name)),
-            exe_dir.join(format!("extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
-            exe_dir.join(format!("resources/bin/{}/{}", platform_dir, exe_name)),
-            exe_dir.join(format!("resources/bin/{}", exe_name)),
-            exe_dir.join(exe_name),
-            exe_dir.join(format!("../build/extraResources/bin/exiftool/{}", exe_name)),
-            exe_dir.join(format!("../extraResources/bin/exiftool/{}", exe_name)),
-            exe_dir.join(format!("../resources/bin/{}", exe_name)),
-        ];
-        for cand in exe_candidates {
-            if cand.exists() {
-                return Some(cand);
+        let mut curr: Option<&Path> = Some(exe_dir.as_path());
+        while let Some(dir) = curr {
+            let candidates = [
+                dir.join(format!("build/extraResources/bin/exiftool/{}", exe_name)),
+                dir.join(format!("build/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("apps/omni/build/extraResources/bin/exiftool/{}", exe_name)),
+                dir.join(format!("apps/omni/build/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("extraResources/bin/exiftool/{}", exe_name)),
+                dir.join(format!("extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("apps/omni/extraResources/bin/exiftool/{}", exe_name)),
+                dir.join(format!("apps/omni/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("resources/bin/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("resources/bin/{}", exe_name)),
+                dir.join(format!("apps/omni/resources/bin/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("apps/omni/resources/bin/{}", exe_name)),
+                dir.join(exe_name),
+            ];
+            for cand in candidates {
+                if cand.exists() {
+                    return Some(cand);
+                }
             }
+            curr = dir.parent();
         }
     }
 
@@ -395,7 +402,13 @@ fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_jso
 
     // 优先 1：调用 exiftool.exe CLI 获取全量真实属性
     if let Some(exe_path) = find_exiftool_executable() {
-        if let Ok(output) = Command::new(&exe_path).arg("-json").arg(p).output() {
+        let mut cmd = Command::new(&exe_path);
+        if let Some(parent) = exe_path.parent() {
+            cmd.current_dir(parent);
+        }
+        cmd.arg("-json").arg(p);
+
+        if let Ok(output) = cmd.output() {
             if output.status.success() {
                 if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
                     if let Some(arr) = json_val.as_array() {

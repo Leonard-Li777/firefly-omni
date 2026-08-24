@@ -570,9 +570,9 @@ MIME Type: application/pdf
                             : 'bg-slate-950/40 border-slate-800/80 hover:border-slate-700 text-slate-300'
                         }`}
                       >
-                        <div className="flex items-center space-x-3 overflow-hidden pr-2">
+                        <div className="flex items-center space-x-3 overflow-hidden pr-2 flex-1 min-w-0">
                           <FileCode className="w-5 h-5 flex-shrink-0 text-amber-400" />
-                          <div className="truncate">
+                          <div className="truncate flex-1 min-w-0">
                             <p className="text-sm font-medium truncate" title={item.fileName}>{item.fileName}</p>
                             <span className="text-xs text-slate-500">
                               {(item.fileSize / 1024).toFixed(1)} KB
@@ -605,11 +605,11 @@ MIME Type: application/pdf
                 <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 flex flex-col flex-1 min-h-0 space-y-4">
                   {/* File Inspection Header & Section Selector */}
                   <div className="border-b border-slate-800 pb-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                    <div>
+                    <div className="min-w-0 flex-1">
                       <h2 className="font-bold text-base text-slate-100 flex items-center">
-                        <span>{selectedFile.fileName}</span>
+                        <span className="truncate flex-1 min-w-0" title={selectedFile.fileName}>{selectedFile.fileName}</span>
                         {selectedFile.apiResponse?.is_corrupted && (
-                          <span className="ml-2 px-2 py-0.5 rounded text-[10px] bg-rose-500/20 text-rose-300 border border-rose-500/30 flex items-center">
+                          <span className="ml-2 px-2 py-0.5 rounded text-[10px] bg-rose-500/20 text-rose-300 border border-rose-500/30 flex items-center flex-shrink-0">
                             <AlertCircle className="w-3 h-3 mr-1" /> 已损坏
                           </span>
                         )}
