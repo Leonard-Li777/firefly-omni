@@ -417,3 +417,32 @@ async fn test_ocr_model_size_switch_and_config_persistence() {
     let get_cfg: OmniConfig = serde_json::from_slice(&get_body).unwrap();
     assert_eq!(get_cfg.ocr_model_size, "small");
 }
+
+#[tokio::test]
+async fn test_universal_exiftool_metadata_extraction() {
+    let app = setup_test_app();
+
+    let temp_txt = std::env::temp_dir().join("test_exiftool_meta.txt");
+    std::fs::write(&temp_txt, "Hello ExifTool Test").unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "file_path": temp_txt.to_string_lossy().to_string()
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let _ = std::fs::remove_file(&temp_txt);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+
+    assert!(result.metadata.get("exiftool").is_some(), "Universal ExifTool metadata should be extracted for all files!");
+}

@@ -74,6 +74,17 @@ impl OmniExtractor {
             }
         }
 
+        // 1.5 尝试通过 exiftool-rs 全量提取所有文件格式的 ExifTool 元数据 (PDF, Office, 音视频, 图像等)
+        if let Ok(exif_result) = exiftool_rs::image_info(p) {
+            let mut exif_map = serde_json::Map::new();
+            for (k, v) in exif_result {
+                exif_map.insert(k, v.to_string().into());
+            }
+            if !exif_map.is_empty() {
+                result.metadata["exiftool"] = serde_json::Value::Object(exif_map);
+            }
+        }
+
         // 2. 尝试提取图像 EXIF 、尺寸信息与感知哈希 (pHash) 及 PP-OCRv6 OCR 文字识别
         if is_image {
             // 计算图像 64-bit 感知哈希 (pHash)
@@ -99,16 +110,10 @@ impl OmniExtractor {
                 }
             }
 
-            // 如果 kamadak-exif 深度解析为空，尝试 exiftool-rs 补充元数据
+            // 如果 kamadak-exif 深度解析为空，补充 exiftool 元数据到 image.exif
             if !img_meta.contains_key("exif") {
-                if let Ok(exif_result) = exiftool_rs::image_info(p) {
-                    let mut exif_map = serde_json::Map::new();
-                    for (k, v) in exif_result {
-                        exif_map.insert(k, v.to_string().into());
-                    }
-                    if !exif_map.is_empty() {
-                        img_meta.insert("exif".into(), serde_json::Value::Object(exif_map));
-                    }
+                if let Some(exiftool_val) = result.metadata.get("exiftool") {
+                    img_meta.insert("exif".into(), exiftool_val.clone());
                 }
             }
             result.metadata["image"] = serde_json::Value::Object(img_meta);

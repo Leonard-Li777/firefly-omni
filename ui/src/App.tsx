@@ -415,7 +415,9 @@ MIME Type: application/pdf
       }
     }
 
-    if (meta.image?.exif) {
+    if (meta.exiftool) {
+      flatten(meta.exiftool)
+    } else if (meta.image?.exif) {
       flatten(meta.image.exif)
     } else {
       flatten(meta)
