@@ -496,6 +496,7 @@ pub async fn duplicate_scan_stream_handler(
         let _ = tx.send(Ok(Event::default()
             .event("start")
             .data(serde_json::json!({ "total_scanned": total_scanned }).to_string())));
+        tokio::task::yield_now().await;
 
         let enabled_strategies = req.strategies.clone().unwrap_or_default();
         let run_exact = enabled_strategies.is_empty() || enabled_strategies.iter().any(|s| s == "exact_hash");
@@ -519,6 +520,7 @@ pub async fn duplicate_scan_stream_handler(
                             "total": total_scanned,
                             "total_scanned": total_scanned
                         }).to_string())));
+                    tokio::task::yield_now().await;
                 }
                 if let Ok(meta) = std::fs::metadata(f) {
                     if meta.is_file() && meta.len() > 0 {
@@ -542,6 +544,7 @@ pub async fn duplicate_scan_stream_handler(
                         let hash_str = format!("{:016x}", hash);
                         hash_map.entry(hash_str).or_default().push(p);
                     }
+                    tokio::task::yield_now().await;
                 }
                 for (hash, dup_paths) in hash_map {
                     if dup_paths.len() >= 2 {
@@ -580,6 +583,7 @@ pub async fn duplicate_scan_stream_handler(
                         let _ = tx.send(Ok(Event::default()
                             .event("group")
                             .data(serde_json::to_string(&group).unwrap())));
+                        tokio::task::yield_now().await;
 
                         exact_group_idx += 1;
                     }
@@ -591,7 +595,7 @@ pub async fn duplicate_scan_stream_handler(
         if run_image {
             let image_extensions = ["jpg", "jpeg", "png", "webp", "bmp", "avif", "gif"];
             let mut image_files: Vec<(PathBuf, String, u64)> = Vec::new();
-            let img_progress_step = if image_files.len() < 20 { 1 } else { 5 };
+            let img_progress_step = if total_scanned < 20 { 1 } else { 5 };
             for (idx, f) in files_to_scan.iter().enumerate() {
                 if let Some(ext) = f.extension().and_then(|e| e.to_str()) {
                     if image_extensions.contains(&ext.to_lowercase().as_str()) {
@@ -603,6 +607,7 @@ pub async fn duplicate_scan_stream_handler(
                                     "total": total_scanned,
                                     "total_scanned": total_scanned
                                 }).to_string())));
+                            tokio::task::yield_now().await;
                         }
                         if let Some(phash) = OmniExtractionResult::compute_phash(f) {
                             let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
@@ -610,6 +615,7 @@ pub async fn duplicate_scan_stream_handler(
                         }
                     }
                 }
+                tokio::task::yield_now().await;
             }
 
             let mut img_group_idx = 1;
@@ -661,6 +667,7 @@ pub async fn duplicate_scan_stream_handler(
                     let _ = tx.send(Ok(Event::default()
                         .event("group")
                         .data(serde_json::to_string(&dup_group).unwrap())));
+                    tokio::task::yield_now().await;
 
                     img_group_idx += 1;
                 }
@@ -671,15 +678,27 @@ pub async fn duplicate_scan_stream_handler(
         if run_audio {
             let audio_extensions = ["mp3", "wav", "flac", "aac", "m4a", "ogg", "wma"];
             let mut audio_files: Vec<(PathBuf, String, u64)> = Vec::new();
-            for f in &files_to_scan {
+            let audio_progress_step = if total_scanned < 20 { 1 } else { 5 };
+            for (idx, f) in files_to_scan.iter().enumerate() {
                 if let Some(ext) = f.extension().and_then(|e| e.to_str()) {
                     if audio_extensions.contains(&ext.to_lowercase().as_str()) {
+                        if idx % audio_progress_step == 0 || idx + 1 == total_scanned {
+                            let _ = tx.send(Ok(Event::default()
+                                .event("progress")
+                                .data(serde_json::json!({
+                                    "scanned": idx + 1,
+                                    "total": total_scanned,
+                                    "total_scanned": total_scanned
+                                }).to_string())));
+                            tokio::task::yield_now().await;
+                        }
                         if let Some(phash) = OmniExtractionResult::compute_phash(f) {
                             let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
                             audio_files.push((f.clone(), phash, size));
                         }
                     }
                 }
+                tokio::task::yield_now().await;
             }
 
             let mut audio_group_idx = 1;
@@ -731,6 +750,7 @@ pub async fn duplicate_scan_stream_handler(
                     let _ = tx.send(Ok(Event::default()
                         .event("group")
                         .data(serde_json::to_string(&dup_group).unwrap())));
+                    tokio::task::yield_now().await;
 
                     audio_group_idx += 1;
                 }
@@ -741,15 +761,27 @@ pub async fn duplicate_scan_stream_handler(
         if run_video {
             let video_extensions = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"];
             let mut video_files: Vec<(PathBuf, String, u64)> = Vec::new();
-            for f in &files_to_scan {
+            let video_progress_step = if total_scanned < 20 { 1 } else { 5 };
+            for (idx, f) in files_to_scan.iter().enumerate() {
                 if let Some(ext) = f.extension().and_then(|e| e.to_str()) {
                     if video_extensions.contains(&ext.to_lowercase().as_str()) {
+                        if idx % video_progress_step == 0 || idx + 1 == total_scanned {
+                            let _ = tx.send(Ok(Event::default()
+                                .event("progress")
+                                .data(serde_json::json!({
+                                    "scanned": idx + 1,
+                                    "total": total_scanned,
+                                    "total_scanned": total_scanned
+                                }).to_string())));
+                            tokio::task::yield_now().await;
+                        }
                         if let Some(phash) = OmniExtractionResult::compute_phash(f) {
                             let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
                             video_files.push((f.clone(), phash, size));
                         }
                     }
                 }
+                tokio::task::yield_now().await;
             }
 
             let mut video_group_idx = 1;
@@ -801,6 +833,7 @@ pub async fn duplicate_scan_stream_handler(
                     let _ = tx.send(Ok(Event::default()
                         .event("group")
                         .data(serde_json::to_string(&dup_group).unwrap())));
+                    tokio::task::yield_now().await;
 
                     video_group_idx += 1;
                 }
@@ -815,6 +848,7 @@ pub async fn duplicate_scan_stream_handler(
                 "total_freed_bytes": total_freed_bytes,
                 "duration_ms": start.elapsed().as_millis() as u64
             }).to_string())));
+        tokio::task::yield_now().await;
     });
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);

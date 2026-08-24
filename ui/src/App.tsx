@@ -232,10 +232,11 @@ export default function App() {
           let eventData = ''
 
           for (const line of lines) {
-            if (line.startsWith('event:')) {
-              eventName = line.replace('event:', '').trim()
-            } else if (line.startsWith('data:')) {
-              eventData += line.replace('data:', '').trim()
+            const cleanLine = line.trim()
+            if (cleanLine.startsWith('event:')) {
+              eventName = cleanLine.slice(6).trim()
+            } else if (cleanLine.startsWith('data:')) {
+              eventData += cleanLine.slice(5).trim()
             }
           }
 
@@ -250,7 +251,7 @@ export default function App() {
               } else if (eventName === 'progress') {
                 setScanResult((prev: any) => ({
                   ...prev,
-                  total_scanned: parsed.scanned || prev?.total_scanned || 0
+                  total_scanned: parsed.scanned !== undefined ? parsed.scanned : (parsed.total_scanned || prev?.total_scanned || 0)
                 }))
               } else if (eventName === 'group') {
                 // 实时上屏！把最新发现的重复组动态追加到界面列表顶部！
