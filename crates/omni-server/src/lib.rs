@@ -509,13 +509,15 @@ pub async fn duplicate_scan_stream_handler(
         // 1. 100% 精确去重 (实时上屏)
         if run_exact {
             let mut size_map: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+            let progress_step = if total_scanned < 50 { 1 } else { 10 };
             for (idx, f) in files_to_scan.iter().enumerate() {
-                if idx % 50 == 0 {
+                if idx % progress_step == 0 || idx + 1 == total_scanned {
                     let _ = tx.send(Ok(Event::default()
                         .event("progress")
                         .data(serde_json::json!({
                             "scanned": idx + 1,
-                            "total": total_scanned
+                            "total": total_scanned,
+                            "total_scanned": total_scanned
                         }).to_string())));
                 }
                 if let Ok(meta) = std::fs::metadata(f) {
@@ -589,9 +591,19 @@ pub async fn duplicate_scan_stream_handler(
         if run_image {
             let image_extensions = ["jpg", "jpeg", "png", "webp", "bmp", "avif", "gif"];
             let mut image_files: Vec<(PathBuf, String, u64)> = Vec::new();
-            for f in &files_to_scan {
+            let img_progress_step = if image_files.len() < 20 { 1 } else { 5 };
+            for (idx, f) in files_to_scan.iter().enumerate() {
                 if let Some(ext) = f.extension().and_then(|e| e.to_str()) {
                     if image_extensions.contains(&ext.to_lowercase().as_str()) {
+                        if idx % img_progress_step == 0 || idx + 1 == total_scanned {
+                            let _ = tx.send(Ok(Event::default()
+                                .event("progress")
+                                .data(serde_json::json!({
+                                    "scanned": idx + 1,
+                                    "total": total_scanned,
+                                    "total_scanned": total_scanned
+                                }).to_string())));
+                        }
                         if let Some(phash) = OmniExtractionResult::compute_phash(f) {
                             let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
                             image_files.push((f.clone(), phash, size));
