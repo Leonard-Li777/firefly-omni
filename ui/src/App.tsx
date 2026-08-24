@@ -610,6 +610,14 @@ MIME Type: application/pdf
       flatten(meta.exiftool)
     } else if (meta.executable) {
       flatten(meta.executable)
+    } else if (meta.archive) {
+      flatten(meta.archive)
+    } else if (meta.database) {
+      flatten(meta.database)
+    } else if (meta.model) {
+      flatten(meta.model)
+    } else if (meta.font) {
+      flatten(meta.font)
     } else if (meta.image?.exif) {
       flatten(meta.image.exif)
     } else {
@@ -1051,6 +1059,64 @@ MIME Type: application/pdf
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">pe_type (PE 架构):</span>
                                   <span className="font-mono text-cyan-300">{String(selectedFile.apiResponse.metadata.executable.pe_type)}</span>
+                                </div>
+                              )}
+                            </>
+                          )}
+
+                          {/* 压缩包/镜像元数据 (archive) */}
+                          {selectedFile.apiResponse?.metadata?.archive && (
+                            <>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">压缩包/磁盘镜像元数据</div>
+                              {selectedFile.apiResponse.metadata.archive.format && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">format (压缩格式):</span>
+                                  <span className="font-mono text-amber-300">{String(selectedFile.apiResponse.metadata.archive.format)}</span>
+                                </div>
+                              )}
+                              {selectedFile.apiResponse.metadata.archive.uncompressed_size !== undefined && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">uncompressed (解压尺寸):</span>
+                                  <span className="font-mono text-emerald-300">{formatBytes(Number(selectedFile.apiResponse.metadata.archive.uncompressed_size) || 0)}</span>
+                                </div>
+                              )}
+                              {selectedFile.apiResponse.metadata.archive.file_count !== undefined && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">file_count (内部文件数):</span>
+                                  <span className="font-mono text-sky-300">{String(selectedFile.apiResponse.metadata.archive.file_count)} 个</span>
+                                </div>
+                              )}
+                            </>
+                          )}
+
+                          {/* 数据库与 AI 模型元数据 (database / model) */}
+                          {selectedFile.apiResponse?.metadata?.database && (
+                            <>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">数据库结构元数据</div>
+                              <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                <span className="text-slate-400">engine (数据库引擎):</span>
+                                <span className="font-mono text-purple-300 font-bold">{String(selectedFile.apiResponse.metadata.database.engine)}</span>
+                              </div>
+                            </>
+                          )}
+                          {selectedFile.apiResponse?.metadata?.model && (
+                            <>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">AI / 神经网络模型元数据</div>
+                              <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                <span className="text-slate-400">format (模型类型):</span>
+                                <span className="font-mono text-cyan-300 font-bold">{String(selectedFile.apiResponse.metadata.model.model_format)}</span>
+                              </div>
+                            </>
+                          )}
+
+                          {/* 字体元数据 (font) */}
+                          {selectedFile.apiResponse?.metadata?.font && (
+                            <>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">字体资产元数据</div>
+                              {selectedFile.apiResponse.metadata.font.font_name && (
+                                <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
+                                  <span className="text-slate-400">font_name (字体族名):</span>
+                                  <span className="text-amber-300">{String(selectedFile.apiResponse.metadata.font.font_name)}</span>
                                 </div>
                               )}
                             </>

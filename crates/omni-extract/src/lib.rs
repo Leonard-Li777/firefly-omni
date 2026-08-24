@@ -312,6 +312,72 @@ impl OmniExtractor {
             }
         }
 
+        // 11. 提取 压缩包/磁盘镜像 属性 (archive)
+        let is_archive = matches!(ext.as_str(), "7z" | "7zip" | "zip" | "rar" | "tar" | "gz" | "gzip" | "bz2" | "xz" | "tgz" | "tbz2" | "iso" | "dmg" | "deb" | "rpm" | "jar" | "war" | "ear" | "pkg" | "xar" | "cbr" | "cbz" | "vhd" | "vhdx" | "vmdk" | "img" | "qcow2" | "vdi" | "ova");
+        if is_archive || exiftool_map.contains_key("ZipFileName") || exiftool_map.contains_key("ZipUncompressedSize") {
+            let mut archive_meta = serde_json::Map::new();
+            if let Some(val) = exiftool_map.get("ZipFileName").or_else(|| exiftool_map.get("ArchiveFormat")).or_else(|| exiftool_map.get("FileType")) {
+                archive_meta.insert("format".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("ZipUncompressedSize").or_else(|| exiftool_map.get("UncompressedSize")) {
+                archive_meta.insert("uncompressed_size".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("ZipFileCount").or_else(|| exiftool_map.get("FileCount")) {
+                archive_meta.insert("file_count".into(), val.clone());
+            }
+            if !archive_meta.is_empty() {
+                result.metadata["archive"] = serde_json::Value::Object(archive_meta);
+            }
+        }
+
+        // 12. 提取 数据库 文件属性 (database)
+        let is_database = matches!(ext.as_str(), "db" | "db3" | "sqlite" | "sqlite3" | "sqlitedb" | "mdb" | "accdb" | "fdb" | "dbf");
+        if is_database {
+            let mut db_meta = serde_json::Map::new();
+            if let Some(val) = exiftool_map.get("FileType") {
+                db_meta.insert("engine".into(), val.clone());
+            } else {
+                db_meta.insert("engine".into(), ext.to_uppercase().into());
+            }
+            db_meta.insert("file_size".into(), file_size.into());
+            result.metadata["database"] = serde_json::Value::Object(db_meta);
+        }
+
+        // 13. 提取 AI 模型/神经网络 属性 (model)
+        let is_model = matches!(ext.as_str(), "onnx" | "gguf" | "safetensors" | "pt" | "pth" | "tflite" | "h5");
+        if is_model {
+            let mut model_meta = serde_json::Map::new();
+            if let Some(val) = exiftool_map.get("FileType") {
+                model_meta.insert("model_format".into(), val.clone());
+            } else {
+                model_meta.insert("model_format".into(), ext.to_uppercase().into());
+            }
+            model_meta.insert("file_size".into(), file_size.into());
+            result.metadata["model"] = serde_json::Value::Object(model_meta);
+        }
+
+        // 14. 提取 字体 文件属性 (font)
+        let is_font = matches!(ext.as_str(), "ttf" | "otf" | "woff" | "woff2" | "ttc" | "eot");
+        if is_font || exiftool_map.contains_key("FontName") {
+            let mut font_meta = serde_json::Map::new();
+            if let Some(val) = exiftool_map.get("FontName").or_else(|| exiftool_map.get("FamilyName")) {
+                font_meta.insert("font_name".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("FontSubfamily") {
+                font_meta.insert("subfamily".into(), val.clone());
+            }
+            if let Some(val) = exiftool_map.get("FontVersion") {
+                font_meta.insert("version".into(), val.clone());
+            }
+            if !font_meta.is_empty() {
+                result.metadata["font"] = serde_json::Value::Object(font_meta);
+            }
+        }
+
+        // 15. 通用 Category 统一标记 (符合 packages/shared/src/utils/file-constants.ts 定义)
+        let category = determine_file_category(&ext, &mime_type);
+        result.metadata["category"] = serde_json::Value::String(category);
+
         info!("Successfully extracted file information for {}", path_str);
         Ok(result)
     }
@@ -776,6 +842,54 @@ fn extract_document_fallback(path: &Path, max_bytes: usize) -> Result<(String, s
 
 
 
+
+fn determine_file_category(ext: &str, mime_type: &str) -> String {
+    let ext_lower = ext.to_lowercase();
+    match ext_lower.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "tiff" | "tif" | "avif"
+        | "heic" | "heif" | "ico" | "icns" | "psd" | "raw" | "dng" | "cr2" | "nef" | "arw"
+        | "dwg" | "dxf" | "stl" | "pcx" | "tga" | "xcf" | "j2k" | "jp2" | "jxl" | "jpx" | "wmf" => "image",
+
+        "mp4" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "webm" | "m4v" | "mpeg" | "mpg"
+        | "3gp" | "ogv" | "rm" | "rmvb" | "asf" | "vob" | "f4v" | "m2ts" | "mxf" | "dv" => "video",
+
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "aiff" | "opus" | "ape"
+        | "dsd" | "dsf" | "dff" | "mqa" | "ac3" | "dts" | "ra" | "au" | "snd" | "caf"
+        | "amr" | "3ga" | "mid" | "midi" | "weba" | "oga" => "audio",
+
+        "pdf" | "doc" | "docx" | "docm" | "xls" | "xlsx" | "xlsm" | "xlsb" | "ppt" | "pptx"
+        | "pptm" | "odt" | "ods" | "odp" | "numbers" | "rtf" | "epub" | "fb2" | "mobi"
+        | "azw3" | "djvu" | "umd" | "csv" | "one" | "ai" | "ps" | "cbt" | "cb7" | "cbr" | "cbz" => "document",
+
+        "7z" | "7zip" | "zip" | "rar" | "tar" | "gz" | "gzip" | "bz2" | "xz" | "tgz"
+        | "tbz2" | "iso" | "dmg" | "deb" | "rpm" | "jar" | "war" | "ear" | "pkg" | "xar"
+        | "vhd" | "vhdx" | "vmdk" | "img" | "qcow2" | "vdi" | "ova" | "ace" | "lha" | "lzh" | "msi" | "snap" => "archive",
+
+        "exe" | "dll" | "sys" | "so" | "dylib" | "apk" | "class" | "dex" | "elf" | "wasm"
+        | "app" | "bin" | "o" | "obj" | "pyc" | "pyo" | "drv" | "swf" | "crx" => "executable",
+
+        "db" | "db3" | "sqlite" | "sqlite3" | "sqlitedb" | "mdb" | "accdb" | "fdb" | "dbf" => "database",
+
+        "onnx" | "gguf" | "safetensors" | "pt" | "pth" | "tflite" | "h5" | "hdf5" | "npy" | "npz" => "model",
+
+        "ttf" | "otf" | "woff" | "woff2" | "ttc" | "eot" => "font",
+
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "java" | "c" | "cpp" | "cc"
+        | "cxx" | "h" | "hpp" | "cs" | "go" | "rs" | "php" | "rb" | "swift" | "kt" | "scala"
+        | "dart" | "zig" | "lua" | "pl" | "sql" | "sh" | "bash" | "ps1" | "bat" | "cmd"
+        | "html" | "htm" | "css" | "json" | "xml" | "yaml" | "yml" | "toml" | "vue" => "code",
+
+        "txt" | "md" | "rst" | "tex" | "log" | "diff" | "patch" | "srt" | "vtt" | "lrc" => "text",
+
+        _ => {
+            if mime_type.starts_with("image/") { "image" }
+            else if mime_type.starts_with("video/") { "video" }
+            else if mime_type.starts_with("audio/") { "audio" }
+            else if mime_type.starts_with("text/") { "text" }
+            else { "application" }
+        }
+    }.to_string()
+}
 
 fn is_plain_text_or_code_ext(ext: &str) -> bool {
     matches!(
