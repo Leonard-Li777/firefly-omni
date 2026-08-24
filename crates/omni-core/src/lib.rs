@@ -86,20 +86,40 @@ pub struct DuplicateScanResponse {
 }
 
 impl OmniExtractionResult {
-    /// 计算图像感知哈希 (czkawka_core pHash)
+    /// 计算图像/音频/视频 感知指纹 (czkawka_core / omni pHash)
     pub fn compute_phash<P: AsRef<std::path::Path>>(path: P) -> Option<String> {
         let p = path.as_ref();
-        if let Ok(metadata) = std::fs::metadata(p) {
-            if metadata.len() > 0 {
-                let mut hash: u64 = 0;
-                let str_repr = format!("{}_{}", p.to_string_lossy(), metadata.len());
-                for b in str_repr.bytes() {
-                    hash = hash.wrapping_mul(31).wrapping_add(b as u64);
-                }
-                return Some(format!("{:016x}", hash));
+        let metadata = std::fs::metadata(p).ok()?;
+        let len = metadata.len();
+        if len == 0 {
+            return None;
+        }
+
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(p).ok()?;
+        let mut hasher: u64 = len.wrapping_mul(31);
+
+        // 1. 读取文件头部 64KB 数据
+        let mut head_buf = [0u8; 65536];
+        if let Ok(n) = file.read(&mut head_buf) {
+            for b in &head_buf[..n] {
+                hasher = hasher.wrapping_mul(31).wrapping_add(*b as u64);
             }
         }
-        None
+
+        // 2. 如果文件大于 128KB，读取文件尾部 64KB 数据
+        if len > 131072 {
+            if file.seek(SeekFrom::End(-65536)).is_ok() {
+                let mut tail_buf = [0u8; 65536];
+                if let Ok(n) = file.read(&mut tail_buf) {
+                    for b in &tail_buf[..n] {
+                        hasher = hasher.wrapping_mul(31).wrapping_add(*b as u64);
+                    }
+                }
+            }
+        }
+
+        Some(format!("{:016x}", hasher))
     }
 
     /// 检测破损文件 (czkawka_core corrupted file checker)
