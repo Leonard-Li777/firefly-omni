@@ -77,15 +77,10 @@ impl OmniExtractor {
         basic_meta.insert("is_readonly".into(), metadata.permissions().readonly().into());
         result.metadata["basic"] = serde_json::Value::Object(basic_meta);
 
-        // 2. 尝试通过 exiftool-rs 全量提取所有文件格式的 ExifTool 元数据 (PDF, Office, 音视频, 图像等)
-        let mut exiftool_map = serde_json::Map::new();
-        if let Ok(exif_result) = exiftool_rs::image_info(p) {
-            for (k, v) in exif_result {
-                exiftool_map.insert(k.clone(), v.to_string().into());
-            }
-            if !exiftool_map.is_empty() {
-                result.metadata["exiftool"] = serde_json::Value::Object(exiftool_map.clone());
-            }
+        // 2. 尝试通过 ExifTool CLI / exiftool-rs 全量提取所有文件格式的 ExifTool 元数据 (PDF, Office, 音视频, 图像等)
+        let exiftool_map = extract_full_exiftool_metadata(p);
+        if !exiftool_map.is_empty() {
+            result.metadata["exiftool"] = serde_json::Value::Object(exiftool_map.clone());
         }
 
         // 3. 校验文件分类
@@ -292,6 +287,93 @@ impl OmniExtractor {
         }
         substituted
     }
+}
+
+/// 查找系统或 Monorepo node_modules 中的 exiftool / exiftool.exe 可执行文件
+fn find_exiftool_executable() -> Option<std::path::PathBuf> {
+    use std::process::Command;
+
+    // 1. 尝试直接通过命令行 PATH 搜索
+    if Command::new("exiftool").arg("-ver").output().map(|o| o.status.success()).unwrap_or(false) {
+        return Some(std::path::PathBuf::from("exiftool"));
+    }
+    if Command::new("exiftool.exe").arg("-ver").output().map(|o| o.status.success()).unwrap_or(false) {
+        return Some(std::path::PathBuf::from("exiftool.exe"));
+    }
+
+    // 2. 向上递归搜索 Monorepo 与应用级 node_modules 中的 exiftool-vendored.exe
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut curr: Option<&Path> = Some(cwd.as_path());
+        while let Some(dir) = curr {
+            let candidates = [
+                dir.join("node_modules/exiftool-vendored.exe/bin/exiftool.exe"),
+                dir.join("apps/desktop/node_modules/exiftool-vendored.exe/bin/exiftool.exe"),
+                dir.join("packages/core-engine/node_modules/exiftool-vendored.exe/bin/exiftool.exe"),
+            ];
+            for cand in candidates {
+                if cand.exists() {
+                    return Some(cand);
+                }
+            }
+
+            // 检查 pnpm 扁平化 node_modules 目录
+            let pnpm_dir = dir.join("node_modules/.pnpm");
+            if pnpm_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(pnpm_dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with("exiftool-vendored.exe") {
+                            let exe = entry.path().join("node_modules/exiftool-vendored.exe/bin/exiftool.exe");
+                            if exe.exists() {
+                                return Some(exe);
+                            }
+                        }
+                    }
+                }
+            }
+
+            curr = dir.parent();
+        }
+    }
+
+    None
+}
+
+/// 提取全量 ExifTool 字典 (包含 Creator, Producer, CreateDate, ModifyDate, PDFVersion, PageCount 等全量 100+ 属性)
+fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_json::Value> {
+    use std::process::Command;
+    let mut map = serde_json::Map::new();
+
+    // 优先 1：调用 exiftool.exe CLI 获取全量真实属性
+    if let Some(exe_path) = find_exiftool_executable() {
+        if let Ok(output) = Command::new(exe_path).arg("-json").arg(p).output() {
+            if output.status.success() {
+                if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                    if let Some(arr) = json_val.as_array() {
+                        if let Some(first_obj) = arr.first().and_then(|v| v.as_object()) {
+                            let skip_keys = ["SourceFile", "ExifToolVersion", "Directory"];
+                            for (k, v) in first_obj {
+                                if !skip_keys.contains(&k.as_str()) && !v.is_null() {
+                                    map.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 备选 2：如果 CLI 未找到，降级使用 exiftool-rs
+    if map.is_empty() {
+        if let Ok(exif_result) = exiftool_rs::image_info(p) {
+            for (k, v) in exif_result {
+                map.insert(k, v.to_string().into());
+            }
+        }
+    }
+
+    map
 }
 
 /// 智能解析纯文本/代码文件（自动检测 UTF-8 / GBK 编码，并检测二进制 NUL 字符防乱码）

@@ -434,7 +434,7 @@ MIME Type: application/pdf
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
+    <div className="h-screen overflow-hidden bg-slate-950 text-slate-100 flex flex-col font-sans">
       {/* Top Navbar */}
       <header className="border-b border-slate-800 bg-slate-900/60 backdrop-blur-md px-6 py-4 flex items-center justify-between sticky top-0 z-50">
         <div className="flex items-center space-x-3">
@@ -500,11 +500,11 @@ MIME Type: application/pdf
       </header>
 
       {/* Main Content Area */}
-      <main className="flex-1 p-6 max-w-7xl w-full mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
+      <main className="flex-1 min-h-0 p-6 max-w-7xl w-full mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6 overflow-y-auto lg:overflow-hidden lg:auto-rows-fr">
         {activeTab === 'inspector' && (
           <>
             {/* Left Column: Drag & Drop Zone + File List */}
-            <div className="lg:col-span-4 flex flex-col space-y-4">
+            <div className="lg:col-span-4 min-h-0 flex flex-col space-y-4">
               {/* Dropzone */}
               <div
                 onDragEnter={handleDrag}
@@ -535,7 +535,7 @@ MIME Type: application/pdf
               </div>
 
               {/* Uploaded File List */}
-              <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex-1 flex flex-col">
+              <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 flex-1 min-h-0 flex flex-col">
                 <div className="flex items-center justify-between mb-3 px-1">
                   <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
                     已分析文件 ({files.length})
@@ -559,7 +559,7 @@ MIME Type: application/pdf
                     暂无待分析文件
                   </div>
                 ) : (
-                  <div className="space-y-2 overflow-y-auto max-h-[460px] pr-1">
+                  <div className="space-y-2 overflow-y-auto flex-1 min-h-0 pr-1">
                     {files.map((item, idx) => (
                       <div
                         key={idx}
@@ -600,9 +600,9 @@ MIME Type: application/pdf
             </div>
 
             {/* Right Column: Multi-Panel Inspector (Magika, ExifTool, Text, OCR) */}
-            <div className="lg:col-span-8 flex flex-col space-y-4">
+            <div className="lg:col-span-8 min-h-0 flex flex-col space-y-4">
               {selectedFile ? (
-                <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 flex flex-col h-full space-y-4">
+                <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5 flex flex-col flex-1 min-h-0 space-y-4">
                   {/* File Inspection Header & Section Selector */}
                   <div className="border-b border-slate-800 pb-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                     <div>
@@ -690,12 +690,12 @@ MIME Type: application/pdf
                   </div>
 
                   {/* 4 Distinct Extraction Zones */}
-                  <div className={`grid gap-4 flex-1 overflow-y-auto max-h-[620px] pr-1 ${
+                  <div className={`grid gap-4 flex-1 min-h-0 overflow-y-auto pr-1 auto-rows-fr ${
                     inspectorSection === 'all' ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1'
                   }`}>
                     {/* Zone 1: Magika 文件类型鉴定区 */}
                     {(inspectorSection === 'all' || inspectorSection === 'magika') && (
-                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3">
+                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3 min-h-0 overflow-hidden">
                         <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
                           <span className="text-xs font-bold text-amber-400 flex items-center">
                             <ShieldCheck className="w-4 h-4 mr-1.5 text-amber-400" />
@@ -705,7 +705,7 @@ MIME Type: application/pdf
                             Neural Inference
                           </span>
                         </div>
-                        <div className="space-y-1.5 text-xs overflow-y-auto max-h-[220px] pr-1">
+                        <div className="space-y-1.5 text-xs overflow-y-auto flex-1 min-h-0 pr-1">
                           <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                             <span className="text-slate-400">label (类型标识):</span>
                             <span className="font-mono text-amber-400 font-semibold">{getMagikaMetadata(selectedFile)?.label || selectedFile.fileName.split('.').pop() || 'bin'}</span>
@@ -814,7 +814,7 @@ MIME Type: application/pdf
 
                     {/* Zone 2: ExifTool 元数据提取区 */}
                     {(inspectorSection === 'all' || inspectorSection === 'exif') && (
-                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3">
+                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3 min-h-0 overflow-hidden">
                         <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
                           <span className="text-xs font-bold text-sky-400 flex items-center">
                             <Camera className="w-4 h-4 mr-1.5 text-sky-400" />
@@ -825,7 +825,7 @@ MIME Type: application/pdf
                           </span>
                         </div>
                         {getFlattenedExifMetadata(selectedFile).length > 0 ? (
-                          <div className="space-y-1.5 text-xs overflow-y-auto max-h-[160px] pr-1">
+                          <div className="space-y-1.5 text-xs overflow-y-auto flex-1 min-h-0 pr-1">
                             {getFlattenedExifMetadata(selectedFile).map(([k, v]) => (
                               <div key={k} className="flex justify-between items-center bg-slate-900/60 px-2 py-1 rounded border border-slate-800/80 text-[11px]">
                                 <span className="text-slate-400 font-mono">{k}</span>
@@ -844,7 +844,7 @@ MIME Type: application/pdf
 
                     {/* Zone 3: Text 文本提取区 */}
                     {(inspectorSection === 'all' || inspectorSection === 'text') && (
-                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3">
+                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3 min-h-0 overflow-hidden">
                         <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
                           <span className="text-xs font-bold text-emerald-400 flex items-center">
                             <FileText className="w-4 h-4 mr-1.5 text-emerald-400" />
@@ -858,14 +858,14 @@ MIME Type: application/pdf
                           readOnly
                           value={selectedFile.extractedText || selectedFile.apiResponse?.markdown_content || '(未包含文本内容 / Non-text stream)'}
                           placeholder="(未包含文本内容 / Non-text stream)"
-                          className="w-full min-h-[140px] flex-1 bg-slate-900/80 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-slate-300 focus:outline-none resize-none"
+                          className="w-full min-h-0 flex-1 bg-slate-900/80 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-slate-300 focus:outline-none resize-none"
                         />
                       </div>
                     )}
 
                     {/* Zone 4: OCR 识别结果区 (PP-OCRv6 + pHash) */}
                     {(inspectorSection === 'all' || inspectorSection === 'ocr') && (
-                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3">
+                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3 min-h-0 overflow-hidden">
                         <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
                           <span className="text-xs font-bold text-purple-400 flex items-center">
                             <Eye className="w-4 h-4 mr-1.5 text-purple-400" />
@@ -895,7 +895,7 @@ MIME Type: application/pdf
                         </div>
 
                         {/* OCR Result Box */}
-                        <div className="flex-1 flex flex-col min-h-[110px]">
+                        <div className="flex-1 flex flex-col min-h-0">
                           <span className="text-[10px] font-semibold text-slate-400 mb-1">
                             PP-OCRv6 识别提取结果:
                           </span>
@@ -920,7 +920,7 @@ MIME Type: application/pdf
                   </div>
                 </div>
               ) : (
-                <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-12 flex flex-col items-center justify-center text-center h-full text-slate-500">
+                <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-12 flex flex-col items-center justify-center text-center flex-1 min-h-0 text-slate-500">
                   <Activity className="w-12 h-12 mb-3 opacity-30 text-amber-400" />
                   <p className="text-sm font-medium text-slate-300">请选择或上传文件进行多模态分析</p>
                   <p className="text-xs text-slate-500 mt-1 max-w-sm">
@@ -933,7 +933,7 @@ MIME Type: application/pdf
         )}
 
         {activeTab === 'config' && (
-          <div className="lg:col-span-12 bg-slate-900/60 border border-slate-800 rounded-2xl p-6 max-w-3xl mx-auto w-full">
+          <div className="lg:col-span-12 bg-slate-900/60 border border-slate-800 rounded-2xl p-6 max-w-3xl mx-auto w-full flex flex-col min-h-0">
             <h2 className="text-lg font-bold mb-1 text-slate-100 flex items-center">
               <Cpu className="w-5 h-5 mr-2 text-amber-400" />
               Omni Core 引擎参数配置
@@ -942,7 +942,7 @@ MIME Type: application/pdf
               调整底层 Rust 线程池、ORT ONNX Execution Provider 与推理参数
             </p>
 
-            <div className="space-y-6 text-sm">
+            <div className="space-y-6 text-sm flex-1 min-h-0 overflow-y-auto pr-1">
               <div>
                 <label className="block text-slate-300 font-medium mb-2">
                   最大提取并发线程数 (Workers)
@@ -1081,7 +1081,7 @@ MIME Type: application/pdf
                 )}
               </div>
 
-              <div className="pt-4 border-t border-slate-800 flex justify-end">
+              <div className="pt-4 border-t border-slate-800 flex justify-end flex-shrink-0">
                 <button
                   onClick={saveConfig}
                   className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl transition-all shadow-lg shadow-amber-500/20 flex items-center gap-1.5"

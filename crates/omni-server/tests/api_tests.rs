@@ -162,6 +162,34 @@ async fn test_extract_real_pdf_from_work_folder() {
 }
 
 #[tokio::test]
+async fn test_extract_user_pdf_metadata() {
+    let pdf_path = std::path::PathBuf::from(r"F:\lilun\Desktop\经济学_国家财富估算与GDP对比_Annual-Wealth-Estimates-for-Chin.pdf");
+    if !pdf_path.exists() {
+        println!("File does not exist: {:?}", pdf_path);
+        return;
+    }
+
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "file_path": pdf_path.to_string_lossy().to_string()
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+    println!("DEBUG METADATA FOR USER PDF:\n{:#?}", result.metadata);
+}
+
+#[tokio::test]
 async fn test_extract_real_docx_from_work_folder() {
     let app = setup_test_app();
     let real_docx_path = resolve_work_folder_path("SPEEDY/项目模块_功能需求文档_日历调度AI集成需求_V1.docx");
