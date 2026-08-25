@@ -7,11 +7,32 @@ use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 fn setup_test_app() -> Router {
+    // 默认注入"未配置数据集"的软不可用地理服务
+    setup_test_app_with_geo(Arc::new(omni_pro::geo::GeoService::unavailable()))
+}
+
+/// 以指定地理服务构造测试路由（geo 用例通过内嵌夹具 JSON 注入可用实例）
+fn setup_test_app_with_geo(geo: Arc<omni_pro::geo::GeoService>) -> Router {
     let state = AppState {
         config: Arc::new(Mutex::new(OmniConfig::default())),
+        geo,
     };
     create_app_router(state)
 }
+
+/// 内嵌密封夹具：与 omni-geo 集成测试同构的最小数据集（零网络、零外部文件）
+const GEO_FIXTURE_JSON: &str = r#"{
+  "version": 20260824,
+  "points": [
+    { "id": 1, "lat": 22.54, "lng": 114.06, "cc": "CN", "ad1": "44", "pop": 12500000,
+      "n": { "en": "Shenzhen", "zh": "深圳市", "ja": "深セン" } },
+    { "id": 2, "lat": 23.14, "lng": 114.06, "cc": "CN", "ad1": "44", "pop": 900000,
+      "n": { "en": "Heyuan", "zh": "河源市" } }
+  ],
+  "admin1": { "CN.44": { "en": "Guangdong", "zh": "广东省" } },
+  "admin2": {},
+  "countries": { "CN": { "en": "China", "zh": "中国" } }
+}"#;
 
 fn resolve_work_folder_path(relative_path: &str) -> std::path::PathBuf {
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
@@ -310,7 +331,7 @@ async fn test_extract_image_phash_and_metadata() {
 
     // 创建一幅 100x100 的纯色 PNG 图片用于测试
     let temp_img = std::env::temp_dir().join("test_image_extraction.png");
-    let img = image::RgbImage::from_fn(100, 100, |x, y| {
+    let img = image::RgbImage::from_fn(100, 100, |x, _y| {
         if x > 50 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 255, 0]) }
     });
     img.save(&temp_img).unwrap();
@@ -581,3 +602,301 @@ async fn test_extract_exe_file_metadata() {
     assert!(result.metadata.get("exiftool").is_some(), "ExifTool metadata should be present for .exe file");
     assert!(result.metadata.get("executable").is_some(), "Executable metadata block should be present for .exe file");
 }
+
+#[tokio::test]
+async fn test_native_czkawka_bridge_duplicate_scan() {
+    let test_dir = std::path::PathBuf::from(r"D:\workspace\firefly-ai-folder\tests\media_duplicate_test");
+    if !test_dir.exists() {
+        return;
+    }
+
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/duplicate/scan")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "paths": [test_dir.to_string_lossy().to_string()],
+                    "strategies": ["audio_hash", "video_phash"],
+                    "min_similarity": 7.5,
+                    "check_video": true
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let result: omni_core::DuplicateScanResponse = serde_json::from_slice(&body).unwrap();
+
+    println!("CZKAWKA BRIDGE DUPLICATE RESPONSE:\n{:#?}", result);
+    assert!(result.success);
+    assert!(!result.duplicate_groups.is_empty(), "Native czkawka_core should detect duplicate groups!");
+}
+
+#[tokio::test]
+async fn test_native_czkawka_bridge_stream_scan() {
+    let test_dir = std::path::PathBuf::from(r"D:\workspace\firefly-ai-folder\tests\media_duplicate_test");
+    if !test_dir.exists() {
+        return;
+    }
+
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/duplicate/scan/stream")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "paths": [test_dir.to_string_lossy().to_string()],
+                    "strategies": ["exact_hash", "audio_hash", "video_phash"],
+                    "check_video": true
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+
+    println!("CZKAWKA STREAM SSE OUTPUT:\n{}", body_str);
+    assert!(body_str.contains("event: start"));
+    assert!(body_str.contains("event: progress"));
+    assert!(body_str.contains("event: group"));
+    assert!(body_str.contains("event: done"));
+}
+
+#[tokio::test]
+async fn test_czkawka_bridge_full_tools_on_work_folder_private() {
+    let target_dir = resolve_work_folder_path("PRIVATE/czkawka_bridge_samples");
+    if !target_dir.exists() {
+        println!("Test directory does not exist at {:?}", target_dir);
+        return;
+    }
+
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/duplicate/scan")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({
+                    "paths": [target_dir.to_string_lossy().to_string()],
+                    "strategies": [
+                        "exact_hash",
+                        "empty_folders",
+                        "empty_files",
+                        "temporary_files",
+                        "bad_extensions",
+                        "bad_names",
+                        "broken_files",
+                        "big_files"
+                    ],
+                    "min_similarity": 7.5
+                })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let result: omni_core::DuplicateScanResponse = serde_json::from_slice(&body).unwrap();
+
+    println!("CZKAWKA WORK_FOLDER PRIVATE SCAN RESPONSE:\n{:#?}", result);
+    assert!(result.success);
+    assert!(!result.duplicate_groups.is_empty(), "All 14 bridge tools should detect artifacts in PRIVATE samples!");
+
+    // 检查各新增策略是否成功探测并回传
+    let strategies: Vec<String> = result.duplicate_groups.iter().map(|g| g.strategy.clone()).collect();
+    println!("Detected Strategies in sample folder: {:?}", strategies);
+
+    assert!(strategies.iter().any(|s| s == "exact_hash" || s == "duplicates"), "Exact duplicates should be detected");
+    assert!(strategies.iter().any(|s| s == "empty_files"), "Empty files should be detected");
+    assert!(strategies.iter().any(|s| s == "temporary_files"), "Temporary files should be detected");
+    assert!(strategies.iter().any(|s| s == "bad_extensions"), "Bad extension file should be detected");
+    assert!(strategies.iter().any(|s| s == "bad_names"), "Bad name file should be detected");
+    assert!(strategies.iter().any(|s| s == "broken_files"), "Broken PDF file should be detected");
+    assert!(strategies.iter().any(|s| s == "big_files"), "Big file should be detected");
+}
+
+// ==================== /api/geo/reverse 离线反向地理编码契约测试 ====================
+
+#[tokio::test]
+async fn test_health_reports_geo_unavailable_when_dataset_missing() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    // 数据集未配置 → geoAvailable 必须为 false（软降级，不影响整体健康）
+    assert_eq!(json["geoAvailable"], false);
+}
+
+#[tokio::test]
+async fn test_health_reports_geo_available_with_inline_fixture() {
+    let geo = Arc::new(omni_pro::geo::GeoService::from_json_str(GEO_FIXTURE_JSON).unwrap());
+    let app = setup_test_app_with_geo(geo);
+    let response = app
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["geoAvailable"], true);
+}
+
+#[tokio::test]
+async fn test_geo_reverse_soft_fails_with_200_when_unavailable() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/geo/reverse")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "points": [{ "latitude": 22.55, "longitude": 114.07 }]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // 契约：数据缺失不报 5xx，恒为 200 + available:false + reason
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["available"], false);
+    assert!(json["reason"].as_str().is_some_and(|r| !r.is_empty()));
+}
+
+#[tokio::test]
+async fn test_geo_reverse_happy_path_city_tier() {
+    let geo = Arc::new(omni_pro::geo::GeoService::from_json_str(GEO_FIXTURE_JSON).unwrap());
+    let app = setup_test_app_with_geo(geo);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/geo/reverse")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "points": [{ "latitude": 22.55, "longitude": 114.07 }],
+                        "language": "zh-CN"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["available"], true);
+    assert_eq!(json["datasetVersion"], 20260824);
+
+    let r = &json["results"][0];
+    assert_eq!(r["found"], true);
+    assert_eq!(r["country"], "中国");
+    assert_eq!(r["province"], "广东省");
+    assert_eq!(r["city"], "深圳市");
+    assert!(r["distanceKm"].is_number());
+}
+
+#[tokio::test]
+async fn test_geo_reverse_batch_alignment_and_dirty_points() {
+    let geo = Arc::new(omni_pro::geo::GeoService::from_json_str(GEO_FIXTURE_JSON).unwrap());
+    let app = setup_test_app_with_geo(geo);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/geo/reverse")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "points": [
+                            { "latitude": 91.0, "longitude": 0.0 },
+                            { "latitude": -33.90, "longitude": 151.20 },
+                            { "latitude": 23.00, "longitude": 114.06 }
+                        ],
+                        "language": "en"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let results = json["results"].as_array().expect("results 数组");
+    assert_eq!(results.len(), 3, "结果与请求按下标对齐");
+    // 脏坐标单点失败
+    assert_eq!(results[0]["found"], false);
+    // 悉尼不在夹具数据集内（夹具仅中国两点）且距离超限 → 未命中
+    assert_eq!(results[1]["found"], false);
+    // 合法点命中河源（约15.6km ≤ 默认城市阈值）→ 全量层英文回传
+    assert_eq!(results[2]["found"], true);
+    assert_eq!(results[2]["city"], "Heyuan");
+    assert_eq!(results[2]["country"], "China");
+}
+
+#[tokio::test]
+async fn test_geo_reverse_request_threshold_overrides() {
+    let geo = Arc::new(omni_pro::geo::GeoService::from_json_str(GEO_FIXTURE_JSON).unwrap());
+    let app = setup_test_app_with_geo(geo);
+    // 河源距查询点约15.6km：maxCityKm=10 后应降级为中间层（city 置空）
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/geo/reverse")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "points": [{ "latitude": 23.00, "longitude": 114.06 }],
+                        "language": "en",
+                        "maxCityKm": 10
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let r = &json["results"][0];
+    assert_eq!(r["found"], true, "15.6km 应命中中间层");
+    assert_eq!(r["city"], serde_json::Value::Null);
+    assert_eq!(r["province"], "Guangdong");
+}
+
+
+

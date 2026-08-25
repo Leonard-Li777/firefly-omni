@@ -8,6 +8,7 @@ license.workspace = true
 omni-core = { path = "../omni-core" }
 omni-extract = { path = "../omni-extract" }
 omni-vision = { path = "../omni-vision" }
+omni-pro = { path = "../../omni-pro", package = "omni-pro" }
 axum.workspace = true
 tower-http.workspace = true
 tokio.workspace = true

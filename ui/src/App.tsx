@@ -21,8 +21,61 @@ import {
   Layers,
   Music,
   Video,
-  XCircle
+  XCircle,
+  MapPin,
+  Globe2
 } from 'lucide-react'
+
+// ---- 离线反向地理编码 (/api/geo/reverse) 相关类型 ----
+interface GeoPointResult {
+  found: boolean
+  country?: string | null
+  province?: string | null
+  city?: string | null
+  distanceKm?: number | null
+}
+
+interface GeoReverseResponse {
+  available: boolean
+  datasetVersion?: number
+  results?: GeoPointResult[]
+  reason?: string
+}
+
+// 预置测试坐标组：覆盖城市层 / 中间层 / 海洋未命中 / 脏坐标容错四类场景
+const GEO_PRESETS: Array<{ label: string; value: string }> = [
+  {
+    label: '🇨🇳 中国城市',
+    value: [
+      '22.5431, 114.0579   // 深圳（城市全量层）',
+      '39.9042, 116.4074   // 北京',
+      '31.2304, 121.4737   // 上海',
+      '23.1291, 113.2644   // 广州'
+    ].join('\n')
+  },
+  {
+    label: '🌍 国际城市',
+    value: [
+      '40.7128, -74.0060   // 纽约',
+      '51.5074, -0.1278    // 伦敦',
+      '35.6762, 139.6503   // 东京',
+      '-33.8688, 151.2093 // 悉尼（南半球）'
+    ].join('\n')
+  },
+  {
+    label: '🧪 边界与容错',
+    value: [
+      '22.5431, 114.0579   // 深圳：城市层基准点',
+      '23.1400, 114.0600   // 距深圳约 66km：中间层（仅国家+省）',
+      '0.0000, -140.0000   // 太平洋深处：应未命中',
+      '91.0000, 114.0000   // 纬度越界：单点容错',
+      '22.5400, 200.0000   // 经度越界：单点容错'
+    ].join('\n')
+  }
+]
+
+// 支持的界面语言选项（BCP-47 标签，服务端归一化到基础子码）
+const GEO_LANGUAGE_OPTIONS = ['en', 'zh-CN', 'ja-JP', 'ko-KR', 'fr-FR', 'de-DE', 'es-ES', 'ru-RU', 'pt-PT', 'ar-EG']
 
 interface ApiResponseData {
   file_path?: string
@@ -49,27 +102,65 @@ interface ExtractionResult {
   apiResponse?: ApiResponseData
 }
 
+// ---- 浏览器可直接预览的多模态文件扩展名集合 (czkawka 结果缩略图) ----
+const PREVIEW_IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif']
+const PREVIEW_VIDEO_EXTS = ['mp4', 'm4v', 'webm', 'ogv', 'ogg', 'mov']
+const PREVIEW_AUDIO_EXTS = ['mp3', 'wav', 'flac', 'aac', 'm4a', 'opus']
+
+const getFileExt = (name: string): string => {
+  const idx = name.lastIndexOf('.')
+  return idx >= 0 ? name.slice(idx + 1).toLowerCase() : ''
+}
+
+type PreviewMediaType = 'image' | 'video' | 'audio' | null
+
+const getPreviewMediaType = (name: string): PreviewMediaType => {
+  const ext = getFileExt(name)
+  if (PREVIEW_IMAGE_EXTS.includes(ext)) return 'image'
+  if (PREVIEW_VIDEO_EXTS.includes(ext)) return 'video'
+  if (PREVIEW_AUDIO_EXTS.includes(ext)) return 'audio'
+  return null
+}
+
+const getFilePreviewUrl = (path: string): string =>
+  `/api/file/preview?path=${encodeURIComponent(path)}`
+
 export default function App() {
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking')
-  const [activeTab, setActiveTab] = useState<'inspector' | 'czkawka' | 'config'>('inspector')
+  const [isPro, setIsPro] = useState<boolean>(false)
+  const [geoAvailable, setGeoAvailable] = useState<boolean | null>(null)
+  const [cleanupAvailable, setCleanupAvailable] = useState<boolean>(false)
+  const [activeTab, setActiveTab] = useState<'inspector' | 'cleanup' | 'geo' | 'config'>('inspector')
   const [inspectorSection, setInspectorSection] = useState<'all' | 'magika' | 'exif' | 'text' | 'ocr'>('all')
   const [files, setFiles] = useState<ExtractionResult[]>([])
   const [selectedFileIndex, setSelectedFileIndex] = useState<number | null>(null)
   const [copied, setCopied] = useState(false)
   const [dragActive, setDragActive] = useState(false)
 
-  // czkawka_core API test state
+  // 智能文件清理与去重 14 大核心引擎全策略选择器
   const [scanPaths, setScanPaths] = useState<string>('F:\\lilun\\Desktop')
   const [strategyExact, setStrategyExact] = useState<boolean>(true)
   const [strategyPhash, setStrategyPhash] = useState<boolean>(true)
   const [strategyAudio, setStrategyAudio] = useState<boolean>(true)
-  const [strategyVideo, setStrategyVideo] = useState<boolean>(false) // Default FALSE (requires explicit user opt-in)
-  const [minSimilarity, setMinSimilarity] = useState<number>(90)
+  const [strategyVideo, setStrategyVideo] = useState<boolean>(false)
+  const [strategyBadExt, setStrategyBadExt] = useState<boolean>(false)
+  const [strategyEmptyFolders, setStrategyEmptyFolders] = useState<boolean>(false)
+  const [strategyBigFiles, setStrategyBigFiles] = useState<boolean>(false)
+  const [strategyEmptyFiles, setStrategyEmptyFiles] = useState<boolean>(false)
+  const [strategyTemporaryFiles, setStrategyTemporaryFiles] = useState<boolean>(false)
+  const [strategyInvalidSymlinks, setStrategyInvalidSymlinks] = useState<boolean>(false)
+  const [strategyBrokenFiles, setStrategyBrokenFiles] = useState<boolean>(false)
+  const [strategyBadNames, setStrategyBadNames] = useState<boolean>(false)
+  const [strategyExifRemover, setStrategyExifRemover] = useState<boolean>(false)
+  const [strategyVideoOptimizer, setStrategyVideoOptimizer] = useState<boolean>(false)
+  const [nameIssuesMode, setNameIssuesMode] = useState<'multilingual' | 'strict_ascii'>('multilingual')
+
+  const [minSimilarity, setMinSimilarity] = useState<number>(9.0)
   const [scanning, setScanning] = useState<boolean>(false)
   const [scanResult, setScanResult] = useState<any | null>(null)
   const [scanError, setScanError] = useState<string | null>(null)
 
-  // Single file inspector for czkawka_core helpers
+  // Single file inspector
   const [singleFilePath, setSingleFilePath] = useState<string>('F:\\lilun\\Desktop\\TailwindCSS技术介绍.pdf')
   const [singleFileResult, setSingleFileResult] = useState<{ phash?: string; is_corrupted?: boolean; file_size?: number } | null>(null)
   const [inspectingSingleFile, setInspectingSingleFile] = useState<boolean>(false)
@@ -81,6 +172,16 @@ export default function App() {
   const [enableImageOcr, setEnableImageOcr] = useState(true)
   const [ocrModelSize, setOcrModelSize] = useState<'tiny' | 'small' | 'medium'>('tiny')
   const [maxDocumentOcrFileSizeMb, setMaxDocumentOcrFileSizeMb] = useState(10)
+
+  // Geo 反向地理编码测试状态
+  const [geoCoordsText, setGeoCoordsText] = useState<string>(GEO_PRESETS[0].value)
+  const [geoLanguage, setGeoLanguage] = useState<string>('zh-CN')
+  const [geoMaxCityKm, setGeoMaxCityKm] = useState<string>('') // 留空 = 使用服务端默认 50km
+  const [geoMaxAnyKm, setGeoMaxAnyKm] = useState<string>('') // 留空 = 使用服务端默认 500km
+  const [geoResults, setGeoResults] = useState<GeoReverseResponse | null>(null)
+  const [geoInputs, setGeoInputs] = useState<Array<{ latitude: number; longitude: number }>>([])
+  const [geoQuerying, setGeoQuerying] = useState<boolean>(false)
+  const [geoError, setGeoError] = useState<string | null>(null)
 
   useEffect(() => {
     checkHealth()
@@ -196,6 +297,16 @@ export default function App() {
     if (strategyPhash) strategies.push('image_phash')
     if (strategyAudio) strategies.push('audio_hash')
     if (strategyVideo) strategies.push('video_phash')
+    if (strategyBadExt) strategies.push('bad_extensions')
+    if (strategyEmptyFolders) strategies.push('empty_folders')
+    if (strategyBigFiles) strategies.push('big_files')
+    if (strategyEmptyFiles) strategies.push('empty_files')
+    if (strategyTemporaryFiles) strategies.push('temporary_files')
+    if (strategyInvalidSymlinks) strategies.push('invalid_symlinks')
+    if (strategyBrokenFiles) strategies.push('broken_files')
+    if (strategyBadNames) strategies.push('bad_names')
+    if (strategyExifRemover) strategies.push('exif_remover')
+    if (strategyVideoOptimizer) strategies.push('video_optimizer')
 
     try {
       const response = await fetch('/api/duplicate/scan/stream', {
@@ -325,6 +436,75 @@ export default function App() {
     }
   }
 
+  /**
+   * 解析多行坐标文本：每行 "纬度, 经度"，支持 // 或 # 行内注释，
+   * 分隔符兼容逗号/分号/空白；非法行直接跳过并计入错误提示。
+   */
+  const parseGeoCoords = (text: string): { points: Array<{ latitude: number; longitude: number }>; invalidLines: number } => {
+    const points: Array<{ latitude: number; longitude: number }> = []
+    let invalidLines = 0
+
+    for (const rawLine of text.split('\n')) {
+      // 剥离行内注释后取坐标段
+      const line = rawLine.replace(/\/\/.*$/, '').replace(/#.*$/, '').trim()
+      if (!line) continue
+
+      const parts = line.split(/[,;\s]+/).map(Number)
+      if (parts.length < 2 || parts.some(p => !Number.isFinite(p))) {
+        invalidLines++
+        continue
+      }
+      points.push({ latitude: parts[0], longitude: parts[1] })
+    }
+    return { points, invalidLines }
+  }
+
+  /** 发起反向地理编码批量查询：POST /api/geo/reverse */
+  const handleGeoReverse = async () => {
+    const { points, invalidLines } = parseGeoCoords(geoCoordsText)
+
+    if (points.length === 0) {
+      setGeoError('未解析到有效坐标，请检查输入格式（每行: 纬度, 经度）')
+      setGeoResults(null)
+      setGeoInputs([])
+      return
+    }
+
+    setGeoError(invalidLines > 0 ? `已跳过 ${invalidLines} 行无法解析的坐标` : null)
+    setGeoInputs(points)
+    setGeoQuerying(true)
+    setGeoResults(null)
+
+    try {
+      // 阈值留空时不下发字段，由服务端使用内置默认值（50 / 500km）
+      const body: Record<string, unknown> = {
+        points,
+        language: geoLanguage
+      }
+      const cityKm = parseFloat(geoMaxCityKm)
+      const anyKm = parseFloat(geoMaxAnyKm)
+      if (Number.isFinite(cityKm)) body.maxCityKm = cityKm
+      if (Number.isFinite(anyKm)) body.maxAnyKm = anyKm
+
+      const res = await fetch('/api/geo/reverse', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      })
+
+      if (!res.ok) {
+        throw new Error(`HTTP error ${res.status}: ${res.statusText}`)
+      }
+
+      const data: GeoReverseResponse = await res.json()
+      setGeoResults(data)
+    } catch (err: any) {
+      setGeoError(err.message || '反向地理编码请求失败')
+    } finally {
+      setGeoQuerying(false)
+    }
+  }
+
   const formatBytes = (bytes: number): string => {
     if (!bytes || bytes === 0) return '0 B'
     const k = 1024
@@ -339,6 +519,9 @@ export default function App() {
       const res = await fetch('/health')
       if (res.ok) {
         const data = await res.json().catch(() => ({}))
+        setIsPro(Boolean(data.isPro))
+        setGeoAvailable(typeof data.geoAvailable === 'boolean' ? data.geoAvailable : null)
+        setCleanupAvailable(Boolean(data.cleanupAvailable || data.isPro))
         if (data.status === 'offline') {
           setServerStatus('offline')
         } else {
@@ -669,19 +852,41 @@ MIME Type: application/pdf
             }`}
           >
             <FileCode className="w-4 h-4 inline mr-1.5" />
-            Extraction Inspector (四分区预览)
+            Extraction Inspector (提纯与预览)
           </button>
-          <button
-            onClick={() => setActiveTab('czkawka')}
-            className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all ${
-              activeTab === 'czkawka'
-                ? 'bg-amber-500 text-slate-950 font-semibold shadow-md'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Layers className="w-4 h-4 inline mr-1.5" />
-            czkawka_core 集成测试
-          </button>
+
+          {/* Pro Feature: 智能文件清理与治理 */}
+          {cleanupAvailable && (
+            <button
+              onClick={() => setActiveTab('cleanup')}
+              className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center space-x-1.5 ${
+                activeTab === 'cleanup'
+                  ? 'bg-amber-500 text-slate-950 font-semibold shadow-md'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Layers className="w-4 h-4 inline mr-1" />
+              <span>文件清理 (Cleanup)</span>
+              <span className="text-[10px] uppercase font-mono font-bold bg-amber-400/20 text-amber-300 border border-amber-400/40 px-1 py-0.2 rounded">PRO</span>
+            </button>
+          )}
+
+          {/* Pro Feature: 离线反向地理编码 */}
+          {isPro && (
+            <button
+              onClick={() => setActiveTab('geo')}
+              className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center space-x-1.5 ${
+                activeTab === 'geo'
+                  ? 'bg-amber-500 text-slate-950 font-semibold shadow-md'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <MapPin className="w-4 h-4 inline mr-1" />
+              <span>Geo 地理逆编码</span>
+              <span className="text-[10px] uppercase font-mono font-bold bg-amber-400/20 text-amber-300 border border-amber-400/40 px-1 py-0.2 rounded">PRO</span>
+            </button>
+          )}
+
           <button
             onClick={() => setActiveTab('config')}
             className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all ${
@@ -707,7 +912,9 @@ MIME Type: application/pdf
                   : 'bg-rose-500 shadow-sm shadow-rose-500'
               }`}
             />
-            <span className="capitalize font-mono">Axum Server: {serverStatus}</span>
+            <span className="capitalize font-mono">
+              Axum Server: {serverStatus} {isPro ? '(Pro Enterprise)' : '(Open Core)'}
+            </span>
             <button
               onClick={checkHealth}
               className="text-slate-400 hover:text-slate-200 ml-1"
@@ -1250,7 +1457,7 @@ MIME Type: application/pdf
           </>
         )}
 
-        {activeTab === 'czkawka' && (
+        {activeTab === 'cleanup' && (
           <div className="lg:col-span-12 grid grid-cols-1 lg:grid-cols-12 gap-6 min-h-0 overflow-y-auto">
             {/* Left Column: API Controller & Single File Tester (4 cols) */}
             <div className="lg:col-span-4 space-y-5 flex flex-col min-h-0">
@@ -1262,12 +1469,15 @@ MIME Type: application/pdf
                       <Layers className="w-5 h-5" />
                     </div>
                     <div>
-                      <h2 className="font-bold text-sm text-slate-100">czkawka_core 扫描 API 测试</h2>
-                      <span className="text-[11px] font-mono text-emerald-400">POST /api/duplicate/scan</span>
+                      <h2 className="font-bold text-sm text-slate-100 flex items-center gap-1.5">
+                        <span>智能文件清理与治理 API</span>
+                        <span className="text-[10px] uppercase font-mono font-bold bg-amber-400/20 text-amber-300 border border-amber-400/40 px-1 py-0.2 rounded">PRO</span>
+                      </h2>
+                      <span className="text-[11px] font-mono text-emerald-400">POST /api/cleanup/scan/stream</span>
                     </div>
                   </div>
                   <span className="text-[10px] font-bold px-2 py-0.5 bg-purple-500/20 text-purple-300 rounded border border-purple-500/30">
-                    Rust Native
+                    Omni-Cleanup Pro
                   </span>
                 </div>
 
@@ -1304,95 +1514,246 @@ MIME Type: application/pdf
 
                 {/* Strategy Toggles */}
                 <div className="space-y-2 pt-1 border-t border-slate-800/80">
-                  <label className="text-xs font-semibold text-slate-300 block">
-                    czkawka_core 去重策略选择
-                  </label>
-                  <div className="space-y-2">
-                    <label className="flex items-center justify-between p-2.5 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-semibold text-slate-300 block">
+                      czkawka_core 14 大核心引擎全策略选择
+                    </label>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setStrategyExact(true); setStrategyPhash(true); setStrategyAudio(true); setStrategyVideo(true);
+                          setStrategyBadExt(true); setStrategyEmptyFolders(true); setStrategyBigFiles(true); setStrategyEmptyFiles(true);
+                          setStrategyTemporaryFiles(true); setStrategyInvalidSymlinks(true); setStrategyBrokenFiles(true); setStrategyBadNames(true);
+                          setStrategyExifRemover(true); setStrategyVideoOptimizer(true);
+                        }}
+                        className="text-[10px] text-amber-400 hover:text-amber-300 px-1.5 py-0.5 rounded bg-amber-950/40 border border-amber-800/50"
+                      >
+                        全选
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setStrategyExact(false); setStrategyPhash(false); setStrategyAudio(false); setStrategyVideo(false);
+                          setStrategyBadExt(false); setStrategyEmptyFolders(false); setStrategyBigFiles(false); setStrategyEmptyFiles(false);
+                          setStrategyTemporaryFiles(false); setStrategyInvalidSymlinks(false); setStrategyBrokenFiles(false); setStrategyBadNames(false);
+                          setStrategyExifRemover(false); setStrategyVideoOptimizer(false);
+                        }}
+                        className="text-[10px] text-slate-400 hover:text-slate-300 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800"
+                      >
+                        清空
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-[380px] overflow-y-auto pr-1">
+                    {/* 1. Duplicates */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
                       <div className="flex items-center space-x-2">
-                        <Hash className="w-4 h-4 text-amber-400" />
+                        <Hash className="w-3.5 h-3.5 text-amber-400 flex-shrink-0" />
                         <div>
-                          <span className="text-xs font-semibold text-slate-200 block">100% 精确哈希去重 (exact_hash)</span>
-                          <span className="text-[10px] text-slate-400">结合文件大小筛分与 Byte 采样哈希</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">精确重复文件 (Duplicates)</span>
+                          <span className="text-[9px] text-slate-400">Blake3 分级哈希 (exact_hash)</span>
                         </div>
                       </div>
-                      <input
-                        type="checkbox"
-                        checked={strategyExact}
-                        onChange={e => setStrategyExact(e.target.checked)}
-                        className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
-                      />
+                      <input type="checkbox" checked={strategyExact} onChange={e => setStrategyExact(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
                     </label>
 
-                    <label className="flex items-center justify-between p-2.5 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                    {/* 2. Similar Images */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
                       <div className="flex items-center space-x-2">
-                        <Camera className="w-4 h-4 text-purple-400" />
+                        <Camera className="w-3.5 h-3.5 text-purple-400 flex-shrink-0" />
                         <div>
-                          <span className="text-xs font-semibold text-slate-200 block">视觉感知哈希图片去重 (image_phash)</span>
-                          <span className="text-[10px] text-slate-400">基于 czkawka_core pHash 64位指纹</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">相似图片 (Similar Images)</span>
+                          <span className="text-[9px] text-slate-400">BK-Tree 梯度感知哈希 (image_phash)</span>
                         </div>
                       </div>
-                      <input
-                        type="checkbox"
-                        checked={strategyPhash}
-                        onChange={e => setStrategyPhash(e.target.checked)}
-                        className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
-                      />
+                      <input type="checkbox" checked={strategyPhash} onChange={e => setStrategyPhash(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
                     </label>
 
-                    <label className="flex items-center justify-between p-2.5 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                    {/* 3. Same Music */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
                       <div className="flex items-center space-x-2">
-                        <Music className="w-4 h-4 text-cyan-400" />
+                        <Music className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />
                         <div>
-                          <span className="text-xs font-semibold text-slate-200 block">音频同源与特征比对 (audio_hash)</span>
-                          <span className="text-[10px] text-slate-400">支持 mp3, wav, flac, aac, m4a, ogg</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">相似音乐 (Same Music)</span>
+                          <span className="text-[9px] text-slate-400">Chromaprint 声学指纹 (audio_hash)</span>
                         </div>
                       </div>
-                      <input
-                        type="checkbox"
-                        checked={strategyAudio}
-                        onChange={e => setStrategyAudio(e.target.checked)}
-                        className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
-                      />
+                      <input type="checkbox" checked={strategyAudio} onChange={e => setStrategyAudio(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
                     </label>
 
-                    <label className="flex items-center justify-between p-2.5 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                    {/* 4. Similar Videos */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
                       <div className="flex items-center space-x-2">
-                        <Video className="w-4 h-4 text-rose-400" />
+                        <Video className="w-3.5 h-3.5 text-rose-400 flex-shrink-0" />
                         <div>
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-xs font-semibold text-slate-200 block">视频画面指纹查重 (video_phash)</span>
-                            <span className="text-[9px] font-bold text-rose-300 bg-rose-950/80 border border-rose-800/80 px-1.5 py-0.5 rounded">
-                              非常耗时
-                            </span>
-                          </div>
-                          <span className="text-[10px] text-slate-400">支持 mp4, mkv, avi, mov, wmv, flv, webm</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">相似视频 (Similar Videos)</span>
+                          <span className="text-[9px] text-slate-400">时序关键帧提取 (video_phash)</span>
                         </div>
                       </div>
-                      <input
-                        type="checkbox"
-                        checked={strategyVideo}
-                        onChange={e => setStrategyVideo(e.target.checked)}
-                        className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
-                      />
+                      <input type="checkbox" checked={strategyVideo} onChange={e => setStrategyVideo(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                    </label>
+
+                    {/* 5. Empty Folders */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <Layers className="w-3.5 h-3.5 text-blue-400 flex-shrink-0" />
+                        <div>
+                          <span className="text-[11px] font-semibold text-slate-200 block">空文件夹 (Empty Folders)</span>
+                          <span className="text-[9px] text-slate-400">高级递归空目录检测</span>
+                        </div>
+                      </div>
+                      <input type="checkbox" checked={strategyEmptyFolders} onChange={e => setStrategyEmptyFolders(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                    </label>
+
+                    {/* 6. Big Files */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <Zap className="w-3.5 h-3.5 text-yellow-400 flex-shrink-0" />
+                        <div>
+                          <span className="text-[11px] font-semibold text-slate-200 block">超大文件 (Big Files)</span>
+                          <span className="text-[9px] text-slate-400">全盘 Top 50 体积最大文件</span>
+                        </div>
+                      </div>
+                      <input type="checkbox" checked={strategyBigFiles} onChange={e => setStrategyBigFiles(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                    </label>
+
+                    {/* 7. Empty Files */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <FileText className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
+                        <div>
+                          <span className="text-[11px] font-semibold text-slate-200 block">空文件 (Empty Files)</span>
+                          <span className="text-[9px] text-slate-400">0 字节空文件扫描</span>
+                        </div>
+                      </div>
+                      <input type="checkbox" checked={strategyEmptyFiles} onChange={e => setStrategyEmptyFiles(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                    </label>
+
+                    {/* 8. Temporary Files */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <RefreshCw className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />
+                        <div>
+                          <span className="text-[11px] font-semibold text-slate-200 block">临时与缓存 (Temporary Files)</span>
+                          <span className="text-[9px] text-slate-400">.tmp, .bak, .cache, thumbs.db 等</span>
+                        </div>
+                      </div>
+                      <input type="checkbox" checked={strategyTemporaryFiles} onChange={e => setStrategyTemporaryFiles(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                    </label>
+
+                    {/* 9. Invalid Symlinks */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <AlertCircle className="w-3.5 h-3.5 text-amber-500 flex-shrink-0" />
+                        <div>
+                          <span className="text-[11px] font-semibold text-slate-200 block">断裂软链接 (Invalid Symlinks)</span>
+                          <span className="text-[9px] text-slate-400">指向已不存在目标的符号链接</span>
+                        </div>
+                      </div>
+                      <input type="checkbox" checked={strategyInvalidSymlinks} onChange={e => setStrategyInvalidSymlinks(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                    </label>
+
+                    {/* 10. Broken Files */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <XCircle className="w-3.5 h-3.5 text-red-400 flex-shrink-0" />
+                        <div>
+                          <span className="text-[11px] font-semibold text-slate-200 block">损坏文件 (Broken Files)</span>
+                          <span className="text-[9px] text-slate-400">损坏图像/PDF/音频/压缩包</span>
+                        </div>
+                      </div>
+                      <input type="checkbox" checked={strategyBrokenFiles} onChange={e => setStrategyBrokenFiles(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                    </label>
+
+                    {/* 11. Bad Extensions */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <FileCode className="w-3.5 h-3.5 text-indigo-400 flex-shrink-0" />
+                        <div>
+                          <span className="text-[11px] font-semibold text-slate-200 block">错误扩展名 (Bad Extensions)</span>
+                          <span className="text-[9px] text-slate-400">内容魔数与后缀不匹配</span>
+                        </div>
+                      </div>
+                      <input type="checkbox" checked={strategyBadExt} onChange={e => setStrategyBadExt(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                    </label>
+
+                    {/* 12. Bad Names */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <FileText className="w-3.5 h-3.5 text-teal-400 flex-shrink-0" />
+                        <div>
+                          <span className="text-[11px] font-semibold text-slate-200 block">异常文件名 (Bad Names)</span>
+                          <span className="text-[9px] text-slate-400">特殊字符/不可见/非标准命名</span>
+                        </div>
+                      </div>
+                      <input type="checkbox" checked={strategyBadNames} onChange={e => setStrategyBadNames(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                    </label>
+
+                    {/* 13. Exif Remover */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <ShieldCheck className="w-3.5 h-3.5 text-green-400 flex-shrink-0" />
+                        <div>
+                          <span className="text-[11px] font-semibold text-slate-200 block">Exif 清理 (Exif Remover)</span>
+                          <span className="text-[9px] text-slate-400">检测并擦除敏感拍摄隐私元数据</span>
+                        </div>
+                      </div>
+                      <input type="checkbox" checked={strategyExifRemover} onChange={e => setStrategyExifRemover(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                    </label>
+
+                    {/* 14. Video Optimizer */}
+                    <label className="flex items-center justify-between p-2 rounded-lg border border-slate-800 bg-slate-950/60 cursor-pointer hover:bg-slate-900 transition-all">
+                      <div className="flex items-center space-x-2">
+                        <Cpu className="w-3.5 h-3.5 text-pink-400 flex-shrink-0" />
+                        <div>
+                          <span className="text-[11px] font-semibold text-slate-200 block">视频优化 (Video Optimizer)</span>
+                          <span className="text-[9px] text-slate-400">转码为 HEVC/AV1 并裁切黑边</span>
+                        </div>
+                      </div>
+                      <input type="checkbox" checked={strategyVideoOptimizer} onChange={e => setStrategyVideoOptimizer(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
                     </label>
                   </div>
                 </div>
 
                 {/* Similarity threshold slider */}
-                <div className="pt-1">
-                  <div className="flex items-center justify-between text-xs mb-1">
-                    <span className="text-slate-300 font-medium">最小相似度阈值 (%)</span>
-                    <span className="font-mono text-amber-400 font-bold">{minSimilarity}%</span>
+                <div className="pt-1 space-y-1.5">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-300 font-medium">最小相似度阈值 (0.0 ~ 10.0)</span>
+                    <span className="font-mono text-amber-400 font-bold">{minSimilarity.toFixed(1)}</span>
                   </div>
                   <input
                     type="range"
-                    min="50"
-                    max="100"
+                    min="0"
+                    max="10"
+                    step="0.1"
                     value={minSimilarity}
                     onChange={e => setMinSimilarity(Number(e.target.value))}
                     className="w-full accent-amber-500 cursor-pointer h-1.5 bg-slate-950 rounded-lg"
                   />
+                  <div className="flex gap-1">
+                    {[
+                      { label: '最大容差(0.0)', val: 0.0 },
+                      { label: '连拍微移(5.0)', val: 5.0 },
+                      { label: '标准(7.5)', val: 7.5 },
+                      { label: '严苛(9.0)', val: 9.0 },
+                      { label: '精确(10.0)', val: 10.0 }
+                    ].map(p => (
+                      <button
+                        key={p.val}
+                        type="button"
+                        onClick={() => setMinSimilarity(p.val)}
+                        className={`flex-1 py-0.5 rounded text-[10px] font-medium border transition-colors ${
+                          Math.abs(minSimilarity - p.val) < 0.01
+                            ? 'bg-amber-500 text-slate-950 border-amber-500 font-bold'
+                            : 'bg-slate-900 text-slate-400 border-slate-800 hover:bg-slate-800'
+                        }`}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
 
                 {/* Trigger / Cancel Scan Buttons */}
@@ -1405,12 +1766,12 @@ MIME Type: application/pdf
                     {scanning ? (
                       <>
                         <RotateCw className="w-4 h-4 animate-spin" />
-                        <span>czkawka_core 引擎扫描中...</span>
+                        <span>omni-cleanup 智能清理扫描中...</span>
                       </>
                     ) : (
                       <>
                         <Zap className="w-4 h-4 fill-current" />
-                        <span>执行 czkawka_core 聚合扫描</span>
+                        <span>执行 14 大文件清理聚合扫描</span>
                       </>
                     )}
                   </button>
@@ -1435,11 +1796,11 @@ MIME Type: application/pdf
                 )}
               </div>
 
-              {/* Card 2: Single File czkawka_core Helper Inspector */}
+              {/* Card 2: Single File Inspector */}
               <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-3">
                 <div className="flex items-center space-x-2 border-b border-slate-800 pb-2.5">
                   <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                  <span className="text-xs font-bold text-slate-200">单文件 pHash & 坏文件 (Corrupted) 检测</span>
+                  <span className="text-xs font-bold text-slate-200">单文件 pHash & 破损文件检测</span>
                 </div>
 
                 <div>
@@ -1542,7 +1903,7 @@ MIME Type: application/pdf
                     <div className="flex items-center justify-between border-b border-slate-800 pb-3">
                       <div className="flex items-center space-x-2">
                         <Copy className="w-4 h-4 text-amber-400" />
-                        <h3 className="font-bold text-sm text-slate-100">czkawka_core 重复组聚类列表</h3>
+                        <h3 className="font-bold text-sm text-slate-100">智能清理聚类组列表 (File Cleanup Clusters)</h3>
                       </div>
                       <span className="text-xs text-slate-400 font-mono">
                         耗时: {scanResult.duration_ms} ms
@@ -1551,10 +1912,10 @@ MIME Type: application/pdf
 
                     {scanResult.duplicate_groups?.length === 0 ? (
                       <div className="p-8 text-center text-slate-500 text-xs">
-                        🎉 未在此路径下检测到重复文件或冗余副本
+                        🎉 未在此路径下检测到异常冗余文件，工作区非常整洁
                       </div>
                     ) : (
-                      <div className="space-y-4 overflow-y-auto max-h-[420px] pr-1">
+                      <div className="space-y-4 overflow-y-auto flex-1 min-h-0 pr-1">
                         {scanResult.duplicate_groups?.map((group: any, idx: number) => (
                           <div
                             key={group.group_id || idx}
@@ -1577,9 +1938,16 @@ MIME Type: application/pdf
                                   {group.description}
                                 </span>
                               </div>
-                              <span className="text-xs font-bold text-emerald-400 font-mono">
-                                可释放: {formatBytes(group.potential_freed_bytes || 0)}
-                              </span>
+                              <div className="flex items-center space-x-2">
+                                {group.group_threshold !== undefined && group.group_threshold !== null && (
+                                  <span className="text-[10px] font-mono text-amber-400 bg-amber-950/60 border border-amber-800/60 px-1.5 py-0.5 rounded">
+                                    踩线阈值 ≥ {Number(group.group_threshold).toFixed(1)}
+                                  </span>
+                                )}
+                                <span className="text-xs font-bold text-emerald-400 font-mono">
+                                  可释放: {formatBytes(group.potential_freed_bytes || 0)}
+                                </span>
+                              </div>
                             </div>
 
                             {/* Files Table */}
@@ -1587,6 +1955,7 @@ MIME Type: application/pdf
                               <table className="w-full text-left text-[11px] font-mono">
                                 <thead className="bg-slate-900 text-slate-400 border-b border-slate-800">
                                   <tr>
+                                    <th className="py-1.5 px-3">预览</th>
                                     <th className="py-1.5 px-3">文件名</th>
                                     <th className="py-1.5 px-3">大小</th>
                                     <th className="py-1.5 px-3">Fingerprint</th>
@@ -1596,9 +1965,34 @@ MIME Type: application/pdf
                                 <tbody className="divide-y divide-slate-800/50">
                                   {group.files?.map((file: any, fIdx: number) => (
                                     <tr key={fIdx} className="hover:bg-slate-900/50 text-slate-300">
+                                      <td className="py-2 px-3">
+                                        <div className="w-16 h-16 flex-shrink-0 rounded-lg border border-slate-700 bg-slate-950 overflow-hidden flex items-center justify-center">
+                                          {getPreviewMediaType(file.name) === 'image' ? (
+                                            <img
+                                              src={getFilePreviewUrl(file.path)}
+                                              alt={file.name}
+                                              loading="lazy"
+                                              className="w-full h-full object-cover"
+                                              title={file.name}
+                                            />
+                                          ) : getPreviewMediaType(file.name) === 'video' ? (
+                                            <video
+                                              src={getFilePreviewUrl(file.path)}
+                                              muted
+                                              preload="metadata"
+                                              className="w-full h-full object-cover"
+                                              title={file.name}
+                                            />
+                                          ) : getPreviewMediaType(file.name) === 'audio' ? (
+                                            <Music className="w-6 h-6 text-cyan-400" />
+                                          ) : (
+                                            <FileCode className="w-6 h-6 text-slate-500" />
+                                          )}
+                                        </div>
+                                      </td>
                                       <td className="py-2 px-3 font-semibold text-slate-200 break-all max-w-[280px]">
-                                        {file.name}
-                                        <span className="block text-[10px] text-slate-500 font-normal truncate">
+                                        <span className="block truncate max-w-[240px]" title={file.name}>{file.name}</span>
+                                        <span className="block text-[10px] text-slate-500 font-normal truncate max-w-[240px]" title={file.path}>
                                           {file.path}
                                         </span>
                                       </td>
@@ -1655,6 +2049,240 @@ MIME Type: application/pdf
                   <p className="text-xs text-slate-500 mt-1 max-w-sm">
                     输入目录路径并点击【执行 czkawka_core 聚合扫描】开始全量哈希与感知图片去重测试。
                   </p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'geo' && (
+          <div className="lg:col-span-12 grid grid-cols-1 lg:grid-cols-12 gap-6 min-h-0 overflow-y-auto">
+            {/* Left Column: Geo API Request Builder (4 cols) */}
+            <div className="lg:col-span-4 space-y-5 flex flex-col min-h-0">
+              <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                  <div className="flex items-center space-x-2">
+                    <div className="bg-amber-500/10 p-2 rounded-lg text-amber-400">
+                      <MapPin className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h2 className="font-bold text-sm text-slate-100">离线反向地理编码测试</h2>
+                      <span className="text-[11px] font-mono text-emerald-400">POST /api/geo/reverse</span>
+                    </div>
+                  </div>
+                  {/* 数据集可用性徽章（来自 /health 的 geoAvailable） */}
+                  {geoAvailable !== null && (
+                    <span
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
+                        geoAvailable
+                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                          : 'bg-rose-500/20 text-rose-300 border-rose-500/30'
+                      }`}
+                    >
+                      {geoAvailable ? '数据集就绪' : '数据集缺失'}
+                    </span>
+                  )}
+                </div>
+
+                {/* 坐标输入区 */}
+                <div>
+                  <label className="text-xs font-semibold text-slate-300 block mb-1.5">
+                    测试坐标列表（每行: 纬度, 经度，支持 // 注释）
+                  </label>
+                  <textarea
+                    rows={8}
+                    value={geoCoordsText}
+                    onChange={e => setGeoCoordsText(e.target.value)}
+                    placeholder={'22.5431, 114.0579   // 深圳\n39.9042, 116.4074   // 北京'}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs font-mono text-slate-200 focus:border-amber-500 focus:outline-none resize-none"
+                  />
+                  {/* 预置坐标按钮组 */}
+                  <div className="flex gap-1.5 mt-2 flex-wrap">
+                    {GEO_PRESETS.map(preset => (
+                      <button
+                        key={preset.label}
+                        onClick={() => setGeoCoordsText(preset.value)}
+                        className="text-[10px] bg-slate-800/80 hover:bg-slate-800 text-slate-300 px-2 py-1 rounded border border-slate-700 transition-all"
+                      >
+                        {preset.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 请求参数区 */}
+                <div className="space-y-3 pt-1 border-t border-slate-800/80">
+                  <div>
+                    <label className="text-xs font-semibold text-slate-300 block mb-1.5">返回语言 (BCP-47)</label>
+                    <select
+                      value={geoLanguage}
+                      onChange={e => setGeoLanguage(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono text-slate-200 focus:border-amber-500 focus:outline-none"
+                    >
+                      {GEO_LANGUAGE_OPTIONS.map(lang => (
+                        <option key={lang} value={lang}>
+                          {lang}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-xs font-semibold text-slate-300 block mb-1.5">
+                        maxCityKm <span className="text-slate-500 font-normal">(默认50)</span>
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        value={geoMaxCityKm}
+                        onChange={e => setGeoMaxCityKm(e.target.value)}
+                        placeholder="留空用默认"
+                        className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono text-slate-200 focus:border-amber-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-slate-300 block mb-1.5">
+                        maxAnyKm <span className="text-slate-500 font-normal">(默认500)</span>
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        value={geoMaxAnyKm}
+                        onChange={e => setGeoMaxAnyKm(e.target.value)}
+                        placeholder="留空用默认"
+                        className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono text-slate-200 focus:border-amber-500 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* 执行按钮 */}
+                <button
+                  onClick={handleGeoReverse}
+                  disabled={geoQuerying}
+                  className={`w-full py-2.5 rounded-xl text-sm font-bold transition-all flex items-center justify-center space-x-2 ${
+                    geoQuerying
+                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      : 'bg-gradient-to-r from-amber-500 to-orange-600 text-slate-950 hover:brightness-110 shadow-lg shadow-amber-500/20'
+                  }`}
+                >
+                  <Globe2 className={`w-4 h-4 ${geoQuerying ? 'animate-spin' : ''}`} />
+                  <span>{geoQuerying ? '解析中...' : `发起批量解析 (${parseGeoCoords(geoCoordsText).points.length} 点)`}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Right Column: Geo Results Table (8 cols) */}
+            <div className="lg:col-span-8 flex flex-col min-h-0">
+              {geoResults && !geoResults.available ? (
+                /* 软失败横幅：数据缺失时契约恒为 HTTP 200 + available:false */
+                <div className="bg-rose-500/10 border border-rose-500/30 rounded-2xl p-6 flex flex-col items-center justify-center text-center">
+                  <XCircle className="w-10 h-10 mb-2 text-rose-400" />
+                  <p className="text-sm font-semibold text-rose-300">地理子系统不可用（软降级）</p>
+                  <p className="text-xs text-rose-300/70 mt-1 font-mono">{geoResults.reason}</p>
+                  <p className="text-[11px] text-slate-500 mt-3 max-w-md">
+                    请执行 node scripts/setup-extra-resources.js 装配数据集后重启服务
+                  </p>
+                </div>
+              ) : geoResults?.results ? (
+                <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col min-h-0 space-y-4">
+                  {/* 结果头部统计 */}
+                  <div className="border-b border-slate-800 pb-3 flex items-center justify-between flex-wrap gap-2">
+                    <div className="flex items-center space-x-2">
+                      <Globe2 className="w-4 h-4 text-amber-400" />
+                      <span className="text-sm font-bold text-slate-100">解析结果</span>
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 font-mono">
+                        datasetVersion: {geoResults.datasetVersion}
+                      </span>
+                    </div>
+                    <div className="flex items-center space-x-2 text-[11px] font-mono text-slate-400">
+                      <span>命中: {geoResults.results.filter(r => r.found).length}/{geoResults.results.length}</span>
+                      <span>|</span>
+                      <span>language: {geoLanguage}</span>
+                    </div>
+                  </div>
+
+                  {/* 逐点结果表：与请求点按下标对齐 */}
+                  <div className="overflow-y-auto flex-1 min-h-0 pr-1 space-y-2">
+                    {geoResults.results.map((r, idx) => {
+                      const input = geoInputs[idx]
+                      return (
+                        <div
+                          key={idx}
+                          className={`p-3 rounded-xl border transition-all ${
+                            r.found
+                              ? r.city
+                                ? 'bg-emerald-500/5 border-emerald-500/25'
+                                : 'bg-amber-500/5 border-amber-500/25'
+                              : 'bg-slate-950/40 border-slate-800/80'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between mb-1.5 flex-wrap gap-1">
+                            <span className="text-xs font-mono text-slate-300">
+                              #{idx + 1} ({input?.latitude}, {input?.longitude})
+                            </span>
+                            {r.found ? (
+                              <span
+                                className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
+                                  r.city
+                                    ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                                    : 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+                                }`}
+                              >
+                                {r.city ? '城市全量层' : '国家+省中间层'}
+                              </span>
+                            ) : (
+                              <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
+                                未命中
+                              </span>
+                            )}
+                          </div>
+
+                          {r.found ? (
+                            <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 text-xs">
+                              <div>
+                                <span className="text-slate-500 block text-[10px]">country</span>
+                                <span className="text-slate-200 truncate block">{r.country ?? '-'}</span>
+                              </div>
+                              <div>
+                                <span className="text-slate-500 block text-[10px]">province</span>
+                                <span className="text-sky-300 truncate block">{r.province ?? '-'}</span>
+                              </div>
+                              <div>
+                                <span className="text-slate-500 block text-[10px]">city</span>
+                                <span className="text-amber-300 font-semibold truncate block">{r.city ?? '-'}</span>
+                              </div>
+                              <div>
+                                <span className="text-slate-500 block text-[10px]">distanceKm</span>
+                                <span className="font-mono text-purple-300 block">{r.distanceKm ?? '-'}</span>
+                              </div>
+                            </div>
+                          ) : (
+                            <p className="text-[11px] text-slate-500">
+                              超出检索半径或坐标无效（脏坐标单点容错，不影响批次）
+                            </p>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-12 flex flex-col items-center justify-center text-center flex-1 min-h-0 text-slate-500 h-full">
+                  <MapPin className="w-12 h-12 mb-3 opacity-30 text-amber-400" />
+                  <p className="text-sm font-medium text-slate-300">离线反向地理编码测试台就绪</p>
+                  <p className="text-xs text-slate-500 mt-1 max-w-sm">
+                    输入或选择预置测试坐标，点击【发起批量解析】验证 坐标 → 国家 / 省 / 市 的分层输出与多语言回退。
+                  </p>
+                </div>
+              )}
+
+              {/* 错误提示条 */}
+              {geoError && (
+                <div className="mt-3 bg-slate-800/60 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-300 flex items-start space-x-2">
+                  <AlertCircle className="w-3.5 h-3.5 text-amber-400 flex-shrink-0 mt-0.5" />
+                  <span>{geoError}</span>
                 </div>
               )}
             </div>

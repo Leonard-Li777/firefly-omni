@@ -8,6 +8,10 @@ members = [
     "crates/omni-cli",
     "crates/omni-mcp",
     "crates/omni-node",
+    "crates/omni-pro-stub",
+    "omni-pro",
+    "omni-pro/crates/omni-geo",
+    "omni-pro/crates/omni-cleanup",
 ]
 
 [workspace.package]

@@ -464,7 +464,7 @@ impl OmniVisionEngine {
         };
 
         let (w, h) = (img.width(), img.height());
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
+        let _file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
 
         info!("Executing Dynamic PP-OCRv6 ({}) recognition pipeline on {} ({}x{})", model_size, path.display(), w, h);
 
@@ -489,28 +489,7 @@ impl OmniVisionEngine {
             return Ok(String::new());
         }
 
-        let output = format!(
-            "--- Firefly Omni Extracted OCR Content ---\n\
-            File Name: {}\n\
-            Resolution: {} x {} px\n\
-            Model Size: {}\n\
-            Model Keys: {} (Dictionary Entries: {})\n\
-            Pipeline: Dynamic Pixel Grid Detection + PP-OCRv6 CTC Decoder\n\
-            Status: Dynamic Image Recognition Complete\n\n\
-            ==================================================\n\
-            【PP-OCRv6 动态图像识别出的文本段落】\n\
-            ==================================================\n\n\
-            {}",
-            file_name,
-            w,
-            h,
-            if model_size.is_empty() { "small" } else { model_size },
-            if model_dir.is_some() { "Loaded" } else { "Default" },
-            keys_map.len(),
-            formatted_text
-        );
-
-        Ok(output)
+        Ok(formatted_text.trim().to_string())
     }
 
     /// PP-OCRv6 动态图像文本识别引擎 默认重载

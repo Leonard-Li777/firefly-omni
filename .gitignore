@@ -3,5 +3,13 @@ node_modules/
 dist/
 .DS_Store
 build/extraResources/bin
+# omni-geo 地理数据集体积庞大，不入库（由构建脚本生成 / Release 下载装配）
+build/extraResources/geo
+build/geo-cache
 build/presetResources
+
+# omni-pro 闭源专业版子模块隔离 (firefly-omni-pro.git)
+omni-pro/
+pro/
+
 

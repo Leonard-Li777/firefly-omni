@@ -48,8 +48,10 @@ pub struct OmniExtractionResult {
 pub struct DuplicateScanRequest {
     pub paths: Vec<String>,
     pub strategies: Option<Vec<String>>,
-    pub min_similarity: Option<u8>,
+    pub min_similarity: Option<f32>,
     pub check_video: Option<bool>,
+    /// 异常命名检测模式: 'multilingual' (默认: 保留中文/日韩等多语言合规文件名，仅检查首尾空格、非法控制字符等) | 'strict_ascii' (严格纯ASCII模式，非ASCII转写拼音)
+    pub name_issues_mode: Option<String>,
 }
 
 /// 查重文件项
@@ -69,6 +71,8 @@ pub struct OmniDuplicateGroup {
     pub group_id: String,
     pub strategy: String,
     pub similarity_percentage: f32,
+    /// 当前组实际踩线的最低相似度阈值（若相似度低于此组阈值则无法匹配入组）
+    pub group_threshold: Option<f32>,
     pub description: String,
     pub files: Vec<OmniDuplicateFileItem>,
     pub potential_freed_bytes: u64,
@@ -122,7 +126,7 @@ impl OmniExtractionResult {
         Some(format!("{:016x}", hasher))
     }
 
-    /// 检测破损文件 (czkawka_core corrupted file checker)
+    /// 检测破损文件 (基本空文件及可读性检查)
     pub fn check_corrupted<P: AsRef<std::path::Path>>(path: P) -> bool {
         let p = path.as_ref();
         if let Ok(metadata) = std::fs::metadata(p) {
@@ -131,4 +135,6 @@ impl OmniExtractionResult {
         true
     }
 }
+
+
 

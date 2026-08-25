@@ -34,3 +34,52 @@
 ## 📜 许可证 (License)
 
 本项目采用 [Apache-2.0 License](./LICENSE) 协议开源。
+---
+
+## 🌍 离线反向地理编码 (omni-geo)
+
+`crates/omni-geo` 提供完全离线的"坐标 → 国家 / 省 / 州 / 城市"解析能力，基于 GeoNames cities500 裁剪数据集（约 20 万居民点），支持分层降级输出：
+
+| 距离 | 输出层级 |
+| --- | --- |
+| d ≤ 50km（可按请求覆盖） | country + province + city |
+| 50km < d ≤ 500km | country + province |
+| d > 500km | found: false |
+
+### HTTP 接口
+
+- `POST /api/geo/reverse` — 批量反向地理编码（结果与请求点按下标对齐，脏坐标单点容错）
+- `GET /health` — 附 `geoAvailable` 字段供宿主探测
+
+请求示例：
+
+```json
+{
+  "points": [{ "latitude": 22.55, "longitude": 114.07 }],
+  "language": "zh-CN",
+  "maxCityKm": 50,
+  "maxAnyKm": 500
+}
+```
+
+数据集缺失时接口恒返回 HTTP 200 + `available:false`（软降级），不影响服务其余功能。
+
+### 数据集装配
+
+开发环境执行资源初始化脚本即可自动装配（本地 presetResources 优先，缺失时从 firefly-omni Release 回退下载）：
+
+```powershell
+node scripts/setup-extra-resources.js
+```
+
+维护者重建/发布数据集：
+
+```powershell
+node scripts/build-geo-dataset.mjs     # 从 GeoNames 官方转储构建（支持 --use-cache）
+node scripts/upload-ci-static-resources.js   # 上传至 firefly-omni Release (tag: geo-data)
+```
+
+### 📋 数据归属声明 (Attribution — CC-BY 4.0)
+
+本模块使用的地理数据来自 [GeoNames.org](https://www.geonames.org/)，依据 **Creative Commons Attribution 4.0 (CC-BY 4.0)** 许可使用。
+使用本软件即视为已获得该数据的许可声明：**"GeoNames 数据由 geonames.org 提供"**。
