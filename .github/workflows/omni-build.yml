@@ -26,6 +26,9 @@ concurrency:
   group: omni-build-${{ github.event.inputs.edition }}-${{ github.event.inputs.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: 构建 ${{ matrix.os }} / ${{ matrix.target }}

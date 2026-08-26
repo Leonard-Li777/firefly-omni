@@ -17,6 +17,9 @@ concurrency:
   group: omni-libmupdf-build-${{ github.event.inputs.mupdf_version }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   build-libmupdf:
     name: 编译 libmupdf / ${{ matrix.artifact_suffix }}
