@@ -175,9 +175,15 @@ jobs:
 
           if [ "${{ runner.os }}" = "macOS" ]; then
             cp mupdf/build/release/universal/*.a "${OUT_DIR}/" 2>/dev/null || true
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            # 收集 Windows MSBuild 生成的所有依赖静态库
+            find mupdf/platform/win32/x64/Release -name "*.lib" 2>/dev/null | while read f; do
+              cp "$f" "${OUT_DIR}/"
+              echo "📦 已收集: $f"
+            done
           else
-            # 兼容 MSBuild 与 make 产生的 lib 路径 (mupdf/build, platform/win32/x64/Release, 等)
-            find mupdf -name "*.lib" -o -name "*.a" 2>/dev/null | grep -E "(libmupdf|mupdf-third|mupdf-threads)" | while read f; do
+            # Linux 产物
+            find mupdf/build -name "*.a" 2>/dev/null | while read f; do
               cp "$f" "${OUT_DIR}/"
               echo "📦 已收集: $f"
             done
