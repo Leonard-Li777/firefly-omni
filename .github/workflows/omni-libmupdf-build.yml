@@ -97,13 +97,15 @@ jobs:
             libs \
             -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
 
+      - name: 设置 MSBuild 环境 (Windows)
+        if: runner.os == 'Windows'
+        uses: microsoft/setup-msbuild@v2
+
       - name: 编译 MuPDF 静态库（Windows）
         if: runner.os == 'Windows'
         shell: cmd
         run: |
           cd mupdf
-          :: 使用 MSBuild 或 nmake，MuPDF 提供 platform/win32 解决方案
-          :: 优先尝试 Visual Studio 构建
           if exist platform\win32\mupdf.sln (
             msbuild platform\win32\mupdf.sln ^
               /p:Configuration=Release ^
