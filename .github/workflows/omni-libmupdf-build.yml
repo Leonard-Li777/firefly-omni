@@ -54,6 +54,9 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
       - name: 安装 Linux 编译依赖
         if: runner.os == 'Linux'
         run: |
@@ -208,7 +211,7 @@ jobs:
           TAG="${{ github.event.inputs.upload_tag }}"
           FILE="${{ env.ASSET_FILE }}"
           echo "🚀 使用 gh CLI 上传 $FILE 到 Release $TAG..."
-          gh release upload "$TAG" "$FILE" --clobber
+          gh release upload "$TAG" "$FILE" --repo "${{ github.repository }}" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
