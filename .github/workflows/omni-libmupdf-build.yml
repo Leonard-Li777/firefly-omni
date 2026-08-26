@@ -110,7 +110,7 @@ jobs:
             HAVE_GLFW=no \
             HAVE_CURL=no \
             HAVE_GLUT=no \
-            SYS_ZLIB=libs \
+            USE_SYSTEM_ZLIB=yes \
             XCFLAGS="-arch arm64" \
             XLIBS="-arch arm64" \
             build=release \
@@ -127,7 +127,7 @@ jobs:
             HAVE_GLFW=no \
             HAVE_CURL=no \
             HAVE_GLUT=no \
-            SYS_ZLIB=libs \
+            USE_SYSTEM_ZLIB=yes \
             XCFLAGS="-arch x86_64" \
             XLIBS="-arch x86_64" \
             build=release \
