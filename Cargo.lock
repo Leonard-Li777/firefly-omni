@@ -3652,6 +3652,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-cover"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "image",
+ "mupdf",
+ "psd",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "webp",
+ "which",
+]
+
+[[package]]
 name = "omni-extract"
 version = "0.1.0"
 dependencies = [
@@ -3715,20 +3732,14 @@ name = "omni-pro"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
- "image",
- "mupdf",
  "omni-cleanup",
  "omni-core",
+ "omni-cover",
  "omni-geo",
- "psd",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "tracing",
- "webp",
- "which",
 ]
 
 [[package]]
