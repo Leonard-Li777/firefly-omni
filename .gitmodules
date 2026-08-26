@@ -1,0 +1,4 @@
+[submodule "omni-pro"]
+	path = omni-pro
+	url = git@github.com:Leonard-Li777/firefly-omni-pro.git
+	branch = main
