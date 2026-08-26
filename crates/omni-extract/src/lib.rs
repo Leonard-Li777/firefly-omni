@@ -1,4 +1,4 @@
-use omni_core::{OmniConfig, OmniExtractionResult};
+use omni_core::{to_native_path_str, OmniConfig, OmniExtractionResult};
 use omni_vision::OmniVisionEngine;
 use anyhow::Result;
 use encoding_rs::{GBK, UTF_8, UTF_16LE};
@@ -15,7 +15,7 @@ pub struct OmniExtractor;
 impl OmniExtractor {
     pub async fn extract<P: AsRef<Path>>(path: P, config: &OmniConfig) -> Result<OmniExtractionResult> {
         let p = path.as_ref();
-        let path_str = p.to_string_lossy().to_string();
+        let path_str = to_native_path_str(p);
         let metadata = std::fs::metadata(p)?;
         let file_size = metadata.len();
 

@@ -1,0 +1,3 @@
+[env]
+LIBCLANG_PATH = { value = "D:\\workspace\\firefly-ai-folder\\apps\\omni\\build\\presetResources\\libclang\\bin", relative = false }
+MUPDF_LIB = { value = "D:\\workspace\\firefly-ai-folder\\apps\\omni\\build\\presetResources\\libmupdf", relative = false }

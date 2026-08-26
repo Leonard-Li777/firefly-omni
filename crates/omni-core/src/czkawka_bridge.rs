@@ -118,6 +118,17 @@ fn ensure_media_tools_in_path() {
     }
 }
 
+/// 将 Path/PathBuf 统一转换为符合当前操作系统原生标准的路径字符串（Windows 下为 \，Unix/macOS 下为 /）
+#[inline]
+pub fn to_native_path_str<P: AsRef<std::path::Path>>(path: P) -> String {
+    let raw = path.as_ref().to_string_lossy().to_string();
+    if cfg!(target_os = "windows") {
+        raw.replace('/', "\\")
+    } else {
+        raw.replace('\\', "/")
+    }
+}
+
 impl CzkawkaBridge {
     pub fn init() {
         INIT_CZKAWKA.call_once(|| {
@@ -164,8 +175,28 @@ impl CzkawkaBridge {
         let video_subclip_min = (0.7 - sim_factor * 0.5) as f64;
         let video_audio_similarity = (min_sim * 10.0) as f64;
 
-        let run_exact = enabled_strategies.is_empty() || enabled_strategies.iter().any(|s| s == "exact_hash" || s == "exact" || s == "duplicates");
-        let run_image = enabled_strategies.is_empty() || enabled_strategies.iter().any(|s| s == "image_phash" || s == "image" || s == "similar_images");
+        let total_strategies = enabled_strategies.len();
+        let completed_strategies = Arc::new(AtomicUsize::new(0));
+
+        let progress_tx = {
+            let on_prog = Arc::new(on_progress);
+            let comp = completed_strategies.clone();
+            move |data: &ProgressData| {
+                let current_step = comp.load(Ordering::Relaxed);
+                let current_pct = if data.files_to_check > 0 {
+                    (data.current_stage * 100) / data.files_to_check
+                } else {
+                    0
+                };
+                let overall_pct = ((current_step * 100) + current_pct) / total_strategies.max(1);
+                on_prog(overall_pct.min(100), current_step, format!("正在比对: {}/{}", data.current_stage, data.files_to_check));
+            }
+        };
+
+        let mut groups: Vec<OmniDuplicateGroup> = Vec::new();
+
+        let run_exact = enabled_strategies.iter().any(|s| s == "exact_hash" || s == "exact" || s == "duplicates");
+        let run_image = enabled_strategies.iter().any(|s| s == "image_phash" || s == "image" || s == "similar_images");
         let run_audio = enabled_strategies.iter().any(|s| s == "audio_hash" || s == "audio" || s == "same_music");
         let run_video = req.check_video == Some(true) || enabled_strategies.iter().any(|s| s == "video_phash" || s == "video" || s == "similar_videos");
         let run_bad_ext = enabled_strategies.iter().any(|s| s == "bad_extensions");
@@ -179,29 +210,6 @@ impl CzkawkaBridge {
         let run_exif_remover = enabled_strategies.iter().any(|s| s == "exif_remover");
         let run_video_optimizer = enabled_strategies.iter().any(|s| s == "video_optimizer");
 
-        let (progress_tx, progress_rx) = crossbeam_channel::unbounded::<ProgressData>();
-        let on_progress_arc = Arc::new(on_progress);
-        let on_progress_thread = on_progress_arc.clone();
-        let stop_flag_thread = stop_flag.clone();
-        let total_files_scanned = Arc::new(AtomicUsize::new(0));
-        let total_files_scanned_thread = total_files_scanned.clone();
-
-        let progress_handle = std::thread::spawn(move || {
-            while let Ok(progress) = progress_rx.recv() {
-                if stop_flag_thread.load(Ordering::Relaxed) {
-                    break;
-                }
-                let checked = progress.entries_checked;
-                let total = progress.entries_to_check.max(checked);
-                total_files_scanned_thread.fetch_max(total, Ordering::Relaxed);
-                total_files_scanned_thread.fetch_max(checked, Ordering::Relaxed);
-                let stage_name = format!("{:?}", progress.stage);
-                on_progress_thread(checked, total, stage_name);
-            }
-        });
-
-        let mut groups: Vec<OmniDuplicateGroup> = Vec::new();
-
         if run_exact {
             let params = DuplicateFinderParameters::new(CheckingMethod::Hash, HashType::Blake3, false, 0, 0, false);
             let mut finder = DuplicateFinder::new(params);
@@ -212,7 +220,7 @@ impl CzkawkaBridge {
                 for vector in vectors_vector {
                     if vector.len() >= 2 {
                         let items: Vec<OmniDuplicateFileItem> = vector.iter().map(|entry| {
-                            OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: *size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.hash.clone(), similarity_score: Some(1.0) }
+                            OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: *size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.hash.clone(), similarity_score: Some(1.0) }
                         }).collect();
                         let group = OmniDuplicateGroup {
                             group_id: format!("exact_{}", exact_group_idx),
@@ -240,7 +248,7 @@ impl CzkawkaBridge {
             for vector in img_finder.get_similar_images() {
                 if vector.len() >= 2 {
                     let items: Vec<OmniDuplicateFileItem> = vector.iter().map(|entry| {
-                        OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{:?}", entry.hashes), similarity_score: Some(min_sim / 10.0) }
+                        OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{:?}", entry.hashes), similarity_score: Some(min_sim / 10.0) }
                     }).collect();
                     let avg_size = vector.iter().map(|e| e.size).sum::<u64>() / vector.len() as u64;
                     // 动态计算当前组实际踩线容差阈值 (0.0 ~ 10.0)
@@ -277,7 +285,7 @@ impl CzkawkaBridge {
             for vector in music_tool.get_duplicated_music_entries() {
                 if vector.len() >= 2 {
                     let items: Vec<OmniDuplicateFileItem> = vector.iter().map(|entry| {
-                        OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{:?}", entry.fingerprint), similarity_score: Some(min_sim / 10.0) }
+                        OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{:?}", entry.fingerprint), similarity_score: Some(min_sim / 10.0) }
                     }).collect();
                     let avg_size = vector.iter().map(|e| e.size).sum::<u64>() / vector.len() as u64;
                     let group = OmniDuplicateGroup {
@@ -325,7 +333,7 @@ impl CzkawkaBridge {
             for vector in video_tool.get_similar_videos() {
                 if vector.len() >= 2 {
                     let items: Vec<OmniDuplicateFileItem> = vector.iter().map(|entry| {
-                        OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{:?}", entry.signature), similarity_score: Some(min_sim / 10.0) }
+                        OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{:?}", entry.signature), similarity_score: Some(min_sim / 10.0) }
                     }).collect();
                     let avg_size = vector.iter().map(|e| e.size).sum::<u64>() / vector.len() as u64;
                     let group = OmniDuplicateGroup {
@@ -344,6 +352,8 @@ impl CzkawkaBridge {
             }
         }
 
+        let mut detected_bad_ext_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         if run_bad_ext {
             let mut bad_tool = BadExtensions::new(BadExtensionsParameters::new());
             bad_tool.set_included_paths(target_paths.clone());
@@ -351,7 +361,9 @@ impl CzkawkaBridge {
             let bad_files = bad_tool.get_bad_extensions_files();
             if !bad_files.is_empty() {
                 let items: Vec<OmniDuplicateFileItem> = bad_files.iter().map(|entry| {
-                    OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: format!("{} (真实应为: .{})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.proper_extension), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.proper_extensions_group.clone(), similarity_score: Some(0.0) }
+                    let p = to_native_path_str(&entry.path);
+                    detected_bad_ext_paths.insert(p.clone());
+                    OmniDuplicateFileItem { path: p, name: format!("{} (真实应为: .{})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.proper_extension), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.proper_extensions_group.clone(), similarity_score: Some(0.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "bad_extensions".to_string(),
@@ -374,7 +386,7 @@ impl CzkawkaBridge {
             let empty_folder_list = empty_folder_tool.get_empty_folder_list();
             if !empty_folder_list.is_empty() {
                 let items: Vec<OmniDuplicateFileItem> = empty_folder_list.values().map(|entry| {
-                    OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: 0, modified_at: format!("{}", entry.modified_date), fingerprint: "empty_folder".to_string(), similarity_score: Some(1.0) }
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: 0, modified_at: format!("{}", entry.modified_date), fingerprint: "empty_folder".to_string(), similarity_score: Some(1.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "empty_folders".to_string(),
@@ -395,16 +407,18 @@ impl CzkawkaBridge {
             big_file_tool.set_included_paths(target_paths.clone());
             big_file_tool.search(stop_flag, Some(&progress_tx));
             let big_files = big_file_tool.get_big_files();
-            if !big_files.is_empty() {
-                let items: Vec<OmniDuplicateFileItem> = big_files.iter().map(|entry| {
-                    OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{}_bytes", entry.size), similarity_score: Some(1.0) }
+            const MIN_BIG_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB 起始指标
+            let filtered_big_files: Vec<_> = big_files.iter().filter(|entry| entry.size >= MIN_BIG_FILE_SIZE).collect();
+            if !filtered_big_files.is_empty() {
+                let items: Vec<OmniDuplicateFileItem> = filtered_big_files.iter().map(|entry| {
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{}_bytes", entry.size), similarity_score: Some(1.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "big_files".to_string(),
                     strategy: "big_files".to_string(),
                     similarity_percentage: 100.0,
                     group_threshold: None,
-                    description: format!("占用空间最大的文件 Top {} (共{}个)", items.len(), items.len()),
+                    description: format!("占用空间超大文件 >= 10MB Top {} (共{}个)", items.len(), items.len()),
                     files: items,
                     potential_freed_bytes: 0
                 };
@@ -420,7 +434,7 @@ impl CzkawkaBridge {
             let empty_files = empty_files_tool.get_empty_files();
             if !empty_files.is_empty() {
                 let items: Vec<OmniDuplicateFileItem> = empty_files.iter().map(|entry| {
-                    OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: "0_bytes".to_string(), similarity_score: Some(1.0) }
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: "0_bytes".to_string(), similarity_score: Some(1.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "empty_files".to_string(),
@@ -444,7 +458,7 @@ impl CzkawkaBridge {
             if !temp_files.is_empty() {
                 let total_size: u64 = temp_files.iter().map(|e| e.size).sum();
                 let items: Vec<OmniDuplicateFileItem> = temp_files.iter().map(|entry| {
-                    OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: "temp_file".to_string(), similarity_score: Some(1.0) }
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: entry.path.file_name().unwrap_or_default().to_string_lossy().to_string(), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: "temp_file".to_string(), similarity_score: Some(1.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "temporary_files".to_string(),
@@ -467,7 +481,7 @@ impl CzkawkaBridge {
             let invalid_symlinks = symlink_tool.get_invalid_symlinks();
             if !invalid_symlinks.is_empty() {
                 let items: Vec<OmniDuplicateFileItem> = invalid_symlinks.iter().map(|entry| {
-                    OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: format!("{} (指向不存在: {})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.symlink_info.destination_path.to_string_lossy()), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{:?}", entry.symlink_info.type_of_error), similarity_score: Some(0.0) }
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: format!("{} (指向不存在: {})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.symlink_info.destination_path.to_string_lossy()), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{:?}", entry.symlink_info.type_of_error), similarity_score: Some(0.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "invalid_symlinks".to_string(),
@@ -484,23 +498,37 @@ impl CzkawkaBridge {
         }
 
         if run_broken_files {
+            // 若用户未同时勾选 bad_extensions 策略，则在后台动态探测一次 bad_extensions 路径以进行交叉防误判
+            if !run_bad_ext {
+                let mut temp_bad_tool = BadExtensions::new(BadExtensionsParameters::new());
+                temp_bad_tool.set_included_paths(target_paths.clone());
+                temp_bad_tool.search(stop_flag, None);
+                for entry in temp_bad_tool.get_bad_extensions_files() {
+                    detected_bad_ext_paths.insert(to_native_path_str(&entry.path));
+                }
+            }
+
             let params = BrokenFilesParameters::new(CheckedTypes::PDF | CheckedTypes::AUDIO | CheckedTypes::IMAGE | CheckedTypes::ARCHIVE | CheckedTypes::MARKUP);
             let mut broken_tool = BrokenFiles::new(params);
             broken_tool.set_included_paths(target_paths.clone());
             broken_tool.search(stop_flag, Some(&progress_tx));
             let broken_files = broken_tool.get_broken_files();
-            if !broken_files.is_empty() {
-                let items: Vec<OmniDuplicateFileItem> = broken_files.iter().map(|entry| {
+            let valid_broken_files: Vec<_> = broken_files
+                .iter()
+                .filter(|e| e.size > 0 && !detected_bad_ext_paths.contains(&to_native_path_str(&e.path)))
+                .collect();
+            if !valid_broken_files.is_empty() {
+                let items: Vec<OmniDuplicateFileItem> = valid_broken_files.iter().map(|entry| {
                     let name = entry.path.file_name().unwrap_or_default().to_string_lossy().to_string();
                     let error_msg = entry.get_error_string();
-                    OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: if error_msg.is_empty() { name } else { format!("{} ({})", name, error_msg) }, size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: error_msg, similarity_score: Some(0.0) }
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: if error_msg.is_empty() { name } else { format!("{} ({})", name, error_msg) }, size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: error_msg, similarity_score: Some(0.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "broken_files".to_string(),
                     strategy: "broken_files".to_string(),
                     similarity_percentage: 0.0,
                     group_threshold: None,
-                    description: format!("损坏或无法解码的文件 ({}个)", broken_files.len()),
+                    description: format!("损坏或无法解码的文件 ({}个)", valid_broken_files.len()),
                     files: items,
                     potential_freed_bytes: 0
                 };
@@ -534,7 +562,7 @@ impl CzkawkaBridge {
             let bad_names = bad_names_tool.get_bad_names_files();
             if !bad_names.is_empty() {
                 let items: Vec<OmniDuplicateFileItem> = bad_names.iter().map(|entry| {
-                    OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: format!("{} (建议更名: {})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.new_name), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.new_name.clone(), similarity_score: Some(0.0) }
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: format!("{} (建议更名: {})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.new_name), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.new_name.clone(), similarity_score: Some(0.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "bad_names".to_string(),
@@ -557,7 +585,7 @@ impl CzkawkaBridge {
             let exif_files = exif_tool.get_exif_files();
             if !exif_files.is_empty() {
                 let items: Vec<OmniDuplicateFileItem> = exif_files.iter().map(|entry| {
-                    OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: format!("{} (含 {} 项Exif标记)", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.exif_tags.len()), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{}_exif_tags", entry.exif_tags.len()), similarity_score: Some(1.0) }
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: format!("{} (含 {} 项Exif标记)", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.exif_tags.len()), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{}_exif_tags", entry.exif_tags.len()), similarity_score: Some(1.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "exif_remover".to_string(),
@@ -581,7 +609,7 @@ impl CzkawkaBridge {
             let transcode_entries = video_opt_tool.get_video_transcode_entries();
             if !transcode_entries.is_empty() {
                 let items: Vec<OmniDuplicateFileItem> = transcode_entries.iter().map(|entry| {
-                    OmniDuplicateFileItem { path: entry.path.to_string_lossy().to_string(), name: format!("{} (当前编码: {}, 分辨率: {}x{})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.codec, entry.width, entry.height), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.codec.clone(), similarity_score: Some(1.0) }
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: format!("{} (当前编码: {}, 分辨率: {}x{})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.codec, entry.width, entry.height), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.codec.clone(), similarity_score: Some(1.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "video_optimizer".to_string(),

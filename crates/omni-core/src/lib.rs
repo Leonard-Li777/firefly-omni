@@ -136,5 +136,13 @@ impl OmniExtractionResult {
     }
 }
 
-
-
+/// 将 Path/PathBuf 统一转换为符合当前操作系统原生标准的路径字符串（Windows 下为 \，Unix/macOS 下为 /）
+#[inline]
+pub fn to_native_path_str<P: AsRef<std::path::Path>>(path: P) -> String {
+    let raw = path.as_ref().to_string_lossy().to_string();
+    if cfg!(target_os = "windows") {
+        raw.replace('/', "\\")
+    } else {
+        raw.replace('\\', "/")
+    }
+}
