@@ -102,15 +102,15 @@ jobs:
         run: |
           cd mupdf
           
-          # 1. 编译 arm64 架构
+          # 1. 编译 arm64 架构 (采用纯静态嵌入，避免 MacOSX.sdk zlib fdopen 宏冲突)
           echo "🔨 正在编译 macOS arm64 静态库..."
           make clean
           make \
             HAVE_X11=no \
             HAVE_GLFW=no \
             HAVE_CURL=no \
-            OS=Darwin \
-            XCFLAGS="-arch arm64" \
+            HAVE_GLUT=no \
+            XCFLAGS="-arch arm64 -DHAVE_FDOPEN=1" \
             XLIBS="-arch arm64" \
             build=release \
             libs \
@@ -125,8 +125,8 @@ jobs:
             HAVE_X11=no \
             HAVE_GLFW=no \
             HAVE_CURL=no \
-            OS=Darwin \
-            XCFLAGS="-arch x86_64" \
+            HAVE_GLUT=no \
+            XCFLAGS="-arch x86_64 -DHAVE_FDOPEN=1" \
             XLIBS="-arch x86_64" \
             build=release \
             libs \
@@ -174,15 +174,10 @@ jobs:
           if [ "${{ runner.os }}" = "macOS" ]; then
             cp mupdf/build/release/universal/*.a "${OUT_DIR}/" 2>/dev/null || true
           else
-            find mupdf/build -name "libmupdf.a" -o -name "libmupdf.lib" 2>/dev/null | while read f; do
+            # 兼容 MSBuild 与 make 产生的 lib 路径 (mupdf/build, platform/win32/x64/Release, 等)
+            find mupdf -name "*.lib" -o -name "*.a" 2>/dev/null | grep -E "(libmupdf|mupdf-third|mupdf-threads)" | while read f; do
               cp "$f" "${OUT_DIR}/"
               echo "📦 已收集: $f"
-            done
-            find mupdf/build -name "libmupdf-third.a" -o -name "libmupdf-third.lib" 2>/dev/null | while read f; do
-              cp "$f" "${OUT_DIR}/"
-            done
-            find mupdf/build -name "libmupdf-threads.a" 2>/dev/null | while read f; do
-              cp "$f" "${OUT_DIR}/"
             done
           fi
 
