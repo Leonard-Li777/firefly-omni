@@ -1,0 +1,215 @@
+name: omni-build
+
+on:
+  # 手动触发，支持选择版本类型和目标分支
+  workflow_dispatch:
+    inputs:
+      edition:
+        description: '构建版本类型'
+        required: true
+        default: 'pro'
+        type: choice
+        options:
+          - pro
+          - ce
+      ref:
+        description: '构建分支或标签（默认 main）'
+        required: false
+        default: 'main'
+      version_tag:
+        description: '发布版本号（如 v0.1.0），留空则使用 Cargo.toml 中的版本'
+        required: false
+        default: ''
+
+# 防止同一版本并发构建
+concurrency:
+  group: omni-build-${{ github.event.inputs.edition }}-${{ github.event.inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.os }} / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_suffix: windows-x86_64
+            archive_ext: zip
+
+          # macOS x86_64 (Intel)
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact_suffix: macos-x86_64
+            archive_ext: tar.gz
+
+          # macOS aarch64 (Apple Silicon)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_suffix: macos-aarch64
+            archive_ext: tar.gz
+
+          # Linux x86_64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact_suffix: linux-x86_64
+            archive_ext: tar.gz
+
+          # Linux aarch64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_suffix: linux-aarch64
+            archive_ext: tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          submodules: recursive
+          # Pro 版需要访问私有 submodule（omni-pro、omni-geo、omni-cleanup）
+          token: ${{ secrets.PRO_SUBMODULE_TOKEN || github.token }}
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+          key: ${{ matrix.target }}-${{ github.event.inputs.edition }}
+
+      - name: 安装 Linux aarch64 交叉编译工具链
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: 安装 Linux 构建依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            pkg-config \
+            libssl-dev \
+            cmake \
+            clang \
+            libfreetype-dev \
+            libfontconfig-dev
+
+      - name: 配置构建版本（CE / Pro）
+        shell: bash
+        run: |
+          if [ "${{ github.event.inputs.edition }}" = "ce" ]; then
+            echo "🌍 构建社区开源版 (CE)..."
+            # CE 版使用 omni-pro-stub，排除私有 submodule
+            node scripts/configure-edition.js --ce 2>/dev/null || true
+          else
+            echo "🔒 构建企业专有版 (Pro)..."
+          fi
+
+      - name: 下载 libmupdf 预编译静态库
+        shell: bash
+        run: |
+          # 从 ci-resources Release 拉取对应平台的预编译 libmupdf
+          ARTIFACT_SUFFIX="${{ matrix.artifact_suffix }}"
+          ASSET_NAME="libmupdf-${ARTIFACT_SUFFIX}.tar.gz"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            ASSET_NAME="libmupdf-${ARTIFACT_SUFFIX}.zip"
+          fi
+
+          echo "📥 下载 ${ASSET_NAME}..."
+          node scripts/download-libmupdf.js --platform "${{ matrix.artifact_suffix }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建 firefly-omni 二进制
+        shell: bash
+        run: |
+          # 设置 MUPDF_LIB 环境变量指向预编译静态库
+          LIB_DIR="build/libmupdf/${{ matrix.artifact_suffix }}"
+          if [ -d "$LIB_DIR" ]; then
+            export MUPDF_LIB="$(pwd)/$LIB_DIR"
+            echo "✅ 使用预编译 MuPDF: $MUPDF_LIB"
+          else
+            echo "⚠️ 未找到预编译 libmupdf，将使用 vendored 编译（较慢）"
+          fi
+
+          cargo build \
+            --manifest-path Cargo.toml \
+            --bin firefly-omni \
+            --release \
+            --target ${{ matrix.target }}
+        env:
+          MUPDF_LIB: ${{ env.MUPDF_LIB }}
+
+      - name: 打包产物
+        shell: bash
+        run: |
+          BIN_NAME="firefly-omni"
+          TARGET_DIR="target/${{ matrix.target }}/release"
+          ARTIFACT_NAME="firefly-omni-${{ matrix.artifact_suffix }}"
+
+          mkdir -p dist
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            BIN_NAME="${BIN_NAME}.exe"
+            cp "${TARGET_DIR}/${BIN_NAME}" "dist/${BIN_NAME}"
+            cd dist
+            7z a "${ARTIFACT_NAME}.zip" "${BIN_NAME}"
+            echo "ARTIFACT_PATH=dist/${ARTIFACT_NAME}.zip" >> $GITHUB_ENV
+          else
+            cp "${TARGET_DIR}/${BIN_NAME}" "dist/${BIN_NAME}"
+            chmod +x "dist/${BIN_NAME}"
+            cd dist
+            tar czf "${ARTIFACT_NAME}.tar.gz" "${BIN_NAME}"
+            echo "ARTIFACT_PATH=dist/${ARTIFACT_NAME}.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: 读取版本号
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version_tag }}" ]; then
+            VERSION="${{ github.event.inputs.version_tag }}"
+          else
+            VERSION="v$(cargo metadata --manifest-path Cargo.toml --no-deps --format-version 1 \
+              | python3 -c "import sys,json; pkgs=json.load(sys.stdin)['packages']; \
+                print(next(p['version'] for p in pkgs if p['name']=='omni-server'))")"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "📌 发布版本: ${VERSION}"
+
+      - name: 发布到 GitHub Release（Pro 版 → 私有仓库）
+        if: github.event.inputs.edition == 'pro'
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: Leonard-Li777/firefly-ai-folder
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Firefly Omni ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          files: ${{ env.ARTIFACT_PATH }}
+          # 同一 tag 下多次上传会追加产物，不覆盖已有文件
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.PRO_RELEASE_TOKEN }}
+
+      - name: 发布到 GitHub Release（CE 版 → 开源仓库）
+        if: github.event.inputs.edition == 'ce'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Firefly Omni CE ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          files: ${{ env.ARTIFACT_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

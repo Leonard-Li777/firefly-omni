@@ -114,3 +114,16 @@ impl PdfRenderer {
         anyhow::bail!("Open-core mode: omni-pro not present");
     }
 }
+
+/// 多格式封面提取（社区版存根，统一返回不可用）
+pub mod cover {
+    pub struct CoverRenderer;
+
+    impl CoverRenderer {
+        pub fn render_cover<P: AsRef<std::path::Path>>(_file_path: P) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("Open-core mode: cover extraction requires omni-pro");
+        }
+    }
+}
+
+pub use cover::CoverRenderer;

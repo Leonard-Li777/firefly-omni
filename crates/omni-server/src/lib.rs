@@ -187,18 +187,14 @@ async fn file_preview_handler(Query(req): Query<FilePreviewRequest>) -> Response
 }
 
 /// 通用文件封面截取接口: GET /api/cover?path=<urlencoded 绝对路径>
-/// 支持 PDF 等格式的高清封面截取；若传入暂不支持的格式，返回 204 No Content (空) 方便调用方平滑降级
+/// 支持 PDF、PSD、视频（MP4/MOV/AVI/MKV）等格式的高清封面截取（WebP 格式返回）
+/// 若传入暂不支持的格式，返回 204 No Content 方便调用方平滑降级
 async fn cover_handler(Query(req): Query<FilePreviewRequest>) -> Response {
-    let lower_path = req.path.to_lowercase();
-    let is_pdf = lower_path.ends_with(".pdf");
-
-    if !is_pdf {
-        return StatusCode::NO_CONTENT.into_response();
-    }
-
     let path = PathBuf::from(&req.path);
+
+    // 交由 CoverRenderer 按扩展名路由，不支持的格式由其内部返回 Err
     let outcome = tokio::task::spawn_blocking(move || {
-        omni_pro::PdfRenderer::render_cover(&path)
+        omni_pro::CoverRenderer::render_cover(&path)
     })
     .await;
 
@@ -206,11 +202,13 @@ async fn cover_handler(Query(req): Query<FilePreviewRequest>) -> Response {
         Ok(Ok(bytes)) => {
             let body = Body::from(bytes);
             let mut resp = Response::new(body);
+            // CoverRenderer 统一返回 WebP 格式
             resp.headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/webp"));
             resp
         }
         Ok(Err(err)) => {
+            // 不支持的格式或渲染失败 → 204 静默降级
             tracing::debug!("Cover rendering failed or skipped for {}: {}", req.path, err);
             StatusCode::NO_CONTENT.into_response()
         }

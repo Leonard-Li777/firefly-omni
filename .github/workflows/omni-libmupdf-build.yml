@@ -1,0 +1,171 @@
+name: omni-libmupdf-build
+
+on:
+  # 仅手动触发——MuPDF 版本升级时运行一次，产物长期复用
+  workflow_dispatch:
+    inputs:
+      mupdf_version:
+        description: 'MuPDF 版本标签（如 1.24.9）'
+        required: true
+        default: '1.24.9'
+      upload_tag:
+        description: '上传到哪个 GitHub Release Tag'
+        required: true
+        default: 'ci-resources'
+
+concurrency:
+  group: omni-libmupdf-build-${{ github.event.inputs.mupdf_version }}
+  cancel-in-progress: true
+
+jobs:
+  build-libmupdf:
+    name: 编译 libmupdf / ${{ matrix.artifact_suffix }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows x86_64
+          - os: windows-latest
+            artifact_suffix: windows-x86_64
+            archive_ext: zip
+            lib_name: libmupdf.lib
+
+          # macOS x86_64 (Intel)
+          - os: macos-13
+            artifact_suffix: macos-x86_64
+            archive_ext: tar.gz
+            lib_name: libmupdf.a
+
+          # macOS aarch64 (Apple Silicon)
+          - os: macos-latest
+            artifact_suffix: macos-aarch64
+            archive_ext: tar.gz
+            lib_name: libmupdf.a
+
+          # Linux x86_64
+          - os: ubuntu-22.04
+            artifact_suffix: linux-x86_64
+            archive_ext: tar.gz
+            lib_name: libmupdf.a
+
+          # Linux aarch64
+          - os: ubuntu-22.04-arm
+            artifact_suffix: linux-aarch64
+            archive_ext: tar.gz
+            lib_name: libmupdf.a
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: 安装 Linux 编译依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake \
+            clang \
+            libfreetype-dev \
+            libfontconfig-dev \
+            libjpeg-dev \
+            libopenjp2-7-dev \
+            zlib1g-dev
+
+      - name: 安装 macOS 编译依赖
+        if: runner.os == 'macOS'
+        run: brew install cmake
+
+      - name: 克隆 MuPDF 源码
+        shell: bash
+        run: |
+          git clone \
+            --depth 1 \
+            --branch ${{ github.event.inputs.mupdf_version }} \
+            --recurse-submodules \
+            https://github.com/ArtifexSoftware/mupdf.git
+          echo "✅ MuPDF ${{ github.event.inputs.mupdf_version }} 克隆完成"
+
+      - name: 编译 MuPDF 静态库（Unix）
+        if: runner.os != 'Windows'
+        run: |
+          cd mupdf
+          make \
+            HAVE_X11=no \
+            HAVE_GLFW=no \
+            HAVE_CURL=no \
+            OS=Linux \
+            build=release \
+            libs \
+            -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
+
+      - name: 编译 MuPDF 静态库（Windows）
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          cd mupdf
+          :: 使用 MSBuild 或 nmake，MuPDF 提供 platform/win32 解决方案
+          :: 优先尝试 Visual Studio 构建
+          if exist platform\win32\mupdf.sln (
+            msbuild platform\win32\mupdf.sln ^
+              /p:Configuration=Release ^
+              /p:Platform=x64 ^
+              /m
+          ) else (
+            nmake HAVE_GLFW=no HAVE_CURL=no build=release libs
+          )
+
+      - name: 收集产物
+        shell: bash
+        run: |
+          OUT_DIR="libmupdf-out"
+          mkdir -p "${OUT_DIR}"
+
+          # 复制静态库文件（多个变体兼容）
+          find mupdf/build -name "libmupdf.a" -o -name "libmupdf.lib" 2>/dev/null | while read f; do
+            cp "$f" "${OUT_DIR}/"
+            echo "📦 已收集: $f"
+          done
+          find mupdf/build -name "libmupdf-third.a" -o -name "libmupdf-third.lib" 2>/dev/null | while read f; do
+            cp "$f" "${OUT_DIR}/"
+          done
+          find mupdf/build -name "libmupdf-threads.a" 2>/dev/null | while read f; do
+            cp "$f" "${OUT_DIR}/"
+          done
+
+          # 复制头文件
+          cp -r mupdf/include "${OUT_DIR}/"
+
+          echo "📂 产物目录内容:"
+          ls -lh "${OUT_DIR}/"
+
+      - name: 打包产物
+        shell: bash
+        run: |
+          ASSET_NAME="libmupdf-${{ matrix.artifact_suffix }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${ASSET_NAME}.zip" libmupdf-out/
+            echo "ASSET_FILE=${ASSET_NAME}.zip" >> $GITHUB_ENV
+          else
+            tar czf "${ASSET_NAME}.tar.gz" libmupdf-out/
+            echo "ASSET_FILE=${ASSET_NAME}.tar.gz" >> $GITHUB_ENV
+          fi
+          echo "✅ 打包完成: $ASSET_FILE"
+
+      - name: 上传到 GitHub Release（ci-resources）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.upload_tag }}
+          name: CI 静态资源（${{ github.event.inputs.upload_tag }}）
+          draft: false
+          prerelease: false
+          files: ${{ env.ASSET_FILE }}
+          # 已存在相同文件时覆盖
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 上传为 Actions Artifact（备份）
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmupdf-${{ matrix.artifact_suffix }}
+          path: ${{ env.ASSET_FILE }}
+          retention-days: 30
