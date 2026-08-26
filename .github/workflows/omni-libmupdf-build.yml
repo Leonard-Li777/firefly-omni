@@ -33,15 +33,9 @@ jobs:
             archive_ext: zip
             lib_name: libmupdf.lib
 
-          # macOS x86_64 (Intel)
-          - os: macos-13
-            artifact_suffix: macos-x86_64
-            archive_ext: tar.gz
-            lib_name: libmupdf.a
-
-          # macOS aarch64 (Apple Silicon)
+          # macOS Universal (在 Apple Silicon 构建机上编译 x86_64 + arm64 并 lipo 合并为通用静态库)
           - os: macos-latest
-            artifact_suffix: macos-aarch64
+            artifact_suffix: macos-universal
             archive_ext: tar.gz
             lib_name: libmupdf.a
 
@@ -87,8 +81,8 @@ jobs:
             https://github.com/ArtifexSoftware/mupdf.git
           echo "✅ MuPDF ${{ github.event.inputs.mupdf_version }} 克隆完成"
 
-      - name: 编译 MuPDF 静态库（Unix）
-        if: runner.os != 'Windows'
+      - name: 编译 MuPDF 静态库（Linux）
+        if: runner.os == 'Linux'
         run: |
           cd mupdf
           make \
@@ -98,7 +92,54 @@ jobs:
             OS=Linux \
             build=release \
             libs \
-            -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
+            -j$(nproc 2>/dev/null || echo 4)
+
+      - name: 编译 MuPDF Universal 双架构静态库（macOS）
+        if: runner.os == 'macOS'
+        run: |
+          # 1. 编译 arm64 架构
+          echo "🔨 正在编译 macOS arm64 静态库..."
+          cd mupdf
+          make clean
+          make \
+            HAVE_X11=no \
+            HAVE_GLFW=no \
+            HAVE_CURL=no \
+            XCFLAGS="-arch arm64" \
+            XLIBS="-arch arm64" \
+            build=release \
+            libs \
+            -j$(sysctl -n hw.logicalcpu || echo 4)
+          mkdir -p ../mupdf-arm64
+          cp build/release/libmupdf*.a ../mupdf-arm64/
+
+          # 2. 编译 x86_64 架构 (Intel 交叉编译)
+          echo "🔨 正在交叉编译 macOS x86_64 静态库..."
+          make clean
+          make \
+            HAVE_X11=no \
+            HAVE_GLFW=no \
+            HAVE_CURL=no \
+            XCFLAGS="-arch x86_64" \
+            XLIBS="-arch x86_64" \
+            build=release \
+            libs \
+            -j$(sysctl -n hw.logicalcpu || echo 4)
+          mkdir -p ../mupdf-x86_64
+          cp build/release/libmupdf*.a ../mupdf-x86_64/
+
+          # 3. 使用 lipo 创建 Universal 通用胖静态库
+          echo "🔗 正在合并为 Universal 通用二进制..."
+          mkdir -p build/release/universal
+          for lib in ../mupdf-arm64/*.a; do
+            filename=$(basename "$lib")
+            if [ -f "../mupdf-x86_64/$filename" ]; then
+              lipo -create "$lib" "../mupdf-x86_64/$filename" -output "build/release/universal/$filename"
+              echo "✅ 已生成 Universal: $filename"
+            else
+              cp "$lib" "build/release/universal/$filename"
+            fi
+          done
 
       - name: 设置 MSBuild 环境 (Windows)
         if: runner.os == 'Windows'
@@ -124,17 +165,20 @@ jobs:
           OUT_DIR="libmupdf-out"
           mkdir -p "${OUT_DIR}"
 
-          # 复制静态库文件（多个变体兼容）
-          find mupdf/build -name "libmupdf.a" -o -name "libmupdf.lib" 2>/dev/null | while read f; do
-            cp "$f" "${OUT_DIR}/"
-            echo "📦 已收集: $f"
-          done
-          find mupdf/build -name "libmupdf-third.a" -o -name "libmupdf-third.lib" 2>/dev/null | while read f; do
-            cp "$f" "${OUT_DIR}/"
-          done
-          find mupdf/build -name "libmupdf-threads.a" 2>/dev/null | while read f; do
-            cp "$f" "${OUT_DIR}/"
-          done
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            cp mupdf/build/release/universal/*.a "${OUT_DIR}/" 2>/dev/null || true
+          else
+            find mupdf/build -name "libmupdf.a" -o -name "libmupdf.lib" 2>/dev/null | while read f; do
+              cp "$f" "${OUT_DIR}/"
+              echo "📦 已收集: $f"
+            done
+            find mupdf/build -name "libmupdf-third.a" -o -name "libmupdf-third.lib" 2>/dev/null | while read f; do
+              cp "$f" "${OUT_DIR}/"
+            done
+            find mupdf/build -name "libmupdf-threads.a" 2>/dev/null | while read f; do
+              cp "$f" "${OUT_DIR}/"
+            done
+          fi
 
           # 复制头文件
           cp -r mupdf/include "${OUT_DIR}/"
@@ -163,7 +207,6 @@ jobs:
           draft: false
           prerelease: false
           files: ${{ env.ASSET_FILE }}
-          # 已存在相同文件时覆盖
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

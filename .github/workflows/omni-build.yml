@@ -42,8 +42,8 @@ jobs:
             artifact_suffix: windows-x86_64
             archive_ext: zip
 
-          # macOS x86_64 (Intel)
-          - os: macos-13
+          # macOS x86_64 (Intel 交叉编译)
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact_suffix: macos-x86_64
             archive_ext: tar.gz
@@ -121,15 +121,17 @@ jobs:
       - name: 下载 libmupdf 预编译静态库
         shell: bash
         run: |
-          # 从 ci-resources Release 拉取对应平台的预编译 libmupdf
-          ARTIFACT_SUFFIX="${{ matrix.artifact_suffix }}"
-          ASSET_NAME="libmupdf-${ARTIFACT_SUFFIX}.tar.gz"
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            ASSET_NAME="libmupdf-${ARTIFACT_SUFFIX}.zip"
+          # macOS 统一使用 Universal 通用胖静态库，Windows 使用 zip，Linux 使用对应平台 tar.gz
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            ASSET_NAME="libmupdf-macos-universal.tar.gz"
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            ASSET_NAME="libmupdf-windows-x86_64.zip"
+          else
+            ASSET_NAME="libmupdf-${{ matrix.artifact_suffix }}.tar.gz"
           fi
 
           echo "📥 下载 ${ASSET_NAME}..."
-          node scripts/download-libmupdf.js --platform "${{ matrix.artifact_suffix }}"
+          node scripts/download-libmupdf.js --asset "${ASSET_NAME}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
