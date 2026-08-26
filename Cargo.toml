@@ -12,7 +12,6 @@ members = [
     "omni-pro",
     "omni-pro/crates/omni-geo",
     "omni-pro/crates/omni-cleanup",
-    "omni-pro/crates/omni-cover",
 ]
 
 [workspace.package]

@@ -107,15 +107,6 @@ pub mod cleanup {
     pub type CzkawkaBridge = OmniCleanup;
 }
 
-pub struct PdfRenderer;
-
-impl PdfRenderer {
-    pub fn render_cover<P: AsRef<std::path::Path>>(_pdf_path: P) -> anyhow::Result<Vec<u8>> {
-        anyhow::bail!("Open-core mode: omni-pro not present");
-    }
-}
-
-/// 多格式封面提取（社区版存根，统一返回不可用）
 pub mod cover {
     pub struct CoverRenderer;
 
