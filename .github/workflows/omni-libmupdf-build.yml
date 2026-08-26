@@ -97,14 +97,16 @@ jobs:
       - name: 编译 MuPDF Universal 双架构静态库（macOS）
         if: runner.os == 'macOS'
         run: |
+          cd mupdf
+          
           # 1. 编译 arm64 架构
           echo "🔨 正在编译 macOS arm64 静态库..."
-          cd mupdf
           make clean
           make \
             HAVE_X11=no \
             HAVE_GLFW=no \
             HAVE_CURL=no \
+            OS=Darwin \
             XCFLAGS="-arch arm64" \
             XLIBS="-arch arm64" \
             build=release \
@@ -120,6 +122,7 @@ jobs:
             HAVE_X11=no \
             HAVE_GLFW=no \
             HAVE_CURL=no \
+            OS=Darwin \
             XCFLAGS="-arch x86_64" \
             XLIBS="-arch x86_64" \
             build=release \
@@ -200,16 +203,14 @@ jobs:
           echo "✅ 打包完成: $ASSET_FILE"
 
       - name: 上传到 GitHub Release（ci-resources）
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.upload_tag }}
-          name: CI 静态资源（${{ github.event.inputs.upload_tag }}）
-          draft: false
-          prerelease: false
-          files: ${{ env.ASSET_FILE }}
-          fail_on_unmatched_files: false
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.upload_tag }}"
+          FILE="${{ env.ASSET_FILE }}"
+          echo "🚀 使用 gh CLI 上传 $FILE 到 Release $TAG..."
+          gh release upload "$TAG" "$FILE" --clobber
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 上传为 Actions Artifact（备份）
         uses: actions/upload-artifact@v4
