@@ -14,14 +14,17 @@ pub struct OmniExtractor;
 
 impl OmniExtractor {
     pub async fn extract<P: AsRef<Path>>(path: P, config: &OmniConfig) -> Result<OmniExtractionResult> {
+        let t_extract_start = std::time::Instant::now();
         let p = path.as_ref();
         let path_str = to_native_path_str(p);
         let metadata = std::fs::metadata(p)?;
         let file_size = metadata.len();
 
-        // 识别真实 MIME 类型与扩展名
+        // 识别真实 MIME 类型与扩展名 (Magika 类型识别阶段计时)
+        let t_magika_start = std::time::Instant::now();
         let mime_type = OmniVisionEngine::detect_mime_type(p).unwrap_or_else(|_| "application/octet-stream".to_string());
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let magika_duration_ms = t_magika_start.elapsed().as_millis() as u64;
 
         let mut result = OmniExtractionResult {
             file_path: path_str.clone(),
@@ -41,6 +44,7 @@ impl OmniExtractor {
             }),
             phash: None,
             is_corrupted: file_size == 0,
+            benchmark: None,
         };
 
         // 超过单文件上限大小直接返回
@@ -49,39 +53,13 @@ impl OmniExtractor {
             return Ok(result);
         }
 
-        // 1. 提取基础属性 (basic)
-        let mut basic_meta = serde_json::Map::new();
-        basic_meta.insert("size".into(), file_size.into());
-        basic_meta.insert("ext".into(), ext.clone().into());
-        if let Ok(created) = metadata.created() {
-            if let Ok(duration) = created.duration_since(std::time::UNIX_EPOCH) {
-                if let Some(dt) = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0) {
-                    basic_meta.insert("createdAt".into(), dt.to_rfc3339().into());
-                }
-            }
-        }
-        if let Ok(modified) = metadata.modified() {
-            if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                if let Some(dt) = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0) {
-                    basic_meta.insert("modifiedAt".into(), dt.to_rfc3339().into());
-                }
-            }
-        }
-        if let Ok(accessed) = metadata.accessed() {
-            if let Ok(duration) = accessed.duration_since(std::time::UNIX_EPOCH) {
-                if let Some(dt) = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0) {
-                    basic_meta.insert("accessedAt".into(), dt.to_rfc3339().into());
-                }
-            }
-        }
-        basic_meta.insert("is_readonly".into(), metadata.permissions().readonly().into());
-        result.metadata["basic"] = serde_json::Value::Object(basic_meta);
-
         // 2. 尝试通过 ExifTool CLI / exiftool-rs 全量提取所有文件格式的 ExifTool 元数据 (PDF, Office, 音视频, 图像等)
+        let t_meta_start = std::time::Instant::now();
         let exiftool_map = extract_full_exiftool_metadata(p);
         if !exiftool_map.is_empty() {
             result.metadata["exiftool"] = serde_json::Value::Object(exiftool_map.clone());
         }
+        let metadata_duration_ms = t_meta_start.elapsed().as_millis() as u64;
 
         // 3. 校验文件分类
         let is_pdf = ext == "pdf" || mime_type == "application/pdf";
@@ -99,22 +77,30 @@ impl OmniExtractor {
             "document" | "full" | _ => is_text_or_code || is_pdf || is_office,
         };
 
+        let mut doc_duration_ms: Option<u64> = None;
+        let mut text_duration_ms: Option<u64> = None;
+        let mut ocr_duration_ms: Option<u64> = None;
+
         if should_extract_content {
             let max_bytes = config.max_content_size_kb * 1024;
 
             if is_pdf || is_office {
+                let t_doc_start = std::time::Instant::now();
                 if let Ok((doc_text, doc_meta)) = extract_pdf_content_and_meta(p, max_bytes, config) {
                     result.markdown_content = doc_text;
                     result.metadata["document"] = doc_meta;
                 }
+                doc_duration_ms = Some(t_doc_start.elapsed().as_millis() as u64);
             } else if is_text_or_code {
+                let t_text_start = std::time::Instant::now();
                 if let Ok(content) = extract_plain_text(p, max_bytes) {
                     result.markdown_content = content;
                 }
+                text_duration_ms = Some(t_text_start.elapsed().as_millis() as u64);
             }
         }
 
-        // 5. 补充文档精细元数据 (document)
+        // 5. 补充文档精细元数据 (document) 与 文本统计 (text_stats)
         if is_pdf || is_office {
             let mut doc_meta = result.metadata.get("document").and_then(|v| v.as_object()).cloned().unwrap_or_default();
             doc_meta.insert("extractor".into(), "anydoc".into());
@@ -140,18 +126,19 @@ impl OmniExtractor {
             if let Some(val) = exiftool_map.get("CreateDate") { doc_meta.insert("creation_date".into(), val.clone()); }
             if let Some(val) = exiftool_map.get("ModifyDate") { doc_meta.insert("modify_date".into(), val.clone()); }
 
-            if !result.markdown_content.is_empty() {
-                let lines = result.markdown_content.lines().count();
-                let words = result.markdown_content.split_whitespace().count();
-                let chars = result.markdown_content.chars().count();
-                doc_meta.insert("line_count".into(), lines.into());
-                if !doc_meta.contains_key("word_count") {
-                    doc_meta.insert("word_count".into(), words.into());
-                }
-                doc_meta.insert("char_count".into(), chars.into());
-            }
-
             result.metadata["document"] = serde_json::Value::Object(doc_meta);
+        }
+
+        // 如果提取到了文本内容，写入标准的 text_stats（字符数、行数、词数统计）
+        if !result.markdown_content.is_empty() {
+            let lines = result.markdown_content.lines().count();
+            let words = result.markdown_content.split_whitespace().count();
+            let chars = result.markdown_content.chars().count();
+            let mut text_stats = serde_json::Map::new();
+            text_stats.insert("line_count".into(), lines.into());
+            text_stats.insert("word_count".into(), words.into());
+            text_stats.insert("char_count".into(), chars.into());
+            result.metadata["text_stats"] = serde_json::Value::Object(text_stats);
         }
 
         // 6. 提取图像 EXIF 、尺寸与 pHash 及 PP-OCRv6 文字识别
@@ -193,11 +180,13 @@ impl OmniExtractor {
             result.metadata["image"] = serde_json::Value::Object(img_meta);
 
             if config.enable_image_ocr {
+                let t_ocr_start = std::time::Instant::now();
                 if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text_with_size(p, &config.ocr_model_size) {
                     if !ocr_text.trim().is_empty() {
                         result.markdown_content = ocr_text;
                     }
                 }
+                ocr_duration_ms = Some(t_ocr_start.elapsed().as_millis() as u64);
             }
         }
 
@@ -374,11 +363,19 @@ impl OmniExtractor {
             }
         }
 
-        // 15. 通用 Category 统一标记 (符合 packages/shared/src/utils/file-constants.ts 定义)
-        let category = determine_file_category(&ext, &mime_type);
-        result.metadata["category"] = serde_json::Value::String(category);
+        let total_extract_ms = t_extract_start.elapsed().as_millis() as u64;
+        result.benchmark = Some(omni_core::OmniBenchmark {
+            total_ms: total_extract_ms,
+            magika_ms: Some(magika_duration_ms),
+            metadata_ms: if metadata_duration_ms > 0 { Some(metadata_duration_ms) } else { None },
+            text_ms: text_duration_ms,
+            document_ms: doc_duration_ms,
+            ocr_ms: ocr_duration_ms,
+            html_ms: None,
+            thumbnail_ms: None,
+        });
 
-        info!("Successfully extracted file information for {}", path_str);
+        info!("Successfully extracted file information for {} in {}ms", path_str, total_extract_ms);
         Ok(result)
     }
 
@@ -547,11 +544,29 @@ fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_jso
                 if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
                     if let Some(arr) = json_val.as_array() {
                         if let Some(first_obj) = arr.first().and_then(|v| v.as_object()) {
-                            let skip_keys = ["SourceFile", "ExifToolVersion", "Directory"];
+                            let skip_keys = [
+                                "SourceFile", "ExifToolVersion", "Directory", "FilePermissions",
+                                "ThumbnailImage", "PreviewImage", "JpgFromRaw", "OtherImage",
+                                "MakerNotes", "MakerNoteSony", "MakerNoteCanon", "MakerNoteNikon",
+                                "SonyDateTime2", "SonyToneCurve", "UserComment", "PrintIM"
+                            ];
                             for (k, v) in first_obj {
-                                if !skip_keys.contains(&k.as_str()) && !v.is_null() {
-                                    map.insert(k.clone(), v.clone());
+                                if skip_keys.contains(&k.as_str()) || v.is_null() {
+                                    continue;
                                 }
+                                // 如果是字符串，限制单字段长度（过滤超过 2KB 的 base64/二进制 hex dump）
+                                if let Some(s) = v.as_str() {
+                                    if s.len() > 2048 {
+                                        continue;
+                                    }
+                                }
+                                // 如果是数组，且元素过多（超过 200 项的直方图/色彩空间表），跳过以减小传输开销
+                                if let Some(arr) = v.as_array() {
+                                    if arr.len() > 200 {
+                                        continue;
+                                    }
+                                }
+                                map.insert(k.clone(), v.clone());
                             }
                         }
                     }
@@ -603,7 +618,7 @@ fn extract_plain_text(path: &Path, max_bytes: usize) -> Result<String> {
 /// anydoc 原生文档提纯解析器 (支持 PDF/DOC/DOCX/EPUB/PPT/PPTX/HTML/XLS/XLSX 等格式毫秒级解析并输出 Markdown，对于 DOCX 优先提取嵌入图片并执行 PP-OCRv6 原位替换)
 fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConfig) -> Result<(String, serde_json::Value)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    if ext == "docx" {
+    if ext == "docx" && config.max_document_ocr_items != 0 {
         if let Ok((docx_text, docx_meta)) = extract_docx_with_embedded_image_ocr(path, max_bytes, config) {
             if !docx_text.trim().is_empty() {
                 return Ok((docx_text, docx_meta));
@@ -656,10 +671,15 @@ fn extract_docx_with_embedded_image_ocr(path: &Path, max_bytes: usize, config: &
         }
     }
 
-    // 2. 遍历 ZIP 提取 word/media/ 下的所有嵌入图片，若开启 OCR 则执行 PP-OCRv6 识别
+    // 2. 遍历 ZIP 提取 word/media/ 下的所有嵌入图片，根据 max_document_ocr_items 限制提取识别
     let mut image_ocr_map = HashMap::new();
-    if config.enable_document_ocr || config.enable_image_ocr {
+    let max_ocr_items = config.max_document_ocr_items;
+    if max_ocr_items != 0 {
+        let mut recognized_count = 0;
         for i in 0..archive.len() {
+            if max_ocr_items > 0 && recognized_count >= max_ocr_items as usize {
+                break;
+            }
             let mut file = archive.by_index(i)?;
             let name = file.name().to_string();
             let name_lower = name.to_lowercase();
@@ -674,6 +694,7 @@ fn extract_docx_with_embedded_image_ocr(path: &Path, max_bytes: usize, config: &
                             if let Some(filename) = Path::new(&name).file_name().and_then(|n| n.to_str()) {
                                 image_ocr_map.insert(filename.to_string(), ocr_text.clone());
                             }
+                            recognized_count += 1;
                         }
                     }
                 }
@@ -840,57 +861,6 @@ fn extract_document_fallback(path: &Path, max_bytes: usize) -> Result<(String, s
 }
 
 
-
-
-
-fn determine_file_category(ext: &str, mime_type: &str) -> String {
-    let ext_lower = ext.to_lowercase();
-    match ext_lower.as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "tiff" | "tif" | "avif"
-        | "heic" | "heif" | "ico" | "icns" | "psd" | "raw" | "dng" | "cr2" | "nef" | "arw"
-        | "dwg" | "dxf" | "stl" | "pcx" | "tga" | "xcf" | "j2k" | "jp2" | "jxl" | "jpx" | "wmf" => "image",
-
-        "mp4" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "webm" | "m4v" | "mpeg" | "mpg"
-        | "3gp" | "ogv" | "rm" | "rmvb" | "asf" | "vob" | "f4v" | "m2ts" | "mxf" | "dv" => "video",
-
-        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "aiff" | "opus" | "ape"
-        | "dsd" | "dsf" | "dff" | "mqa" | "ac3" | "dts" | "ra" | "au" | "snd" | "caf"
-        | "amr" | "3ga" | "mid" | "midi" | "weba" | "oga" => "audio",
-
-        "pdf" | "doc" | "docx" | "docm" | "xls" | "xlsx" | "xlsm" | "xlsb" | "ppt" | "pptx"
-        | "pptm" | "odt" | "ods" | "odp" | "numbers" | "rtf" | "epub" | "fb2" | "mobi"
-        | "azw3" | "djvu" | "umd" | "csv" | "one" | "ai" | "ps" | "cbt" | "cb7" | "cbr" | "cbz" => "document",
-
-        "7z" | "7zip" | "zip" | "rar" | "tar" | "gz" | "gzip" | "bz2" | "xz" | "tgz"
-        | "tbz2" | "iso" | "dmg" | "deb" | "rpm" | "jar" | "war" | "ear" | "pkg" | "xar"
-        | "vhd" | "vhdx" | "vmdk" | "img" | "qcow2" | "vdi" | "ova" | "ace" | "lha" | "lzh" | "msi" | "snap" => "archive",
-
-        "exe" | "dll" | "sys" | "so" | "dylib" | "apk" | "class" | "dex" | "elf" | "wasm"
-        | "app" | "bin" | "o" | "obj" | "pyc" | "pyo" | "drv" | "swf" | "crx" => "executable",
-
-        "db" | "db3" | "sqlite" | "sqlite3" | "sqlitedb" | "mdb" | "accdb" | "fdb" | "dbf" => "database",
-
-        "onnx" | "gguf" | "safetensors" | "pt" | "pth" | "tflite" | "h5" | "hdf5" | "npy" | "npz" => "model",
-
-        "ttf" | "otf" | "woff" | "woff2" | "ttc" | "eot" => "font",
-
-        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "java" | "c" | "cpp" | "cc"
-        | "cxx" | "h" | "hpp" | "cs" | "go" | "rs" | "php" | "rb" | "swift" | "kt" | "scala"
-        | "dart" | "zig" | "lua" | "pl" | "sql" | "sh" | "bash" | "ps1" | "bat" | "cmd"
-        | "html" | "htm" | "css" | "json" | "xml" | "yaml" | "yml" | "toml" | "vue" => "code",
-
-        "txt" | "md" | "rst" | "tex" | "log" | "diff" | "patch" | "srt" | "vtt" | "lrc" => "text",
-
-        _ => {
-            if mime_type.starts_with("image/") { "image" }
-            else if mime_type.starts_with("video/") { "video" }
-            else if mime_type.starts_with("audio/") { "audio" }
-            else if mime_type.starts_with("text/") { "text" }
-            else { "application" }
-        }
-    }.to_string()
-}
-
 fn is_plain_text_or_code_ext(ext: &str) -> bool {
     matches!(
         ext,
@@ -982,7 +952,10 @@ mod tests {
             return;
         }
 
-        let config = OmniConfig::default();
+        let config = OmniConfig {
+            max_document_ocr_items: 5,
+            ..Default::default()
+        };
         let res = OmniExtractor::extract(&docx_path, &config).await.unwrap();
         println!("--- USER DOCX MARKDOWN CONTENT ---\n{}", res.markdown_content);
         assert!(res.markdown_content.contains("📷 **[图片内提取文字]**"), "DOCX should contain in-place image OCR replacement!");

@@ -10,7 +10,8 @@ use axum::{
     Json, Router,
 };
 use omni_core::{
-    DuplicateScanRequest, DuplicateScanResponse, OmniConfig, OmniExtractionResult,
+    DuplicateFixRequest, DuplicateFixResponse, DuplicateScanRequest, DuplicateScanResponse,
+    OmniConfig, OmniExtractionResult,
 };
 use omni_extract::OmniExtractor;
 use serde::Deserialize;
@@ -59,13 +60,15 @@ pub fn create_app_router(state: AppState) -> Router {
             "/health",
             get(health_handler),
         )
-        .route("/api/config", get(get_config).post(update_config))
+        .route("/api/config", get(get_config).post(update_config).put(update_config))
         .route("/api/extract", post(extract_file_handler))
         .route("/api/extract/upload", post(extract_multipart_handler))
         .route("/api/cleanup/scan", post(cleanup_scan_handler))
         .route("/api/cleanup/scan/stream", post(cleanup_scan_stream_handler))
+        .route("/api/cleanup/fix", post(cleanup_fix_handler))
         .route("/api/duplicate/scan", post(cleanup_scan_handler))
         .route("/api/duplicate/scan/stream", post(cleanup_scan_stream_handler))
+        .route("/api/duplicate/fix", post(cleanup_fix_handler))
         .route("/api/file/preview", get(file_preview_handler))
         .route("/api/cover", get(cover_handler))
         .route("/api/geo/reverse", post(geo_reverse_handler))
@@ -188,9 +191,30 @@ async fn file_preview_handler(Query(req): Query<FilePreviewRequest>) -> Response
 
 /// 通用文件封面截取接口: GET /api/cover?path=<urlencoded 绝对路径>
 /// 支持 PDF、PSD、视频（MP4/MOV/AVI/MKV）等格式的高清封面截取（WebP 格式返回）
-/// 若传入暂不支持的格式，返回 204 No Content 方便调用方平滑降级
-async fn cover_handler(Query(req): Query<FilePreviewRequest>) -> Response {
+/// 对于 Office 格式，仅在 enable_office_cover = true 时提取，未开启或暂不支持的格式返回 204 No Content
+async fn cover_handler(
+    State(state): State<AppState>,
+    Query(req): Query<FilePreviewRequest>,
+) -> Response {
     let path = PathBuf::from(&req.path);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+
+    let is_office = matches!(
+        ext.as_str(),
+        "doc" | "docx" | "ppt" | "pptx" | "xls" | "xlsx" | "wps" | "odt" | "rtf"
+    );
+
+    // 若为 Office 格式且未开启 enable_office_cover，直接快速返回 204 No Content
+    if is_office {
+        let enable_office_cover = state.config.lock().map(|c| c.enable_office_cover).unwrap_or(false);
+        if !enable_office_cover {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+    }
 
     // 交由 CoverRenderer 按扩展名路由，不支持的格式由其内部返回 Err
     let outcome = tokio::task::spawn_blocking(move || {
@@ -313,18 +337,39 @@ async fn extract_file_handler(
     Json(req): Json<ExtractRequest>,
 ) -> Json<OmniExtractionResult> {
     let cfg = state.config.lock().unwrap().clone();
-    match OmniExtractor::extract(&req.file_path, &cfg).await {
-        Ok(res) => Json(res),
-        Err(err) => Json(OmniExtractionResult {
-            file_path: req.file_path,
-            mime_type: "application/octet-stream".to_string(),
-            file_size: 0,
-            markdown_content: format!("Error: Extraction failed - {}", err),
-            metadata: serde_json::json!({}),
-            phash: None,
-            is_corrupted: true,
-        }),
-    }
+    let t_start = std::time::Instant::now();
+    let res = match OmniExtractor::extract(&req.file_path, &cfg).await {
+        Ok(res) => {
+            let cost_ms = t_start.elapsed().as_millis();
+            tracing::info!(
+                "[OmniServer] 提取成功: file={}, enable_image_ocr={}, 耗时={}ms",
+                req.file_path,
+                cfg.enable_image_ocr,
+                cost_ms
+            );
+            Json(res)
+        }
+        Err(err) => {
+            let cost_ms = t_start.elapsed().as_millis();
+            tracing::error!(
+                "[OmniServer] 提取失败: file={}, 错误={}, 耗时={}ms",
+                req.file_path,
+                err,
+                cost_ms
+            );
+            Json(OmniExtractionResult {
+                file_path: req.file_path,
+                mime_type: "application/octet-stream".to_string(),
+                file_size: 0,
+                markdown_content: format!("Error: Extraction failed - {}", err),
+                metadata: serde_json::json!({}),
+                phash: None,
+                is_corrupted: true,
+                benchmark: None,
+            })
+        }
+    };
+    res
 }
 
 /// 处理 Web UI 前端拖拽文件二进制流上传请求: POST /api/extract/upload
@@ -368,6 +413,7 @@ async fn extract_multipart_handler(
         metadata: serde_json::json!({}),
         phash: None,
         is_corrupted: true,
+        benchmark: None,
     })
 }
 
@@ -453,6 +499,31 @@ pub async fn cleanup_scan_stream_handler(
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// 处理清理/查重修复请求 (Exif 清理 / 视频转码): POST /api/cleanup/fix 或 POST /api/duplicate/fix
+async fn cleanup_fix_handler(
+    Json(req): Json<DuplicateFixRequest>,
+) -> Json<DuplicateFixResponse> {
+    let action = req.action.clone();
+    let paths = req.paths.clone();
+
+    let outcome = tokio::task::spawn_blocking(move || {
+        omni_pro::cleanup::OmniCleanup::execute_fix(&action, paths)
+    })
+    .await
+    .unwrap_or_else(|err| {
+        (0, 0, Vec::new(), vec![format!("任务执行异常: {err}")])
+    });
+
+    Json(DuplicateFixResponse {
+        success: outcome.1 == 0,
+        action: req.action,
+        success_count: outcome.0,
+        failed_count: outcome.1,
+        processed_paths: outcome.2,
+        errors: outcome.3,
+    })
 }
 
 

@@ -209,11 +209,15 @@ impl CzkawkaBridge {
         let run_bad_names = enabled_strategies.iter().any(|s| s == "bad_names" || s == "bad_name");
         let run_exif_remover = enabled_strategies.iter().any(|s| s == "exif_remover");
         let run_video_optimizer = enabled_strategies.iter().any(|s| s == "video_optimizer");
+        let excluded_items: Vec<String> = req.excluded_items.clone().unwrap_or_default();
 
         if run_exact {
             let params = DuplicateFinderParameters::new(CheckingMethod::Hash, HashType::Blake3, false, 0, 0, false);
             let mut finder = DuplicateFinder::new(params);
             finder.set_included_paths(target_paths.clone());
+            if !excluded_items.is_empty() {
+                finder.set_excluded_items(excluded_items.clone());
+            }
             finder.search(stop_flag, Some(&progress_tx));
             let mut exact_group_idx = 1;
             for (size, vectors_vector) in finder.get_files_sorted_by_hash().iter().rev() {

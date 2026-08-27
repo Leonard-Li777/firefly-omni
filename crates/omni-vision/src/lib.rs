@@ -2,7 +2,6 @@ use anyhow::Result;
 use ort::{inputs, session::Session};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::info;
 
 /// 包含检测框坐标与概率的 OCR 文本切片
 #[derive(Debug, Clone)]
@@ -37,7 +36,7 @@ impl OmniVisionEngine {
                 "txt" | "md" => "text/plain",
                 _ => "application/octet-stream",
             };
-            info!("Detected MIME for {}: {}", p.display(), mime);
+            tracing::debug!("Detected MIME for {}: {}", p.display(), mime);
             return Ok(mime.to_string());
         }
 
@@ -466,7 +465,7 @@ impl OmniVisionEngine {
         let (w, h) = (img.width(), img.height());
         let _file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
 
-        info!("Executing Dynamic PP-OCRv6 ({}) recognition pipeline on {} ({}x{})", model_size, path.display(), w, h);
+        tracing::debug!("Executing Dynamic PP-OCRv6 ({}) recognition pipeline on {} ({}x{})", model_size, path.display(), w, h);
 
         let model_dir = Self::resolve_ppocr_model_dir();
         let keys_map = Self::load_keys_map(model_dir.as_deref(), model_size);

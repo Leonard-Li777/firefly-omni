@@ -102,6 +102,13 @@ pub mod cleanup {
                 duration_ms: 0,
             }
         }
+
+        pub fn execute_fix(
+            _action: &str,
+            _paths: Vec<String>,
+        ) -> (usize, usize, Vec<String>, Vec<String>) {
+            (0, 0, Vec::new(), vec!["Open-core mode: omni-cleanup not present".to_string()])
+        }
     }
 
     pub type CzkawkaBridge = OmniCleanup;

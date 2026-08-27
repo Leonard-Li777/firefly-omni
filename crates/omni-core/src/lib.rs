@@ -3,11 +3,12 @@ use serde::{Deserialize, Serialize};
 /// 基础分析与配置规范 (对齐 Desktop ConfigKey)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OmniConfig {
-    pub enable_document_ocr: bool,
+    pub enable_office_cover: bool,
+    /// 文档 OCR 识别数量上限（Office 内嵌图数 / PDF 页数），0 表示不识别，-1 表示不限
+    pub max_document_ocr_items: i32,
     pub enable_image_ocr: bool,
     /// OCR 识别模型精度/尺寸 ('tiny' | 'small' | 'medium')
     pub ocr_model_size: String,
-    pub max_document_ocr_file_size_mb: u64,
     pub max_content_size_kb: usize,
     pub max_file_size_mb: u64,
     /// 分析模式: 'simple' (极速分类) | 'document' (快速文档摘要) | 'full' (标准 AI 分析)
@@ -19,16 +20,29 @@ pub struct OmniConfig {
 impl Default for OmniConfig {
     fn default() -> Self {
         Self {
-            enable_document_ocr: true,
-            enable_image_ocr: true,
+            enable_office_cover: false,
+            max_document_ocr_items: 0,
+            enable_image_ocr: false,
             ocr_model_size: "tiny".to_string(),
-            max_document_ocr_file_size_mb: 10,
             max_content_size_kb: 30,
             max_file_size_mb: 100,
             analysis_mode: "full".to_string(),
             reuse_basic_analysis_data: true,
         }
     }
+}
+
+/// Omni 引擎内容提取细分耗时基准统计（精确到毫秒）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OmniBenchmark {
+    pub total_ms: u64,
+    pub magika_ms: Option<u64>,
+    pub metadata_ms: Option<u64>,
+    pub text_ms: Option<u64>,
+    pub document_ms: Option<u64>,
+    pub ocr_ms: Option<u64>,
+    pub html_ms: Option<u64>,
+    pub thumbnail_ms: Option<u64>,
 }
 
 /// 全量文件提取结果元数据
@@ -41,6 +55,7 @@ pub struct OmniExtractionResult {
     pub metadata: serde_json::Value,
     pub phash: Option<String>,
     pub is_corrupted: bool,
+    pub benchmark: Option<OmniBenchmark>,
 }
 
 /// 查重扫描请求
@@ -52,6 +67,8 @@ pub struct DuplicateScanRequest {
     pub check_video: Option<bool>,
     /// 异常命名检测模式: 'multilingual' (默认: 保留中文/日韩等多语言合规文件名，仅检查首尾空格、非法控制字符等) | 'strict_ascii' (严格纯ASCII模式，非ASCII转写拼音)
     pub name_issues_mode: Option<String>,
+    /// 排除/受保护的目录或文件项名单（如 .VirtualDirectory, node_modules, .git 等，czkawka 原生跳过）
+    pub excluded_items: Option<Vec<String>>,
 }
 
 /// 查重文件项
@@ -87,6 +104,24 @@ pub struct DuplicateScanResponse {
     pub total_redundant_files: usize,
     pub total_freed_bytes: u64,
     pub duration_ms: u64,
+}
+
+/// 查重/清理修复请求 (Exif 擦除 / 视频优化转码)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuplicateFixRequest {
+    pub action: String,
+    pub paths: Vec<String>,
+}
+
+/// 查重/清理修复响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuplicateFixResponse {
+    pub success: bool,
+    pub action: String,
+    pub success_count: usize,
+    pub failed_count: usize,
+    pub processed_paths: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 impl OmniExtractionResult {
