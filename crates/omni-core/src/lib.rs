@@ -15,6 +15,9 @@ pub struct OmniConfig {
     pub analysis_mode: String,
     /// 是否复用已有基础分析数据 (跳过已有提取)
     pub reuse_basic_analysis_data: bool,
+    /// 全局忽略/排除受保护项目名单（用于 czkawka 查重清理原生排除保护）
+    #[serde(default)]
+    pub excluded_items: Vec<String>,
 }
 
 impl Default for OmniConfig {
@@ -28,6 +31,7 @@ impl Default for OmniConfig {
             max_file_size_mb: 100,
             analysis_mode: "full".to_string(),
             reuse_basic_analysis_data: true,
+            excluded_items: Vec::new(),
         }
     }
 }

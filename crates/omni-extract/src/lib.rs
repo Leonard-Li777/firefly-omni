@@ -615,10 +615,32 @@ fn extract_plain_text(path: &Path, max_bytes: usize) -> Result<String> {
 }
 
 
-/// anydoc 原生文档提纯解析器 (支持 PDF/DOC/DOCX/EPUB/PPT/PPTX/HTML/XLS/XLSX 等格式毫秒级解析并输出 Markdown，对于 DOCX 优先提取嵌入图片并执行 PP-OCRv6 原位替换)
+/// anydoc 原生文档提纯解析器 (支持 PDF/DOC/DOCX/EPUB/PPT/PPTX/HTML/XLS/XLSX 等格式毫秒级解析并输出 Markdown，对于 DOCX/PDF 优先提取原生文本层，并在文本层不足且开启 OCR 时分页/分图 OCR 且动态按上限提前终止)
 fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConfig) -> Result<(String, serde_json::Value)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    // 1. 对于 DOCX 文档，若开启了文档 OCR (max_document_ocr_items != 0)
     if ext == "docx" && config.max_document_ocr_items != 0 {
+        // 先检查 anydoc 提取的原生文本层大小
+        if let Ok(raw_markdown) = anydoc::to_markdown(path) {
+            let raw_len = raw_markdown.trim().len();
+            // 如果原生文本层已经满足或超过 max_bytes 限制 (max_bytes > 0)，则无需进行昂贵的图片 OCR 扫描，节约性能
+            if max_bytes > 0 && raw_len >= max_bytes {
+                tracing::info!(
+                    "DOCX 原生文本层 ({} 字节) 已达到内容上限 ({} 字节)，跳过嵌入图片 OCR 识别",
+                    raw_len,
+                    max_bytes
+                );
+                let truncated_content = truncate_string(&raw_markdown, max_bytes);
+                let meta = serde_json::json!({
+                    "extractor": "anydoc",
+                    "ocr_skipped_due_to_content_limit": true
+                });
+                return Ok((truncated_content, meta));
+            }
+        }
+
+        // 原生文本层未超限，进行嵌入图片 OCR 提纯与原位融合
         if let Ok((docx_text, docx_meta)) = extract_docx_with_embedded_image_ocr(path, max_bytes, config) {
             if !docx_text.trim().is_empty() {
                 return Ok((docx_text, docx_meta));
@@ -626,27 +648,42 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
         }
     }
 
-    match anydoc::to_markdown(path) {
-        Ok(markdown) => {
-            let title_candidate = path.file_stem().unwrap_or_default().to_string_lossy();
-            let content_text = if !markdown.trim().is_empty() {
-                markdown
-            } else {
-                format!("Document Title: {}\nSummary: Anydoc parsed 0 text nodes.", title_candidate)
-            };
+    // 2. 尝试提取 anydoc 基础 Markdown 文本层
+    let mut base_text = String::new();
+    if let Ok(markdown) = anydoc::to_markdown(path) {
+        base_text = markdown;
+    }
 
-            let truncated_content = truncate_string(&content_text, max_bytes);
+    // 3. 对于 PDF 文档：检查原生文本层是否已达到上限
+    if ext == "pdf" {
+        let raw_len = base_text.trim().len();
+        // 判定条件：如果原生文本层非空且已达到或超过上限 (max_bytes > 0)，则直接跳过后续昂贵的分页 OCR 提取
+        if max_bytes > 0 && raw_len >= max_bytes {
+            tracing::info!(
+                "PDF 原生文本层 ({} 字节) 已达到内容上限 ({} 字节)，跳过分页 OCR 提取",
+                raw_len,
+                max_bytes
+            );
+            let truncated_content = truncate_string(&base_text, max_bytes);
             let meta = serde_json::json!({
                 "extractor": "anydoc",
+                "ocr_skipped_due_to_content_limit": true
             });
-
-            Ok((truncated_content, meta))
-        }
-        Err(e) => {
-            tracing::warn!("anydoc extract failed for {}: {}, fallback to basic document scan", path.display(), e);
-            extract_document_fallback(path, max_bytes)
+            return Ok((truncated_content, meta));
         }
     }
+
+    // 4. 若文本层有效，截断并输出
+    if !base_text.trim().is_empty() {
+        let truncated_content = truncate_string(&base_text, max_bytes);
+        let meta = serde_json::json!({
+            "extractor": "anydoc",
+        });
+        return Ok((truncated_content, meta));
+    }
+
+    // 5. 兜底回退
+    extract_document_fallback(path, max_bytes)
 }
 
 /// 解析 DOCX 文档中的嵌入图片，执行 PP-OCRv6 文字提取并在 word/document.xml 段落中精确定位原位替换
@@ -671,15 +708,28 @@ fn extract_docx_with_embedded_image_ocr(path: &Path, max_bytes: usize, config: &
         }
     }
 
-    // 2. 遍历 ZIP 提取 word/media/ 下的所有嵌入图片，根据 max_document_ocr_items 限制提取识别
+    // 2. 遍历 ZIP 提取 word/media/ 下的所有嵌入图片，根据 max_document_ocr_items 及 max_bytes 限制提取识别
     let mut image_ocr_map = HashMap::new();
     let max_ocr_items = config.max_document_ocr_items;
+    let max_limit_bytes = if config.max_content_size_kb > 0 { config.max_content_size_kb * 1024 } else { 0 };
+
     if max_ocr_items != 0 {
         let mut recognized_count = 0;
+        let mut accumulated_ocr_bytes = 0usize;
+
         for i in 0..archive.len() {
             if max_ocr_items > 0 && recognized_count >= max_ocr_items as usize {
                 break;
             }
+            // 若提取的 OCR 累计字节数已达到内容上限，提前终止后续图片的 OCR 处理
+            if max_limit_bytes > 0 && accumulated_ocr_bytes >= max_limit_bytes {
+                tracing::info!(
+                    "DOCX 嵌入图片 OCR 提取文本大小已达上限 ({} KB)，提前终止后续图片识别",
+                    config.max_content_size_kb
+                );
+                break;
+            }
+
             let mut file = archive.by_index(i)?;
             let name = file.name().to_string();
             let name_lower = name.to_lowercase();
@@ -689,12 +739,22 @@ fn extract_docx_with_embedded_image_ocr(path: &Path, max_bytes: usize, config: &
                     if let Ok(ocr_text) = omni_vision::OmniVisionEngine::recognize_ocr_image_bytes(&bytes, &config.ocr_model_size) {
                         if !ocr_text.trim().is_empty() {
                             let clean_name = name.trim_start_matches("word/").to_string();
+                            accumulated_ocr_bytes += ocr_text.len();
                             image_ocr_map.insert(name.clone(), ocr_text.clone());
                             image_ocr_map.insert(clean_name.clone(), ocr_text.clone());
                             if let Some(filename) = Path::new(&name).file_name().and_then(|n| n.to_str()) {
                                 image_ocr_map.insert(filename.to_string(), ocr_text.clone());
                             }
                             recognized_count += 1;
+
+                            // 识别单张后若已超限，立即打断循环
+                            if max_limit_bytes > 0 && accumulated_ocr_bytes >= max_limit_bytes {
+                                tracing::info!(
+                                    "DOCX 嵌入图片 OCR 文本识别达到上限 ({} KB)，终止后续图片处理",
+                                    config.max_content_size_kb
+                                );
+                                break;
+                            }
                         }
                     }
                 }
