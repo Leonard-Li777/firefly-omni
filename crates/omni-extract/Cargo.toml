@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 omni-core = { path = "../omni-core" }
 omni-vision = { path = "../omni-vision" }
+omni-pro = { path = "../../omni-pro" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
@@ -20,6 +21,7 @@ encoding_rs.workspace = true
 regex.workspace = true
 chrono.workspace = true
 anydoc = "0.1"
+pdf-inspector = "1.17"
 zip = "2.1"
 quick-xml = "0.36"
 

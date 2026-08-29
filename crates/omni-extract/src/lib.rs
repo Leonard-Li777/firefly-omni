@@ -86,11 +86,17 @@ impl OmniExtractor {
 
             if is_pdf || is_office {
                 let t_doc_start = std::time::Instant::now();
-                if let Ok((doc_text, doc_meta)) = extract_pdf_content_and_meta(p, max_bytes, config) {
+                if let Ok((doc_text, doc_meta, doc_ocr_ms)) = extract_pdf_content_and_meta(p, max_bytes, config) {
                     result.markdown_content = doc_text;
                     result.metadata["document"] = doc_meta;
+                    if let Some(ocr_ms) = doc_ocr_ms {
+                        ocr_duration_ms = Some(ocr_ms);
+                    }
                 }
-                doc_duration_ms = Some(t_doc_start.elapsed().as_millis() as u64);
+                let total_doc_ms = t_doc_start.elapsed().as_millis() as u64;
+                let ocr_ms = ocr_duration_ms.unwrap_or(0);
+                // 将纯文本解析与 OCR 耗时剥离
+                doc_duration_ms = Some(total_doc_ms.saturating_sub(ocr_ms));
             } else if is_text_or_code {
                 let t_text_start = std::time::Instant::now();
                 if let Ok(content) = extract_plain_text(p, max_bytes) {
@@ -129,12 +135,14 @@ impl OmniExtractor {
             result.metadata["document"] = serde_json::Value::Object(doc_meta);
         }
 
-        // 如果提取到了文本内容，写入标准的 text_stats（字符数、行数、词数统计）
+        // 5. 补充文档精细元数据 (document) 与 文本统计 (text_stats)
+        // 如果提取到了文本内容，写入标准的 text_stats（字符数、行数、词数、编码统计）
         if !result.markdown_content.is_empty() {
             let lines = result.markdown_content.lines().count();
             let words = result.markdown_content.split_whitespace().count();
             let chars = result.markdown_content.chars().count();
             let mut text_stats = serde_json::Map::new();
+            text_stats.insert("encoding".into(), "UTF-8".into());
             text_stats.insert("line_count".into(), lines.into());
             text_stats.insert("word_count".into(), words.into());
             text_stats.insert("char_count".into(), chars.into());
@@ -241,20 +249,7 @@ impl OmniExtractor {
             result.metadata["video"] = serde_json::Value::Object(video_meta);
         }
 
-        // 9. 提取文本与代码精细属性 (text)
-        if is_text_or_code {
-            let mut text_meta = serde_json::Map::new();
-            text_meta.insert("encoding".into(), "UTF-8 / Smart Detection".into());
-            if !result.markdown_content.is_empty() {
-                let lines = result.markdown_content.lines().count();
-                let words = result.markdown_content.split_whitespace().count();
-                let chars = result.markdown_content.chars().count();
-                text_meta.insert("line_count".into(), lines.into());
-                text_meta.insert("word_count".into(), words.into());
-                text_meta.insert("char_count".into(), chars.into());
-            }
-            result.metadata["text"] = serde_json::Value::Object(text_meta);
-        }
+
 
         // 10. 提取 PE 可执行程序属性 (executable / exe)
         let is_exe = matches!(ext.as_str(), "exe" | "dll" | "sys" | "so" | "dylib")
@@ -363,19 +358,29 @@ impl OmniExtractor {
             }
         }
 
-        let total_extract_ms = t_extract_start.elapsed().as_millis() as u64;
+        let text_duration = text_duration_ms.or(doc_duration_ms);
+        let max_parallel_ms = magika_duration_ms
+            .max(metadata_duration_ms)
+            .max(text_duration.unwrap_or(0))
+            .max(ocr_duration_ms.unwrap_or(0));
+
         result.benchmark = Some(omni_core::OmniBenchmark {
-            total_ms: total_extract_ms,
+            total_ms: max_parallel_ms,
             magika_ms: Some(magika_duration_ms),
             metadata_ms: if metadata_duration_ms > 0 { Some(metadata_duration_ms) } else { None },
-            text_ms: text_duration_ms,
-            document_ms: doc_duration_ms,
+            text_ms: text_duration,
+            document_ms: None, // 彻底废弃旧的冗余正文字段
             ocr_ms: ocr_duration_ms,
             html_ms: None,
             thumbnail_ms: None,
         });
 
-        info!("Successfully extracted file information for {} in {}ms", path_str, total_extract_ms);
+        info!(
+            "Successfully extracted file information for {} in {}ms (Max parallel: {}ms)",
+            path_str,
+            t_extract_start.elapsed().as_millis(),
+            max_parallel_ms
+        );
         Ok(result)
     }
 
@@ -587,36 +592,72 @@ fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_jso
     map
 }
 
-/// 智能解析纯文本/代码文件（自动检测 UTF-8 / GBK 编码，并检测二进制 NUL 字符防乱码）
+/// 智能解析纯文本/代码文件（自动检测 UTF-8 / GBK / UTF-16 编码，并检测二进制 NUL 字符防乱码）
 fn extract_plain_text(path: &Path, max_bytes: usize) -> Result<String> {
     let mut file = File::open(path)?;
     let mut buffer = Vec::new();
-    let mut take = file.by_ref().take(max_bytes as u64);
-    take.read_to_end(&mut buffer)?;
+    file.read_to_end(&mut buffer)?;
 
-    // 如果前 1000 字节存在 \x00 NUL 字符，说明是二进制流，避免强转乱码
+    if buffer.is_empty() {
+        return Ok(String::new());
+    }
+
+    // 1. 检查 UTF-8 / UTF-16 BOM 头
+    if buffer.len() >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF {
+        let (utf8_decoded, _, _) = UTF_8.decode(&buffer[3..]);
+        return Ok(truncate_string(&utf8_decoded, max_bytes));
+    }
+    if buffer.len() >= 2 {
+        if buffer[0] == 0xFF && buffer[1] == 0xFE {
+            let (utf16_decoded, _, _) = UTF_16LE.decode(&buffer[2..]);
+            return Ok(truncate_string(&utf16_decoded, max_bytes));
+        } else if buffer[0] == 0xFE && buffer[1] == 0xFF {
+            let (utf16_decoded, _, _) = encoding_rs::UTF_16BE.decode(&buffer[2..]);
+            return Ok(truncate_string(&utf16_decoded, max_bytes));
+        }
+    }
+
+    // 2. 检查前 1000 字节是否存在 \x00 NUL 字符（排除 UTF-16 BOM 后若有密集 NUL 说明是二进制流）
     if buffer.iter().take(1000).any(|&b| b == 0) {
+        // 如果奇偶位存在大量 0x00，且符合 UTF-16LE 无 BOM 结构
+        let sample = &buffer[..buffer.len().min(1000)];
+        let nul_odd = sample.iter().enumerate().filter(|(i, &b)| i % 2 == 1 && b == 0).count();
+        let nul_even = sample.iter().enumerate().filter(|(i, &b)| i % 2 == 0 && b == 0).count();
+        if (nul_odd > sample.len() / 4 && nul_even == 0) || (nul_even > sample.len() / 4 && nul_odd == 0) {
+            let (utf16_decoded, _, utf16_errors) = UTF_16LE.decode(&buffer);
+            if !utf16_errors {
+                return Ok(truncate_string(&utf16_decoded, max_bytes));
+            }
+        }
         return Ok("[Binary File] NUL byte detected, text content skipped to prevent garbled output.".to_string());
     }
 
-    // 智能编码识别与转换 (UTF-8 优先, GBK 降级)
-    let (decoded, _, had_errors) = UTF_8.decode(&buffer);
-    if !had_errors {
-        return Ok(truncate_string(&decoded, max_bytes));
+    // 3. 严格验证是否为标准 UTF-8（中文及现代文本事实标准，不允许任何解码错误）
+    if let Ok(utf8_str) = std::str::from_utf8(&buffer) {
+        return Ok(truncate_string(utf8_str, max_bytes));
     }
 
+    // 4. 尝试 GBK 编码解码（常见于 Windows 中文记事本 ANSI 格式）
     let (gbk_decoded, _, gbk_errors) = GBK.decode(&buffer);
     if !gbk_errors {
         return Ok(truncate_string(&gbk_decoded, max_bytes));
     }
 
-    let (utf16_decoded, _, _) = UTF_16LE.decode(&buffer);
-    Ok(truncate_string(&utf16_decoded, max_bytes))
+    // 5. 降级：选择 UTF-8 lossy 与 GBK lossy 中错误替换符最少的解码结果
+    let (utf8_lossy, _, _) = UTF_8.decode(&buffer);
+    let utf8_rep_count = utf8_lossy.chars().filter(|&c| c == '\u{FFFD}').count();
+    let gbk_rep_count = gbk_decoded.chars().filter(|&c| c == '\u{FFFD}').count();
+
+    if gbk_rep_count < utf8_rep_count {
+        Ok(truncate_string(&gbk_decoded, max_bytes))
+    } else {
+        Ok(truncate_string(&utf8_lossy, max_bytes))
+    }
 }
 
 
 /// anydoc 原生文档提纯解析器 (支持 PDF/DOC/DOCX/EPUB/PPT/PPTX/HTML/XLS/XLSX 等格式毫秒级解析并输出 Markdown，对于 DOCX/PDF 优先提取原生文本层，并在文本层不足且开启 OCR 时分页/分图 OCR 且动态按上限提前终止)
-fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConfig) -> Result<(String, serde_json::Value)> {
+fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConfig) -> Result<(String, serde_json::Value, Option<u64>)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
     // 1. 对于 DOCX 文档，若开启了文档 OCR (max_document_ocr_items != 0)
@@ -636,14 +677,16 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
                     "extractor": "anydoc",
                     "ocr_skipped_due_to_content_limit": true
                 });
-                return Ok((truncated_content, meta));
+                return Ok((truncated_content, meta, None));
             }
         }
 
         // 原生文本层未超限，进行嵌入图片 OCR 提纯与原位融合
+        let t_docx_ocr_start = std::time::Instant::now();
         if let Ok((docx_text, docx_meta)) = extract_docx_with_embedded_image_ocr(path, max_bytes, config) {
+            let docx_ocr_ms = t_docx_ocr_start.elapsed().as_millis() as u64;
             if !docx_text.trim().is_empty() {
-                return Ok((docx_text, docx_meta));
+                return Ok((docx_text, docx_meta, Some(docx_ocr_ms)));
             }
         }
     }
@@ -654,36 +697,105 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
         base_text = markdown;
     }
 
-    // 3. 对于 PDF 文档：检查原生文本层是否已达到上限
+    // 3. 对于 PDF 文档：使用 pdf-inspector 检查是否为原生文本型 PDF (TextBased)
     if ext == "pdf" {
+        let pdf_type_res = pdf_inspector::detect_pdf_type(path).ok();
+        let is_text_pdf = matches!(pdf_type_res.as_ref().map(|r| r.pdf_type), Some(pdf_inspector::PdfType::TextBased));
         let raw_len = base_text.trim().len();
-        // 判定条件：如果原生文本层非空且已达到或超过上限 (max_bytes > 0)，则直接跳过后续昂贵的分页 OCR 提取
-        if max_bytes > 0 && raw_len >= max_bytes {
+
+        // 判定条件：如果是文本型 PDF 且提取到了有效文本层（或文本层已达上限），直接输出并标记跳过 OCR
+        if (is_text_pdf && raw_len > 0) || (max_bytes > 0 && raw_len >= max_bytes) {
             tracing::info!(
-                "PDF 原生文本层 ({} 字节) 已达到内容上限 ({} 字节)，跳过分页 OCR 提取",
-                raw_len,
-                max_bytes
+                "PDF 为原生文本类型 (is_text_pdf={}, 提取文本 {} 字节)，跳过后续分页 OCR 识别",
+                is_text_pdf,
+                raw_len
             );
             let truncated_content = truncate_string(&base_text, max_bytes);
             let meta = serde_json::json!({
-                "extractor": "anydoc",
-                "ocr_skipped_due_to_content_limit": true
+                "extractor": "anydoc+pdf-inspector",
+                "is_text_pdf": is_text_pdf,
+                "pdf_type": pdf_type_res.as_ref().map(|r| format!("{:?}", r.pdf_type)),
+                "ocr_skipped": true,
+                "ocr_skipped_reason": if is_text_pdf { "native_text_pdf" } else { "content_limit_reached" }
             });
-            return Ok((truncated_content, meta));
+            return Ok((truncated_content, meta, None));
+        }
+
+        // 若非纯文本 PDF（如扫描件/纯图片 PDF）或文本层为空，且开启了文档 OCR (max_document_ocr_items != 0)
+        let max_ocr_pages = config.max_document_ocr_items;
+        if max_ocr_pages != 0 {
+            let max_limit_bytes = if max_bytes > 0 { max_bytes } else { usize::MAX };
+            let page_limit = if max_ocr_pages < 0 { 0usize } else { max_ocr_pages as usize };
+
+            let t_pdf_ocr_start = std::time::Instant::now();
+            if let Ok(page_images) = omni_pro::CoverRenderer::render_pdf_page_images(path, page_limit) {
+                if !page_images.is_empty() {
+                    tracing::info!(
+                        "PDF 包含 {} 页待 OCR 扫描页面，开始执行原生 MuPDF + PP-OCRv6 极速识别",
+                        page_images.len()
+                    );
+                    let mut ocr_page_texts = Vec::new();
+                    let mut current_bytes = raw_len;
+
+                    for (page_idx, img) in page_images.iter().enumerate() {
+                        if current_bytes >= max_limit_bytes {
+                            tracing::info!(
+                                "PDF OCR 识别文本已达到上限 ({} 字节)，在第 {} 页提前终止",
+                                current_bytes,
+                                page_idx + 1
+                            );
+                            break;
+                        }
+
+                        if let Ok(page_text) = omni_vision::OmniVisionEngine::recognize_ocr_dynamic_image(img, &config.ocr_model_size) {
+                            let trimmed = page_text.trim();
+                            if !trimmed.is_empty() {
+                                current_bytes += trimmed.len();
+                                ocr_page_texts.push(format!("## Page {}\n{}", page_idx + 1, trimmed));
+                            }
+                        }
+                    }
+
+                    let ocr_elapsed_ms = t_pdf_ocr_start.elapsed().as_millis() as u64;
+
+                    if !ocr_page_texts.is_empty() {
+                        let combined_ocr = ocr_page_texts.join("\n\n");
+                        let final_markdown = if raw_len > 0 {
+                            format!("{}\n\n---\n\n### 🔍 多页 OCR 图像识别文本\n\n{}", base_text.trim(), combined_ocr)
+                        } else {
+                            combined_ocr
+                        };
+
+                        let truncated_content = truncate_string(&final_markdown, max_bytes);
+                        let meta = serde_json::json!({
+                            "extractor": "anydoc+mupdf_ocr",
+                            "is_text_pdf": false,
+                            "pdf_type": pdf_type_res.as_ref().map(|r| format!("{:?}", r.pdf_type)),
+                            "ocr_pages_processed": ocr_page_texts.len(),
+                        });
+                        return Ok((truncated_content, meta, Some(ocr_elapsed_ms)));
+                    }
+                }
+            }
         }
     }
 
     // 4. 若文本层有效，截断并输出
     if !base_text.trim().is_empty() {
         let truncated_content = truncate_string(&base_text, max_bytes);
+        let pdf_type_res = if ext == "pdf" { pdf_inspector::detect_pdf_type(path).ok() } else { None };
+        let is_text_pdf = matches!(pdf_type_res.as_ref().map(|r| r.pdf_type), Some(pdf_inspector::PdfType::TextBased));
         let meta = serde_json::json!({
             "extractor": "anydoc",
+            "is_text_pdf": if ext == "pdf" { Some(is_text_pdf) } else { None },
+            "pdf_type": pdf_type_res.as_ref().map(|r| format!("{:?}", r.pdf_type)),
         });
-        return Ok((truncated_content, meta));
+        return Ok((truncated_content, meta, None));
     }
 
     // 5. 兜底回退
-    extract_document_fallback(path, max_bytes)
+    let (fallback_content, fallback_meta) = extract_document_fallback(path, max_bytes)?;
+    Ok((fallback_content, fallback_meta, None))
 }
 
 /// 解析 DOCX 文档中的嵌入图片，执行 PP-OCRv6 文字提取并在 word/document.xml 段落中精确定位原位替换
@@ -989,6 +1101,28 @@ mod tests {
         assert!(res.markdown_content.contains("Hello Firefly Omni!"));
         assert!(res.markdown_content.contains("测试中文文本"));
         assert!(!res.is_corrupted);
+    }
+
+    #[tokio::test]
+    async fn test_extract_plain_text_utf8_truncation() {
+        let temp_path = std::env::temp_dir().join("omni_test_utf8_long.txt");
+        let mut file = File::create(&temp_path).unwrap();
+        // 构造一个大于 30KB 的中文 UTF-8 文本
+        let sample = "角色：你是一位海报设计大师。智能分析系统匹配规则。\n";
+        for _ in 0..1000 {
+            file.write_all(sample.as_bytes()).unwrap();
+        }
+
+        let config = OmniConfig {
+            max_content_size_kb: 30,
+            ..Default::default()
+        };
+        let res = OmniExtractor::extract(&temp_path, &config).await.unwrap();
+        let _ = std::fs::remove_file(&temp_path);
+
+        assert_eq!(res.mime_type, "text/plain");
+        assert!(res.markdown_content.contains("海报设计大师"));
+        assert!(res.markdown_content.contains("[Content truncated at 30 KB limit]"));
     }
 
     #[tokio::test]

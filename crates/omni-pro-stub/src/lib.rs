@@ -121,6 +121,14 @@ pub mod cover {
         pub fn render_cover<P: AsRef<std::path::Path>>(_file_path: P) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("Open-core mode: cover extraction requires omni-pro");
         }
+
+        pub fn render_cover_with_options<P: AsRef<std::path::Path>>(_file_path: P, _allow_libreoffice: bool) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("Open-core mode: cover extraction requires omni-pro");
+        }
+
+        pub fn render_pdf_page_png_buffers<P: AsRef<std::path::Path>>(_file_path: P, _max_pages: usize) -> anyhow::Result<Vec<Vec<u8>>> {
+            Ok(Vec::new())
+        }
     }
 }
 

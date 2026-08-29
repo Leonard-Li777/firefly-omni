@@ -197,28 +197,14 @@ async fn cover_handler(
     Query(req): Query<FilePreviewRequest>,
 ) -> Response {
     let path = PathBuf::from(&req.path);
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .unwrap_or_default();
 
-    let is_office = matches!(
-        ext.as_str(),
-        "doc" | "docx" | "ppt" | "pptx" | "xls" | "xlsx" | "wps" | "odt" | "rtf"
-    );
+    // 检查是否开启了 Office 完整封面截图选项 (LibreOffice)
+    let enable_office_cover = state.config.lock().map(|c| c.enable_office_cover).unwrap_or(false);
 
-    // 若为 Office 格式且未开启 enable_office_cover，直接快速返回 204 No Content
-    if is_office {
-        let enable_office_cover = state.config.lock().map(|c| c.enable_office_cover).unwrap_or(false);
-        if !enable_office_cover {
-            return StatusCode::NO_CONTENT.into_response();
-        }
-    }
-
-    // 交由 CoverRenderer 按扩展名路由，不支持的格式由其内部返回 Err
+    // 交由 CoverRenderer 按扩展名路由：
+    // 对于 Office 文档，内部会默认先解压提取压缩包中的首张图；无图时仅在 enable_office_cover = true 时才执行 LO 渲染
     let outcome = tokio::task::spawn_blocking(move || {
-        omni_pro::CoverRenderer::render_cover(&path)
+        omni_pro::CoverRenderer::render_cover_with_options(&path, enable_office_cover)
     })
     .await;
 
@@ -310,7 +296,23 @@ pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
 
     info!("firefly-omni Axum HTTP server starting on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            // 当由 Electron / Node.js 宿主拉起时，stdin 管道随宿主退出而关闭 (EOF)
+            // 监听 stdin EOF 或终止信号，确保宿主崩溃或强制关闭时 omni-server 立即退出不残留
+            use tokio::io::AsyncReadExt;
+            let mut stdin = tokio::io::stdin();
+            let mut buf = [0u8; 1];
+            tokio::select! {
+                _ = stdin.read(&mut buf) => {
+                    tracing::info!("firefly-omni stdin closed (host terminated), shutting down gracefully.");
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("firefly-omni received Ctrl+C, shutting down gracefully.");
+                }
+            }
+        })
+        .await?;
     Ok(())
 }
 
