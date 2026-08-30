@@ -112,7 +112,11 @@ function main() {
   if (opts.dryRun) pubArgs.push('--dry-run')
   const pub = spawnSync(process.execPath, pubArgs, { stdio: 'inherit', env: process.env })
   if (pub.status !== 0) {
-    console.error('✗ 发布到统一资源中心失败')
+    console.error('✗ 发布到统一资源中心失败。')
+    console.error('💡 排查提示：')
+    console.error('   1. 若报错 HTTP 401: Bad credentials，说明缺少具有写权限的 PAT Token。')
+    console.error('   2. 请确保在 firefly-omni 仓库 Settings -> Secrets and variables -> Actions 中已配置 UNISOURCE_RELEASE_TOKEN 或 PRO_SUBMODULE_TOKEN。')
+    console.error('   3. 该 Token 需具备 repo 或 write:packages 作用域以操作 Leonard-Li777/firefly-resources。')
     process.exit(pub.status || 1)
   }
 

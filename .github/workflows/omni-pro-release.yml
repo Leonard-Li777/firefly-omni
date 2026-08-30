@@ -293,15 +293,27 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ secrets.UNISOURCE_RELEASE_TOKEN }}
+      GH_TOKEN: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.SUBMODULE_ACCESS_TOKEN || secrets.RELEASE_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.SUBMODULE_ACCESS_TOKEN || secrets.RELEASE_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
 
     steps:
       - name: 检出代码（含发布脚本与 Cargo.toml）
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref }}
-          token: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.SUBMODULE_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.SUBMODULE_ACCESS_TOKEN || secrets.RELEASE_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
           submodules: recursive
+
+      - name: 验证 GitHub 认证凭据
+        shell: bash
+        run: |
+          echo "🔍 检查 GitHub CLI 认证状态..."
+          if gh auth status 2>&1; then
+            echo "✅ GitHub CLI 凭据有效。"
+          else
+            echo "⚠️ GitHub CLI 凭据无效或未配置。"
+            echo "💡 请确保在 firefly-omni 仓库 Settings -> Secrets -> Actions 中配置了具有 repo 权限的 UNISOURCE_RELEASE_TOKEN 或 PRO_SUBMODULE_TOKEN。"
+          fi
 
       - name: 下载全部构建构件
         uses: actions/download-artifact@v4
@@ -336,4 +348,5 @@ jobs:
             "$VERSION" \
             --fr "$GITHUB_WORKSPACE/unisource-repo"
         env:
-          GH_TOKEN: ${{ secrets.UNISOURCE_RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.SUBMODULE_ACCESS_TOKEN || secrets.RELEASE_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.SUBMODULE_ACCESS_TOKEN || secrets.RELEASE_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
