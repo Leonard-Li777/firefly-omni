@@ -5,37 +5,118 @@ on:
     tags:
       - 'v*'
 
+# 同一 tag 发布避免并发写 Release
+concurrency:
+  group: omni-opensource-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
 jobs:
   build:
-    name: Build Open-Source Binary (${{ matrix.target }})
+    name: 构建并发布开源版 (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: firefly-omni-windows-x64.zip
+            archive_ext: zip
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             artifact_name: firefly-omni-windows-arm64.zip
+            archive_ext: zip
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: firefly-omni-macos-x64.zip
+            archive_ext: zip
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: firefly-omni-macos-arm64.zip
-          - os: ubuntu-latest
+            archive_ext: zip
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact_name: firefly-omni-linux-x64.tar.gz
+            archive_ext: tar.gz
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: firefly-omni-linux-arm64.tar.gz
+            archive_ext: tar.gz
 
     steps:
-      - name: Checkout Open-Source Repo
+      - name: 检出开源代码
         uses: actions/checkout@v4
 
-      - name: Setup Rust Toolchain
+      - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build Open-Source Binary
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+          key: ${{ matrix.target }}-opensource
+
+      - name: 安装 Linux 构建依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            pkg-config \
+            libssl-dev \
+            cmake \
+            clang \
+            libfreetype-dev \
+            libfontconfig-dev
+
+      - name: 安装 Linux aarch64 交叉编译工具链
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: 构建开源二进制
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: 打包产物
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            BIN_NAME="firefly-omni.exe"
+          else
+            BIN_NAME="firefly-omni"
+          fi
+          TARGET_DIR="target/${{ matrix.target }}/release"
+          mkdir -p dist
+          cp "${TARGET_DIR}/${BIN_NAME}" "dist/${BIN_NAME}"
+          chmod +x "dist/${BIN_NAME}"
+          cd dist
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              7z a "${{ matrix.artifact_name }}" "${BIN_NAME}"
+            else
+              zip -qr "${{ matrix.artifact_name }}" "${BIN_NAME}"
+            fi
+          else
+            tar czf "${{ matrix.artifact_name }}" "${BIN_NAME}"
+          fi
+          rm -f "${BIN_NAME}"
+          echo "ARTIFACT_PATH=dist/${{ matrix.artifact_name }}" >> $GITHUB_ENV
+          ls -lh
+
+      - name: 发布到 GitHub Release（开源版）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Firefly Omni Open-Source ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: ${{ env.ARTIFACT_PATH }}
+          # 同一 tag 下多个 job 各自上传，重复调用会追加产物
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
