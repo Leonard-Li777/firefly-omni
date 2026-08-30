@@ -95,11 +95,14 @@ jobs:
       - name: 安装 Linux aarch64 交叉编译工具链
         if: matrix.target == 'aarch64-unknown-linux-gnu' && runner.os == 'Linux'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          ARCH=$(uname -m)
+          if [ "$ARCH" != "aarch64" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          fi
 
-      - name: 安装 Linux 构建依赖
+      - name: 安装 Linux 构建依赖与 libclang
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
@@ -109,14 +112,49 @@ jobs:
             cmake \
             clang \
             libclang-dev \
+            libclang1 \
+            llvm \
             llvm-dev \
             libfreetype-dev \
             libfontconfig-dev
+          # 动态解析 LLVM lib 目录并设置 LIBCLANG_PATH 与 LD_LIBRARY_PATH
+          LLVM_LIB_DIR=$(llvm-config --libdir 2>/dev/null || true)
+          if [ -z "$LLVM_LIB_DIR" ] || [ ! -d "$LLVM_LIB_DIR" ]; then
+            LLVM_LIB_DIR=$(dirname $(find /usr/lib/llvm* -name "libclang.so*" 2>/dev/null | head -n 1) 2>/dev/null || true)
+          fi
+          if [ -n "$LLVM_LIB_DIR" ] && [ -d "$LLVM_LIB_DIR" ]; then
+            echo "LIBCLANG_PATH=$LLVM_LIB_DIR" >> $GITHUB_ENV
+            echo "LD_LIBRARY_PATH=$LLVM_LIB_DIR:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+            echo "🔍 Linux LIBCLANG_PATH 已配置: $LLVM_LIB_DIR"
+          fi
 
-      - name: 配置 Windows 构建环境
-        if: runner.os == 'Windows'
+      - name: 配置 macOS 构建环境与 libclang
+        if: runner.os == 'macOS'
         run: |
-          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          XCODE_CLANG_LIB="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          if [ -f "$XCODE_CLANG_LIB/libclang.dylib" ]; then
+            echo "LIBCLANG_PATH=$XCODE_CLANG_LIB" >> $GITHUB_ENV
+            echo "🔍 macOS LIBCLANG_PATH 已配置 (Xcode): $XCODE_CLANG_LIB"
+          else
+            brew install llvm
+            echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> $GITHUB_ENV
+            echo "🔍 macOS LIBCLANG_PATH 已配置 (Homebrew): $(brew --prefix llvm)/lib"
+          fi
+
+      - name: 配置 Windows 构建环境与 libclang
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if [ -d "C:/Program Files/LLVM/bin" ]; then
+            echo "LIBCLANG_PATH=C:/Program Files/LLVM/bin" >> $GITHUB_ENV
+            echo "PATH=C:/Program Files/LLVM/bin:$PATH" >> $GITHUB_ENV
+            echo "🔍 Windows LIBCLANG_PATH 已配置: C:/Program Files/LLVM/bin"
+          else
+            choco install llvm -y --no-progress
+            echo "LIBCLANG_PATH=C:/Program Files/LLVM/bin" >> $GITHUB_ENV
+            echo "PATH=C:/Program Files/LLVM/bin:$PATH" >> $GITHUB_ENV
+            echo "🔍 Windows LIBCLANG_PATH 已安装并配置: C:/Program Files/LLVM/bin"
+          fi
 
       - name: 配置构建版本（CE / Pro）
         shell: bash
@@ -146,30 +184,35 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: 配置 MuPDF 编译环境变量
+        shell: bash
+        run: |
+          LIB_DIR="build/libmupdf/${{ matrix.artifact_suffix }}"
+          if [ -d "$LIB_DIR" ]; then
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              ABS_LIB="$(cd "$LIB_DIR" && pwd -W 2>/dev/null || pwd -P)"
+            else
+              ABS_LIB="$(cd "$LIB_DIR" && pwd -P)"
+            fi
+            echo "MUPDF_LIB=$ABS_LIB" >> $GITHUB_ENV
+            echo "MUPDF_DIR=$ABS_LIB" >> $GITHUB_ENV
+            echo "MUPDF_LIB_DIR=$ABS_LIB" >> $GITHUB_ENV
+            echo "MUPDF_INCLUDE_DIR=$ABS_LIB/include" >> $GITHUB_ENV
+            echo "MUPDF_STATIC=1" >> $GITHUB_ENV
+            echo "✅ 已配置 MuPDF 编译环境变量: $ABS_LIB"
+          else
+            echo "⚠️ 未找到预编译 libmupdf: $LIB_DIR，将使用 vendored 编译路径"
+          fi
+
       - name: 构建 firefly-omni 二进制
         shell: bash
         run: |
-          # 设置 MUPDF 环境变量指向预编译静态库与头文件（兼容 mupdf-sys 与 omni-cli）
-          LIB_DIR="build/libmupdf/${{ matrix.artifact_suffix }}"
-          if [ -d "$LIB_DIR" ]; then
-            ABS_LIB="$(pwd)/$LIB_DIR"
-            export MUPDF_LIB="$ABS_LIB"
-            export MUPDF_DIR="$ABS_LIB"
-            export MUPDF_LIB_DIR="$ABS_LIB"
-            export MUPDF_INCLUDE_DIR="$ABS_LIB/include"
-            export MUPDF_STATIC=1
-            echo "✅ 使用预编译 MuPDF: $ABS_LIB"
-          else
-            echo "⚠️ 未找到预编译 libmupdf，将使用 vendored 编译（较慢）"
-          fi
-
           cargo build \
             --manifest-path Cargo.toml \
             --bin firefly-omni \
             --release \
             --target ${{ matrix.target }}
         env:
-          MUPDF_LIB: ${{ env.MUPDF_LIB }}
           PKG_CONFIG_ALLOW_CROSS: 1
 
       - name: 打包产物

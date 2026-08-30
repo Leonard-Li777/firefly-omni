@@ -61,7 +61,17 @@ jobs:
           workspaces: '.'
           key: ${{ matrix.target }}-opensource
 
-      - name: 安装 Linux 构建依赖
+      - name: 安装 Linux aarch64 交叉编译工具链
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && runner.os == 'Linux'
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" != "aarch64" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          fi
+
+      - name: 安装 Linux 构建依赖与 libclang
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
@@ -70,16 +80,59 @@ jobs:
             libssl-dev \
             cmake \
             clang \
+            libclang-dev \
+            libclang1 \
+            llvm \
+            llvm-dev \
             libfreetype-dev \
             libfontconfig-dev
+          # 动态解析 LLVM lib 目录并设置 LIBCLANG_PATH 与 LD_LIBRARY_PATH
+          LLVM_LIB_DIR=$(llvm-config --libdir 2>/dev/null || true)
+          if [ -z "$LLVM_LIB_DIR" ] || [ ! -d "$LLVM_LIB_DIR" ]; then
+            LLVM_LIB_DIR=$(dirname $(find /usr/lib/llvm* -name "libclang.so*" 2>/dev/null | head -n 1) 2>/dev/null || true)
+          fi
+          if [ -n "$LLVM_LIB_DIR" ] && [ -d "$LLVM_LIB_DIR" ]; then
+            echo "LIBCLANG_PATH=$LLVM_LIB_DIR" >> $GITHUB_ENV
+            echo "LD_LIBRARY_PATH=$LLVM_LIB_DIR:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+            echo "🔍 Linux LIBCLANG_PATH 已配置: $LLVM_LIB_DIR"
+          fi
 
-      - name: 安装 Linux aarch64 交叉编译工具链
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: 配置 macOS 构建环境与 libclang
+        if: runner.os == 'macOS'
         run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          XCODE_CLANG_LIB="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          if [ -f "$XCODE_CLANG_LIB/libclang.dylib" ]; then
+            echo "LIBCLANG_PATH=$XCODE_CLANG_LIB" >> $GITHUB_ENV
+            echo "🔍 macOS LIBCLANG_PATH 已配置 (Xcode): $XCODE_CLANG_LIB"
+          else
+            brew install llvm
+            echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> $GITHUB_ENV
+            echo "🔍 macOS LIBCLANG_PATH 已配置 (Homebrew): $(brew --prefix llvm)/lib"
+          fi
+
+      - name: 配置 Windows 构建环境与 libclang
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if [ -d "C:/Program Files/LLVM/bin" ]; then
+            echo "LIBCLANG_PATH=C:/Program Files/LLVM/bin" >> $GITHUB_ENV
+            echo "PATH=C:/Program Files/LLVM/bin:$PATH" >> $GITHUB_ENV
+            echo "🔍 Windows LIBCLANG_PATH 已配置: C:/Program Files/LLVM/bin"
+          else
+            choco install llvm -y --no-progress
+            echo "LIBCLANG_PATH=C:/Program Files/LLVM/bin" >> $GITHUB_ENV
+            echo "PATH=C:/Program Files/LLVM/bin:$PATH" >> $GITHUB_ENV
+            echo "🔍 Windows LIBCLANG_PATH 已安装并配置: C:/Program Files/LLVM/bin"
+          fi
+
+      - name: 配置构建版本（CE 开源版）
+        shell: bash
+        run: |
+          echo "🌍 配置社区开源版 (CE)..."
+          node scripts/configure-edition.js --ce 2>/dev/null || true
 
       - name: 构建开源二进制
+        shell: bash
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: 打包产物

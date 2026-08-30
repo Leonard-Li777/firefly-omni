@@ -8,26 +8,30 @@ const path = require('path')
 function configureOmniEdition(edition = 'pro') {
   const omniRoot = path.resolve(__dirname, '..')
   const serverCargoPath = path.join(omniRoot, 'crates', 'omni-server', 'Cargo.toml')
+  const extractCargoPath = path.join(omniRoot, 'crates', 'omni-extract', 'Cargo.toml')
   const rootCargoPath = path.join(omniRoot, 'Cargo.toml')
 
   const isCE = edition === 'ce' || process.env.OMNI_EDITION === 'ce' || process.argv.includes('--ce')
 
-  if (fs.existsSync(serverCargoPath)) {
-    let content = fs.readFileSync(serverCargoPath, 'utf8')
-    if (isCE) {
-      // 切换至开源存根: omni-pro = { path = "../omni-pro-stub", package = "omni-pro-stub" }
-      content = content.replace(
-        /omni-pro\s*=\s*\{[^}]*\}/g,
-        'omni-pro = { path = "../omni-pro-stub", package = "omni-pro-stub" }'
-      )
-    } else {
-      // 切换至 Pro 版源码: omni-pro = { path = "../../omni-pro", package = "omni-pro" }
-      content = content.replace(
-        /omni-pro\s*=\s*\{[^}]*\}/g,
-        'omni-pro = { path = "../../omni-pro", package = "omni-pro" }'
-      )
+  const targetCargoPaths = [serverCargoPath, extractCargoPath]
+  for (const cargoPath of targetCargoPaths) {
+    if (fs.existsSync(cargoPath)) {
+      let content = fs.readFileSync(cargoPath, 'utf8')
+      if (isCE) {
+        // 切换至开源存根: omni-pro = { path = "../omni-pro-stub", package = "omni-pro-stub" }
+        content = content.replace(
+          /omni-pro\s*=\s*\{[^}]*\}/g,
+          'omni-pro = { path = "../omni-pro-stub", package = "omni-pro-stub" }'
+        )
+      } else {
+        // 切换至 Pro 版源码: omni-pro = { path = "../../omni-pro", package = "omni-pro" }
+        content = content.replace(
+          /omni-pro\s*=\s*\{[^}]*\}/g,
+          'omni-pro = { path = "../../omni-pro", package = "omni-pro" }'
+        )
+      }
+      fs.writeFileSync(cargoPath, content, 'utf8')
     }
-    fs.writeFileSync(serverCargoPath, content, 'utf8')
   }
 
   if (fs.existsSync(rootCargoPath)) {
