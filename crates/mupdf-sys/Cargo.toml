@@ -1,0 +1,9 @@
+[package]
+name = "mupdf-sys"
+version = "0.4.4"
+edition = "2021"
+links = "mupdf-wrapper"
+
+[build-dependencies]
+bindgen = { version = "0.69", features = ["runtime"], default-features = false }
+cc = "1.0"

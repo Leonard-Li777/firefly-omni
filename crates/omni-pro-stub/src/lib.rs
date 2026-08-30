@@ -126,10 +126,18 @@ pub mod cover {
             anyhow::bail!("Open-core mode: cover extraction requires omni-pro");
         }
 
+        pub fn render_pdf_page_images<P: AsRef<std::path::Path>>(_file_path: P, _max_pages: usize) -> anyhow::Result<Vec<image::DynamicImage>> {
+            Ok(Vec::new())
+        }
+
         pub fn render_pdf_page_png_buffers<P: AsRef<std::path::Path>>(_file_path: P, _max_pages: usize) -> anyhow::Result<Vec<Vec<u8>>> {
             Ok(Vec::new())
         }
     }
+
+    pub fn raw_to_webp(_samples: &[u8], _width: u32, _height: u32, _channels: u8) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("Open-core mode: cover extraction requires omni-pro");
+    }
 }
 
-pub use cover::CoverRenderer;
+pub use cover::{raw_to_webp, CoverRenderer};

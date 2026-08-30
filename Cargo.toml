@@ -1,4 +1,4 @@
-﻿[workspace]
+[workspace]
 resolver = "2"
 members = [
     "crates/omni-core",
@@ -9,6 +9,7 @@ members = [
     "crates/omni-mcp",
     "crates/omni-node",
     "crates/omni-pro-stub",
+    "crates/mupdf-sys",
     "omni-pro",
     "omni-pro/crates/omni-geo",
     "omni-pro/crates/omni-cleanup",
@@ -38,3 +39,6 @@ image = "0.25"
 encoding_rs = "0.8"
 regex = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
+
+[patch.crates-io]
+mupdf-sys = { path = "crates/mupdf-sys" }

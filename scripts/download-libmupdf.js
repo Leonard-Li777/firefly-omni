@@ -107,21 +107,40 @@ function extractArchive(archive, destDir) {
       log(`解压成功 (tar.gz): ${path.basename(archive)}`)
       return
     }
-    throw new Error(`tar 解压失败: ${archive}（${(res.stderr || '').toString().trim()}）`)
+    // 备用 7z 解压 tar.gz
+    const res7z = spawnSync('7z', ['x', archive, `-so`], { stdio: ['pipe', 'pipe', 'pipe'] })
+    if (res7z.status === 0 && res7z.stdout) {
+      const resTar = spawnSync('tar', ['-xf', '-', '-C', destDir], { input: res7z.stdout, stdio: ['pipe', 'pipe', 'pipe'] })
+      if (resTar.status === 0) {
+        log(`解压成功 (tar.gz, 7z+tar): ${path.basename(archive)}`)
+        return
+      }
+    }
+    throw new Error(`tar 解压失败: ${archive}（${(res.stderr || res.stdout || '').toString().trim()}）`)
   }
   if (isZip) {
     if (process.platform === 'win32') {
+      // 1. 优先尝试 7z（Windows CI 预装，性能与稳定性最高）
+      res = spawnSync('7z', ['x', archive, `-o${destDir}`, '-y'], { stdio: 'pipe' })
+      if (res.status === 0) {
+        log(`解压成功 (zip, 7z): ${path.basename(archive)}`)
+        return
+      }
+      // 2. 尝试系统 tar
       res = spawnSync('tar', ['-xf', archive, '-C', destDir], { stdio: 'pipe' })
       if (res.status === 0) {
         log(`解压成功 (zip, 系统 tar): ${path.basename(archive)}`)
         return
       }
+      // 3. 尝试 PowerShell Expand-Archive（转义路径）
+      const safeArchive = archive.replace(/'/g, "''")
+      const safeDest = destDir.replace(/'/g, "''")
       res = spawnSync(
         'powershell',
         [
           '-NoProfile',
           '-Command',
-          `Expand-Archive -Path '${archive}' -DestinationPath '${destDir}' -Force`
+          `Expand-Archive -LiteralPath '${safeArchive}' -DestinationPath '${safeDest}' -Force`
         ],
         { stdio: 'pipe' }
       )
@@ -129,11 +148,17 @@ function extractArchive(archive, destDir) {
         log(`解压成功 (zip, PowerShell): ${path.basename(archive)}`)
         return
       }
-      throw new Error(`zip 解压失败: ${archive}（${(res.stderr || '').toString().trim()}）`)
+      throw new Error(`zip 解压失败: ${archive}（${(res.stderr || res.stdout || '').toString().trim()}）`)
     }
+    // 非 Windows 优先尝试 unzip，其次 7z / tar
     res = spawnSync('unzip', ['-q', '-o', archive, '-d', destDir], { stdio: 'pipe' })
     if (res.status === 0) {
       log(`解压成功 (zip, unzip): ${path.basename(archive)}`)
+      return
+    }
+    res = spawnSync('7z', ['x', archive, `-o${destDir}`, '-y'], { stdio: 'pipe' })
+    if (res.status === 0) {
+      log(`解压成功 (zip, 7z): ${path.basename(archive)}`)
       return
     }
     res = spawnSync('tar', ['-xf', archive, '-C', destDir], { stdio: 'pipe' })
@@ -141,7 +166,7 @@ function extractArchive(archive, destDir) {
       log(`解压成功 (zip, tar): ${path.basename(archive)}`)
       return
     }
-    throw new Error(`zip 解压失败: ${archive}（${(res.stderr || '').toString().trim()}）`)
+    throw new Error(`zip 解压失败: ${archive}（${(res.stderr || res.stdout || '').toString().trim()}）`)
   }
   throw new Error(`不支持的压缩包格式: ${archive}`)
 }

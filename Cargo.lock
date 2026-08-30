@@ -36,9 +36,9 @@ dependencies = [
 
 [[package]]
 name = "aes"
-version = "0.9.2"
+version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8eb277bec05f56a0e0591f155a484cbd0f4f07ff2905051a48c72f004f7ed58"
+checksum = "35f0f96ce78e38c3dc6d8948aa8163d06385be74000f3c7a95bf1eef35d3ea32"
 dependencies = [
  "cipher 0.5.2",
  "cpubits",
@@ -2727,9 +2727,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libredox"
-version = "0.1.20"
+version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28d0a00925a9f930d679b6789b721e3a7f9ed110f41b86d2497caa780c3a070a"
+checksum = "d7955dfc218a8afb29dfeffd540e3a6e96baeb94fe7138228dd7cc6937fbbf96"
 dependencies = [
  "libc",
 ]
@@ -2905,7 +2905,7 @@ version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e2ec995d822e05cabc3f06d196ee43650af3fe4fe38012cacb35e0c3d113b68"
 dependencies = [
- "aes 0.9.2",
+ "aes 0.9.3",
  "bitflags 2.13.1",
  "cbc 0.2.1",
  "chrono",
@@ -3153,12 +3153,9 @@ dependencies = [
 [[package]]
 name = "mupdf-sys"
 version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd2bd5de0f9c7ab0da37de2299626b8449a1263304f8a54def2a93ddfe31ee9b"
 dependencies = [
  "bindgen",
  "cc",
- "pkg-config",
 ]
 
 [[package]]
@@ -3759,6 +3756,7 @@ name = "omni-pro-stub"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "image",
  "omni-core",
  "serde",
  "serde_json",
@@ -4782,11 +4780,11 @@ dependencies = [
 
 [[package]]
 name = "sevenz-rust2"
-version = "0.21.5"
+version = "0.21.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cabfe266b357df6e7aa8d0c9bb11eac1fd0ed049f6318455bf55345d9de6c3b5"
+checksum = "b7e6633e9d494e3b8e69b6e806cd76fb19e5d60b7aedcf35ac051e78c4f0c27c"
 dependencies = [
- "aes 0.9.2",
+ "aes 0.9.3",
  "bzip2 0.6.1",
  "cbc 0.2.1",
  "crc32fast",
@@ -5768,9 +5766,9 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "twox-hash"
-version = "2.1.3"
+version = "2.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
+checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 
 [[package]]
 name = "type-map"
@@ -6650,7 +6648,7 @@ version = "8.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
- "aes 0.9.2",
+ "aes 0.9.3",
  "bzip2 0.6.1",
  "constant_time_eq 0.4.2",
  "crc32fast",

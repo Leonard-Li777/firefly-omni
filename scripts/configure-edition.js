@@ -47,6 +47,7 @@ function configureOmniEdition(edition = 'pro') {
     "crates/omni-mcp",
     "crates/omni-node",
     "crates/omni-pro-stub",
+    "crates/mupdf-sys",
 ]`
       rootContent = rootContent.replace(/members\s*=\s*\[[\s\S]*?\]/m, ceMembers)
     } else {
@@ -60,6 +61,7 @@ function configureOmniEdition(edition = 'pro') {
     "crates/omni-mcp",
     "crates/omni-node",
     "crates/omni-pro-stub",
+    "crates/mupdf-sys",
     "omni-pro",
     "omni-pro/crates/omni-geo",
     "omni-pro/crates/omni-cleanup",
