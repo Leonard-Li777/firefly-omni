@@ -102,6 +102,7 @@ jobs:
         run: |
           SDK_PATH="$(xcrun --show-sdk-path)"
           echo "SDKROOT=$SDK_PATH" >> $GITHUB_ENV
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> $GITHUB_ENV
           echo "BINDGEN_EXTRA_CLANG_ARGS=-isysroot $SDK_PATH" >> $GITHUB_ENV
 
           XCODE_CLANG_LIB="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"

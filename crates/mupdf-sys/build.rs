@@ -65,9 +65,18 @@ fn main() {
     }
 
     if cfg!(target_os = "macos") {
+        println!("cargo:rustc-link-lib=dylib=z");
+        println!("cargo:rustc-link-lib=dylib=c++");
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
-        println!("cargo:rustc-link-lib=dylib=c++");
+        println!("cargo:rustc-link-lib=framework=CoreText");
+    }
+
+    if cfg!(target_os = "linux") {
+        println!("cargo:rustc-link-lib=dylib=z");
+        println!("cargo:rustc-link-lib=dylib=m");
+        println!("cargo:rustc-link-lib=dylib=pthread");
+        println!("cargo:rustc-link-lib=dylib=dl");
     }
 
     let include_dir = if lib_dir.join("include").exists() {

@@ -63,6 +63,23 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=shell32");
             println!("cargo:rustc-link-lib=dylib=windowscodecs");
         }
+
+        #[cfg(target_os = "macos")]
+        {
+            println!("cargo:rustc-link-lib=dylib=z");
+            println!("cargo:rustc-link-lib=dylib=c++");
+            println!("cargo:rustc-link-lib=framework=CoreFoundation");
+            println!("cargo:rustc-link-lib=framework=CoreGraphics");
+            println!("cargo:rustc-link-lib=framework=CoreText");
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            println!("cargo:rustc-link-lib=dylib=z");
+            println!("cargo:rustc-link-lib=dylib=m");
+            println!("cargo:rustc-link-lib=dylib=pthread");
+            println!("cargo:rustc-link-lib=dylib=dl");
+        }
         println!("cargo:rerun-if-env-changed=MUPDF_LIB");
     }
 }
