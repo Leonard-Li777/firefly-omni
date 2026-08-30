@@ -108,8 +108,15 @@ jobs:
             libssl-dev \
             cmake \
             clang \
+            libclang-dev \
+            llvm-dev \
             libfreetype-dev \
             libfontconfig-dev
+
+      - name: 配置 Windows 构建环境
+        if: runner.os == 'Windows'
+        run: |
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
       - name: 配置构建版本（CE / Pro）
         shell: bash
