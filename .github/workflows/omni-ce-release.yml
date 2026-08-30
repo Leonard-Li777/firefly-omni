@@ -1,13 +1,19 @@
-name: Build and Release Open-Source Firefly Omni
+name: omni-ce-release
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: '发布版本号（如 v0.1.0）'
+        required: false
+        default: ''
 
 # 同一 tag 发布避免并发写 Release
 concurrency:
-  group: omni-opensource-release-${{ github.ref }}
+  group: omni-ce-release-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -145,6 +151,46 @@ jobs:
           echo "🌍 配置社区开源版 (CE)..."
           node scripts/configure-edition.js --ce 2>/dev/null || true
 
+      - name: 下载 libmupdf 预编译静态库
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            ASSET_NAME="libmupdf-macos-universal.tar.gz"
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            ASSET_NAME="libmupdf-windows-x86_64.zip"
+          else
+            if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+              ASSET_NAME="libmupdf-linux-aarch64.tar.gz"
+            else
+              ASSET_NAME="libmupdf-linux-x86_64.tar.gz"
+            fi
+          fi
+
+          echo "📥 下载 ${ASSET_NAME}..."
+          node scripts/download-libmupdf.js --asset "${ASSET_NAME}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置 MuPDF 编译环境变量
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            SUFFIX="macos-universal"
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            SUFFIX="windows-x86_64"
+          else
+            if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+              SUFFIX="linux-aarch64"
+            else
+              SUFFIX="linux-x86_64"
+            fi
+          fi
+          MUPDF_DIR="${GITHUB_WORKSPACE}/build/libmupdf/${SUFFIX}"
+          if [ -d "$MUPDF_DIR" ]; then
+            echo "MUPDF_LIB=$MUPDF_DIR" >> $GITHUB_ENV
+            echo "🔍 MUPDF_LIB 已配置: $MUPDF_DIR"
+          fi
+
       - name: 构建开源二进制
         shell: bash
         run: cargo build --release --target ${{ matrix.target }}
@@ -178,8 +224,8 @@ jobs:
       - name: 发布到 GitHub Release（开源版）
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Firefly Omni Open-Source ${{ github.ref_name }}
+          tag_name: ${{ github.event.inputs.version_tag || github.ref_name }}
+          name: Firefly Omni Open-Source ${{ github.event.inputs.version_tag || github.ref_name }}
           draft: false
           prerelease: false
           files: ${{ env.ARTIFACT_PATH }}

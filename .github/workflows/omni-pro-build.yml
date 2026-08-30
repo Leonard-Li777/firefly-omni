@@ -1,4 +1,4 @@
-name: omni-build
+name: omni-pro-build
 
 on:
   # 手动触发，支持选择版本类型和目标分支
