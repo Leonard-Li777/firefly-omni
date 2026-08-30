@@ -32,34 +32,8 @@ const fs = require('fs')
 const path = require('path')
 const os = require('os')
 const crypto = require('crypto')
-const axios = require('axios')
 const { spawnSync } = require('child_process')
-
-// 适配 proxy 工具（与 omni 其它脚本一致）
-let detectProxy, createAxiosProxyConfig, isNetworkError, createProxyAgent
-try {
-  const proxyUtils = require('../../../scripts/utils/proxy-utils')
-  detectProxy = proxyUtils.detectProxy
-  createAxiosProxyConfig = proxyUtils.createAxiosProxyConfig
-  isNetworkError = proxyUtils.isNetworkError
-  createProxyAgent = proxyUtils.createProxyAgent
-} catch (e) {
-  detectProxy = () => process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.ALL_PROXY || null
-  createAxiosProxyConfig = (proxyUrl, headers = {}) => {
-    const config = { headers }
-    if (proxyUrl) {
-      const { HttpsProxyAgent } = require('https-proxy-agent')
-      config.httpsAgent = new HttpsProxyAgent(proxyUrl)
-      config.proxy = false
-    }
-    return config
-  }
-  isNetworkError = err => Boolean(err && (err.code || !err.response))
-  createProxyAgent = proxyUrl => {
-    const { HttpsProxyAgent } = require('https-proxy-agent')
-    return new HttpsProxyAgent(proxyUrl)
-  }
-}
+const { Readable } = require('stream')
 
 const OMNI_ROOT = path.resolve(__dirname, '..')
 const DEFAULT_REPO = 'Leonard-Li777/firefly-omni'
@@ -226,34 +200,44 @@ function deployLocalFallback(suffixes) {
 }
 
 /**
- * 下载到文件（stream 管道，支持代理与 GitHub 认证）
+ * 下载到文件（优先使用 gh CLI，回退使用原生 fetch stream）
  * @param {string} url 下载地址
  * @param {string} destPath 落盘路径
+ * @param {string} repo 仓库
+ * @param {string} tag 标签
+ * @param {string} asset 资产名
  * @returns {Promise<void>}
  */
-async function downloadToFile(url, destPath) {
-  const proxyUrl = detectProxy()
+async function downloadToFile(url, destPath, repo, tag, asset) {
+  const destDir = path.dirname(destPath)
+  // 1. 优先尝试 gh CLI（CI 中原生认证与重定向处理）
+  try {
+    const gh = spawnSync('gh', ['release', 'download', tag, '--pattern', asset, '--repo', repo, '--dir', destDir, '--clobber'], {
+      stdio: 'inherit',
+      env: process.env
+    })
+    if (gh.status === 0 && fs.existsSync(destPath)) {
+      return
+    }
+  } catch (e) {
+    // gh 缺失时继续尝试 fetch
+  }
+
+  // 2. 原生 fetch 兜底
   const headers = {}
-  if (process.env.GITHUB_TOKEN) {
-    headers.Authorization = `token ${process.env.GITHUB_TOKEN}`
-  } else if (process.env.GH_TOKEN) {
-    headers.Authorization = `token ${process.env.GH_TOKEN}`
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN
+  if (token) {
+    headers.Authorization = `token ${token}`
   }
-  const axiosConfig = {
-    ...createAxiosProxyConfig(proxyUrl, headers),
-    responseType: 'stream',
-    maxRedirects: 5,
-    timeout: 600000,
-    maxContentLength: 1024 * 1024 * 1024,
-    maxBodyLength: 1024 * 1024 * 1024
+  const res = await fetch(url, { headers, redirect: 'follow' })
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}: ${res.statusText}`)
   }
-  const res = await axios.get(url, axiosConfig)
   const writer = fs.createWriteStream(destPath)
   await new Promise((resolve, reject) => {
-    res.data.pipe(writer)
+    Readable.fromWeb(res.body).pipe(writer)
     writer.on('finish', resolve)
     writer.on('error', reject)
-    res.data.on('error', reject)
   })
 }
 
@@ -304,7 +288,7 @@ async function main() {
   try {
     ensureDir(tmpRoot)
     log(`📥 下载 ${url}`)
-    await downloadToFile(url, archivePath)
+    await downloadToFile(url, archivePath, repo, tag, asset)
     log(`   完成，大小 ${(fs.statSync(archivePath).size / 1048576).toFixed(1)} MiB`)
     extractArchive(archivePath, extractRoot)
     const libRoot = flattenLibRoot(extractRoot)
