@@ -1,4 +1,4 @@
-name: omni-pro-build
+name: omni-pro-release
 
 on:
   # 手动触发，支持选择版本类型和目标分支
@@ -23,7 +23,7 @@ on:
 
 # 防止同一版本并发构建
 concurrency:
-  group: omni-build-${{ github.event.inputs.edition }}-${{ github.event.inputs.ref }}
+  group: omni-pro-release-${{ github.event.inputs.edition }}-${{ github.event.inputs.ref }}
   cancel-in-progress: true
 
 permissions:
