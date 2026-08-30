@@ -66,12 +66,6 @@ jobs:
             artifact_suffix: linux-aarch64
             archive_ext: tar.gz
 
-          # Windows aarch64（实验性：无 arm64 预编译 libmupdf，走 vendored 编译，失败不阻塞）
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            artifact_suffix: windows-aarch64
-            archive_ext: zip
-            experimental: true
 
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -129,7 +123,6 @@ jobs:
           fi
 
       - name: 下载 libmupdf 预编译静态库
-        if: matrix.target != 'aarch64-pc-windows-msvc'
         shell: bash
         run: |
           # macOS 统一使用 Universal 通用胖静态库，Windows 使用 zip，Linux 使用对应平台 tar.gz
@@ -170,6 +163,7 @@ jobs:
             --target ${{ matrix.target }}
         env:
           MUPDF_LIB: ${{ env.MUPDF_LIB }}
+          PKG_CONFIG_ALLOW_CROSS: 1
 
       - name: 打包产物
         shell: bash
