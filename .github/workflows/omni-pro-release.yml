@@ -259,16 +259,42 @@ jobs:
     name: 聚合发布 Pro 构件到统一资源中心
     needs: build
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.SUBMODULE_ACCESS_TOKEN || secrets.RELEASE_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
-      GITHUB_TOKEN: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.SUBMODULE_ACCESS_TOKEN || secrets.RELEASE_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
 
     steps:
+      - name: 初始化跨仓库发布 Token
+        shell: bash
+        env:
+          T1: ${{ secrets.UNISOURCE_RELEASE_TOKEN }}
+          T2: ${{ secrets.PRO_SUBMODULE_TOKEN }}
+          T3: ${{ secrets.PRIVATE_MONOREPO_PAT }}
+          T4: ${{ secrets.PAT }}
+          T_DEFAULT: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ACTIVE_TOKEN=""
+          if [ -n "$T1" ]; then
+            ACTIVE_TOKEN="$T1"
+            echo "🔑 使用 Secret: UNISOURCE_RELEASE_TOKEN"
+          elif [ -n "$T2" ]; then
+            ACTIVE_TOKEN="$T2"
+            echo "🔑 使用 Secret: PRO_SUBMODULE_TOKEN"
+          elif [ -n "$T3" ]; then
+            ACTIVE_TOKEN="$T3"
+            echo "🔑 使用 Secret: PRIVATE_MONOREPO_PAT"
+          elif [ -n "$T4" ]; then
+            ACTIVE_TOKEN="$T4"
+            echo "🔑 使用 Secret: PAT"
+          else
+            ACTIVE_TOKEN="$T_DEFAULT"
+            echo "⚠️ 回退使用默认 GITHUB_TOKEN（无跨仓库权限，可能导致 401）"
+          fi
+          echo "GH_TOKEN=$ACTIVE_TOKEN" >> $GITHUB_ENV
+          echo "GITHUB_TOKEN=$ACTIVE_TOKEN" >> $GITHUB_ENV
+
       - name: 检出代码（含发布脚本与 Cargo.toml）
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref || 'master' }}
-          token: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.SUBMODULE_ACCESS_TOKEN || secrets.RELEASE_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+          token: ${{ env.GH_TOKEN || secrets.GITHUB_TOKEN }}
           submodules: recursive
 
       - name: 验证 GitHub 认证凭据
@@ -315,5 +341,5 @@ jobs:
             "$VERSION" \
             --fr "$GITHUB_WORKSPACE/unisource-repo"
         env:
-          GH_TOKEN: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.SUBMODULE_ACCESS_TOKEN || secrets.RELEASE_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.SUBMODULE_ACCESS_TOKEN || secrets.RELEASE_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ env.GH_TOKEN }}
