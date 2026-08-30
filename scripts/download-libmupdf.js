@@ -3,7 +3,7 @@
  * 目的：从 firefly-omni 仓库的 ci-resources Release 下载预编译好的
  * libmupdf 静态库（libmupdf-out/：*.a / *.lib + include/），解压并摊平
  * 到 omni 的 build/libmupdf/<suffix>/ 目录，供 Rust build script 以
- * MUPDF_LIB 环境变量引用（见 omni-build.yml）。
+ * MUPDF_LIB 环境变量引用（见 omni-pro-release.yml / omni-ce-release.yml）。
  *
  * 用法:
  *   node scripts/download-libmupdf.js --asset <asset> [--force]

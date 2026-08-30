@@ -2,7 +2,7 @@
 
 /**
  * 统一资源中心（firefly-resources）多平台发布脚本
- * 供 omni-build.yml 聚合 job 与本地手动发布使用：
+ * 供 omni-pro-release.yml 聚合 job 与本地手动发布使用：
  *   扫描构建产物目录 → 按文件名映射平台键 → 组装 manifest → publish-resources.js 上传+更新 index → 提交推送 index.json。
  *
  * 用法：
@@ -11,7 +11,7 @@
  * 环境变量：
  *   GH_TOKEN   用于 gh CLI（上传资产）与 git push（更新 index.json，需对 firefly-resources 有推送权限）
  *
- * 产物命名规范（与 omni-build.yml 打包一致）：
+ * 产物命名规范（与 omni-pro-release.yml 打包一致）：
  *   firefly-omni-windows-x86_64.zip / firefly-omni-macos-x86_64.tar.gz / firefly-omni-linux-aarch64.tar.gz 等
  * 将映射为统一资源中心平台键：win32-x64 / win32-arm64 / darwin-x64 / darwin-arm64 / linux-x64 / linux-arm64。
  * 未收集到的平台（如实验性构建失败的 windows-arm64）自动跳过，不影响其它平台发布。
