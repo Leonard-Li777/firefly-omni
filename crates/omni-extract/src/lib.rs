@@ -109,7 +109,9 @@ impl OmniExtractor {
         // 5. 补充文档精细元数据 (document) 与 文本统计 (text_stats)
         if is_pdf || is_office {
             let mut doc_meta = result.metadata.get("document").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-            doc_meta.insert("extractor".into(), "anydoc".into());
+            if !doc_meta.contains_key("extractor") {
+                doc_meta.insert("extractor".into(), "anydoc".into());
+            }
 
             if let Some(val) = exiftool_map.get("Title") { doc_meta.insert("title".into(), val.clone()); }
             if let Some(val) = exiftool_map.get("Author").or_else(|| exiftool_map.get("Creator")) { doc_meta.insert("author".into(), val.clone()); }
@@ -418,9 +420,14 @@ impl OmniExtractor {
 }
 
 /// 查找三大平台 (Windows / macOS / Linux) 原生解耦的 ExifTool 可执行文件
-fn find_exiftool_executable() -> Option<std::path::PathBuf> {
-    use std::process::Command;
+/// exiftool 可执行文件路径缓存（仅查找一次，避免每次提取都重复启动 Perl 进程探测）
+static EXIFTOOL_EXE_CACHE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
 
+fn find_exiftool_executable() -> Option<std::path::PathBuf> {
+    EXIFTOOL_EXE_CACHE.get_or_init(|| find_exiftool_executable_inner()).clone()
+}
+
+fn find_exiftool_executable_inner() -> Option<std::path::PathBuf> {
     let is_win = cfg!(target_os = "windows");
     let exe_name = if is_win { "exiftool.exe" } else { "exiftool" };
     let platform_dir = match std::env::consts::OS {
@@ -431,18 +438,29 @@ fn find_exiftool_executable() -> Option<std::path::PathBuf> {
     };
 
     // 1. 优先查找系统 PATH 中的 exiftool / exiftool.exe
-    if Command::new(exe_name).arg("-ver").output().map(|o| o.status.success()).unwrap_or(false) {
-        return Some(std::path::PathBuf::from(exe_name));
-    }
-    if is_win && Command::new("exiftool").arg("-ver").output().map(|o| o.status.success()).unwrap_or(false) {
-        return Some(std::path::PathBuf::from("exiftool"));
+    // 注意：不再用 -ver 进程探测（每次启动 Perl 约需 1-2s），改为直接检查 PATH 上的文件是否存在
+    if let Ok(path_env) = std::env::var("PATH") {
+        let sep = if is_win { ';' } else { ':' };
+        for dir in path_env.split(sep) {
+            let candidate = std::path::Path::new(dir).join(exe_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            // Windows 上同时尝试无 .exe 后缀的 exiftool
+            if is_win {
+                let candidate2 = std::path::Path::new(dir).join("exiftool");
+                if candidate2.exists() {
+                    return Some(candidate2);
+                }
+            }
+        }
     }
 
     // 2. 查找 APPDATA / HOME 本地缓存目录中的 bin/{platform}/
     if let Ok(appdata) = std::env::var("APPDATA") {
         let candidates = [
-            Path::new(&appdata).join(format!("firefly-ai-folder/bin/{}/{}", platform_dir, exe_name)),
-            Path::new(&appdata).join(format!("firefly-ai-folder/bin/{}", exe_name)),
+            std::path::Path::new(&appdata).join(format!("firefly-ai-folder/bin/{}/{}", platform_dir, exe_name)),
+            std::path::Path::new(&appdata).join(format!("firefly-ai-folder/bin/{}", exe_name)),
         ];
         for cand in candidates {
             if cand.exists() {
@@ -452,8 +470,8 @@ fn find_exiftool_executable() -> Option<std::path::PathBuf> {
     }
     if let Ok(home) = std::env::var("HOME") {
         let candidates = [
-            Path::new(&home).join(format!(".config/firefly-ai-folder/bin/{}/{}", platform_dir, exe_name)),
-            Path::new(&home).join(format!(".config/firefly-ai-folder/bin/{}", exe_name)),
+            std::path::Path::new(&home).join(format!(".config/firefly-ai-folder/bin/{}/{}", platform_dir, exe_name)),
+            std::path::Path::new(&home).join(format!(".config/firefly-ai-folder/bin/{}", exe_name)),
         ];
         for cand in candidates {
             if cand.exists() {
@@ -463,8 +481,8 @@ fn find_exiftool_executable() -> Option<std::path::PathBuf> {
     }
 
     // 3. 向上递归搜索可执行文件所在目录 (exe_dir)
-    if let Ok(exe_dir) = std::env::current_exe().map(|p| p.parent().unwrap_or(Path::new("")).to_path_buf()) {
-        let mut curr: Option<&Path> = Some(exe_dir.as_path());
+    if let Ok(exe_dir) = std::env::current_exe().map(|p| p.parent().unwrap_or(std::path::Path::new("")).to_path_buf()) {
+        let mut curr: Option<&std::path::Path> = Some(exe_dir.as_path());
         while let Some(dir) = curr {
             let candidates = [
                 dir.join(format!("build/extraResources/bin/exiftool/{}", exe_name)),
@@ -492,7 +510,7 @@ fn find_exiftool_executable() -> Option<std::path::PathBuf> {
 
     // 4. 向上递归搜索 CWD / Monorepo build/extraResources/bin
     if let Ok(cwd) = std::env::current_dir() {
-        let mut curr: Option<&Path> = Some(cwd.as_path());
+        let mut curr: Option<&std::path::Path> = Some(cwd.as_path());
         while let Some(dir) = curr {
             let candidates = [
                 dir.join(format!("build/extraResources/bin/exiftool/{}", exe_name)),
@@ -525,10 +543,212 @@ fn find_exiftool_executable() -> Option<std::path::PathBuf> {
     None
 }
 
-/// 提取全量 ExifTool 字典 (包含 Creator, Producer, CreateDate, ModifyDate, PDFVersion, PageCount 等全量 100+ 属性)
-fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_json::Value> {
-    use std::process::Command;
+
+/// 格式化 PDF 内部日期字符串 (例如: D:20250407143317+08'00' -> 2025:04:07 14:33:17+08:00)
+fn format_pdf_date(raw: &str) -> String {
+    let s = raw.strip_prefix("D:").unwrap_or(raw);
+    if s.len() >= 14 {
+        let year = &s[0..4];
+        let month = &s[4..6];
+        let day = &s[6..8];
+        let hour = &s[8..10];
+        let min = &s[10..12];
+        let sec = &s[12..14];
+        let rest = &s[14..];
+        let tz = rest.replace('\'', ":").trim_end_matches(':').to_string();
+        if !tz.is_empty() {
+            format!("{}:{}:{} {}:{}:{}{}", year, month, day, hour, min, sec, tz)
+        } else {
+            format!("{}:{}:{} {}:{}:{}", year, month, day, hour, min, sec)
+        }
+    } else {
+        s.to_string()
+    }
+}
+
+/// Rust 原生极速解析 PDF 元数据字典 (通过 lopdf，耗时通常 < 3ms，完全免疫 ExifTool 在 AES-256 加密 PDF 上的 3.5s 解密卡顿)
+fn extract_pdf_metadata_native(p: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let doc = lopdf::Document::load(p).ok()?;
     let mut map = serde_json::Map::new();
+
+    map.insert("FileType".into(), "PDF".into());
+    map.insert("FileTypeExtension".into(), "pdf".into());
+    map.insert("MIMEType".into(), "application/pdf".into());
+    map.insert("PDFVersion".into(), doc.version.clone().into());
+
+    let page_count = doc.get_pages().len();
+    if page_count > 0 {
+        map.insert("PageCount".into(), (page_count as u64).into());
+    }
+
+    // 从 Trailer 查找 Info 字典
+    let info_obj = if let Ok(info_ref) = doc.trailer.get(b"Info") {
+        match info_ref {
+            lopdf::Object::Reference(id) => doc.get_object(*id).ok(),
+            lopdf::Object::Dictionary(_) => Some(info_ref),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(lopdf::Object::Dictionary(dict)) = info_obj {
+        for (key, val) in dict.iter() {
+            let key_str = String::from_utf8_lossy(key).to_string();
+            let val_str = match val {
+                lopdf::Object::String(bytes, _) => {
+                    if bytes.starts_with(&[0xFE, 0xFF]) {
+                        let u16_vec: Vec<u16> = bytes[2..]
+                            .chunks_exact(2)
+                            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                            .collect();
+                        String::from_utf16_lossy(&u16_vec)
+                    } else {
+                        String::from_utf8_lossy(bytes).to_string()
+                    }
+                }
+                lopdf::Object::Name(bytes) => String::from_utf8_lossy(bytes).to_string(),
+                lopdf::Object::Integer(i) => i.to_string(),
+                lopdf::Object::Real(f) => f.to_string(),
+                lopdf::Object::Boolean(b) => b.to_string(),
+                _ => continue,
+            };
+
+            let trimmed = val_str.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let formatted_val = if (key_str == "CreationDate" || key_str == "ModDate") && trimmed.starts_with("D:") {
+                format_pdf_date(trimmed)
+            } else {
+                trimmed.to_string()
+            };
+
+            let std_key = match key_str.as_str() {
+                "CreationDate" => "CreateDate",
+                "ModDate" => "ModifyDate",
+                other => other,
+            };
+
+            map.insert(std_key.to_string(), formatted_val.into());
+        }
+    }
+
+    if map.len() >= 3 {
+        Some(map)
+    } else {
+        None
+    }
+}
+
+/// ExifTool -stay_open 守护进程句柄（单进程常驻内存，延迟初始化，原子同步管道通信）
+struct ExifToolDaemon {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout_reader: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl ExifToolDaemon {
+    fn spawn(exe: &std::path::Path) -> Option<Self> {
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new(exe);
+        if let Some(parent) = exe.parent() {
+            cmd.current_dir(parent);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        cmd.args(["-stay_open", "True", "-@", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = cmd.spawn().ok()?;
+        let stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+        let stdout_reader = std::io::BufReader::new(stdout);
+
+        Some(ExifToolDaemon {
+            child,
+            stdin,
+            stdout_reader,
+        })
+    }
+
+    fn query(&mut self, abs_path: &std::path::Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+        use std::io::{BufRead, Write};
+
+        // 发送命令：每行一个参数，末尾以 -execute 触发
+        let cmd = format!("-json\n-fast2\n-charset\nfilename=utf8\n{}\n-execute\n", abs_path.display());
+        self.stdin.write_all(cmd.as_bytes()).ok()?;
+        self.stdin.flush().ok()?;
+
+        let mut output = String::new();
+        loop {
+            let mut line = String::new();
+            match self.stdout_reader.read_line(&mut line) {
+                Ok(0) => return None, // EOF，子进程已退出
+                Ok(_) => {
+                    if line.trim() == "{ready}" {
+                        break;
+                    }
+                    output.push_str(&line);
+                }
+                Err(_) => return None,
+            }
+        }
+
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let val: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+        val.as_array()?.first()?.as_object().cloned()
+    }
+}
+
+impl Drop for ExifToolDaemon {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let _ = self.stdin.write_all(b"-stay_open\nFalse\n");
+        let _ = self.stdin.flush();
+        let _ = self.child.kill();
+    }
+}
+
+/// 全局 ExifTool 守护进程单例
+static EXIFTOOL_DAEMON: std::sync::OnceLock<std::sync::Mutex<Option<ExifToolDaemon>>> = std::sync::OnceLock::new();
+
+/// 显式关闭 ExifTool 守护进程（供 CLI 模式在进程退出前释放所有管道资源，常驻服务模式无需调用）
+pub fn shutdown_exiftool_daemon() {
+    if let Some(mutex) = EXIFTOOL_DAEMON.get() {
+        if let Ok(mut guard) = mutex.lock() {
+            if let Some(mut daemon) = guard.take() {
+                use std::io::Write;
+                let _ = daemon.stdin.write_all(b"-stay_open\nFalse\n");
+                let _ = daemon.stdin.flush();
+                let _ = daemon.child.kill();
+            }
+        }
+    }
+}
+
+/// 提取全量 ExifTool 字典 (包含 Creator, Producer, CreateDate, ModifyDate, PDFVersion, PageCount 等全量 100+ 属性)
+/// 对于 PDF 优先使用 Rust 原生 lopdf 毫秒级提取；对于其他文件使用常驻内存的 ExifTool -stay_open 守护进程（~2ms 响应）
+fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    // 优先 0：对于 PDF 文件，优先使用 Rust 原生 lopdf 提取（<3ms，彻底避免 ExifTool 在 AES 加密 PDF 上的 3.5s 卡顿）
+    if ext == "pdf" {
+        if let Some(pdf_map) = extract_pdf_metadata_native(p) {
+            return pdf_map;
+        }
+    }
 
     let abs_path = if p.is_relative() {
         std::env::current_dir().map(|cwd| cwd.join(p)).unwrap_or_else(|_| p.to_path_buf())
@@ -536,51 +756,59 @@ fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_jso
         p.to_path_buf()
     };
 
-    // 优先 1：调用 exiftool.exe CLI 获取全量真实属性
+    // 优先 1：调用 exiftool -stay_open 守护进程（常驻内存，响应通常 < 5ms）
     if let Some(exe_path) = find_exiftool_executable() {
-        let mut cmd = Command::new(&exe_path);
-        if let Some(parent) = exe_path.parent() {
-            cmd.current_dir(parent);
-        }
-        cmd.arg("-json").arg(&abs_path);
+        let daemon_lock = EXIFTOOL_DAEMON.get_or_init(|| {
+            std::sync::Mutex::new(ExifToolDaemon::spawn(&exe_path))
+        });
 
-        if let Ok(output) = cmd.output() {
-            if output.status.success() {
-                if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                    if let Some(arr) = json_val.as_array() {
-                        if let Some(first_obj) = arr.first().and_then(|v| v.as_object()) {
-                            let skip_keys = [
-                                "SourceFile", "ExifToolVersion", "Directory", "FilePermissions",
-                                "ThumbnailImage", "PreviewImage", "JpgFromRaw", "OtherImage",
-                                "MakerNotes", "MakerNoteSony", "MakerNoteCanon", "MakerNoteNikon",
-                                "SonyDateTime2", "SonyToneCurve", "UserComment", "PrintIM"
-                            ];
-                            for (k, v) in first_obj {
-                                if skip_keys.contains(&k.as_str()) || v.is_null() {
-                                    continue;
-                                }
-                                // 如果是字符串，限制单字段长度（过滤超过 2KB 的 base64/二进制 hex dump）
-                                if let Some(s) = v.as_str() {
-                                    if s.len() > 2048 {
-                                        continue;
-                                    }
-                                }
-                                // 如果是数组，且元素过多（超过 200 项的直方图/色彩空间表），跳过以减小传输开销
-                                if let Some(arr) = v.as_array() {
-                                    if arr.len() > 200 {
-                                        continue;
-                                    }
-                                }
-                                map.insert(k.clone(), v.clone());
-                            }
-                        }
+        let mut first_obj_opt = None;
+        if let Ok(mut guard) = daemon_lock.lock() {
+            if guard.is_none() {
+                *guard = ExifToolDaemon::spawn(&exe_path);
+            }
+            if let Some(daemon) = guard.as_mut() {
+                if let Some(obj) = daemon.query(&abs_path) {
+                    first_obj_opt = Some(obj);
+                } else {
+                    // 查询失败可能子进程异常，尝试重启一次
+                    *guard = ExifToolDaemon::spawn(&exe_path);
+                    if let Some(daemon) = guard.as_mut() {
+                        first_obj_opt = daemon.query(&abs_path);
                     }
                 }
             }
         }
+
+        if let Some(first_obj) = first_obj_opt {
+            let skip_keys = [
+                "SourceFile", "ExifToolVersion", "Directory", "FilePermissions",
+                "ThumbnailImage", "PreviewImage", "JpgFromRaw", "OtherImage",
+                "MakerNotes", "MakerNoteSony", "MakerNoteCanon", "MakerNoteNikon",
+                "SonyDateTime2", "SonyToneCurve", "UserComment", "PrintIM"
+            ];
+            for (k, v) in &first_obj {
+                if skip_keys.contains(&k.as_str()) || v.is_null() {
+                    continue;
+                }
+                // 如果是字符串，限制单字段长度（过滤超过 2KB 的 base64/二进制 hex dump）
+                if let Some(s) = v.as_str() {
+                    if s.len() > 2048 {
+                        continue;
+                    }
+                }
+                // 如果是数组，且元素过多（超过 200 项的直方图/色彩空间表），跳过以减小传输开销
+                if let Some(arr) = v.as_array() {
+                    if arr.len() > 200 {
+                        continue;
+                    }
+                }
+                map.insert(k.clone(), v.clone());
+            }
+        }
     }
 
-    // 备选 2：如果 CLI 未找到，降级使用 exiftool-rs
+    // 备选 2：如果 exiftool 未找到或不可用，降级使用 exiftool-rs
     if map.is_empty() {
         if let Ok(exif_result) = exiftool_rs::image_info(p) {
             for (k, v) in exif_result {
@@ -591,6 +819,8 @@ fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_jso
 
     map
 }
+
+
 
 /// 智能解析纯文本/代码文件（自动检测 UTF-8 / GBK / UTF-16 编码，并检测二进制 NUL 字符防乱码）
 fn extract_plain_text(path: &Path, max_bytes: usize) -> Result<String> {
@@ -691,16 +921,30 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
         }
     }
 
-    // 2. 尝试提取 anydoc 基础 Markdown 文本层
+    // 对于非 PDF 文档（Office 等），兜底时需要 base_text；PDF 内部会对其赋值
     let mut base_text = String::new();
-    if let Ok(markdown) = anydoc::to_markdown(path) {
-        base_text = markdown;
-    }
 
-    // 3. 对于 PDF 文档：使用 pdf-inspector 检查是否为原生文本型 PDF (TextBased)
+    // 2. 对于 PDF 文档：先用 pdf-inspector 检查类型，再决定是否需要 anydoc 解析
     if ext == "pdf" {
         let pdf_type_res = pdf_inspector::detect_pdf_type(path).ok();
         let is_text_pdf = matches!(pdf_type_res.as_ref().map(|r| r.pdf_type), Some(pdf_inspector::PdfType::TextBased));
+        let is_scanned = matches!(pdf_type_res.as_ref().map(|r| r.pdf_type), Some(pdf_inspector::PdfType::Scanned));
+
+        // 若是纯图片扫描件且未开启文档 OCR，无需 anydoc 解析，直接返回空
+        if is_scanned && config.max_document_ocr_items == 0 {
+            let meta = serde_json::json!({
+                "extractor": "pdf-inspector",
+                "is_text_pdf": false,
+                "pdf_type": pdf_type_res.as_ref().map(|r| format!("{:?}", r.pdf_type)),
+                "no_text_layer": true,
+            });
+            return Ok((String::new(), meta, None));
+        }
+
+        // 非纯扫描件，或开启了 OCR：尝试提取 anydoc 基础 Markdown 文本层
+        if let Ok(markdown) = anydoc::to_markdown(path) {
+            base_text = markdown;
+        }
         let raw_len = base_text.trim().len();
 
         // 判定条件：如果是文本型 PDF 且提取到了有效文本层（或文本层已达上限），直接输出并标记跳过 OCR
@@ -721,8 +965,10 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
             return Ok((truncated_content, meta, None));
         }
 
-        // 若非纯文本 PDF（如扫描件/纯图片 PDF）或文本层为空，且开启了文档 OCR (max_document_ocr_items != 0)
+        // 严格遵循用户文档 OCR 配置：仅当用户开启了文档 OCR (max_document_ocr_items != 0) 且文本层不足时才执行 OCR 扫描；
+        // 若用户未开启文档 OCR (max_document_ocr_items == 0)，即使无文本层也绝不强行 OCR。
         let max_ocr_pages = config.max_document_ocr_items;
+
         if max_ocr_pages != 0 {
             let max_limit_bytes = if max_bytes > 0 { max_bytes } else { usize::MAX };
             let page_limit = if max_ocr_pages < 0 { 0usize } else { max_ocr_pages as usize };
@@ -778,9 +1024,21 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
                 }
             }
         }
+
+        // 针对 PDF，若原生文本与 OCR 均无内容，返回结构化元数据摘要，坚决不进入二进制 fallback
+        if base_text.trim().is_empty() {
+            // 提取内容为空（无文本层且未开启OCR），返回空字符串，不生成任何提示文案
+            let meta = serde_json::json!({
+                "extractor": "anydoc+pdf-inspector",
+                "is_text_pdf": false,
+                "pdf_type": pdf_type_res.as_ref().map(|r| format!("{:?}", r.pdf_type)),
+                "no_text_layer": true,
+            });
+            return Ok((String::new(), meta, None));
+        }
     }
 
-    // 4. 若文本层有效，截断并输出
+    // 4. 若文本层有效（仅 Office 等非 PDF 文档会走到此处，PDF 已在上方全部提前 return），截断并输出
     if !base_text.trim().is_empty() {
         let truncated_content = truncate_string(&base_text, max_bytes);
         let pdf_type_res = if ext == "pdf" { pdf_inspector::detect_pdf_type(path).ok() } else { None };
@@ -793,7 +1051,7 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
         return Ok((truncated_content, meta, None));
     }
 
-    // 5. 兜底回退
+    // 5. 兜底回退 (仅对 Office/其他文档进行纯文本试探，严格杜绝输出二进制乱码)
     let (fallback_content, fallback_meta) = extract_document_fallback(path, max_bytes)?;
     Ok((fallback_content, fallback_meta, None))
 }

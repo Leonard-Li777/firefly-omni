@@ -3689,6 +3689,7 @@ dependencies = [
  "image",
  "kamadak-exif",
  "lofty 0.21.1",
+ "lopdf 0.42.0",
  "omni-core",
  "omni-pro",
  "omni-vision",

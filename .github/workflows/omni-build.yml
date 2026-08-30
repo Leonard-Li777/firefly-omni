@@ -13,9 +13,9 @@ on:
           - pro
           - ce
       ref:
-        description: '构建分支或标签（默认 main）'
+        description: '构建分支或标签（默认 master）'
         required: false
-        default: 'main'
+        default: 'master'
       version_tag:
         description: '发布版本号（如 v0.1.0），留空则使用 Cargo.toml 中的版本'
         required: false
@@ -65,6 +65,16 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact_suffix: linux-aarch64
             archive_ext: tar.gz
+
+          # Windows aarch64（实验性：无 arm64 预编译 libmupdf，走 vendored 编译，失败不阻塞）
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_suffix: windows-aarch64
+            archive_ext: zip
+            experimental: true
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     runs-on: ${{ matrix.os }}
 
@@ -119,6 +129,7 @@ jobs:
           fi
 
       - name: 下载 libmupdf 预编译静态库
+        if: matrix.target != 'aarch64-pc-windows-msvc'
         shell: bash
         run: |
           # macOS 统一使用 Universal 通用胖静态库，Windows 使用 zip，Linux 使用对应平台 tar.gz
@@ -178,6 +189,13 @@ jobs:
             echo "ARTIFACT_PATH=dist/${ARTIFACT_NAME}.tar.gz" >> $GITHUB_ENV
           fi
 
+      - name: 上传构建构件（供统一资源中心聚合发布）
+        uses: actions/upload-artifact@v4
+        with:
+          name: omni-${{ github.event.inputs.edition }}-${{ matrix.artifact_suffix }}
+          path: ${{ env.ARTIFACT_PATH }}
+          if-no-files-found: error
+
       - name: 读取版本号
         id: version
         shell: bash
@@ -192,20 +210,8 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "📌 发布版本: ${VERSION}"
 
-      - name: 发布到 GitHub Release（Pro 版 → 私有仓库）
-        if: github.event.inputs.edition == 'pro'
-        uses: softprops/action-gh-release@v2
-        with:
-          repository: Leonard-Li777/firefly-ai-folder
-          tag_name: ${{ steps.version.outputs.version }}
-          name: Firefly Omni ${{ steps.version.outputs.version }}
-          draft: false
-          prerelease: false
-          files: ${{ env.ARTIFACT_PATH }}
-          # 同一 tag 下多次上传会追加产物，不覆盖已有文件
-          fail_on_unmatched_files: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.PRO_RELEASE_TOKEN }}
+      # Pro 版已改由 publish-pro 聚合 job 上传构件 → 统一发布到 firefly-resources 资源中心
+      # （消费端 download-preset-resources.js / 装配清单统一从该中心按平台拉取）
 
       - name: 发布到 GitHub Release（CE 版 → 开源仓库）
         if: github.event.inputs.edition == 'ce'
@@ -218,3 +224,55 @@ jobs:
           files: ${{ env.ARTIFACT_PATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 聚合发布 Pro 构件到统一资源中心（firefly-resources）
+  # 收集全部平台产物 → 组装多平台 manifest → publish-resources.js 上传 resources tag 并更新 index.json → 推送 main
+  publish-pro:
+    name: 聚合发布 Pro 构件到统一资源中心
+    if: github.event.inputs.edition == 'pro'
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.UNISOURCE_RELEASE_TOKEN }}
+
+    steps:
+      - name: 检出代码（含发布脚本与 Cargo.toml）
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: 下载全部构建构件
+        uses: actions/download-artifact@v4
+        with:
+          pattern: omni-pro-*
+          path: unisource-build
+          merge-multiple: true
+
+      - name: 克隆统一资源中心
+        shell: bash
+        run: |
+          git clone --depth 1 --branch main \
+            "https://x-access-token:${GH_TOKEN}@github.com/Leonard-Li777/firefly-resources.git" \
+            "$GITHUB_WORKSPACE/unisource-repo"
+
+      - name: 解析发布版本
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version_tag }}" ]; then
+            VERSION="${{ github.event.inputs.version_tag }}"
+          else
+            VERSION="v$(cargo metadata --manifest-path Cargo.toml --no-deps --format-version 1 \
+              | python3 -c "import sys,json; pkgs=json.load(sys.stdin)['packages']; \
+                print(next(p['version'] for p in pkgs if p['name']=='omni-server'))")"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_ENV
+
+      - name: 发布到统一资源中心
+        shell: bash
+        run: |
+          node scripts/publish-unisource.js \
+            "$GITHUB_WORKSPACE/unisource-build" \
+            "$VERSION" \
+            --fr "$GITHUB_WORKSPACE/unisource-repo"
+        env:
+          GH_TOKEN: ${{ secrets.UNISOURCE_RELEASE_TOKEN }}

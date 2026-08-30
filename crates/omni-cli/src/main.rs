@@ -40,6 +40,8 @@ async fn main() -> anyhow::Result<()> {
             println!("🔍 [firefly-omni] 正在提取文件: {}", file);
             let result = omni_extract::OmniExtractor::extract(file, &config).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
+            omni_extract::shutdown_exiftool_daemon();
+            std::process::exit(0);
         }
         None => {
             println!("firefly-omni 🚀 运行成功。使用 --help 查看命令选项。");

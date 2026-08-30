@@ -22,6 +22,7 @@ regex.workspace = true
 chrono.workspace = true
 anydoc = "0.1"
 pdf-inspector = "1.17"
+lopdf = "0.42"
 zip = "2.1"
 quick-xml = "0.36"
 
