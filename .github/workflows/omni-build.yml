@@ -73,13 +73,12 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - name: 检出代码
+      - name: 检出代码（含 Pro 私有子模块）
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref }}
+          token: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.SUBMODULE_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
           submodules: recursive
-          # Pro 版需要访问私有 submodule（omni-pro、omni-geo、omni-cleanup）
-          token: ${{ secrets.PRO_SUBMODULE_TOKEN || github.token }}
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -301,6 +300,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref }}
+          token: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.SUBMODULE_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+          submodules: recursive
 
       - name: 下载全部构建构件
         uses: actions/download-artifact@v4
