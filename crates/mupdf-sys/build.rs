@@ -56,7 +56,10 @@ fn main() {
         }
     }
 
-    if cfg!(target_env = "msvc") {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+
+    if target_env == "msvc" {
         println!("cargo:rustc-link-lib=dylib=advapi32");
         println!("cargo:rustc-link-lib=dylib=user32");
         println!("cargo:rustc-link-lib=dylib=gdi32");
@@ -64,7 +67,7 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=windowscodecs");
     }
 
-    if cfg!(target_os = "macos") {
+    if target_os == "macos" {
         println!("cargo:rustc-link-lib=dylib=z");
         println!("cargo:rustc-link-lib=dylib=c++");
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
@@ -72,7 +75,7 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreText");
     }
 
-    if cfg!(target_os = "linux") {
+    if target_os == "linux" {
         println!("cargo:rustc-link-lib=dylib=z");
         println!("cargo:rustc-link-lib=dylib=m");
         println!("cargo:rustc-link-lib=dylib=pthread");
@@ -92,7 +95,7 @@ fn main() {
     build.file(manifest_dir.join("wrapper.c")).include(&inc_str);
     build.compile("libmupdf-wrapper.a");
 
-    let bindings = bindgen::Builder::default()
+    let mut builder = bindgen::Builder::default()
         .clang_arg(format!("-I{}", inc_str))
         .header(manifest_dir.join("wrapper.h").to_str().unwrap())
         .header(manifest_dir.join("wrapper.c").to_str().unwrap())
@@ -109,7 +112,28 @@ fn main() {
         .allowlist_var("PDF_.*")
         .allowlist_var("UCDN_.*")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .size_t_is_usize(true)
+        .size_t_is_usize(true);
+
+    if let Ok(target) = env::var("TARGET") {
+        builder = builder.clang_arg(format!("--target={}", target));
+    }
+
+    if target_os == "macos" || env::var("TARGET").map(|t| t.contains("apple-darwin")).unwrap_or(false) {
+        if let Ok(sdk_root) = env::var("SDKROOT") {
+            if !sdk_root.is_empty() {
+                builder = builder.clang_arg("-isysroot").clang_arg(sdk_root);
+            }
+        } else if let Ok(output) = std::process::Command::new("xcrun").args(["--show-sdk-path"]).output() {
+            if output.status.success() {
+                let sdk_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !sdk_path.is_empty() {
+                    builder = builder.clang_arg("-isysroot").clang_arg(sdk_path);
+                }
+            }
+        }
+    }
+
+    let bindings = builder
         .generate()
         .expect("Unable to generate bindings");
 

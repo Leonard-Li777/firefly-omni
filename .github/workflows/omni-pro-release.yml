@@ -118,16 +118,25 @@ jobs:
             echo "🔍 Linux LIBCLANG_PATH 已配置: $LLVM_LIB_DIR"
           fi
 
-      - name: 安装 macOS 构建依赖与 libclang
+      - name: 配置 macOS 构建环境与 libclang
         if: runner.os == 'macOS'
         run: |
-          brew install llvm freetype
+          SDK_PATH="$(xcrun --show-sdk-path)"
+          echo "SDKROOT=$SDK_PATH" >> $GITHUB_ENV
           echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> $GITHUB_ENV
-          LLVM_PREFIX=$(brew --prefix llvm 2>/dev/null || echo "/usr/local/opt/llvm")
-          if [ -d "$LLVM_PREFIX/lib" ]; then
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-isysroot $SDK_PATH" >> $GITHUB_ENV
+
+          XCODE_CLANG_LIB="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          if [ -f "$XCODE_CLANG_LIB/libclang.dylib" ]; then
+            echo "LIBCLANG_PATH=$XCODE_CLANG_LIB" >> $GITHUB_ENV
+            echo "DYLD_FALLBACK_LIBRARY_PATH=$XCODE_CLANG_LIB:${DYLD_FALLBACK_LIBRARY_PATH:-}" >> $GITHUB_ENV
+            echo "🔍 macOS LIBCLANG_PATH 已配置 (Xcode): $XCODE_CLANG_LIB"
+          else
+            brew install llvm freetype
+            LLVM_PREFIX="$(brew --prefix llvm 2>/dev/null || echo "/usr/local/opt/llvm")"
             echo "LIBCLANG_PATH=$LLVM_PREFIX/lib" >> $GITHUB_ENV
-            echo "DYLD_FALLBACK_LIBRARY_PATH=$LLVM_PREFIX/lib:$DYLD_FALLBACK_LIBRARY_PATH" >> $GITHUB_ENV
-            echo "🔍 macOS LIBCLANG_PATH 已配置: $LLVM_PREFIX/lib"
+            echo "DYLD_FALLBACK_LIBRARY_PATH=$LLVM_PREFIX/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}" >> $GITHUB_ENV
+            echo "🔍 macOS LIBCLANG_PATH 已配置 (Homebrew): $LLVM_PREFIX/lib"
           fi
 
       - name: 安装 Windows 构建依赖与 libclang
