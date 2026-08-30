@@ -64,6 +64,12 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=windowscodecs");
     }
 
+    if cfg!(target_os = "macos") {
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        println!("cargo:rustc-link-lib=framework=CoreGraphics");
+        println!("cargo:rustc-link-lib=dylib=c++");
+    }
+
     let include_dir = if lib_dir.join("include").exists() {
         lib_dir.join("include")
     } else {

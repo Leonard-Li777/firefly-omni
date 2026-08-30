@@ -120,36 +120,66 @@ function extractArchive(archive, destDir) {
   }
   if (isZip) {
     if (process.platform === 'win32') {
-      // 1. 优先尝试 7z（Windows CI 预装，性能与稳定性最高）
-      res = spawnSync('7z', ['x', archive, `-o${destDir}`, '-y'], { stdio: 'pipe' })
-      if (res.status === 0) {
-        log(`解压成功 (zip, 7z): ${path.basename(archive)}`)
-        return
+      // 1. 尝试 7z（查找常见安装路径）
+      const possible7z = [
+        '7z',
+        'C:\\Program Files\\7-Zip\\7z.exe',
+        'C:\\Program Files (x86)\\7-Zip\\7z.exe',
+        'C:\\ProgramData\\chocolatey\\bin\\7z.exe'
+      ]
+      for (const cmd7z of possible7z) {
+        try {
+          res = spawnSync(cmd7z, ['x', archive, `-o${destDir}`, '-y'], { stdio: 'pipe' })
+          if (res.status === 0) {
+            log(`解压成功 (zip, ${cmd7z}): ${path.basename(archive)}`)
+            return
+          }
+        } catch (e) {
+          // 继续尝试下一个
+        }
       }
+
       // 2. 尝试系统 tar
-      res = spawnSync('tar', ['-xf', archive, '-C', destDir], { stdio: 'pipe' })
+      try {
+        res = spawnSync('tar', ['-xf', archive, '-C', destDir], { stdio: 'pipe' })
+        if (res.status === 0) {
+          log(`解压成功 (zip, 系统 tar): ${path.basename(archive)}`)
+          return
+        }
+      } catch (e) {
+        // 继续尝试下一个
+      }
+
+      // 3. 尝试 PowerShell 原生 .NET ZipFile 解压（最稳定、无第三方依赖）
+      const safeArchive = archive.replace(/'/g, "''").replace(/\\/g, '/')
+      const safeDest = destDir.replace(/'/g, "''").replace(/\\/g, '/')
+      const psScript = `
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $dest = '${safeDest}'
+        if (!(Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+        $zip = [System.IO.Compression.ZipFile]::OpenRead('${safeArchive}')
+        foreach ($entry in $zip.Entries) {
+          $targetPath = [System.IO.Path]::Combine($dest, $entry.FullName)
+          if ($entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\\')) {
+            New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
+          } else {
+            $parentDir = [System.IO.Path]::GetDirectoryName($targetPath)
+            if (!(Test-Path $parentDir)) { New-Item -ItemType Directory -Path $parentDir -Force | Out-Null }
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $targetPath, $true)
+          }
+        }
+        $zip.Dispose()
+      `
+      res = spawnSync('powershell', ['-NoProfile', '-Command', psScript], { stdio: 'pipe' })
       if (res.status === 0) {
-        log(`解压成功 (zip, 系统 tar): ${path.basename(archive)}`)
+        log(`解压成功 (zip, PowerShell .NET ZipFile): ${path.basename(archive)}`)
         return
       }
-      // 3. 尝试 PowerShell Expand-Archive（转义路径）
-      const safeArchive = archive.replace(/'/g, "''")
-      const safeDest = destDir.replace(/'/g, "''")
-      res = spawnSync(
-        'powershell',
-        [
-          '-NoProfile',
-          '-Command',
-          `Expand-Archive -LiteralPath '${safeArchive}' -DestinationPath '${safeDest}' -Force`
-        ],
-        { stdio: 'pipe' }
-      )
-      if (res.status === 0) {
-        log(`解压成功 (zip, PowerShell): ${path.basename(archive)}`)
-        return
-      }
-      throw new Error(`zip 解压失败: ${archive}（${(res.stderr || res.stdout || '').toString().trim()}）`)
+
+      const errMsg = (res.stderr || res.stdout || (res.error ? res.error.message : '') || '').toString().trim()
+      throw new Error(`zip 解压失败: ${archive}（${errMsg}）`)
     }
+
     // 非 Windows 优先尝试 unzip，其次 7z / tar
     res = spawnSync('unzip', ['-q', '-o', archive, '-d', destDir], { stdio: 'pipe' })
     if (res.status === 0) {
@@ -166,7 +196,8 @@ function extractArchive(archive, destDir) {
       log(`解压成功 (zip, tar): ${path.basename(archive)}`)
       return
     }
-    throw new Error(`zip 解压失败: ${archive}（${(res.stderr || res.stdout || '').toString().trim()}）`)
+    const errMsg = (res.stderr || res.stdout || (res.error ? res.error.message : '') || '').toString().trim()
+    throw new Error(`zip 解压失败: ${archive}（${errMsg}）`)
   }
   throw new Error(`不支持的压缩包格式: ${archive}`)
 }
