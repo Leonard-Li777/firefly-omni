@@ -44,6 +44,12 @@ fn main() {
             let p = entry.path();
             if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                 let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+                // 过滤掉不需要的 Tesseract OCR 和 Leptonica 静态库
+                let lower_stem = stem.to_lowercase();
+                if lower_stem.contains("tesseract") || lower_stem.contains("leptonica") {
+                    continue;
+                }
+
                 if ext == "lib" {
                     println!("cargo:rustc-link-lib=static={}", stem);
                 } else if ext == "a" {

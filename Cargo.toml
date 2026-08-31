@@ -42,3 +42,11 @@ chrono = { version = "0.4", features = ["serde"] }
 
 [patch.crates-io]
 mupdf-sys = { path = "crates/mupdf-sys" }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+

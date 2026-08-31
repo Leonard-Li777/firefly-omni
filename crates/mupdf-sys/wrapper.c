@@ -9,8 +9,6 @@
 #pragma comment(lib, "libresources.lib")
 #pragma comment(lib, "libthirdparty.lib")
 #pragma comment(lib, "libharfbuzz.lib")
-#pragma comment(lib, "libtesseract.lib")
-#pragma comment(lib, "libleptonica.lib")
 #pragma comment(lib, "libextract.lib")
 #pragma comment(lib, "libfreeglut.lib")
 #pragma comment(lib, "libmuthreads.lib")
