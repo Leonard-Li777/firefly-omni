@@ -195,6 +195,29 @@ jobs:
         shell: bash
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: 安装 UPX 压缩工具
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            choco install upx -y || echo "UPX 安装跳过"
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            brew install upx || echo "UPX 安装跳过"
+          else
+            sudo apt-get update && sudo apt-get install -y upx-ucl || echo "UPX 安装跳过"
+          fi
+
+      - name: 使用 UPX 瘦身二进制
+        shell: bash
+        continue-on-error: true
+        run: |
+          BIN_PATH="target/${{ matrix.target }}/release/firefly-omni"
+          [ "${{ runner.os }}" = "Windows" ] && BIN_PATH="${BIN_PATH}.exe"
+          if [ -f "$BIN_PATH" ] && command -v upx &>/dev/null; then
+            echo "🗜️ 正在对 $BIN_PATH 执行 UPX 极致压缩..."
+            upx --lzma --best --force "$BIN_PATH" || true
+            ls -lh "$BIN_PATH"
+          fi
+
       - name: 打包产物
         shell: bash
         run: |
