@@ -34,12 +34,14 @@ const SUFFIX_MAP = {
 const FILE_RE = /^firefly-omni-(windows|macos|linux)-(x86_64|aarch64)\.(zip|tar\.gz)$/
 
 function parseArgs(argv) {
-  const out = { dryRun: false }
+  const out = { dryRun: false, force: false }
   const rest = []
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--dry-run') {
       out.dryRun = true
+    } else if (a === '--force' || a === '--overwrite') {
+      out.force = true
     } else if (a === '--fr') {
       out.frDir = path.resolve(argv[++i])
     } else {
@@ -110,6 +112,7 @@ function main() {
   // 3. 调 firefly-resources 发布管线（上传 + 更新本地 index.json）
   const pubArgs = [publishCli, '--manifest', manifestPath]
   if (opts.dryRun) pubArgs.push('--dry-run')
+  if (opts.force) pubArgs.push('--force')
   const pub = spawnSync(process.execPath, pubArgs, { stdio: 'inherit', env: process.env })
   if (pub.status !== 0) {
     console.error('✗ 发布到统一资源中心失败。')

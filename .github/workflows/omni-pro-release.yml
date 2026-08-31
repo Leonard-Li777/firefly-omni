@@ -357,7 +357,8 @@ jobs:
           node scripts/publish-unisource.js \
             "$GITHUB_WORKSPACE/unisource-build" \
             "$VERSION" \
-            --fr "$GITHUB_WORKSPACE/unisource-repo"
+            --fr "$GITHUB_WORKSPACE/unisource-repo" \
+            --force
         env:
           GH_TOKEN: ${{ env.GH_TOKEN }}
           GITHUB_TOKEN: ${{ env.GH_TOKEN }}
