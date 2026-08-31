@@ -886,46 +886,65 @@ fn extract_plain_text(path: &Path, max_bytes: usize) -> Result<String> {
 }
 
 
-/// anydoc 原生文档提纯解析器 (支持 PDF/DOC/DOCX/EPUB/PPT/PPTX/HTML/XLS/XLSX 等格式毫秒级解析并输出 Markdown，对于 DOCX/PDF 优先提取原生文本层，并在文本层不足且开启 OCR 时分页/分图 OCR 且动态按上限提前终止)
+/// 原生文档提纯解析器 (支持 PDF/DOC/DOCX/EPUB/PPT/PPTX/HTML/XLS/XLSX 等格式毫秒级解析并输出 Markdown，对于 DOCX/PDF 优先提取原生文本层，并在文本层不足且开启 OCR 时分页/分图 OCR 且动态按上限提前终止)
 fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConfig) -> Result<(String, serde_json::Value, Option<u64>)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
-    // 1. 对于 DOCX 文档，若开启了文档 OCR (max_document_ocr_items != 0)
-    if ext == "docx" && config.max_document_ocr_items != 0 {
-        // 先检查 anydoc 提取的原生文本层大小
+    // 1. 对于 DOCX 文档：
+    if ext == "docx" {
+        // 1.1 若开启了文档 OCR (max_document_ocr_items != 0)
+        if config.max_document_ocr_items != 0 {
+            // 先检查 anydoc 提取的原生文本层大小
+            if let Ok(raw_markdown) = anydoc::to_markdown(path) {
+                let raw_len = raw_markdown.trim().len();
+                // 如果原生文本层已经满足或超过 max_bytes 限制 (max_bytes > 0)，则无需进行昂贵的图片 OCR 扫描，节约性能
+                if max_bytes > 0 && raw_len >= max_bytes {
+                    tracing::info!(
+                        "DOCX 原生文本层 ({} 字节) 已达到内容上限 ({} 字节)，跳过嵌入图片 OCR 识别",
+                        raw_len,
+                        max_bytes
+                    );
+                    let truncated_content = truncate_string(&raw_markdown, max_bytes);
+                    let meta = serde_json::json!({
+                        "extractor": "anydoc",
+                        "ocr_skipped_due_to_content_limit": true
+                    });
+                    return Ok((truncated_content, meta, None));
+                }
+            }
+
+            // 原生文本层未超限，进行嵌入图片 OCR 提纯与原位融合
+            let t_docx_ocr_start = std::time::Instant::now();
+            if let Ok((docx_text, docx_meta)) = extract_docx_with_embedded_image_ocr(path, max_bytes, config) {
+                let docx_ocr_ms = t_docx_ocr_start.elapsed().as_millis() as u64;
+                if !docx_text.trim().is_empty() {
+                    return Ok((docx_text, docx_meta, Some(docx_ocr_ms)));
+                }
+            }
+        }
+
+        // 1.2 未开启 OCR，或 OCR 融合未提取到内容：优先使用 anydoc 极速提取原生 Markdown
         if let Ok(raw_markdown) = anydoc::to_markdown(path) {
-            let raw_len = raw_markdown.trim().len();
-            // 如果原生文本层已经满足或超过 max_bytes 限制 (max_bytes > 0)，则无需进行昂贵的图片 OCR 扫描，节约性能
-            if max_bytes > 0 && raw_len >= max_bytes {
-                tracing::info!(
-                    "DOCX 原生文本层 ({} 字节) 已达到内容上限 ({} 字节)，跳过嵌入图片 OCR 识别",
-                    raw_len,
-                    max_bytes
-                );
+            if !raw_markdown.trim().is_empty() {
                 let truncated_content = truncate_string(&raw_markdown, max_bytes);
                 let meta = serde_json::json!({
                     "extractor": "anydoc",
-                    "ocr_skipped_due_to_content_limit": true
                 });
                 return Ok((truncated_content, meta, None));
             }
         }
 
-        // 原生文本层未超限，进行嵌入图片 OCR 提纯与原位融合
-        let t_docx_ocr_start = std::time::Instant::now();
-        if let Ok((docx_text, docx_meta)) = extract_docx_with_embedded_image_ocr(path, max_bytes, config) {
-            let docx_ocr_ms = t_docx_ocr_start.elapsed().as_millis() as u64;
+        // 1.3 若 anydoc 解析为空或异常，兜底直接解析 word/document.xml 原生段落流
+        if let Ok((docx_text, docx_meta)) = extract_docx_xml_fallback(path, max_bytes) {
             if !docx_text.trim().is_empty() {
-                return Ok((docx_text, docx_meta, Some(docx_ocr_ms)));
+                return Ok((docx_text, docx_meta, None));
             }
         }
     }
 
-    // 对于非 PDF 文档（Office 等），兜底时需要 base_text；PDF 内部会对其赋值
-    let mut base_text = String::new();
-
     // 2. 对于 PDF 文档：先用 pdf-inspector 检查类型，再决定是否需要 anydoc 解析
     if ext == "pdf" {
+        let mut base_text = String::new();
         let pdf_type_res = pdf_inspector::detect_pdf_type(path).ok();
         let is_text_pdf = matches!(pdf_type_res.as_ref().map(|r| r.pdf_type), Some(pdf_inspector::PdfType::TextBased));
         let is_scanned = matches!(pdf_type_res.as_ref().map(|r| r.pdf_type), Some(pdf_inspector::PdfType::Scanned));
@@ -1036,22 +1055,36 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
             });
             return Ok((String::new(), meta, None));
         }
-    }
 
-    // 4. 若文本层有效（仅 Office 等非 PDF 文档会走到此处，PDF 已在上方全部提前 return），截断并输出
-    if !base_text.trim().is_empty() {
         let truncated_content = truncate_string(&base_text, max_bytes);
-        let pdf_type_res = if ext == "pdf" { pdf_inspector::detect_pdf_type(path).ok() } else { None };
-        let is_text_pdf = matches!(pdf_type_res.as_ref().map(|r| r.pdf_type), Some(pdf_inspector::PdfType::TextBased));
         let meta = serde_json::json!({
             "extractor": "anydoc",
-            "is_text_pdf": if ext == "pdf" { Some(is_text_pdf) } else { None },
+            "is_text_pdf": Some(is_text_pdf),
             "pdf_type": pdf_type_res.as_ref().map(|r| format!("{:?}", r.pdf_type)),
         });
         return Ok((truncated_content, meta, None));
     }
 
-    // 5. 兜底回退 (仅对 Office/其他文档进行纯文本试探，严格杜绝输出二进制乱码)
+    // 3. 对于 DOC / PPT / PPTX / XLS / XLSX / ODT / ODS / ODP / EPUB / RTF 等所有结构化文档：
+    // 使用 anydoc 进行原生提纯解析
+    match anydoc::to_markdown(path) {
+        Ok(raw_markdown) => {
+            let trimmed = raw_markdown.trim();
+            if !trimmed.is_empty() {
+                let truncated_content = truncate_string(trimmed, max_bytes);
+                let meta = serde_json::json!({
+                    "extractor": "anydoc",
+                    "format": ext,
+                });
+                return Ok((truncated_content, meta, None));
+            }
+        }
+        Err(err) => {
+            tracing::warn!("anydoc 解析文档 {} ({}) 失败: {:?}，尝试安全兜底", path.display(), ext, err);
+        }
+    }
+
+    // 4. 兜底回退 (仅对 Office/其他文档进行纯文本试探，严格杜绝输出二进制乱码)
     let (fallback_content, fallback_meta) = extract_document_fallback(path, max_bytes)?;
     Ok((fallback_content, fallback_meta, None))
 }
@@ -1252,39 +1285,87 @@ fn extract_docx_with_embedded_image_ocr(path: &Path, max_bytes: usize, config: &
     Ok((truncated, meta))
 }
 
-fn extract_document_fallback(path: &Path, max_bytes: usize) -> Result<(String, serde_json::Value)> {
-    let mut file = File::open(path)?;
-    let mut buffer = Vec::new();
-    let mut take = file.by_ref().take(max_bytes as u64);
-    take.read_to_end(&mut buffer)?;
+/// 解析 DOCX 文档中 word/document.xml 的文本段落流（纯 XML 极速解析兜底）
+fn extract_docx_xml_fallback(path: &Path, max_bytes: usize) -> Result<(String, serde_json::Value)> {
+    let file = File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut doc_content = String::new();
+    if let Ok(mut doc_file) = archive.by_name("word/document.xml") {
+        let _ = doc_file.read_to_string(&mut doc_content);
+    }
 
+    if doc_content.is_empty() {
+        return Ok((String::new(), serde_json::json!({ "extractor": "docx_xml_fallback" })));
+    }
+
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(&doc_content);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut in_text = false;
+    let mut current_p_text = String::new();
+    let mut paragraph_lines = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name_bytes = e.name().into_inner();
+                let name_str = String::from_utf8_lossy(name_bytes);
+                if name_str == "w:p" {
+                    current_p_text.clear();
+                } else if name_str == "w:t" {
+                    in_text = true;
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if in_text {
+                    if let Ok(t) = e.unescape() {
+                        current_p_text.push_str(&t);
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name_bytes = e.name().into_inner();
+                let name_str = String::from_utf8_lossy(name_bytes);
+                if name_str == "w:p" {
+                    if !current_p_text.trim().is_empty() {
+                        paragraph_lines.push(current_p_text.trim().to_string());
+                    }
+                } else if name_str == "w:t" {
+                    in_text = false;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    let final_markdown = paragraph_lines.join("\n\n");
+    let truncated = truncate_string(&final_markdown, max_bytes);
+    let meta = serde_json::json!({
+        "extractor": "docx_xml_fallback",
+        "paragraphs_count": paragraph_lines.len(),
+    });
+
+    Ok((truncated, meta))
+}
+
+fn extract_document_fallback(path: &Path, max_bytes: usize) -> Result<(String, serde_json::Value)> {
     let title_candidate = path.file_stem().unwrap_or_default().to_string_lossy();
     let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
 
-    // 智能提取二进制流中的可读文本片段 (兼容旧版二进制 .doc / 特殊 .epub 节点)
-    let (decoded, _, had_errors) = UTF_8.decode(&buffer);
-    let raw_text = if !had_errors {
-        decoded.to_string()
-    } else {
-        let (gbk_text, _, _) = GBK.decode(&buffer);
-        gbk_text.to_string()
-    };
-
-    let clean_lines: Vec<&str> = raw_text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| l.len() >= 4 && !l.chars().any(|c| c == '\0'))
-        .collect();
-
-    let content_text = if !clean_lines.is_empty() {
-        clean_lines.join("\n")
-    } else {
-        format!("Document Title: {}\nFormat: {}\nStatus: Document structure extracted.", title_candidate, ext)
-    };
+    // 严禁将未知二进制文件直接作为文本输出乱码，返回干净的结构化占位信息
+    let content_text = format!("Document Title: {}\nFormat: {}\nStatus: Binary document format structure processed.", title_candidate, ext);
 
     let doc_meta = serde_json::json!({
         "fallback": true,
         "format": ext,
+        "binary_fallback_safe": true,
     });
 
     Ok((truncate_string(&content_text, max_bytes), doc_meta))
@@ -1398,20 +1479,64 @@ mod tests {
 
     #[tokio::test]
     async fn test_user_sync_space_docx() {
-        let docx_path = std::path::PathBuf::from(r"F:\lilun\Desktop\项目资料_新手教程_同步空间使用指南_V1.docx");
-        if !docx_path.exists() {
-            println!("User docx does not exist");
-            return;
+        let candidates = [
+            std::path::PathBuf::from("../../tests/work-folder/SPEEDY/PRIVATE/项目资料_新手教程_同步空间使用指南_V1.docx"),
+            std::path::PathBuf::from("../../tests/work-folder/PRIVATE/项目资料_新手教程_同步空间使用指南_V1.docx"),
+            std::path::PathBuf::from(r"F:\lilun\Desktop\项目资料_新手教程_同步空间使用指南_V1.docx"),
+        ];
+        let docx_path = candidates.into_iter().find(|p| p.exists());
+        if let Some(path) = docx_path {
+            let config = OmniConfig {
+                max_document_ocr_items: 5,
+                ..Default::default()
+            };
+            let res = OmniExtractor::extract(&path, &config).await.unwrap();
+            println!("--- USER DOCX MARKDOWN CONTENT ---\n{}", res.markdown_content);
+            assert!(res.markdown_content.contains("📷 **[图片内提取文字]**"), "DOCX should contain in-place image OCR replacement!");
+            assert!(res.markdown_content.contains("网盘") || res.markdown_content.contains("历史版本"), "DOCX OCR should contain recognized image text!");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_user_grammar_doc_and_docx() {
+        let doc_candidates = [
+            std::path::PathBuf::from("../../tests/work-folder/SPEEDY/PRIVATE/语法学习_初级_英语文法概述.doc"),
+            std::path::PathBuf::from(r"F:\lilun\Desktop\语法学习_初级_英语文法概述.doc"),
+        ];
+        if let Some(doc_path) = doc_candidates.into_iter().find(|p| p.exists()) {
+            let config = OmniConfig::default();
+            let res = OmniExtractor::extract(&doc_path, &config).await.unwrap();
+            assert!(!res.is_corrupted);
+            assert!(!res.markdown_content.trim().is_empty());
+            assert!(res.markdown_content.contains("基本句型") || res.markdown_content.contains("單句") || res.markdown_content.contains("Sentence"));
+            assert_eq!(res.metadata.get("document").and_then(|d| d.get("extractor")).and_then(|e| e.as_str()), Some("anydoc"));
         }
 
-        let config = OmniConfig {
-            max_document_ocr_items: 5,
-            ..Default::default()
-        };
-        let res = OmniExtractor::extract(&docx_path, &config).await.unwrap();
-        println!("--- USER DOCX MARKDOWN CONTENT ---\n{}", res.markdown_content);
-        assert!(res.markdown_content.contains("📷 **[图片内提取文字]**"), "DOCX should contain in-place image OCR replacement!");
-        assert!(res.markdown_content.contains("网盘") || res.markdown_content.contains("历史版本"), "DOCX OCR should contain recognized image text!");
+        let docx_candidates = [
+            std::path::PathBuf::from("../../tests/work-folder/SPEEDY/PRIVATE/语法学习_基础语法_单复句结构与高级句型详解.docx"),
+            std::path::PathBuf::from(r"F:\lilun\Desktop\语法学习_基础语法_单复句结构与高级句型详解.docx"),
+        ];
+        if let Some(docx_path) = docx_candidates.into_iter().find(|p| p.exists()) {
+            let config = OmniConfig::default();
+            let res = OmniExtractor::extract(&docx_path, &config).await.unwrap();
+            assert!(!res.is_corrupted);
+            assert!(!res.markdown_content.trim().is_empty());
+            assert!(res.markdown_content.contains("英文文法魔法师") || res.markdown_content.contains("基本句型"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_user_share_platform_docx() {
+        let docx_candidates = [
+            std::path::PathBuf::from("../../tests/work-folder/SPEEDY/PRIVATE/[文档]网盘内容管理工具_共享协作平台_2026-07-02.docx"),
+            std::path::PathBuf::from(r"F:\lilun\Desktop\[文档]网盘内容管理工具_共享协作平台_2026-07-02.docx"),
+        ];
+        if let Some(docx_path) = docx_candidates.into_iter().find(|p| p.exists()) {
+            let config = OmniConfig::default();
+            let res = OmniExtractor::extract(&docx_path, &config).await.unwrap();
+            assert!(!res.is_corrupted);
+            assert!(!res.markdown_content.trim().is_empty());
+        }
     }
 }
 

@@ -36,12 +36,10 @@ fn main() {
     });
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rerun-if-env-changed=MUPDF_LIB");
+    println!("cargo:rerun-if-changed=build.rs");
 
-    // 如果存在合并库 mupdf_all.lib / libmupdf_all.a，直接全量链接；否则遍历链接全部 lib / a
-    let has_all_lib = lib_dir.join("mupdf_all.lib").exists() || lib_dir.join("libmupdf_all.a").exists();
-    if has_all_lib {
-        println!("cargo:rustc-link-lib=static=mupdf_all");
-    } else if let Ok(entries) = fs::read_dir(&lib_dir) {
+    if let Ok(entries) = fs::read_dir(&lib_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
             if let Some(ext) = p.extension().and_then(|e| e.to_str()) {

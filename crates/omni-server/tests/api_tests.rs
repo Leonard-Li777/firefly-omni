@@ -94,7 +94,7 @@ async fn test_get_and_update_config_api() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let config: OmniConfig = serde_json::from_slice(&body).unwrap();
-    assert!(config.enable_document_ocr);
+    assert_eq!(config.max_document_ocr_items, 0);
 
     // 测试 POST /api/config
     let mut new_config = config.clone();
@@ -238,6 +238,129 @@ async fn test_extract_real_docx_from_work_folder() {
     
     assert!(!result.is_corrupted);
     assert!(result.markdown_content.contains("视图与排程体验好"));
+}
+
+#[tokio::test]
+async fn test_extract_speedy_private_documents() {
+    let app = setup_test_app();
+
+    // 1. 验证真实 .doc 英语文法概述
+    let doc_path = resolve_work_folder_path("SPEEDY/PRIVATE/语法学习_初级_英语文法概述.doc");
+    if doc_path.exists() {
+        let req_payload = serde_json::json!({
+            "file_path": doc_path.to_string_lossy().to_string()
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/extract")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+
+        assert!(!result.is_corrupted);
+        assert!(!result.markdown_content.trim().is_empty());
+        assert!(result.markdown_content.contains("基本句型") || result.markdown_content.contains("單句") || result.markdown_content.contains("Sentence"));
+        assert_eq!(
+            result.metadata.get("document").and_then(|d| d.get("extractor")).and_then(|e| e.as_str()),
+            Some("anydoc")
+        );
+    }
+
+    // 2. 验证真实 .docx 单复句结构详解
+    let docx_grammar_path = resolve_work_folder_path("SPEEDY/PRIVATE/语法学习_基础语法_单复句结构与高级句型详解.docx");
+    if docx_grammar_path.exists() {
+        let req_payload = serde_json::json!({
+            "file_path": docx_grammar_path.to_string_lossy().to_string()
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/extract")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+
+        assert!(!result.is_corrupted);
+        assert!(!result.markdown_content.trim().is_empty());
+        assert!(result.markdown_content.contains("英文文法魔法师") || result.markdown_content.contains("基本句型"));
+    }
+
+    // 3. 验证真实 .docx 网盘内容管理工具_共享协作平台
+    let docx_share_path = resolve_work_folder_path("SPEEDY/PRIVATE/[文档]网盘内容管理工具_共享协作平台_2026-07-02.docx");
+    if docx_share_path.exists() {
+        let req_payload = serde_json::json!({
+            "file_path": docx_share_path.to_string_lossy().to_string()
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/extract")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+
+        assert!(!result.is_corrupted);
+        assert!(!result.markdown_content.trim().is_empty());
+    }
+
+    // 4. 验证真实 .docx 同步空间使用指南
+    let sync_guide_path = resolve_work_folder_path("SPEEDY/PRIVATE/项目资料_新手教程_同步空间使用指南_V1.docx");
+    if sync_guide_path.exists() {
+        let req_payload = serde_json::json!({
+            "file_path": sync_guide_path.to_string_lossy().to_string()
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/extract")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result: OmniExtractionResult = serde_json::from_slice(&body).unwrap();
+
+        assert!(!result.is_corrupted);
+        assert!(!result.markdown_content.trim().is_empty());
+    }
 }
 
 #[tokio::test]

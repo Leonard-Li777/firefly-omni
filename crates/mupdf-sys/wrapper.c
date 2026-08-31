@@ -4,6 +4,19 @@
 #include <assert.h>
 #ifdef _WIN32
 #include <windows.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "libmupdf.lib")
+#pragma comment(lib, "libresources.lib")
+#pragma comment(lib, "libthirdparty.lib")
+#pragma comment(lib, "libharfbuzz.lib")
+#pragma comment(lib, "libtesseract.lib")
+#pragma comment(lib, "libleptonica.lib")
+#pragma comment(lib, "libextract.lib")
+#pragma comment(lib, "libfreeglut.lib")
+#pragma comment(lib, "libmuthreads.lib")
+#pragma comment(lib, "libmutool.lib")
+#pragma comment(lib, "libpkcs7.lib")
+#endif
 #else
 #include <pthread.h>
 #endif
