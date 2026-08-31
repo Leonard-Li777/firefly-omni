@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Omni 核心引擎版本号
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// 基础分析与配置规范 (对齐 Desktop ConfigKey)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OmniConfig {

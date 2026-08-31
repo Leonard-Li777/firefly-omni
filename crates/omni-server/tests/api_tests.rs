@@ -73,6 +73,28 @@ async fn test_health_endpoint() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
     assert_eq!(json["server"], "firefly-omni");
+    assert_eq!(json["version"], "0.1.0");
+}
+
+#[tokio::test]
+async fn test_version_endpoint() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["server"], "firefly-omni");
+    assert_eq!(json["version"], "0.1.0");
 }
 
 #[tokio::test]

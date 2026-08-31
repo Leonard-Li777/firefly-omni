@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 
 #[derive(Parser)]
 #[command(name = "firefly-omni")]
+#[command(version)]
 #[command(about = "Universal Multimodal File Intelligence Engine in Rust", long_about = None)]
 struct Cli {
     #[command(subcommand)]

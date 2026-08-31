@@ -60,6 +60,7 @@ pub fn create_app_router(state: AppState) -> Router {
             "/health",
             get(health_handler),
         )
+        .route("/api/version", get(version_handler))
         .route("/api/config", get(get_config).post(update_config).put(update_config))
         .route("/api/extract", post(extract_file_handler))
         .route("/api/extract/upload", post(extract_multipart_handler))
@@ -76,6 +77,17 @@ pub fn create_app_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// 版本信息查询: GET /api/version
+async fn version_handler() -> Json<serde_json::Value> {
+    let is_pro = omni_pro::is_pro_enabled();
+    Json(serde_json::json!({
+        "status": "ok",
+        "server": "firefly-omni",
+        "version": env!("CARGO_PKG_VERSION"),
+        "isPro": is_pro
+    }))
+}
+
 /// 健康检查：附 Pro 模块与地理子系统可用性，供前端 UI 与桌面端启动时探测
 async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let is_pro = omni_pro::is_pro_enabled();
@@ -90,6 +102,7 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
     Json(serde_json::json!({
         "status": "ok",
         "server": "firefly-omni",
+        "version": env!("CARGO_PKG_VERSION"),
         "isPro": is_pro,
         "geoAvailable": geo_available,
         "cleanupAvailable": is_pro
@@ -294,7 +307,7 @@ pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
 
     let app = create_app_router(state);
 
-    info!("firefly-omni Axum HTTP server starting on {}", addr);
+    info!("firefly-omni Axum HTTP server v{} starting on {}", env!("CARGO_PKG_VERSION"), addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
