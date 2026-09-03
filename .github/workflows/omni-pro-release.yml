@@ -35,7 +35,7 @@ jobs:
       - name: 设置 Node.js 环境
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24.15.0'
 
       - name: 计算并更新 Cargo.toml 版本
         id: bump
@@ -426,8 +426,10 @@ jobs:
         uses: actions/github-script@v7
         env:
           NEW_OMNI_VERSION: ${{ needs.bump-version.outputs.version_tag }}
-          CUSTOM_PAT: ${{ secrets.PRO_SUBMODULE_TOKEN || secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.PAT || secrets.GH_PAT }}
+          HAS_CUSTOM_PAT: ${{ !!(secrets.PRO_SUBMODULE_TOKEN || secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.PAT || secrets.GH_PAT) }}
         with:
+          # github-script v7 运行时不再暴露 @octokit/rest，自定义 Token 必须通过 github-token 输入注入
+          github-token: ${{ secrets.PRO_SUBMODULE_TOKEN || secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           script: |
             const targetOwner = 'Leonard-Li777';
             const targetRepo = 'firefly-ai-folder-desktop';
@@ -437,15 +439,12 @@ jobs:
             core.info(`🚀 Omni 发布完毕！正在触发桌面端发版流水线: ${targetOwner}/${targetRepo} -> ${workflowId}`);
             core.info(`📌 Omni 引擎版本: ${omniVersion}`);
 
-            const customToken = process.env.CUSTOM_PAT;
-            let octokitClient = github;
-            if (customToken) {
-              const { Octokit } = require('@octokit/rest');
-              octokitClient = new Octokit({ auth: customToken });
+            if (process.env.HAS_CUSTOM_PAT !== 'true') {
+              core.warning('⚠️ 未配置跨仓库 PAT（PRO_SUBMODULE_TOKEN / UNISOURCE_RELEASE_TOKEN 等），回退使用 GITHUB_TOKEN，跨仓库触发可能返回 401/403。');
             }
 
             try {
-              await octokitClient.rest.actions.createWorkflowDispatch({
+              await github.rest.actions.createWorkflowDispatch({
                 owner: targetOwner,
                 repo: targetRepo,
                 workflow_id: workflowId,
