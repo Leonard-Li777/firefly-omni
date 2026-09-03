@@ -18,8 +18,61 @@ permissions:
   contents: write
 
 jobs:
+  bump-version:
+    name: 自动自增版本并打 Tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      version_tag: ${{ steps.bump.outputs.version_tag }}
+      commit_sha: ${{ steps.bump.outputs.commit_sha }}
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PRO_SUBMODULE_TOKEN || secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.PAT || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 设置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 计算并更新 Cargo.toml 版本
+        id: bump
+        shell: bash
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          TARGET_INPUT="${{ github.event.inputs.version_tag }}"
+          NEW_VER=$(node scripts/bump-version.js "$TARGET_INPUT")
+          TAG_NAME="v$NEW_VER"
+
+          echo "version=$NEW_VER" >> $GITHUB_OUTPUT
+          echo "version_tag=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "📌 计算目标版本: $NEW_VER ($TAG_NAME)"
+
+          if [ -n "$(git status --porcelain Cargo.toml)" ]; then
+            echo "📝 检测到 Cargo.toml 版本发生变化，提交更改..."
+            git add Cargo.toml
+            git commit -m "chore(release): bump version to $TAG_NAME [skip ci]"
+            git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
+            git push origin HEAD:${{ github.ref_name }} --tags
+          else
+            echo "ℹ️ Cargo.toml 版本无变化。"
+            if ! git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+              git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
+              git push origin "$TAG_NAME"
+            fi
+          fi
+
+          SHA=$(git rev-parse HEAD)
+          echo "commit_sha=$SHA" >> $GITHUB_OUTPUT
+          echo "📌 提交 SHA: $SHA"
+
   build:
     name: 构建 ${{ matrix.os }} / ${{ matrix.target }}
+    needs: [bump-version]
     strategy:
       fail-fast: false
       matrix:
@@ -55,7 +108,7 @@ jobs:
             archive_ext: tar.gz
 
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ needs.bump-version.outputs.version_tag }}
 
     runs-on: ${{ matrix.os }}
 
@@ -63,7 +116,7 @@ jobs:
       - name: 检出代码（含 Pro 私有子模块）
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref || 'master' }}
+          ref: ${{ needs.bump-version.outputs.commit_sha }}
           token: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.SUBMODULE_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
           submodules: recursive
 
@@ -362,3 +415,49 @@ jobs:
         env:
           GH_TOKEN: ${{ env.GH_TOKEN }}
           GITHUB_TOKEN: ${{ env.GH_TOKEN }}
+
+  # 联动触发 Desktop 发版工作流（自动拉取新版 omni 引擎并更新 lock.json 发版）
+  trigger-desktop-release:
+    name: 联动触发 Desktop 发版流水线
+    needs: [publish-pro, bump-version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 触发 Desktop 仓库工作流 (firefly-ai-folder-desktop-release.yml)
+        uses: actions/github-script@v7
+        env:
+          NEW_OMNI_VERSION: ${{ needs.bump-version.outputs.version_tag }}
+          CUSTOM_PAT: ${{ secrets.PRO_SUBMODULE_TOKEN || secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.PAT || secrets.GH_PAT }}
+        with:
+          script: |
+            const targetOwner = 'Leonard-Li777';
+            const targetRepo = 'firefly-ai-folder-desktop';
+            const workflowId = 'firefly-ai-folder-desktop-release.yml';
+            const omniVersion = process.env.NEW_OMNI_VERSION || '';
+
+            core.info(`🚀 Omni 发布完毕！正在触发桌面端发版流水线: ${targetOwner}/${targetRepo} -> ${workflowId}`);
+            core.info(`📌 Omni 引擎版本: ${omniVersion}`);
+
+            const customToken = process.env.CUSTOM_PAT;
+            let octokitClient = github;
+            if (customToken) {
+              const { Octokit } = require('@octokit/rest');
+              octokitClient = new Octokit({ auth: customToken });
+            }
+
+            try {
+              await octokitClient.rest.actions.createWorkflowDispatch({
+                owner: targetOwner,
+                repo: targetRepo,
+                workflow_id: workflowId,
+                ref: 'master',
+                inputs: {
+                  update_omni_lock: true,
+                  build_region: 'CN',
+                  download_latest_llama: true
+                }
+              });
+              core.info('✅ 成功触发 Desktop 发版工作流！');
+            } catch (error) {
+              core.setFailed(`❌ 触发 Desktop 发版流水线失败: ${error.message}`);
+            }
+

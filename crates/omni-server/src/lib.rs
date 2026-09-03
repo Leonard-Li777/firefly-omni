@@ -232,7 +232,7 @@ async fn cover_handler(
         }
         Ok(Err(err)) => {
             // 不支持的格式或渲染失败 → 204 静默降级
-            tracing::debug!("Cover rendering failed or skipped for {}: {}", req.path, err);
+            tracing::warn!("Cover rendering failed or skipped for {}: {}", req.path, err);
             StatusCode::NO_CONTENT.into_response()
         }
         Err(err) => {
