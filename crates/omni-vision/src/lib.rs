@@ -521,4 +521,148 @@ impl OmniVisionEngine {
         };
         Self::recognize_ocr_dynamic_image(&img, model_size)
     }
+
+    /// 原生轻量频域/角点高频能量水印等级检测 (0: 无水印, 1: 轻水印, 2: 有水印)
+    pub fn detect_watermark_level(img: &image::DynamicImage) -> u8 {
+        let (w, h) = (img.width(), img.height());
+        if w < 64 || h < 64 {
+            return 0;
+        }
+
+        // 快速采样缩放到 128x128 灰度进行角点高频对比
+        let gray = img.thumbnail_exact(128, 128).to_luma8();
+        let raw = gray.as_raw();
+
+        // 统计右下角与左下角 (20% 区域) 的局部梯度方差与跳变
+        let mut corner_variance = 0.0f64;
+        let mut count = 0usize;
+
+        // 扫描右下角区域 (x: 90..125, y: 90..125)
+        for y in 90..125 {
+            for x in 90..125 {
+                let idx = y * 128 + x;
+                let cur = raw[idx] as f64;
+                let right = raw[idx + 1] as f64;
+                let down = raw[idx + 128] as f64;
+                let grad = (cur - right).abs() + (cur - down).abs();
+                corner_variance += grad;
+                count += 1;
+            }
+        }
+
+        let avg_corner_grad = if count > 0 { corner_variance / count as f64 } else { 0.0 };
+
+        // 如果角点边缘梯度跳变显著高于通常平滑背景，判定包含水印
+        if avg_corner_grad > 48.0 {
+            2 // 有水印
+        } else if avg_corner_grad > 32.0 {
+            1 // 轻水印
+        } else {
+            0 // 无水印
+        }
+    }
+
+    /// 原生轻量频域/角点高频能量水印检测文本 (兼容过渡)
+    pub fn detect_watermark_status(img: &image::DynamicImage) -> &'static str {
+        match Self::detect_watermark_level(img) {
+            2 => "有水印",
+            1 => "轻水印",
+            _ => "无水印",
+        }
+    }
+
+    /// 原生宏块色差打码等级检测 (0: 无码, 1: 薄码, 2: 有码)
+    pub fn detect_mosaic_level(img: &image::DynamicImage) -> u8 {
+        let (w, h) = (img.width(), img.height());
+        if w < 64 || h < 64 {
+            return 0;
+        }
+
+        // 采用 16x16 宏块采样检测低方差矩形区域
+        let gray = img.thumbnail_exact(128, 128).to_luma8();
+        let raw = gray.as_raw();
+
+        let mut mosaic_block_count = 0usize;
+
+        for by in 0..8 {
+            for bx in 0..8 {
+                let mut sum = 0.0f64;
+                let mut sum_sq = 0.0f64;
+                let block_size = 16;
+
+                for y in 0..block_size {
+                    for x in 0..block_size {
+                        let px = raw[(by * block_size + y) * 128 + (bx * block_size + x)] as f64;
+                        sum += px;
+                        sum_sq += px * px;
+                    }
+                }
+
+                let n = (block_size * block_size) as f64;
+                let variance = (sum_sq - (sum * sum) / n) / n;
+
+                // 若方差极低（纯色块/马赛克平滑块）且非边缘纯白纯黑
+                let mean = sum / n;
+                if variance < 1.5 && mean > 15.0 && mean < 240.0 {
+                    mosaic_block_count += 1;
+                }
+            }
+        }
+
+        // 若连续多个局部块呈现马赛克平滑阶跃特征
+        if mosaic_block_count >= 8 {
+            2 // 有码
+        } else if mosaic_block_count >= 4 {
+            1 // 薄码
+        } else {
+            0 // 无码
+        }
+    }
+
+    /// 原生宏块色差打码检测文本 (兼容过渡)
+    pub fn detect_mosaic_status(img: &image::DynamicImage) -> &'static str {
+        match Self::detect_mosaic_level(img) {
+            2 => "有码",
+            1 => "薄码",
+            _ => "无码",
+        }
+    }
+
+    /// Windows NTFS ADS Zone.Identifier 来源检测: (file_source_compat, file_source_code, source_url)
+    pub fn detect_ntfs_zone_identifier<P: AsRef<Path>>(path: P) -> (Option<String>, Option<String>, Option<String>) {
+        #[cfg(target_os = "windows")]
+        {
+            let p = path.as_ref();
+            let ads_path = format!("{}:Zone.Identifier", p.to_string_lossy());
+            if let Ok(content) = fs::read_to_string(&ads_path) {
+                let mut source_url = None;
+                let mut is_internet = false;
+
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("ZoneId=") {
+                        if trimmed == "ZoneId=3" || trimmed == "ZoneId=4" {
+                            is_internet = true;
+                        }
+                    } else if trimmed.starts_with("HostUrl=") {
+                        source_url = Some(trimmed.trim_start_matches("HostUrl=").to_string());
+                        is_internet = true;
+                    } else if trimmed.starts_with("ReferrerUrl=") && source_url.is_none() {
+                        source_url = Some(trimmed.trim_start_matches("ReferrerUrl=").to_string());
+                    }
+                }
+
+                let (file_source, file_source_code) = if is_internet {
+                    (Some("网络下载".to_string()), Some("downloaded".to_string()))
+                } else {
+                    (None, None)
+                };
+
+                return (file_source, file_source_code, source_url);
+            }
+        }
+
+        let _ = path;
+        (None, None, None)
+    }
 }

@@ -189,7 +189,7 @@ impl CzkawkaBridge {
                     0
                 };
                 let overall_pct = ((current_step * 100) + current_pct) / total_strategies.max(1);
-                on_prog(overall_pct.min(100), current_step, format!("正在比对: {}/{}", data.current_stage, data.files_to_check));
+                on_prog(overall_pct.min(100), current_step, format!("{}/{}", data.current_stage, data.files_to_check));
             }
         };
 
@@ -231,7 +231,7 @@ impl CzkawkaBridge {
                             strategy: "exact_hash".to_string(),
                             similarity_percentage: 100.0,
                             group_threshold: Some(10.0), // 踩线阈值: 10.0 (100% 精确一致)
-                            description: format!("100% 完全精确一致文件 ({}个)", vector.len()),
+                            description: format!("exact_hash ({} items)", vector.len()),
                             files: items,
                             potential_freed_bytes: *size * (vector.len() as u64 - 1)
                         };
@@ -262,7 +262,7 @@ impl CzkawkaBridge {
                         strategy: "image_phash".to_string(),
                         similarity_percentage: current_sim_percent,
                         group_threshold: Some(min_sim), // 当前组踩线域值：如果相似度低于此域值就匹配不到
-                        description: format!("视觉感知相似图像 ({}个)", vector.len()),
+                        description: format!("image_phash ({} items)", vector.len()),
                         files: items,
                         potential_freed_bytes: avg_size * (vector.len() as u64 - 1)
                     };
@@ -297,7 +297,7 @@ impl CzkawkaBridge {
                         strategy: "audio_hash".to_string(),
                         similarity_percentage: min_sim * 10.0,
                         group_threshold: Some(min_sim), // 当前组踩线域值
-                        description: format!("同源/声学相似音频文件 ({}个)", vector.len()),
+                        description: format!("audio_hash ({} items)", vector.len()),
                         files: items,
                         potential_freed_bytes: avg_size * (vector.len() as u64 - 1)
                     };
@@ -345,7 +345,7 @@ impl CzkawkaBridge {
                         strategy: "video_phash".to_string(),
                         similarity_percentage: min_sim * 10.0,
                         group_threshold: Some(min_sim), // 当前组踩线域值
-                        description: format!("同源/画面相似视频文件 ({}个)", vector.len()),
+                        description: format!("video_phash ({} items)", vector.len()),
                         files: items,
                         potential_freed_bytes: avg_size * (vector.len() as u64 - 1)
                     };
@@ -367,14 +367,14 @@ impl CzkawkaBridge {
                 let items: Vec<OmniDuplicateFileItem> = bad_files.iter().map(|entry| {
                     let p = to_native_path_str(&entry.path);
                     detected_bad_ext_paths.insert(p.clone());
-                    OmniDuplicateFileItem { path: p, name: format!("{} (真实应为: .{})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.proper_extension), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.proper_extensions_group.clone(), similarity_score: Some(0.0) }
+                    OmniDuplicateFileItem { path: p, name: format!("{} (.{})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.proper_extension), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.proper_extensions_group.clone(), similarity_score: Some(0.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "bad_extensions".to_string(),
                     strategy: "bad_extensions".to_string(),
                     similarity_percentage: 0.0,
                     group_threshold: None,
-                    description: format!("扩展名不匹配文件 ({}个)", bad_files.len()),
+                    description: format!("bad_extensions ({} items)", bad_files.len()),
                     files: items,
                     potential_freed_bytes: 0
                 };
@@ -397,7 +397,7 @@ impl CzkawkaBridge {
                     strategy: "empty_folders".to_string(),
                     similarity_percentage: 100.0,
                     group_threshold: None,
-                    description: format!("空文件夹 ({}个)", empty_folder_list.len()),
+                    description: format!("empty_folders ({} items)", empty_folder_list.len()),
                     files: items,
                     potential_freed_bytes: 0
                 };
@@ -422,7 +422,7 @@ impl CzkawkaBridge {
                     strategy: "big_files".to_string(),
                     similarity_percentage: 100.0,
                     group_threshold: None,
-                    description: format!("占用空间超大文件 >= 10MB Top {} (共{}个)", items.len(), items.len()),
+                    description: format!("big_files ({} items)", items.len()),
                     files: items,
                     potential_freed_bytes: 0
                 };
@@ -445,7 +445,7 @@ impl CzkawkaBridge {
                     strategy: "empty_files".to_string(),
                     similarity_percentage: 100.0,
                     group_threshold: None,
-                    description: format!("0 字节空文件 ({}个)", empty_files.len()),
+                    description: format!("empty_files ({} items)", empty_files.len()),
                     files: items,
                     potential_freed_bytes: 0
                 };
@@ -469,7 +469,7 @@ impl CzkawkaBridge {
                     strategy: "temporary_files".to_string(),
                     similarity_percentage: 100.0,
                     group_threshold: None,
-                    description: format!("临时与残留缓存文件 ({}个)", temp_files.len()),
+                    description: format!("temporary_files ({} items)", temp_files.len()),
                     files: items,
                     potential_freed_bytes: total_size
                 };
@@ -485,14 +485,14 @@ impl CzkawkaBridge {
             let invalid_symlinks = symlink_tool.get_invalid_symlinks();
             if !invalid_symlinks.is_empty() {
                 let items: Vec<OmniDuplicateFileItem> = invalid_symlinks.iter().map(|entry| {
-                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: format!("{} (指向不存在: {})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.symlink_info.destination_path.to_string_lossy()), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{:?}", entry.symlink_info.type_of_error), similarity_score: Some(0.0) }
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: format!("{} -> {}", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.symlink_info.destination_path.to_string_lossy()), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{:?}", entry.symlink_info.type_of_error), similarity_score: Some(0.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "invalid_symlinks".to_string(),
                     strategy: "invalid_symlinks".to_string(),
                     similarity_percentage: 100.0,
                     group_threshold: None,
-                    description: format!("无效或断裂的软链接 ({}个)", invalid_symlinks.len()),
+                    description: format!("invalid_symlinks ({} items)", invalid_symlinks.len()),
                     files: items,
                     potential_freed_bytes: 0
                 };
@@ -532,7 +532,7 @@ impl CzkawkaBridge {
                     strategy: "broken_files".to_string(),
                     similarity_percentage: 0.0,
                     group_threshold: None,
-                    description: format!("损坏或无法解码的文件 ({}个)", valid_broken_files.len()),
+                    description: format!("broken_files ({} items)", valid_broken_files.len()),
                     files: items,
                     potential_freed_bytes: 0
                 };
@@ -566,14 +566,14 @@ impl CzkawkaBridge {
             let bad_names = bad_names_tool.get_bad_names_files();
             if !bad_names.is_empty() {
                 let items: Vec<OmniDuplicateFileItem> = bad_names.iter().map(|entry| {
-                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: format!("{} (建议更名: {})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.new_name), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.new_name.clone(), similarity_score: Some(0.0) }
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: format!("{} -> {}", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.new_name), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.new_name.clone(), similarity_score: Some(0.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "bad_names".to_string(),
                     strategy: "bad_names".to_string(),
                     similarity_percentage: 0.0,
                     group_threshold: None,
-                    description: format!("包含异常/不合规字符的文件名 ({}个)", bad_names.len()),
+                    description: format!("bad_names ({} items)", bad_names.len()),
                     files: items,
                     potential_freed_bytes: 0
                 };
@@ -589,14 +589,14 @@ impl CzkawkaBridge {
             let exif_files = exif_tool.get_exif_files();
             if !exif_files.is_empty() {
                 let items: Vec<OmniDuplicateFileItem> = exif_files.iter().map(|entry| {
-                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: format!("{} (含 {} 项Exif标记)", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.exif_tags.len()), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{}_exif_tags", entry.exif_tags.len()), similarity_score: Some(1.0) }
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: format!("{} ({} exif tags)", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.exif_tags.len()), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: format!("{}_exif_tags", entry.exif_tags.len()), similarity_score: Some(1.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "exif_remover".to_string(),
                     strategy: "exif_remover".to_string(),
                     similarity_percentage: 100.0,
                     group_threshold: None,
-                    description: format!("可清除 Exif 隐私信息的文件 ({}个)", exif_files.len()),
+                    description: format!("exif_remover ({} items)", exif_files.len()),
                     files: items,
                     potential_freed_bytes: 0
                 };
@@ -613,14 +613,14 @@ impl CzkawkaBridge {
             let transcode_entries = video_opt_tool.get_video_transcode_entries();
             if !transcode_entries.is_empty() {
                 let items: Vec<OmniDuplicateFileItem> = transcode_entries.iter().map(|entry| {
-                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: format!("{} (当前编码: {}, 分辨率: {}x{})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.codec, entry.width, entry.height), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.codec.clone(), similarity_score: Some(1.0) }
+                    OmniDuplicateFileItem { path: to_native_path_str(&entry.path), name: format!("{} ({}, {}x{})", entry.path.file_name().unwrap_or_default().to_string_lossy(), entry.codec, entry.width, entry.height), size: entry.size, modified_at: format!("{}", entry.modified_date), fingerprint: entry.codec.clone(), similarity_score: Some(1.0) }
                 }).collect();
                 let group = OmniDuplicateGroup {
                     group_id: "video_optimizer".to_string(),
                     strategy: "video_optimizer".to_string(),
                     similarity_percentage: 100.0,
                     group_threshold: None,
-                    description: format!("可转码/优化的高效能视频 ({}个)", transcode_entries.len()),
+                    description: format!("video_optimizer ({} items)", transcode_entries.len()),
                     files: items,
                     potential_freed_bytes: 0
                 };

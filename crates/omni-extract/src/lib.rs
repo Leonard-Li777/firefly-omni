@@ -399,7 +399,7 @@ impl OmniExtractor {
             .collect();
 
         format!(
-            "\n\n> 📷 **[图片内提取文字]**\n>\n{}\n\n",
+            "\n\n> 📷 **[Image Text / 图片内提取文字]**\n>\n{}\n\n",
             block_lines.join("\n>\n")
         )
     }
@@ -1026,7 +1026,7 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
                     if !ocr_page_texts.is_empty() {
                         let combined_ocr = ocr_page_texts.join("\n\n");
                         let final_markdown = if raw_len > 0 {
-                            format!("{}\n\n---\n\n### 🔍 多页 OCR 图像识别文本\n\n{}", base_text.trim(), combined_ocr)
+                            format!("{}\n\n---\n\n### 🔍 OCR Text / 图像识别文本\n\n{}", base_text.trim(), combined_ocr)
                         } else {
                             combined_ocr
                         };
