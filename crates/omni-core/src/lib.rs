@@ -65,6 +65,145 @@ pub struct OmniExtractionResult {
     pub benchmark: Option<OmniBenchmark>,
 }
 
+/// 原生多模态感知请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OmniPerceptionRequest {
+    pub file_path: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub enable_visual_tags: Option<bool>,
+    #[serde(default)]
+    pub enable_audio_transcript: Option<bool>,
+    #[serde(default)]
+    pub enable_geo_reverse: Option<bool>,
+    #[serde(default)]
+    pub max_content_size_kb: Option<usize>,
+}
+
+/// 原生多模态感知细分耗时
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OmniPerceptionBenchmark {
+    pub total_ms: u64,
+    pub extract_ms: Option<u64>,
+    pub ads_ms: Option<u64>,
+    pub vision_ms: Option<u64>,
+    pub audio_ms: Option<u64>,
+    pub geo_ms: Option<u64>,
+}
+
+/// 全量原生多模态感知结果 (收拢元数据、频域算子、视觉标签、语音转录与物理事实)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OmniPerceptionResult {
+    pub file_path: String,
+    pub mime_type: String,
+    pub file_size: u64,
+    pub category: Option<String>,
+    pub markdown_content: String,
+    pub metadata: serde_json::Value,
+
+    // 物理事实特征
+    pub file_source: Option<String>,
+    /// 来源代码: "downloaded" | "intranet" | "local" | "system" (语言中立，对应维度 ID: 3)
+    pub file_source_code: Option<String>,
+    pub source_url: Option<String>,
+    pub workflow_state: Option<String>,
+    /// 工作流处理状态代码: "draft" | "reviewing" | "completed" | "archived" | "unarchived" (对应维度 ID: 18)
+    pub workflow_state_code: Option<String>,
+    pub security_level: Option<String>,
+    /// 安全密级代码: "top_secret" | "confidential" | "internal" | "public" (对应维度 ID: 17)
+    pub security_level_code: Option<String>,
+    pub has_watermark: Option<bool>,
+    /// 水印等级: 0 (无水印), 1 (轻水印), 2 (有水印) (对应维度 ID: 125 tags 下标)
+    pub watermark_level: Option<u8>,
+    pub watermark_status: Option<String>,
+    pub has_mosaic: Option<bool>,
+    /// 打码等级: 0 (无码), 1 (薄码), 2 (有码) (对应维度 ID: 124 tags 下标)
+    pub mosaic_level: Option<u8>,
+    pub mosaic_status: Option<String>,
+
+    // 多模态直出字段
+    pub visual_tags: Vec<String>,
+    pub audio_transcript: Option<String>,
+    pub audio_events: Vec<String>,
+    pub geo_address: Option<String>,
+
+    pub phash: Option<String>,
+    pub is_corrupted: bool,
+    pub benchmark: Option<OmniPerceptionBenchmark>,
+}
+
+/// 单指标音频转录请求: POST /api/audio/transcribe
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscribeRequest {
+    pub file_path: String,
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+/// 单指标音频转录响应
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AudioTranscribeResponse {
+    pub file_path: String,
+    pub transcript: Option<String>,
+    pub events: Vec<String>,
+    pub language: Option<String>,
+    pub duration_ms: u64,
+}
+
+/// 单指标视觉标签请求: POST /api/vision/tags
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisionTagsRequest {
+    pub file_path: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+}
+
+/// 单指标视觉标签响应
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VisionTagsResponse {
+    pub file_path: String,
+    pub tags: Vec<String>,
+    pub duration_ms: u64,
+}
+
+/// 单指标图像频域特征检测请求: POST /api/vision/inspect
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisionInspectRequest {
+    pub file_path: String,
+}
+
+/// 单指标图像频域特征检测响应
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VisionInspectResponse {
+    pub file_path: String,
+    pub has_watermark: bool,
+    pub watermark_level: u8,
+    pub watermark_status: String,
+    pub has_mosaic: bool,
+    pub mosaic_level: u8,
+    pub mosaic_status: String,
+    pub duration_ms: u64,
+}
+
+/// 单指标文件系统 ADS 来源检测请求: POST /api/fs/ads
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsAdsRequest {
+    pub file_path: String,
+}
+
+/// 单指标文件系统 ADS 来源检测响应
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FsAdsResponse {
+    pub file_path: String,
+    pub file_source: Option<String>,
+    pub file_source_code: Option<String>,
+    pub source_url: Option<String>,
+    pub duration_ms: u64,
+}
+
 /// 查重扫描请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateScanRequest {

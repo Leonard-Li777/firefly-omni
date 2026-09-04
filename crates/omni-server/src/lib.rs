@@ -10,10 +10,13 @@ use axum::{
     Json, Router,
 };
 use omni_core::{
-    DuplicateFixRequest, DuplicateFixResponse, DuplicateScanRequest, DuplicateScanResponse,
-    OmniConfig, OmniExtractionResult,
+    AudioTranscribeRequest, AudioTranscribeResponse, DuplicateFixRequest, DuplicateFixResponse,
+    DuplicateScanRequest, DuplicateScanResponse, FsAdsRequest, FsAdsResponse, OmniConfig,
+    OmniExtractionResult, OmniPerceptionBenchmark, OmniPerceptionRequest, OmniPerceptionResult,
+    VisionInspectRequest, VisionInspectResponse, VisionTagsRequest, VisionTagsResponse,
 };
 use omni_extract::OmniExtractor;
+use omni_vision::OmniVisionEngine;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -64,6 +67,11 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/api/config", get(get_config).post(update_config).put(update_config))
         .route("/api/extract", post(extract_file_handler))
         .route("/api/extract/upload", post(extract_multipart_handler))
+        .route("/api/perceive", post(perceive_file_handler))
+        .route("/api/audio/transcribe", post(audio_transcribe_handler))
+        .route("/api/vision/tags", post(vision_tags_handler))
+        .route("/api/vision/inspect", post(vision_inspect_handler))
+        .route("/api/fs/ads", post(fs_ads_handler))
         .route("/api/cleanup/scan", post(cleanup_scan_handler))
         .route("/api/cleanup/scan/stream", post(cleanup_scan_stream_handler))
         .route("/api/cleanup/fix", post(cleanup_fix_handler))
@@ -385,6 +393,423 @@ async fn extract_file_handler(
         }
     };
     res
+}
+
+/// 工作流处理状态 Rust 端推断辅助函数
+fn detect_workflow_state_rust(path_str: &str, metadata: &serde_json::Value) -> String {
+    let lower_path = path_str.to_lowercase();
+    let file_name = std::path::Path::new(path_str)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // 1. 草稿判定
+    if file_name.contains("草稿")
+        || file_name.contains("draft")
+        || file_name.contains("初稿")
+        || file_name.contains("v0.")
+    {
+        return "draft".to_string();
+    }
+
+    // 2. 待修订 / 审核中判定
+    if file_name.contains("待修改")
+        || file_name.contains("待修")
+        || file_name.contains("修改版")
+        || file_name.contains("批注")
+        || file_name.contains("送审")
+        || file_name.contains("审核")
+    {
+        return "reviewing".to_string();
+    }
+
+    // 3. 定稿 / 已完成判定
+    if file_name.contains("定稿")
+        || file_name.contains("final")
+        || file_name.contains("已盖章")
+        || file_name.contains("已完成")
+        || file_name.contains("已结项")
+        || file_name.contains("正式版")
+    {
+        return "completed".to_string();
+    }
+
+    // 4. 归档判定
+    if lower_path.contains("archive") || lower_path.contains("归档") || file_name.contains("已归档") {
+        return "archived".to_string();
+    }
+
+    // 5. 元数据特征
+    if metadata.get("has_revisions").and_then(|v| v.as_bool()) == Some(true)
+        || metadata.get("has_comments").and_then(|v| v.as_bool()) == Some(true)
+    {
+        return "reviewing".to_string();
+    }
+
+    if metadata.get("has_signature").and_then(|v| v.as_bool()) == Some(true)
+        || metadata.get("is_signed").and_then(|v| v.as_bool()) == Some(true)
+    {
+        return "completed".to_string();
+    }
+
+    "unarchived".to_string()
+}
+
+/// 安全等级 Rust 端推断辅助函数 (返回语言中立标准代码: top_secret, confidential, internal, public)
+fn detect_security_level_rust(path_str: &str, content_preview: &str) -> String {
+    let check_text = format!("{} {}", path_str, content_preview);
+    let lower = check_text.to_lowercase();
+
+    if lower.contains("绝密") || lower.contains("top secret") {
+        return "top_secret".to_string();
+    }
+    if lower.contains("机密")
+        || lower.contains("秘密")
+        || lower.contains("confidential")
+        || lower.contains("restricted")
+    {
+        return "confidential".to_string();
+    }
+    if lower.contains("内部公开") || lower.contains("内部使用") || lower.contains("internal use") {
+        return "internal".to_string();
+    }
+
+    "public".to_string()
+}
+
+/// 处理全量原生多模态感知请求: POST /api/perceive
+/// 单次 I/O 汇聚元数据提取、NTFS ADS 来源直查、频域水印/打码检测、离线逆地理编码与物理事实
+async fn perceive_file_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OmniPerceptionRequest>,
+) -> Json<OmniPerceptionResult> {
+    let cfg = state.config.lock().unwrap().clone();
+    let t_start = std::time::Instant::now();
+    let file_path = req.file_path.clone();
+
+    let mut benchmark = OmniPerceptionBenchmark::default();
+
+    // 1. 底层单次 I/O 提取内容与元数据
+    let t_extract = std::time::Instant::now();
+    let ext_res = match OmniExtractor::extract(&file_path, &cfg).await {
+        Ok(res) => res,
+        Err(err) => {
+            tracing::warn!("[OmniServer] 感知基础提取失败: file={}, err={}", file_path, err);
+            OmniExtractionResult {
+                file_path: file_path.clone(),
+                mime_type: "application/octet-stream".to_string(),
+                file_size: 0,
+                markdown_content: String::new(),
+                metadata: serde_json::json!({}),
+                phash: None,
+                is_corrupted: true,
+                benchmark: None,
+            }
+        }
+    };
+    benchmark.extract_ms = Some(t_extract.elapsed().as_millis() as u64);
+
+    let mime_type = ext_res.mime_type.clone();
+    let file_size = ext_res.file_size;
+    let markdown_content = ext_res.markdown_content.clone();
+    let metadata = ext_res.metadata.clone();
+    let phash = ext_res.phash.clone();
+    let is_corrupted = ext_res.is_corrupted;
+
+    // 2. Windows NTFS ADS 来源追踪 (Zone.Identifier)
+    let t_ads = std::time::Instant::now();
+    let (file_source, file_source_code, source_url) = OmniVisionEngine::detect_ntfs_zone_identifier(&file_path);
+    benchmark.ads_ms = Some(t_ads.elapsed().as_millis() as u64);
+
+    // 3. 图像频域算子与物理特征直出 (水印程度 / 打码程度)
+    let t_vision = std::time::Instant::now();
+    let mut watermark_level = None;
+    let mut watermark_status = None;
+    let mut has_watermark = None;
+    let mut mosaic_level = None;
+    let mut mosaic_status = None;
+    let mut has_mosaic = None;
+
+    let is_image = mime_type.starts_with("image/")
+        || ["png", "jpg", "jpeg", "webp", "bmp"]
+            .iter()
+            .any(|ext| file_path.to_lowercase().ends_with(ext));
+
+    if is_image {
+        if let Ok(img) = image::open(&file_path) {
+            let wm_lvl = OmniVisionEngine::detect_watermark_level(&img);
+            watermark_level = Some(wm_lvl);
+            has_watermark = Some(wm_lvl > 0);
+            watermark_status = Some(match wm_lvl {
+                2 => "heavy".to_string(),
+                1 => "light".to_string(),
+                _ => "none".to_string(),
+            });
+
+            let mc_lvl = OmniVisionEngine::detect_mosaic_level(&img);
+            mosaic_level = Some(mc_lvl);
+            has_mosaic = Some(mc_lvl > 0);
+            mosaic_status = Some(match mc_lvl {
+                2 => "heavy".to_string(),
+                1 => "thin".to_string(),
+                _ => "none".to_string(),
+            });
+        }
+    }
+    benchmark.vision_ms = Some(t_vision.elapsed().as_millis() as u64);
+
+    // 4. 离线逆地理编码 (若元数据中含 GPS 坐标且开启了地理反查)
+    let t_geo = std::time::Instant::now();
+    let mut geo_address = None;
+    let enable_geo = req.enable_geo_reverse.unwrap_or(true);
+
+    if enable_geo {
+        let lat_opt = metadata
+            .get("GPSLatitude")
+            .or_else(|| metadata.get("exiftool").and_then(|e| e.get("GPSLatitude")));
+        let lon_opt = metadata
+            .get("GPSLongitude")
+            .or_else(|| metadata.get("exiftool").and_then(|e| e.get("GPSLongitude")));
+
+        let parse_coord = |v: Option<&serde_json::Value>| -> Option<f64> {
+            match v {
+                Some(serde_json::Value::Number(n)) => n.as_f64(),
+                Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+                _ => None,
+            }
+        };
+
+        if let (Some(lat), Some(lon)) = (parse_coord(lat_opt), parse_coord(lon_opt)) {
+            let geo = state.geo.clone();
+            let lang = req.language.clone().unwrap_or_else(|| "zh-CN".to_string());
+            let outcome = tokio::task::spawn_blocking(move || {
+                let points = vec![omni_pro::geo::GeoQueryPoint {
+                    latitude: lat,
+                    longitude: lon,
+                }];
+                geo.reverse(&points, &lang, 50.0, 500.0)
+            })
+            .await;
+
+            if let Ok(outcome) = outcome {
+                if let Some(first) = outcome.results.into_iter().next() {
+                    if first.found {
+                        geo_address = first.formatted_address;
+                    }
+                }
+            }
+        }
+    }
+    benchmark.geo_ms = Some(t_geo.elapsed().as_millis() as u64);
+
+    // 5. 工作流状态与安全等级推断 (输出语言中立机器代码)
+    let workflow_state_code = Some(detect_workflow_state_rust(&file_path, &metadata));
+    let workflow_state = workflow_state_code.clone();
+    let security_level_code = Some(detect_security_level_rust(&file_path, &markdown_content));
+    let security_level = security_level_code.clone();
+
+    // 6. 提取多模态元数据字段 (若元数据中已有视觉标签或语音转录)
+    let visual_tags = metadata
+        .get("visual_tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    let audio_transcript = metadata
+        .get("audio_transcript")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let audio_events = metadata
+        .get("audio_events")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    let category = metadata
+        .get("category")
+        .and_then(|c| c.get("group"))
+        .and_then(|g| g.as_str())
+        .map(|s| s.to_string());
+
+    benchmark.total_ms = t_start.elapsed().as_millis() as u64;
+
+    tracing::info!(
+        "[OmniServer] 原生多模态感知完成: file={}, 耗时={}ms, watermark_level={:?}, mosaic_level={:?}, geo={:?}",
+        file_path,
+        benchmark.total_ms,
+        watermark_level,
+        mosaic_level,
+        geo_address
+    );
+
+    Json(OmniPerceptionResult {
+        file_path,
+        mime_type,
+        file_size,
+        category,
+        markdown_content,
+        metadata,
+        file_source,
+        file_source_code,
+        source_url,
+        workflow_state,
+        workflow_state_code,
+        security_level,
+        security_level_code,
+        has_watermark,
+        watermark_level,
+        watermark_status,
+        has_mosaic,
+        mosaic_level,
+        mosaic_status,
+        visual_tags,
+        audio_transcript,
+        audio_events,
+        geo_address,
+        phash,
+        is_corrupted,
+        benchmark: Some(benchmark),
+    })
+}
+
+/// 单指标音频转录处理: POST /api/audio/transcribe
+async fn audio_transcribe_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AudioTranscribeRequest>,
+) -> Json<AudioTranscribeResponse> {
+    let cfg = state.config.lock().unwrap().clone();
+    let t_start = std::time::Instant::now();
+    let file_path = req.file_path.clone();
+
+    let mut transcript = None;
+    let mut events = Vec::new();
+
+    if let Ok(res) = OmniExtractor::extract(&file_path, &cfg).await {
+        if let Some(t) = res.metadata.get("audio_transcript").and_then(|v| v.as_str()) {
+            transcript = Some(t.to_string());
+        } else if !res.markdown_content.is_empty()
+            && (res.mime_type.starts_with("audio/") || res.mime_type.starts_with("video/"))
+        {
+            transcript = Some(res.markdown_content);
+        }
+
+        if let Some(ev) = res.metadata.get("audio_events").and_then(|v| v.as_array()) {
+            events = ev.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+        }
+    }
+
+    let duration_ms = t_start.elapsed().as_millis() as u64;
+    Json(AudioTranscribeResponse {
+        file_path,
+        transcript,
+        events,
+        language: req.language,
+        duration_ms,
+    })
+}
+
+/// 单指标视觉标签处理: POST /api/vision/tags
+async fn vision_tags_handler(
+    State(state): State<AppState>,
+    Json(req): Json<VisionTagsRequest>,
+) -> Json<VisionTagsResponse> {
+    let cfg = state.config.lock().unwrap().clone();
+    let t_start = std::time::Instant::now();
+    let file_path = req.file_path.clone();
+
+    let mut tags = Vec::new();
+    if let Ok(res) = OmniExtractor::extract(&file_path, &cfg).await {
+        if let Some(arr) = res.metadata.get("visual_tags").and_then(|v| v.as_array()) {
+            tags = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+        }
+    }
+
+    if let Some(top_k) = req.top_k {
+        if tags.len() > top_k {
+            tags.truncate(top_k);
+        }
+    }
+
+    let duration_ms = t_start.elapsed().as_millis() as u64;
+    Json(VisionTagsResponse {
+        file_path,
+        tags,
+        duration_ms,
+    })
+}
+
+/// 单指标图像频域特征检测处理: POST /api/vision/inspect
+async fn vision_inspect_handler(
+    Json(req): Json<VisionInspectRequest>,
+) -> Json<VisionInspectResponse> {
+    let t_start = std::time::Instant::now();
+    let file_path = req.file_path.clone();
+
+    let mut has_watermark = false;
+    let mut watermark_level = 0u8;
+    let mut watermark_status = "none".to_string();
+    let mut has_mosaic = false;
+    let mut mosaic_level = 0u8;
+    let mut mosaic_status = "none".to_string();
+
+    if let Ok(img) = image::open(&file_path) {
+        watermark_level = OmniVisionEngine::detect_watermark_level(&img);
+        has_watermark = watermark_level > 0;
+        watermark_status = match watermark_level {
+            2 => "heavy".to_string(),
+            1 => "light".to_string(),
+            _ => "none".to_string(),
+        };
+
+        mosaic_level = OmniVisionEngine::detect_mosaic_level(&img);
+        has_mosaic = mosaic_level > 0;
+        mosaic_status = match mosaic_level {
+            2 => "heavy".to_string(),
+            1 => "thin".to_string(),
+            _ => "none".to_string(),
+        };
+    }
+
+    let duration_ms = t_start.elapsed().as_millis() as u64;
+    Json(VisionInspectResponse {
+        file_path,
+        has_watermark,
+        watermark_level,
+        watermark_status,
+        has_mosaic,
+        mosaic_level,
+        mosaic_status,
+        duration_ms,
+    })
+}
+
+/// 单指标文件系统 ADS 来源检测处理: POST /api/fs/ads
+async fn fs_ads_handler(
+    Json(req): Json<FsAdsRequest>,
+) -> Json<FsAdsResponse> {
+    let t_start = std::time::Instant::now();
+    let file_path = req.file_path.clone();
+
+    let (file_source, file_source_code, source_url) = OmniVisionEngine::detect_ntfs_zone_identifier(&file_path);
+
+    let duration_ms = t_start.elapsed().as_millis() as u64;
+    Json(FsAdsResponse {
+        file_path,
+        file_source,
+        file_source_code,
+        source_url,
+        duration_ms,
+    })
 }
 
 /// 处理 Web UI 前端拖拽文件二进制流上传请求: POST /api/extract/upload
