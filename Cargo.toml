@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/omni-core",
     "crates/omni-extract",
-    "crates/omni-vision",
     "crates/omni-server",
     "crates/omni-cli",
     "crates/omni-mcp",
@@ -13,6 +12,8 @@ members = [
     "omni-pro",
     "omni-pro/crates/omni-geo",
     "omni-pro/crates/omni-cleanup",
+    "omni-pro/crates/omni-cover",
+    "omni-pro/crates/omni-vision",
 ]
 
 [workspace.package]

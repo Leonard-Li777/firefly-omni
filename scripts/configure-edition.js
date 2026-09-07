@@ -9,11 +9,13 @@ function configureOmniEdition(edition = 'pro') {
   const omniRoot = path.resolve(__dirname, '..')
   const serverCargoPath = path.join(omniRoot, 'crates', 'omni-server', 'Cargo.toml')
   const extractCargoPath = path.join(omniRoot, 'crates', 'omni-extract', 'Cargo.toml')
+  const mcpCargoPath = path.join(omniRoot, 'crates', 'omni-mcp', 'Cargo.toml')
+  const nodeCargoPath = path.join(omniRoot, 'crates', 'omni-node', 'Cargo.toml')
   const rootCargoPath = path.join(omniRoot, 'Cargo.toml')
 
   const isCE = edition === 'ce' || process.env.OMNI_EDITION === 'ce' || process.argv.includes('--ce')
 
-  const targetCargoPaths = [serverCargoPath, extractCargoPath]
+  const targetCargoPaths = [serverCargoPath, extractCargoPath, mcpCargoPath, nodeCargoPath]
   for (const cargoPath of targetCargoPaths) {
     if (fs.existsSync(cargoPath)) {
       let content = fs.readFileSync(cargoPath, 'utf8')
@@ -37,11 +39,10 @@ function configureOmniEdition(edition = 'pro') {
   if (fs.existsSync(rootCargoPath)) {
     let rootContent = fs.readFileSync(rootCargoPath, 'utf8')
     if (isCE) {
-      // CE 版排除 omni-pro 相关工作区子包
+      // CE 版排除 omni-pro 相关工作区子包，同时彻底排除 omni-vision
       const ceMembers = `members = [
     "crates/omni-core",
     "crates/omni-extract",
-    "crates/omni-vision",
     "crates/omni-server",
     "crates/omni-cli",
     "crates/omni-mcp",
@@ -55,7 +56,6 @@ function configureOmniEdition(edition = 'pro') {
       const proMembers = `members = [
     "crates/omni-core",
     "crates/omni-extract",
-    "crates/omni-vision",
     "crates/omni-server",
     "crates/omni-cli",
     "crates/omni-mcp",
@@ -65,6 +65,8 @@ function configureOmniEdition(edition = 'pro') {
     "omni-pro",
     "omni-pro/crates/omni-geo",
     "omni-pro/crates/omni-cleanup",
+    "omni-pro/crates/omni-cover",
+    "omni-pro/crates/omni-vision",
 ]`
       rootContent = rootContent.replace(/members\s*=\s*\[[\s\S]*?\]/m, proMembers)
     }

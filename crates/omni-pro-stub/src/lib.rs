@@ -10,10 +10,21 @@ pub fn is_pro_enabled() -> bool {
 pub mod geo {
     use super::*;
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct GeoQueryPoint {
-        pub lat: f64,
-        pub lng: f64,
+        pub latitude: f64,
+        pub longitude: f64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct GeoPlaceResult {
+        pub found: bool,
+        pub country: Option<String>,
+        pub province: Option<String>,
+        pub city: Option<String>,
+        pub distance_km: Option<f64>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,7 +34,7 @@ pub mod geo {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub dataset_version: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub results: Option<Vec<serde_json::Value>>,
+        pub results: Option<Vec<GeoPlaceResult>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub reason: Option<String>,
     }
@@ -141,3 +152,213 @@ pub mod cover {
 }
 
 pub use cover::{raw_to_webp, CoverRenderer};
+
+pub mod perceive {
+    use std::path::Path;
+
+    pub fn detect_watermark_level(_img: &image::DynamicImage) -> u8 {
+        0
+    }
+
+    pub fn detect_watermark_status(_img: &image::DynamicImage) -> &'static str {
+        "none"
+    }
+
+    pub fn detect_mosaic_level(_img: &image::DynamicImage) -> u8 {
+        0
+    }
+
+    pub fn detect_mosaic_status(_img: &image::DynamicImage) -> &'static str {
+        "none"
+    }
+
+    pub fn detect_exif_orientation_fast<P: AsRef<Path>>(_path: P) -> Option<String> {
+        None
+    }
+
+    pub fn detect_ntfs_zone_identifier<P: AsRef<Path>>(_path: P) -> (Option<String>, Option<String>, Option<String>) {
+        (None, None, None)
+    }
+
+    pub fn detect_ntfs_zone_identifier_with_lang<P: AsRef<Path>>(_path: P, _lang: Option<&str>) -> (Option<String>, Option<String>, Option<String>) {
+        (None, None, None)
+    }
+
+    pub fn detect_workflow_state(_path_str: &str, _metadata: &serde_json::Value) -> String {
+        "unarchived".to_string()
+    }
+
+    pub fn detect_security_level(_path_str: &str, _content_preview: &str) -> String {
+        "public".to_string()
+    }
+
+    pub fn evaluate_image_aesthetic_and_quality(_img: &image::DynamicImage, _exif_orientation: Option<&str>) -> (f32, Vec<String>) {
+        (7.5, Vec::new())
+    }
+
+    pub fn infer_image_modal_type(
+        _img: &image::DynamicImage,
+        _mobilenet_tags: &[String],
+        _clip_tags: &[String],
+        _nsfw_tags: &[String],
+        _has_text: bool,
+        _file_name: &str,
+    ) -> String {
+        "摄影照片".to_string()
+    }
+}
+
+pub mod vision {
+    use std::path::Path;
+
+    #[derive(Debug, Clone)]
+    pub struct OCRBoxResult {
+        pub box_rect: [u32; 4],
+        pub text: String,
+        pub confidence: f32,
+    }
+
+    pub struct OmniVisionEngine;
+
+    impl OmniVisionEngine {
+        pub fn detect_mime_type<P: AsRef<Path>>(path: P) -> anyhow::Result<String> {
+            let p = path.as_ref();
+            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                let mime = match ext.to_lowercase().as_str() {
+                    "png" => "image/png",
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    "bmp" => "image/bmp",
+                    "pdf" => "application/pdf",
+                    "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "mp3" => "audio/mpeg",
+                    "mp4" => "video/mp4",
+                    "json" => "application/json",
+                    "txt" | "md" => "text/plain",
+                    _ => "application/octet-stream",
+                };
+                return Ok(mime.to_string());
+            }
+            Ok("application/octet-stream".to_string())
+        }
+
+        pub fn group_boxes_into_lines(_boxes: Vec<OCRBoxResult>) -> String {
+            String::new()
+        }
+
+        pub fn ctc_decode(_preds: &[f32], _char_list: &[&str], _seq_len: usize, _num_classes: usize) -> (String, f32) {
+            (String::new(), 0.0)
+        }
+
+        pub fn fast_detect_has_text(_img: &image::DynamicImage) -> bool {
+            true
+        }
+
+        pub fn recognize_ocr_text_with_size<P: AsRef<Path>>(_image_path: P, _model_size: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        pub fn recognize_ocr_text<P: AsRef<Path>>(_image_path: P) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        pub fn recognize_ocr_dynamic_image(_img: &image::DynamicImage, _model_size: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        pub fn recognize_ocr_image_bytes(_bytes: &[u8], _model_size: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        pub fn extract_clip_visual_tags_from_image(
+            _img: &image::DynamicImage,
+            _lang: Option<&str>,
+            _top_k: usize,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn extract_clip_visual_tags_from_image_with_hint(
+            _img: &image::DynamicImage,
+            _path_hint: Option<&str>,
+            _lang: Option<&str>,
+            _top_k: usize,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn extract_clip_visual_tags<P: AsRef<Path>>(
+            _image_path: P,
+            _lang: Option<&str>,
+            _top_k: usize,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn extract_clip_high_confidence_tags(
+            _img: &image::DynamicImage,
+            _path_hint: Option<&str>,
+            _lang: Option<&str>,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn extract_mobilenet_tags(
+            _img: &image::DynamicImage,
+            _has_text: bool,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn extract_mobilenet_high_confidence_tags(
+            _img: &image::DynamicImage,
+            _has_text: bool,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn detect_nsfw_tags_and_rating(
+            _img: &image::DynamicImage,
+            _ocr_text: &str,
+            _clip_tags: &[String],
+        ) -> (Vec<String>, Vec<String>, Option<String>) {
+            (Vec::new(), Vec::new(), None)
+        }
+
+        pub fn detect_is_black_and_white(_img: &image::DynamicImage) -> bool {
+            false
+        }
+
+        pub fn derive_mobilenet_tags(
+            _aspect_ratio: f32,
+            _has_text: bool,
+            _is_bw: bool,
+        ) -> (Vec<String>, Vec<String>) {
+            (Vec::new(), Vec::new())
+        }
+
+        pub fn run_nsfw_model(_img: &image::DynamicImage) -> Option<[f32; 5]> {
+            None
+        }
+
+        pub fn derive_nsfw_tags_and_rating_from_probs(
+            _probs_opt: Option<[f32; 5]>,
+            _ocr_text: &str,
+            _clip_tags: &[String],
+        ) -> (Vec<String>, Vec<String>, Option<String>) {
+            (Vec::new(), Vec::new(), None)
+        }
+
+        pub fn derive_nsfw_high_confidence_tags(
+            _tags: &[String],
+            _rating: Option<&str>,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+    }
+}
+
+pub use vision::{OCRBoxResult, OmniVisionEngine};
