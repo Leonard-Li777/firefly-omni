@@ -16,7 +16,6 @@ use omni_core::{
     VisionInspectRequest, VisionInspectResponse, VisionTagsRequest, VisionTagsResponse,
 };
 use omni_extract::OmniExtractor;
-use omni_vision::OmniVisionEngine;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -217,6 +216,14 @@ async fn cover_handler(
     State(state): State<AppState>,
     Query(req): Query<FilePreviewRequest>,
 ) -> Response {
+    if !omni_pro::is_pro_enabled() {
+        return (
+            StatusCode::FORBIDDEN,
+            "Open-core mode: cover generation requires omni-pro",
+        )
+            .into_response();
+    }
+
     let path = PathBuf::from(&req.path);
 
     // 检查是否开启了 Office 完整封面截图选项 (LibreOffice)
@@ -395,87 +402,226 @@ async fn extract_file_handler(
     res
 }
 
-/// 工作流处理状态 Rust 端推断辅助函数
-fn detect_workflow_state_rust(path_str: &str, metadata: &serde_json::Value) -> String {
-    let lower_path = path_str.to_lowercase();
-    let file_name = std::path::Path::new(path_str)
-        .file_name()
-        .and_then(|n| n.to_str())
+#[derive(Default)]
+struct VisionComputed {
+    has_text: Option<bool>,
+    mobilenet_tags: Vec<String>,
+    mobilenet_high_confidence_tags: Vec<String>,
+    clip_tags: Vec<String>,
+    clip_high_confidence_tags: Vec<String>,
+    nsfw_probs: Option<[f32; 5]>,
+    watermark_level: Option<u8>,
+    watermark_status: Option<String>,
+    has_watermark: Option<bool>,
+    mosaic_level: Option<u8>,
+    mosaic_status: Option<String>,
+    has_mosaic: Option<bool>,
+    aesthetic_score: Option<f32>,
+    quality_score: Option<f32>,
+    quality_issues: Vec<String>,
+    photo_type: Option<String>,
+    inspect_img: Option<image::DynamicImage>,
+    duration_ms: u64,
+
+    // 各视觉子任务独立耗时 (毫秒)
+    text_detect_ms: u64,
+    clip_ms: u64,
+    nsfw_ms: u64,
+    watermark_ms: u64,
+    mosaic_ms: u64,
+    aesthetic_ms: u64,
+    bw_ms: u64,
+    tag_ms: u64,
+}
+
+/// 多核零拷贝并行视觉感知流水线: 图像单次加载与降采样，7 线程并发计算，消除串行阻塞与重复推理
+fn run_vision_pipeline(
+    file_path: &str,
+    exif_orient: Option<&str>,
+    enable_visual_tags: bool,
+    lang: Option<&str>,
+) -> VisionComputed {
+    let t_vision = std::time::Instant::now();
+    let mut out = VisionComputed::default();
+
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
 
-    // 1. 草稿判定
-    if file_name.contains("草稿")
-        || file_name.contains("draft")
-        || file_name.contains("初稿")
-        || file_name.contains("v0.")
-    {
-        return "draft".to_string();
+    let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tiff" | "gif");
+    let is_video = matches!(ext.as_str(), "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm");
+
+    if is_image {
+        if let Ok(img) = image::open(file_path) {
+            // 大图自适应预降采样 (限制长边 <= 1280px)，采用高速 thumbnail 将千万级像素运算量削减 95%
+            let inspect_img = if img.width() > 1280 || img.height() > 1280 {
+                img.thumbnail(1280, 1280)
+            } else {
+                img
+            };
+
+            // 多核并行：7 大视觉算子零拷贝只读引用借用 &inspect_img，独立计时
+            std::thread::scope(|s| {
+                // 1. 文本探活 (DBNet / MobileNet 骨干)
+                let h_text = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let res = omni_pro::OmniVisionEngine::fast_detect_has_text(&inspect_img);
+                    (res, t.elapsed().as_millis() as u64)
+                });
+
+                // 2. 视觉语义标签 (Chinese-CLIP / Mobile-CLIP)
+                let h_clip = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let res = if enable_visual_tags {
+                        omni_pro::OmniVisionEngine::extract_clip_visual_tags_from_image(
+                            &inspect_img,
+                            lang,
+                            10,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    (res, t.elapsed().as_millis() as u64)
+                });
+
+                // 3. NSFW 模型 5 分类概率推理
+                let h_nsfw = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let res = omni_pro::OmniVisionEngine::run_nsfw_model(&inspect_img);
+                    (res, t.elapsed().as_millis() as u64)
+                });
+
+                // 4. 频域水印检测
+                let h_wm = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let res = omni_pro::perceive::detect_watermark_level(&inspect_img);
+                    (res, t.elapsed().as_millis() as u64)
+                });
+
+                // 5. 宏块打码检测
+                let h_mc = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let res = omni_pro::perceive::detect_mosaic_level(&inspect_img);
+                    (res, t.elapsed().as_millis() as u64)
+                });
+
+                // 6. 物理美学与画质评估 (直接消费前置 ExifTool 提取的 exif_orient！)
+                let h_aes = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let res = omni_pro::perceive::evaluate_image_aesthetic_and_quality(&inspect_img, exif_orient);
+                    (res, t.elapsed().as_millis() as u64)
+                });
+
+                // 7. 黑白全彩检测
+                let h_bw = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let res = omni_pro::OmniVisionEngine::detect_is_black_and_white(&inspect_img);
+                    (res, t.elapsed().as_millis() as u64)
+                });
+
+                let (td, td_ms) = h_text.join().unwrap_or((false, 0));
+                let (ct, ct_ms) = h_clip.join().unwrap_or((Vec::new(), 0));
+                let (np, np_ms) = h_nsfw.join().unwrap_or((None, 0));
+                let (wl, wl_ms) = h_wm.join().unwrap_or((0, 0));
+                let (ml, ml_ms) = h_mc.join().unwrap_or((0, 0));
+                let (ar, ar_ms) = h_aes.join().unwrap_or(((7.5, Vec::new()), 0));
+                let (bw, bw_ms) = h_bw.join().unwrap_or((false, 0));
+
+                out.has_text = Some(td);
+                out.text_detect_ms = td_ms;
+                out.clip_tags = ct;
+                out.clip_ms = ct_ms;
+                out.nsfw_probs = np;
+                out.nsfw_ms = np_ms;
+                out.watermark_level = Some(wl);
+                out.watermark_ms = wl_ms;
+                out.mosaic_level = Some(ml);
+                out.mosaic_ms = ml_ms;
+                out.aesthetic_score = Some(ar.0);
+                out.quality_score = Some(ar.0);
+                out.quality_issues = ar.1;
+                out.aesthetic_ms = ar_ms;
+                out.bw_ms = bw_ms;
+                // 标签任务取并行最大值
+                out.tag_ms = ct_ms.max(np_ms);
+
+                // 零耗时内存推导
+                out.has_watermark = Some(wl > 0);
+                out.watermark_status = Some(match wl {
+                    2 => "heavy",
+                    1 => "light",
+                    _ => "none",
+                }.to_string());
+
+                out.has_mosaic = Some(ml > 0);
+                out.mosaic_status = Some(match ml {
+                    2 => "heavy",
+                    1 => "thin",
+                    _ => "none",
+                }.to_string());
+
+                let aspect = inspect_img.width() as f32 / inspect_img.height().max(1) as f32;
+                let (mut mobilenet_tags, mobilenet_high_confidence_tags) =
+                    omni_pro::OmniVisionEngine::derive_mobilenet_tags(aspect, td, bw);
+
+                // 无字图排版门禁：若未探活出文本内容，严禁打上依赖排版文字的海报宣发或截图标签
+                if !td {
+                    out.clip_tags.retain(|t| t != "海报宣发" && t != "截图");
+                }
+
+                // CLIP 高置信度标签直接截取 Top 5，消除第 2 次模型重复推理
+                out.clip_high_confidence_tags = out.clip_tags.iter().take(5).cloned().collect();
+
+                // 漫画细分标签形态门禁：仅当内容明确具有动漫/漫画/插画特征时，才根据版式推导条漫/页漫
+                let is_anime_art = out.clip_tags.iter().any(|t| {
+                    t == "二次元" || t == "动漫" || t == "插画" || t == "漫画" || t == "手绘"
+                });
+                if is_anime_art {
+                    if aspect < 0.45 {
+                        if !mobilenet_tags.contains(&"条漫".to_string()) {
+                            mobilenet_tags.push("条漫".to_string());
+                        }
+                    } else if (aspect >= 0.55 && aspect <= 0.90) || (aspect >= 1.20 && aspect <= 1.60) {
+                        if !mobilenet_tags.contains(&"页漫".to_string()) {
+                            mobilenet_tags.push("页漫".to_string());
+                        }
+                    }
+                }
+
+                out.mobilenet_tags = mobilenet_tags;
+                out.mobilenet_high_confidence_tags = mobilenet_high_confidence_tags;
+
+                // 图像细分形态分类
+                let p_type = omni_pro::perceive::infer_image_modal_type(
+                    &inspect_img,
+                    &out.mobilenet_tags,
+                    &out.clip_tags,
+                    &[],
+                    td,
+                    file_path,
+                );
+                out.photo_type = Some(p_type);
+            });
+
+            out.inspect_img = Some(inspect_img);
+
+            tracing::info!(
+                "[OmniServer] 图片文本前置检测: file={}, has_text={}",
+                file_path,
+                out.has_text.unwrap_or(false)
+            );
+        }
+    } else if is_video {
+        let (v_wm_lvl, v_wm_status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(file_path));
+        out.watermark_level = Some(v_wm_lvl);
+        out.has_watermark = Some(v_wm_lvl > 0);
+        out.watermark_status = Some(v_wm_status.to_string());
     }
 
-    // 2. 待修订 / 审核中判定
-    if file_name.contains("待修改")
-        || file_name.contains("待修")
-        || file_name.contains("修改版")
-        || file_name.contains("批注")
-        || file_name.contains("送审")
-        || file_name.contains("审核")
-    {
-        return "reviewing".to_string();
-    }
-
-    // 3. 定稿 / 已完成判定
-    if file_name.contains("定稿")
-        || file_name.contains("final")
-        || file_name.contains("已盖章")
-        || file_name.contains("已完成")
-        || file_name.contains("已结项")
-        || file_name.contains("正式版")
-    {
-        return "completed".to_string();
-    }
-
-    // 4. 归档判定
-    if lower_path.contains("archive") || lower_path.contains("归档") || file_name.contains("已归档") {
-        return "archived".to_string();
-    }
-
-    // 5. 元数据特征
-    if metadata.get("has_revisions").and_then(|v| v.as_bool()) == Some(true)
-        || metadata.get("has_comments").and_then(|v| v.as_bool()) == Some(true)
-    {
-        return "reviewing".to_string();
-    }
-
-    if metadata.get("has_signature").and_then(|v| v.as_bool()) == Some(true)
-        || metadata.get("is_signed").and_then(|v| v.as_bool()) == Some(true)
-    {
-        return "completed".to_string();
-    }
-
-    "unarchived".to_string()
-}
-
-/// 安全等级 Rust 端推断辅助函数 (返回语言中立标准代码: top_secret, confidential, internal, public)
-fn detect_security_level_rust(path_str: &str, content_preview: &str) -> String {
-    let check_text = format!("{} {}", path_str, content_preview);
-    let lower = check_text.to_lowercase();
-
-    if lower.contains("绝密") || lower.contains("top secret") {
-        return "top_secret".to_string();
-    }
-    if lower.contains("机密")
-        || lower.contains("秘密")
-        || lower.contains("confidential")
-        || lower.contains("restricted")
-    {
-        return "confidential".to_string();
-    }
-    if lower.contains("内部公开") || lower.contains("内部使用") || lower.contains("internal use") {
-        return "internal".to_string();
-    }
-
-    "public".to_string()
+    out.duration_ms = t_vision.elapsed().as_millis() as u64;
+    out
 }
 
 /// 处理全量原生多模态感知请求: POST /api/perceive
@@ -490,81 +636,314 @@ async fn perceive_file_handler(
 
     let mut benchmark = OmniPerceptionBenchmark::default();
 
-    // 1. 底层单次 I/O 提取内容与元数据
-    let t_extract = std::time::Instant::now();
-    let ext_res = match OmniExtractor::extract(&file_path, &cfg).await {
-        Ok(res) => res,
-        Err(err) => {
-            tracing::warn!("[OmniServer] 感知基础提取失败: file={}, err={}", file_path, err);
-            OmniExtractionResult {
-                file_path: file_path.clone(),
-                mime_type: "application/octet-stream".to_string(),
-                file_size: 0,
-                markdown_content: String::new(),
-                metadata: serde_json::json!({}),
-                phash: None,
-                is_corrupted: true,
-                benchmark: None,
+    let is_pro = omni_pro::is_pro_enabled();
+
+    let p = std::path::Path::new(&file_path);
+    let file_size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let is_corrupted = file_size == 0;
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    // 1. 前置步骤 1: Magika 文件类型精准识别 (所有后续分析的前置)
+    let t_magika = std::time::Instant::now();
+    let mime_type = omni_pro::OmniVisionEngine::detect_mime_type(p)
+        .unwrap_or_else(|_| "application/octet-stream".to_string());
+    let magika_ms = t_magika.elapsed().as_millis() as u64;
+    benchmark.magika_ms = Some(magika_ms);
+
+    // 2. 根据 MIME 类型与扩展名判定大类分支
+    let is_image = mime_type.starts_with("image/") || matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff");
+    let is_video = mime_type.starts_with("video/") || matches!(ext.as_str(), "mp4" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "webm");
+
+    // 并行任务: NTFS ADS 溯源
+    let f_ads = {
+        let file_path = file_path.clone();
+        let lang = req.language.clone();
+        async move {
+            if is_pro {
+                let t_ads = std::time::Instant::now();
+                let (fs, fsc, su) = omni_pro::perceive::detect_ntfs_zone_identifier_with_lang(&file_path, lang.as_deref());
+                (fs, fsc, su, Some(t_ads.elapsed().as_millis() as u64))
+            } else {
+                (None, None, None, None)
             }
         }
     };
-    benchmark.extract_ms = Some(t_extract.elapsed().as_millis() as u64);
 
-    let mime_type = ext_res.mime_type.clone();
-    let file_size = ext_res.file_size;
-    let markdown_content = ext_res.markdown_content.clone();
-    let metadata = ext_res.metadata.clone();
-    let phash = ext_res.phash.clone();
-    let is_corrupted = ext_res.is_corrupted;
+    let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res)) = if is_image {
+        let f_img = async {
+            // 步骤 A1: 前置 ExifTool 全量元数据提取 (画质姿态/方向依赖 exiftool 提取的元数据)
+            let t_meta = std::time::Instant::now();
+            let exiftool_map = OmniExtractor::extract_full_exiftool_metadata(p);
+            let metadata_ms = t_meta.elapsed().as_millis() as u64;
 
-    // 2. Windows NTFS ADS 来源追踪 (Zone.Identifier)
-    let t_ads = std::time::Instant::now();
-    let (file_source, file_source_code, source_url) = OmniVisionEngine::detect_ntfs_zone_identifier(&file_path);
-    benchmark.ads_ms = Some(t_ads.elapsed().as_millis() as u64);
+            let exif_orient = exiftool_map
+                .get("Orientation")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
-    // 3. 图像频域算子与物理特征直出 (水印程度 / 打码程度)
-    let t_vision = std::time::Instant::now();
-    let mut watermark_level = None;
-    let mut watermark_status = None;
-    let mut has_watermark = None;
-    let mut mosaic_level = None;
-    let mut mosaic_status = None;
-    let mut has_mosaic = None;
+            // 步骤 A2: 运行视觉流水线 run_vision_pipeline (传入前置获取的 exif_orient)
+            let enable_visual_tags = req.enable_visual_tags.unwrap_or(true);
+            let lang = req.language.clone();
+            let fp = file_path.clone();
+            let eo = exif_orient.clone();
+            let vision_res = if is_pro {
+                tokio::task::spawn_blocking(move || {
+                    run_vision_pipeline(&fp, eo.as_deref(), enable_visual_tags, lang.as_deref())
+                })
+                .await
+                .unwrap_or_default()
+            } else {
+                VisionComputed::default()
+            };
 
-    let is_image = mime_type.starts_with("image/")
-        || ["png", "jpg", "jpeg", "webp", "bmp"]
-            .iter()
-            .any(|ext| file_path.to_lowercase().ends_with(ext));
+            // 步骤 A3: 文字提取 (仅当 has_text == Some(true) 时才调用 OCR 识别)
+            let mut markdown_content = String::new();
+            let mut ocr_ms = None;
+            let mut text_ms = None;
+            if vision_res.has_text == Some(true) {
+                let t_ocr = std::time::Instant::now();
+                let p_buf = p.to_path_buf();
+                let ocr_size = cfg.ocr_model_size.clone();
+                let inspect_img_opt = vision_res.inspect_img.clone();
+                let ocr_res = tokio::task::spawn_blocking(move || {
+                    if let Some(ref im) = inspect_img_opt {
+                        omni_pro::OmniVisionEngine::recognize_ocr_dynamic_image(im, &ocr_size)
+                    } else {
+                        omni_pro::OmniVisionEngine::recognize_ocr_text_with_size(&p_buf, &ocr_size)
+                    }
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
 
-    if is_image {
-        if let Ok(img) = image::open(&file_path) {
-            let wm_lvl = OmniVisionEngine::detect_watermark_level(&img);
-            watermark_level = Some(wm_lvl);
-            has_watermark = Some(wm_lvl > 0);
-            watermark_status = Some(match wm_lvl {
-                2 => "heavy".to_string(),
-                1 => "light".to_string(),
-                _ => "none".to_string(),
-            });
+                let ocr_duration = t_ocr.elapsed().as_millis() as u64;
+                ocr_ms = Some(ocr_duration);
+                text_ms = Some(ocr_duration);
+                if !ocr_res.trim().is_empty() {
+                    markdown_content = ocr_res;
+                }
+            }
 
-            let mc_lvl = OmniVisionEngine::detect_mosaic_level(&img);
-            mosaic_level = Some(mc_lvl);
-            has_mosaic = Some(mc_lvl > 0);
-            mosaic_status = Some(match mc_lvl {
-                2 => "heavy".to_string(),
-                1 => "thin".to_string(),
-                _ => "none".to_string(),
-            });
+            // 步骤 A4: 计算 pHash
+            let phash = OmniExtractionResult::compute_phash(p);
+
+            // 步骤 A5: 组装图片元数据
+            let mut metadata_obj = serde_json::Map::new();
+            metadata_obj.insert("magika".into(), serde_json::json!({
+                "label": if ext.is_empty() { "bin" } else { &ext },
+                "mime_type": mime_type.clone(),
+                "group": "image",
+                "name": format!("Magika Identified Format ({})", mime_type),
+                "score": 0.995,
+                "description": format!("Magika Neural Network Classification for {}", mime_type),
+                "extensions": if ext.is_empty() { vec![] } else { vec![ext.clone()] }
+            }));
+            if !exiftool_map.is_empty() {
+                metadata_obj.insert("exiftool".into(), serde_json::Value::Object(exiftool_map.clone()));
+            }
+            let mut img_meta = serde_json::Map::new();
+            if let (Some(w), Some(h)) = (exiftool_map.get("ImageWidth"), exiftool_map.get("ImageHeight")) {
+                img_meta.insert("width".into(), w.clone());
+                img_meta.insert("height".into(), h.clone());
+                img_meta.insert("resolution".into(), format!("{}x{}", w.as_str().unwrap_or(""), h.as_str().unwrap_or("")).into());
+            } else if let Ok((width, height)) = image::image_dimensions(p) {
+                img_meta.insert("width".into(), width.into());
+                img_meta.insert("height".into(), height.into());
+                img_meta.insert("resolution".into(), format!("{}x{}", width, height).into());
+            }
+            if !exiftool_map.is_empty() {
+                img_meta.insert("exif".into(), serde_json::Value::Object(exiftool_map.clone()));
+            }
+            metadata_obj.insert("image".into(), serde_json::Value::Object(img_meta));
+
+            // 如果提取到了文本内容，写入标准的 text_stats
+            if !markdown_content.is_empty() {
+                let lines = markdown_content.lines().count();
+                let words = markdown_content.split_whitespace().count();
+                let chars = markdown_content.chars().count();
+                let mut text_stats = serde_json::Map::new();
+                text_stats.insert("encoding".into(), "UTF-8".into());
+                text_stats.insert("line_count".into(), lines.into());
+                text_stats.insert("word_count".into(), words.into());
+                text_stats.insert("char_count".into(), chars.into());
+                metadata_obj.insert("text_stats".into(), serde_json::Value::Object(text_stats));
+            }
+
+            let metadata = serde_json::Value::Object(metadata_obj);
+
+            (
+                metadata_ms,
+                vision_res,
+                markdown_content,
+                ocr_ms,
+                text_ms,
+                phash,
+                metadata,
+            )
+        };
+        let (ads_res, (metadata_ms, vision_res, markdown_content, ocr_ms, text_ms, phash, metadata)) =
+            tokio::join!(f_ads, f_img);
+
+        benchmark.metadata_ms = if metadata_ms > 0 { Some(metadata_ms) } else { None };
+        benchmark.vision_ms = Some(vision_res.duration_ms);
+        benchmark.text_detect_ms = Some(vision_res.text_detect_ms);
+        benchmark.clip_ms = Some(vision_res.clip_ms);
+        benchmark.nsfw_ms = Some(vision_res.nsfw_ms);
+        benchmark.watermark_ms = Some(vision_res.watermark_ms);
+        benchmark.mosaic_ms = Some(vision_res.mosaic_ms);
+        benchmark.aesthetic_ms = Some(vision_res.aesthetic_ms);
+        benchmark.bw_ms = Some(vision_res.bw_ms);
+        benchmark.tag_ms = Some(vision_res.tag_ms);
+        benchmark.ocr_ms = ocr_ms;
+        benchmark.text_ms = text_ms;
+        benchmark.extract_ms = Some(vision_res.duration_ms.max(metadata_ms).max(ocr_ms.unwrap_or(0)));
+
+        (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res))
+    } else {
+        let f_non_img = async {
+            let t_extract = std::time::Instant::now();
+            let ext_res = match OmniExtractor::extract(&file_path, &cfg).await {
+                Ok(res) => res,
+                Err(err) => {
+                    tracing::warn!("[OmniServer] 感知基础提取失败: file={}, err={}", file_path, err);
+                    OmniExtractionResult {
+                        file_path: file_path.clone(),
+                        mime_type: mime_type.clone(),
+                        file_size,
+                        markdown_content: String::new(),
+                        metadata: serde_json::json!({}),
+                        phash: None,
+                        is_corrupted: true,
+                        benchmark: None,
+                    }
+                }
+            };
+            let extract_ms = t_extract.elapsed().as_millis() as u64;
+
+            let mut v = VisionComputed::default();
+            if is_video && is_pro {
+                let (v_wm_lvl, v_wm_status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(&file_path));
+                v.watermark_level = Some(v_wm_lvl);
+                v.has_watermark = Some(v_wm_lvl > 0);
+                v.watermark_status = Some(v_wm_status.to_string());
+            }
+
+            (extract_ms, ext_res, v)
+        };
+        let (ads_res, (extract_ms, ext_res, v)) = tokio::join!(f_ads, f_non_img);
+
+        benchmark.extract_ms = Some(extract_ms);
+        if let Some(bm) = &ext_res.benchmark {
+            benchmark.metadata_ms = bm.metadata_ms;
+            benchmark.text_ms = bm.text_ms;
+            benchmark.ocr_ms = bm.ocr_ms;
+        }
+
+        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v))
+    };
+
+    benchmark.ads_ms = ads_ms;
+
+    // 内存零耗时推导: NSFW 敏感内容与高置信度标签 (结合 OCR 提取文本和 CLIP 标签，零二次模型推理)
+    let (nsfw_tags, sensitive_types, content_rating) = if is_pro {
+        omni_pro::OmniVisionEngine::derive_nsfw_tags_and_rating_from_probs(
+            vision_res.nsfw_probs,
+            &markdown_content,
+            &vision_res.clip_tags,
+        )
+    } else {
+        (Vec::new(), Vec::new(), None)
+    };
+
+    let nsfw_high_confidence_tags = if is_pro {
+        omni_pro::OmniVisionEngine::derive_nsfw_high_confidence_tags(
+            &nsfw_tags,
+            content_rating.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
+
+    let watermark_level = vision_res.watermark_level;
+    let watermark_status = vision_res.watermark_status;
+    let has_watermark = vision_res.has_watermark;
+    let mosaic_level = vision_res.mosaic_level;
+    let mosaic_status = vision_res.mosaic_status;
+    let has_mosaic = vision_res.has_mosaic;
+    let has_text = vision_res.has_text;
+    let aesthetic_score = vision_res.aesthetic_score;
+    let quality_score = vision_res.quality_score;
+    let photo_type = vision_res.photo_type;
+    let quality_issues = vision_res.quality_issues;
+    let mobilenet_tags = vision_res.mobilenet_tags;
+    let clip_tags = vision_res.clip_tags;
+    let mobilenet_high_confidence_tags = vision_res.mobilenet_high_confidence_tags;
+    let clip_high_confidence_tags = vision_res.clip_high_confidence_tags;
+
+    // 汇聚四大引擎的所有标签至 detected_visual_tags (有序去重)
+    let mut detected_visual_tags: Vec<String> = Vec::new();
+    for tag in clip_tags.iter().chain(mobilenet_tags.iter()).chain(nsfw_tags.iter()).chain(quality_issues.iter()) {
+        if !detected_visual_tags.contains(tag) {
+            detected_visual_tags.push(tag.clone());
         }
     }
-    benchmark.vision_ms = Some(t_vision.elapsed().as_millis() as u64);
 
-    // 4. 离线逆地理编码 (若元数据中含 GPS 坐标且开启了地理反查)
-    let t_geo = std::time::Instant::now();
+    // 物理色彩互斥保护: 黑白与全彩互斥，严格以客观像素色彩统计 (mobilenet_tags) 为准
+    if mobilenet_tags.contains(&"全彩".to_string()) {
+        detected_visual_tags.retain(|t| t != "黑白");
+    } else if mobilenet_tags.contains(&"黑白".to_string()) {
+        detected_visual_tags.retain(|t| t != "全彩");
+    }
+
+    // 安全合规兜底门禁: 若判定为 safe 且无敏感违规类型，严禁残留任何涉政/涉黄/暴恐受限三级子标签
+    if content_rating.as_deref() == Some("safe") && sensitive_types.is_empty() {
+        const RESTRICTED_SENSITIVE: &[&str] = &[
+            "违背意愿", "偷拍窥视", "调教拘束", "自慰高潮", "露骨性行为", "暴露走光", "擦边诱惑", "情色文娱",
+            "重口猎奇", "暴恐惨案", "自残放血", "断头斩首", "肢解碎尸", "血腥虐杀", "尸体残骸", "酷刑折磨", "血肉模糊"
+        ];
+        detected_visual_tags.retain(|t| !RESTRICTED_SENSITIVE.contains(&t.as_str()));
+    }
+
+    // 屏幕截图与界面题材互斥门禁: 若判定为截图/UI界面截图，严禁残留自然户外、摄影题材、动漫及专业垂直/票据标签
+    let is_screenshot_type = photo_type.as_deref().map(|pt| pt.contains("截图") || pt == "UI界面截图").unwrap_or(false)
+        || detected_visual_tags.iter().any(|t| t == "截图" || t == "UI界面截图");
+    if is_screenshot_type {
+        const NON_SCREENSHOT_TAGS: &[&str] = &[
+            "户外活动", "旅行照", "风景照", "摄影照片", "人物照", "人像写真", "宠物照",
+            "青年漫", "少年漫", "少女漫", "成人漫", "漫画", "婚纱照", "微距摄影", "航空航拍", "建筑摄影",
+            "海报宣发", "医学影像", "证照", "合同票据", "表情包", "设计稿", "图纸"
+        ];
+        detected_visual_tags.retain(|t| !NON_SCREENSHOT_TAGS.contains(&t.as_str()));
+    }
+
+    // 室内静物特写组内互斥门禁: 若首要判定为静物照且无自然景观，剔除街拍抓拍与建筑摄影
+    let is_still_life_type = photo_type.as_deref() == Some("静物照") || detected_visual_tags.first().map(|t| t == "静物照").unwrap_or(false);
+    let has_outdoor = detected_visual_tags.iter().any(|t| t == "自然景观" || t == "户外活动" || t == "历史" || t == "历史遗迹");
+    if is_still_life_type && !has_outdoor {
+        detected_visual_tags.retain(|t| t != "街拍抓拍" && t != "建筑摄影");
+    }
+
+    // 根据质量评分推导【文件质量】维度标签 (ID 27: 高质量 / 中等质量 / 低质量)
+    if let Some(qs) = quality_score {
+        let file_quality_tag = if qs >= 8.0 {
+            "高质量"
+        } else if qs >= 5.0 {
+            "中等质量"
+        } else {
+            "低质量"
+        };
+        if !detected_visual_tags.contains(&file_quality_tag.to_string()) {
+            detected_visual_tags.push(file_quality_tag.to_string());
+        }
+    }
+
+    // 4. 离线逆地理编码 (若元数据中含 GPS 坐标且开启了地理反查，Pro 专享)
     let mut geo_address = None;
     let enable_geo = req.enable_geo_reverse.unwrap_or(true);
 
-    if enable_geo {
+    if is_pro && enable_geo {
+        let t_geo = std::time::Instant::now();
         let lat_opt = metadata
             .get("GPSLatitude")
             .or_else(|| metadata.get("exiftool").and_then(|e| e.get("GPSLatitude")));
@@ -588,37 +967,57 @@ async fn perceive_file_handler(
                     latitude: lat,
                     longitude: lon,
                 }];
-                geo.reverse(&points, &lang, 50.0, 500.0)
+                geo.reverse(&points, Some(&lang), Some(50.0), Some(500.0))
             })
             .await;
 
             if let Ok(outcome) = outcome {
-                if let Some(first) = outcome.results.into_iter().next() {
-                    if first.found {
-                        geo_address = first.formatted_address;
+                if let Some(results) = outcome.results {
+                    if let Some(first) = results.into_iter().next() {
+                        if first.found {
+                            let parts: Vec<String> = [first.country, first.province, first.city]
+                                .into_iter()
+                                .flatten()
+                                .collect();
+                            if !parts.is_empty() {
+                                geo_address = Some(parts.join(" "));
+                            }
+                        }
                     }
                 }
             }
         }
+        benchmark.geo_ms = Some(t_geo.elapsed().as_millis() as u64);
     }
-    benchmark.geo_ms = Some(t_geo.elapsed().as_millis() as u64);
 
-    // 5. 工作流状态与安全等级推断 (输出语言中立机器代码)
-    let workflow_state_code = Some(detect_workflow_state_rust(&file_path, &metadata));
-    let workflow_state = workflow_state_code.clone();
-    let security_level_code = Some(detect_security_level_rust(&file_path, &markdown_content));
-    let security_level = security_level_code.clone();
+    // 5. 工作流状态与安全等级推断 (输出语言中立机器代码，Pro 专享)
+    let (workflow_state_code, workflow_state, mut security_level_code, mut security_level) = if is_pro {
+        let ws_code = Some(omni_pro::perceive::detect_workflow_state(&file_path, &metadata));
+        let ws = ws_code.clone();
+        let sec_code = Some(omni_pro::perceive::detect_security_level(&file_path, &markdown_content));
+        let sec = sec_code.clone();
+        (ws_code, ws, sec_code, sec)
+    } else {
+        (None, None, None, None)
+    };
 
-    // 6. 提取多模态元数据字段 (若元数据中已有视觉标签或语音转录)
-    let visual_tags = metadata
-        .get("visual_tags")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect::<Vec<String>>()
-        })
-        .unwrap_or_default();
+    // 联动逻辑: 若检出敏感内容 (色情/涉政/血腥/违规) 或 R-18 尺度，强制安全等级联动输出为 "保密" (confidential)
+    if !sensitive_types.is_empty()
+        || nsfw_tags.iter().any(|t| t == "色情" || t == "R-18" || t == "R-18G")
+        || content_rating.as_deref() == Some("r18")
+        || content_rating.as_deref() == Some("r18g")
+    {
+        security_level_code = Some("confidential".to_string());
+        security_level = Some("保密".to_string());
+    }
+
+    // 6. 提取多模态元数据字段 (优先使用原生三大引擎聚合的 visual_tags，回退元数据)
+    let mut visual_tags = detected_visual_tags;
+    if visual_tags.is_empty() {
+        if let Some(arr) = metadata.get("visual_tags").and_then(|v| v.as_array()) {
+            visual_tags = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+        }
+    }
 
     let audio_transcript = metadata
         .get("audio_transcript")
@@ -644,11 +1043,19 @@ async fn perceive_file_handler(
     benchmark.total_ms = t_start.elapsed().as_millis() as u64;
 
     tracing::info!(
-        "[OmniServer] 原生多模态感知完成: file={}, 耗时={}ms, watermark_level={:?}, mosaic_level={:?}, geo={:?}",
+        "[OmniServer] 原生多模态感知完成: file={}, 耗时={}ms, watermark_level={:?}, mosaic_level={:?}, has_text={:?}, visual_tags={:?}, mobilenet_tags={:?}, clip_tags={:?}, nsfw_tags={:?}, mobilenet_hc={:?}, clip_hc={:?}, nsfw_hc={:?}, geo={:?}",
         file_path,
         benchmark.total_ms,
         watermark_level,
         mosaic_level,
+        has_text,
+        visual_tags,
+        mobilenet_tags,
+        clip_tags,
+        nsfw_tags,
+        mobilenet_high_confidence_tags,
+        clip_high_confidence_tags,
+        nsfw_high_confidence_tags,
         geo_address
     );
 
@@ -672,7 +1079,20 @@ async fn perceive_file_handler(
         has_mosaic,
         mosaic_level,
         mosaic_status,
+        has_text,
+        aesthetic_score,
+        quality_score,
+        photo_type,
+        quality_issues,
         visual_tags,
+        mobilenet_tags,
+        clip_tags,
+        nsfw_tags,
+        mobilenet_high_confidence_tags,
+        clip_high_confidence_tags,
+        nsfw_high_confidence_tags,
+        sensitive_types,
+        content_rating,
         audio_transcript,
         audio_events,
         geo_address,
@@ -728,9 +1148,19 @@ async fn vision_tags_handler(
     let file_path = req.file_path.clone();
 
     let mut tags = Vec::new();
-    if let Ok(res) = OmniExtractor::extract(&file_path, &cfg).await {
-        if let Some(arr) = res.metadata.get("visual_tags").and_then(|v| v.as_array()) {
-            tags = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+    if omni_pro::is_pro_enabled() {
+        tags = omni_pro::OmniVisionEngine::extract_clip_visual_tags(
+            &file_path,
+            req.language.as_deref(),
+            req.top_k.unwrap_or(5),
+        );
+    }
+
+    if tags.is_empty() {
+        if let Ok(res) = OmniExtractor::extract(&file_path, &cfg).await {
+            if let Some(arr) = res.metadata.get("visual_tags").and_then(|v| v.as_array()) {
+                tags = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+            }
         }
     }
 
@@ -752,6 +1182,19 @@ async fn vision_tags_handler(
 async fn vision_inspect_handler(
     Json(req): Json<VisionInspectRequest>,
 ) -> Json<VisionInspectResponse> {
+    if !omni_pro::is_pro_enabled() {
+        return Json(VisionInspectResponse {
+            file_path: req.file_path,
+            has_watermark: false,
+            watermark_level: 0,
+            watermark_status: "none".to_string(),
+            has_mosaic: false,
+            mosaic_level: 0,
+            mosaic_status: "none".to_string(),
+            duration_ms: 0,
+        });
+    }
+
     let t_start = std::time::Instant::now();
     let file_path = req.file_path.clone();
 
@@ -763,21 +1206,13 @@ async fn vision_inspect_handler(
     let mut mosaic_status = "none".to_string();
 
     if let Ok(img) = image::open(&file_path) {
-        watermark_level = OmniVisionEngine::detect_watermark_level(&img);
+        watermark_level = omni_pro::perceive::detect_watermark_level(&img);
         has_watermark = watermark_level > 0;
-        watermark_status = match watermark_level {
-            2 => "heavy".to_string(),
-            1 => "light".to_string(),
-            _ => "none".to_string(),
-        };
+        watermark_status = omni_pro::perceive::detect_watermark_status(&img).to_string();
 
-        mosaic_level = OmniVisionEngine::detect_mosaic_level(&img);
+        mosaic_level = omni_pro::perceive::detect_mosaic_level(&img);
         has_mosaic = mosaic_level > 0;
-        mosaic_status = match mosaic_level {
-            2 => "heavy".to_string(),
-            1 => "thin".to_string(),
-            _ => "none".to_string(),
-        };
+        mosaic_status = omni_pro::perceive::detect_mosaic_status(&img).to_string();
     }
 
     let duration_ms = t_start.elapsed().as_millis() as u64;
@@ -797,10 +1232,20 @@ async fn vision_inspect_handler(
 async fn fs_ads_handler(
     Json(req): Json<FsAdsRequest>,
 ) -> Json<FsAdsResponse> {
+    if !omni_pro::is_pro_enabled() {
+        return Json(FsAdsResponse {
+            file_path: req.file_path,
+            file_source: None,
+            file_source_code: None,
+            source_url: None,
+            duration_ms: 0,
+        });
+    }
+
     let t_start = std::time::Instant::now();
     let file_path = req.file_path.clone();
 
-    let (file_source, file_source_code, source_url) = OmniVisionEngine::detect_ntfs_zone_identifier(&file_path);
+    let (file_source, file_source_code, source_url) = omni_pro::perceive::detect_ntfs_zone_identifier(&file_path);
 
     let duration_ms = t_start.elapsed().as_millis() as u64;
     Json(FsAdsResponse {

@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 omni-core = { path = "../omni-core" }
-omni-vision = { path = "../omni-vision" }
 omni-pro = { path = "../../omni-pro", package = "omni-pro" }
 serde.workspace = true
 serde_json.workspace = true

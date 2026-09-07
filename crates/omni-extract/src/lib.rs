@@ -1,5 +1,5 @@
 use omni_core::{to_native_path_str, OmniConfig, OmniExtractionResult};
-use omni_vision::OmniVisionEngine;
+use omni_pro::OmniVisionEngine;
 use anyhow::Result;
 use encoding_rs::{GBK, UTF_8, UTF_16LE};
 use lofty::prelude::*;
@@ -13,6 +13,10 @@ use tracing::{info, warn};
 pub struct OmniExtractor;
 
 impl OmniExtractor {
+    pub fn extract_full_exiftool_metadata<P: AsRef<Path>>(path: P) -> serde_json::Map<String, serde_json::Value> {
+        extract_full_exiftool_metadata(path.as_ref())
+    }
+
     pub async fn extract<P: AsRef<Path>>(path: P, config: &OmniConfig) -> Result<OmniExtractionResult> {
         let t_extract_start = std::time::Instant::now();
         let p = path.as_ref();
@@ -189,15 +193,14 @@ impl OmniExtractor {
             }
             result.metadata["image"] = serde_json::Value::Object(img_meta);
 
-            if config.enable_image_ocr {
-                let t_ocr_start = std::time::Instant::now();
-                if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text_with_size(p, &config.ocr_model_size) {
-                    if !ocr_text.trim().is_empty() {
-                        result.markdown_content = ocr_text;
-                    }
+            // 所有图片均尝试 OCR 提取，底层由 fast_detect_has_text 毫秒级探测并跳过无字图片
+            let t_ocr_start = std::time::Instant::now();
+            if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text_with_size(p, &config.ocr_model_size) {
+                if !ocr_text.trim().is_empty() {
+                    result.markdown_content = ocr_text;
                 }
-                ocr_duration_ms = Some(t_ocr_start.elapsed().as_millis() as u64);
             }
+            ocr_duration_ms = Some(t_ocr_start.elapsed().as_millis() as u64);
         }
 
         // 7. 提取音频 Tag 与精细属性 (audio)
@@ -739,7 +742,7 @@ pub fn shutdown_exiftool_daemon() {
 
 /// 提取全量 ExifTool 字典 (包含 Creator, Producer, CreateDate, ModifyDate, PDFVersion, PageCount 等全量 100+ 属性)
 /// 对于 PDF 优先使用 Rust 原生 lopdf 毫秒级提取；对于其他文件使用常驻内存的 ExifTool -stay_open 守护进程（~2ms 响应）
-fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_json::Value> {
+pub fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
 
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
@@ -1012,7 +1015,7 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
                             break;
                         }
 
-                        if let Ok(page_text) = omni_vision::OmniVisionEngine::recognize_ocr_dynamic_image(img, &config.ocr_model_size) {
+                        if let Ok(page_text) = OmniVisionEngine::recognize_ocr_dynamic_image(img, &config.ocr_model_size) {
                             let trimmed = page_text.trim();
                             if !trimmed.is_empty() {
                                 current_bytes += trimmed.len();
@@ -1139,7 +1142,7 @@ fn extract_docx_with_embedded_image_ocr(path: &Path, max_bytes: usize, config: &
             if name_lower.starts_with("word/media/") || name_lower.starts_with("media/") {
                 let mut bytes = Vec::new();
                 if file.read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
-                    if let Ok(ocr_text) = omni_vision::OmniVisionEngine::recognize_ocr_image_bytes(&bytes, &config.ocr_model_size) {
+                    if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_image_bytes(&bytes, &config.ocr_model_size) {
                         if !ocr_text.trim().is_empty() {
                             let clean_name = name.trim_start_matches("word/").to_string();
                             accumulated_ocr_bytes += ocr_text.len();

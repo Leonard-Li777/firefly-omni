@@ -90,6 +90,20 @@ pub struct OmniPerceptionBenchmark {
     pub vision_ms: Option<u64>,
     pub audio_ms: Option<u64>,
     pub geo_ms: Option<u64>,
+
+    // 细分任务独立耗时
+    pub magika_ms: Option<u64>,
+    pub metadata_ms: Option<u64>,
+    pub tag_ms: Option<u64>,
+    pub text_ms: Option<u64>,
+    pub ocr_ms: Option<u64>,
+    pub text_detect_ms: Option<u64>,
+    pub clip_ms: Option<u64>,
+    pub nsfw_ms: Option<u64>,
+    pub watermark_ms: Option<u64>,
+    pub mosaic_ms: Option<u64>,
+    pub aesthetic_ms: Option<u64>,
+    pub bw_ms: Option<u64>,
 }
 
 /// 全量原生多模态感知结果 (收拢元数据、频域算子、视觉标签、语音转录与物理事实)
@@ -121,9 +135,30 @@ pub struct OmniPerceptionResult {
     /// 打码等级: 0 (无码), 1 (薄码), 2 (有码) (对应维度 ID: 124 tags 下标)
     pub mosaic_level: Option<u8>,
     pub mosaic_status: Option<String>,
+    /// 图片是否含有文本特征
+    pub has_text: Option<bool>,
+    /// 图像美学与画质综合得分 (1.0 ~ 10.0)
+    pub aesthetic_score: Option<f32>,
+    /// 文件质量评分 (1.0 ~ 10.0)
+    pub quality_score: Option<f32>,
+    /// 图像形态细分分类 (如: 聊天截图 / 合同票据 / 证照 / 摄影照片 等)
+    pub photo_type: Option<String>,
+    /// 照片技术与画质状态评估标签 (如: 优质精选 / 暗光欠曝 / 逆光死白 / 高ISO噪点 / 模糊废片 等)
+    pub quality_issues: Vec<String>,
 
-    // 多模态直出字段
+    // 多模态直出字段与三大引擎标签
     pub visual_tags: Vec<String>,
+    pub mobilenet_tags: Vec<String>,
+    pub clip_tags: Vec<String>,
+    pub nsfw_tags: Vec<String>,
+    #[serde(default, alias = "raw_mobilenet_tags", alias = "mobilenet_raw_tags")]
+    pub mobilenet_high_confidence_tags: Vec<String>,
+    #[serde(default, alias = "raw_clip_tags", alias = "clip_raw_tags")]
+    pub clip_high_confidence_tags: Vec<String>,
+    #[serde(default, alias = "raw_nsfw_tags", alias = "nsfw_raw_tags")]
+    pub nsfw_high_confidence_tags: Vec<String>,
+    pub sensitive_types: Vec<String>,
+    pub content_rating: Option<String>,
     pub audio_transcript: Option<String>,
     pub audio_events: Vec<String>,
     pub geo_address: Option<String>,
