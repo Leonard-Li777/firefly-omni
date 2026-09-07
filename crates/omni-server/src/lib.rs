@@ -874,10 +874,34 @@ async fn perceive_file_handler(
     let has_text = vision_res.has_text;
     let aesthetic_score = vision_res.aesthetic_score;
     let quality_score = vision_res.quality_score;
-    let photo_type = vision_res.photo_type;
+    let mut photo_type = vision_res.photo_type;
     let quality_issues = vision_res.quality_issues;
     let mobilenet_tags = vision_res.mobilenet_tags;
-    let clip_tags = vision_res.clip_tags;
+    let mut clip_tags = vision_res.clip_tags;
+
+    // 基于实际 OCR 文本正向直通校准截图形态 (例如代码截图、终端控制台、系统报错)
+    if !markdown_content.is_empty() {
+        let text_lower = markdown_content.to_lowercase();
+        let is_code_syntax = text_lower.contains("public class")
+            || text_lower.contains("public void")
+            || text_lower.contains("private boolean")
+            || text_lower.contains("import java")
+            || text_lower.contains("vim命令")
+            || text_lower.contains("normal mode")
+            || text_lower.contains("insert mode")
+            || text_lower.contains("split window")
+            || text_lower.contains("function(")
+            || text_lower.contains("console.log")
+            || text_lower.contains("#include <")
+            || text_lower.contains("fn main");
+        if is_code_syntax {
+            photo_type = Some("代码截图".to_string());
+            if !clip_tags.contains(&"代码截图".to_string()) {
+                clip_tags.retain(|t| t != "聊天截图");
+                clip_tags.push("代码截图".to_string());
+            }
+        }
+    }
     let mobilenet_high_confidence_tags = vision_res.mobilenet_high_confidence_tags;
     let clip_high_confidence_tags = vision_res.clip_high_confidence_tags;
 
