@@ -281,6 +281,24 @@ pub mod vision {
             Vec::new()
         }
 
+        pub fn extract_ram_tags(
+            _img: &image::DynamicImage,
+            _lang: Option<&str>,
+            _top_k: usize,
+        ) -> Vec<omni_core::TagChainItem> {
+            Vec::new()
+        }
+
+        pub fn resolve_tag_to_chain_item(tag: &str, confidence: f32) -> omni_core::TagChainItem {
+            omni_core::TagChainItem {
+                tag: tag.to_string(),
+                confidence,
+                dimension_id: 28,
+                dimension_name: "内容标签".to_string(),
+                logic_pan_dimension: tag.to_string(),
+            }
+        }
+
         pub fn extract_clip_visual_tags_from_image_with_hint(
             _img: &image::DynamicImage,
             _path_hint: Option<&str>,
