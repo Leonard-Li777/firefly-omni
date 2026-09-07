@@ -912,7 +912,8 @@ async fn perceive_file_handler(
         const NON_SCREENSHOT_TAGS: &[&str] = &[
             "户外活动", "旅行照", "风景照", "摄影照片", "人物照", "人像写真", "宠物照",
             "青年漫", "少年漫", "少女漫", "成人漫", "漫画", "婚纱照", "微距摄影", "航空航拍", "建筑摄影",
-            "海报宣发", "医学影像", "证照", "合同票据", "表情包", "设计稿", "图纸"
+            "海报宣发", "医学影像", "证照", "合同票据", "表情包", "设计稿", "图纸",
+            "高ISO噪点", "逆光死白", "暗光欠曝", "虚焦", "抖动", "脱焦", "运动抖动", "曝光正常"
         ];
         detected_visual_tags.retain(|t| !NON_SCREENSHOT_TAGS.contains(&t.as_str()));
     }
@@ -922,6 +923,16 @@ async fn perceive_file_handler(
     let has_outdoor = detected_visual_tags.iter().any(|t| t == "自然景观" || t == "户外活动" || t == "历史" || t == "历史遗迹");
     if is_still_life_type && !has_outdoor {
         detected_visual_tags.retain(|t| t != "街拍抓拍" && t != "建筑摄影");
+    }
+
+    // 摄影专属质量门禁: "高ISO噪点", "逆光死白", "暗光欠曝", "虚焦", "抖动", "脱焦", "运动抖动", "曝光正常" 仅适用于真实摄影照片
+    let is_photo_type = photo_type.as_deref() == Some("摄影照片")
+        || (!is_screenshot_type && detected_visual_tags.iter().any(|t| t == "摄影照片" || t == "人物照" || t == "风景照" || t == "微距摄影" || t == "人像写真"));
+    if !is_photo_type {
+        const PHOTO_ONLY_QUALITY: &[&str] = &[
+            "高ISO噪点", "逆光死白", "暗光欠曝", "虚焦", "抖动", "脱焦", "运动抖动", "曝光正常"
+        ];
+        detected_visual_tags.retain(|t| !PHOTO_ONLY_QUALITY.contains(&t.as_str()));
     }
 
     // 根据质量评分推导【文件质量】维度标签 (ID 27: 高质量 / 中等质量 / 低质量)
