@@ -420,6 +420,7 @@ struct VisionComputed {
     quality_score: Option<f32>,
     quality_issues: Vec<String>,
     photo_type: Option<String>,
+    ram_tags: Vec<omni_core::RamTagItem>,
     inspect_img: Option<image::DynamicImage>,
     duration_ms: u64,
 
@@ -432,6 +433,7 @@ struct VisionComputed {
     aesthetic_ms: u64,
     bw_ms: u64,
     tag_ms: u64,
+    ram_ms: u64,
 }
 
 /// 多核零拷贝并行视觉感知流水线: 图像单次加载与降采样，7 线程并发计算，消除串行阻塞与重复推理
@@ -521,6 +523,17 @@ fn run_vision_pipeline(
                     (res, t.elapsed().as_millis() as u64)
                 });
 
+                // 8. RAM++ 细粒度实体与泛维度/泛标签投影提取
+                let h_ram = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let res = if enable_visual_tags {
+                        omni_pro::OmniVisionEngine::extract_ram_tags(&inspect_img, lang, 10)
+                    } else {
+                        Vec::new()
+                    };
+                    (res, t.elapsed().as_millis() as u64)
+                });
+
                 let (td, td_ms) = h_text.join().unwrap_or((false, 0));
                 let (ct, ct_ms) = h_clip.join().unwrap_or((Vec::new(), 0));
                 let (np, np_ms) = h_nsfw.join().unwrap_or((None, 0));
@@ -528,6 +541,7 @@ fn run_vision_pipeline(
                 let (ml, ml_ms) = h_mc.join().unwrap_or((0, 0));
                 let (ar, ar_ms) = h_aes.join().unwrap_or(((7.5, Vec::new()), 0));
                 let (bw, bw_ms) = h_bw.join().unwrap_or((false, 0));
+                let (ram_res, ram_ms) = h_ram.join().unwrap_or((Vec::new(), 0));
 
                 out.has_text = Some(td);
                 out.text_detect_ms = td_ms;
@@ -544,8 +558,10 @@ fn run_vision_pipeline(
                 out.quality_issues = ar.1;
                 out.aesthetic_ms = ar_ms;
                 out.bw_ms = bw_ms;
+                out.ram_tags = ram_res;
+                out.ram_ms = ram_ms;
                 // 标签任务取并行最大值
-                out.tag_ms = ct_ms.max(np_ms);
+                out.tag_ms = ct_ms.max(np_ms).max(ram_ms);
 
                 // 零耗时内存推导
                 out.has_watermark = Some(wl > 0);
@@ -794,6 +810,7 @@ async fn perceive_file_handler(
         benchmark.mosaic_ms = Some(vision_res.mosaic_ms);
         benchmark.aesthetic_ms = Some(vision_res.aesthetic_ms);
         benchmark.bw_ms = Some(vision_res.bw_ms);
+        benchmark.ram_ms = Some(vision_res.ram_ms);
         benchmark.tag_ms = Some(vision_res.tag_ms);
         benchmark.ocr_ms = ocr_ms;
         benchmark.text_ms = text_ms;
@@ -905,9 +922,17 @@ async fn perceive_file_handler(
     let mobilenet_high_confidence_tags = vision_res.mobilenet_high_confidence_tags;
     let clip_high_confidence_tags = vision_res.clip_high_confidence_tags;
 
-    // 汇聚四大引擎的所有标签至 detected_visual_tags (有序去重)
+    let ram_tags = vision_res.ram_tags;
+
+    // 汇聚各大引擎的所有标签至 detected_visual_tags (有序去重)
     let mut detected_visual_tags: Vec<String> = Vec::new();
-    for tag in clip_tags.iter().chain(mobilenet_tags.iter()).chain(nsfw_tags.iter()).chain(quality_issues.iter()) {
+    for tag in clip_tags
+        .iter()
+        .chain(mobilenet_tags.iter())
+        .chain(nsfw_tags.iter())
+        .chain(quality_issues.iter())
+        .chain(ram_tags.iter().map(|r| &r.tag))
+    {
         if !detected_visual_tags.contains(tag) {
             detected_visual_tags.push(tag.clone());
         }
@@ -1046,13 +1071,36 @@ async fn perceive_file_handler(
         security_level = Some("保密".to_string());
     }
 
-    // 6. 提取多模态元数据字段 (优先使用原生三大引擎聚合的 visual_tags，回退元数据)
-    let mut visual_tags = detected_visual_tags;
-    if visual_tags.is_empty() {
-        if let Some(arr) = metadata.get("visual_tags").and_then(|v| v.as_array()) {
-            visual_tags = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+    // 6. 统一汇聚各大引擎标签并解析为标签链 (TagChainItem) 结构
+    let mut structured_visual_tags: Vec<omni_core::TagChainItem> = Vec::new();
+
+    // 6.1 首先将已具备完整维度与逻辑泛维度的 RAM++ 标签加入
+    for r in &ram_tags {
+        if !structured_visual_tags.iter().any(|t| t.tag.eq_ignore_ascii_case(&r.tag)) {
+            structured_visual_tags.push(r.clone());
         }
     }
+
+    // 6.2 将其他各大引擎的有效视觉标签 (经过互斥门禁过滤的 detected_visual_tags) 统一映射为 TagChainItem
+    for raw_tag in &detected_visual_tags {
+        if !structured_visual_tags.iter().any(|t| t.tag.eq_ignore_ascii_case(raw_tag)) {
+            let item = if is_pro {
+                omni_pro::OmniVisionEngine::resolve_tag_to_chain_item(raw_tag, 0.92)
+            } else {
+                omni_core::TagChainItem {
+                    tag: raw_tag.clone(),
+                    confidence: 0.92,
+                    dimension_id: 28,
+                    dimension_name: "内容标签".to_string(),
+                    logic_pan_dimension: raw_tag.clone(),
+                }
+            };
+            structured_visual_tags.push(item);
+        }
+    }
+
+    // 6.3 ram_tags 降级为平铺字符串数组 (仅包含 RAM++ 检测出的纯实体标签名)
+    let ram_tags_flat: Vec<String> = ram_tags.into_iter().map(|r| r.tag).collect();
 
     let audio_transcript = metadata
         .get("audio_transcript")
@@ -1078,19 +1126,14 @@ async fn perceive_file_handler(
     benchmark.total_ms = t_start.elapsed().as_millis() as u64;
 
     tracing::info!(
-        "[OmniServer] 原生多模态感知完成: file={}, 耗时={}ms, watermark_level={:?}, mosaic_level={:?}, has_text={:?}, visual_tags={:?}, mobilenet_tags={:?}, clip_tags={:?}, nsfw_tags={:?}, mobilenet_hc={:?}, clip_hc={:?}, nsfw_hc={:?}, geo={:?}",
+        "[OmniServer] 原生多模态感知完成: file={}, 耗时={}ms, watermark_level={:?}, mosaic_level={:?}, has_text={:?}, visual_tags_count={}, ram_tags={:?}, geo={:?}",
         file_path,
         benchmark.total_ms,
         watermark_level,
         mosaic_level,
         has_text,
-        visual_tags,
-        mobilenet_tags,
-        clip_tags,
-        nsfw_tags,
-        mobilenet_high_confidence_tags,
-        clip_high_confidence_tags,
-        nsfw_high_confidence_tags,
+        structured_visual_tags.len(),
+        ram_tags_flat,
         geo_address
     );
 
@@ -1119,10 +1162,11 @@ async fn perceive_file_handler(
         quality_score,
         photo_type,
         quality_issues,
-        visual_tags,
+        visual_tags: structured_visual_tags,
         mobilenet_tags,
         clip_tags,
         nsfw_tags,
+        ram_tags: ram_tags_flat,
         mobilenet_high_confidence_tags,
         clip_high_confidence_tags,
         nsfw_high_confidence_tags,

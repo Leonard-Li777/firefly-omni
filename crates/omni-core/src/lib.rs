@@ -104,7 +104,21 @@ pub struct OmniPerceptionBenchmark {
     pub mosaic_ms: Option<u64>,
     pub aesthetic_ms: Option<u64>,
     pub bw_ms: Option<u64>,
+    pub ram_ms: Option<u64>,
 }
+
+/// 统一多模态标签链项 (包含真实受控物理维度与逻辑泛维度容器，用于 visual_tags 标签链)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TagChainItem {
+    pub tag: String,
+    pub confidence: f32,
+    pub dimension_id: u32,
+    pub dimension_name: String,
+    pub logic_pan_dimension: String,
+}
+
+/// 兼容别名: RamTagItem 指向统一 TagChainItem
+pub type RamTagItem = TagChainItem;
 
 /// 全量原生多模态感知结果 (收拢元数据、频域算子、视觉标签、语音转录与物理事实)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -146,16 +160,18 @@ pub struct OmniPerceptionResult {
     /// 照片技术与画质状态评估标签 (如: 优质精选 / 暗光欠曝 / 逆光死白 / 高ISO噪点 / 模糊废片 等)
     pub quality_issues: Vec<String>,
 
-    // 多模态直出字段与三大引擎标签
-    pub visual_tags: Vec<String>,
+    // 多模态直出字段与各大引擎标签 (统一走标签链输出)
+    pub visual_tags: Vec<TagChainItem>,
     pub mobilenet_tags: Vec<String>,
     pub clip_tags: Vec<String>,
     pub nsfw_tags: Vec<String>,
-    #[serde(default, alias = "raw_mobilenet_tags", alias = "mobilenet_raw_tags")]
+    #[serde(default)]
+    pub ram_tags: Vec<String>,
+    #[serde(default, skip_serializing, alias = "raw_mobilenet_tags", alias = "mobilenet_raw_tags")]
     pub mobilenet_high_confidence_tags: Vec<String>,
     #[serde(default, alias = "raw_clip_tags", alias = "clip_raw_tags")]
     pub clip_high_confidence_tags: Vec<String>,
-    #[serde(default, alias = "raw_nsfw_tags", alias = "nsfw_raw_tags")]
+    #[serde(default, skip_serializing, alias = "raw_nsfw_tags", alias = "nsfw_raw_tags")]
     pub nsfw_high_confidence_tags: Vec<String>,
     pub sensitive_types: Vec<String>,
     pub content_rating: Option<String>,
