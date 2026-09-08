@@ -18,9 +18,16 @@ pub struct OmniConfig {
     pub analysis_mode: String,
     /// 是否复用已有基础分析数据 (跳过已有提取)
     pub reuse_basic_analysis_data: bool,
+    /// 音频/视频分析截取时长（秒，默认 30 秒）
+    #[serde(default = "default_audio_analysis_duration")]
+    pub audio_analysis_duration: u32,
     /// 全局忽略/排除受保护项目名单（用于 czkawka 查重清理原生排除保护）
     #[serde(default)]
     pub excluded_items: Vec<String>,
+}
+
+fn default_audio_analysis_duration() -> u32 {
+    30
 }
 
 impl Default for OmniConfig {
@@ -34,6 +41,7 @@ impl Default for OmniConfig {
             max_file_size_mb: 100,
             analysis_mode: "full".to_string(),
             reuse_basic_analysis_data: true,
+            audio_analysis_duration: 30,
             excluded_items: Vec::new(),
         }
     }
@@ -79,6 +87,9 @@ pub struct OmniPerceptionRequest {
     pub enable_geo_reverse: Option<bool>,
     #[serde(default)]
     pub max_content_size_kb: Option<usize>,
+    /// 自定义音频截取时长（秒，缺省时读取 OmniConfig.audio_analysis_duration）
+    #[serde(default)]
+    pub audio_analysis_duration: Option<u32>,
 }
 
 /// 原生多模态感知细分耗时
@@ -128,6 +139,7 @@ pub struct OmniPerceptionResult {
     pub file_size: u64,
     pub category: Option<String>,
     pub markdown_content: String,
+    pub ocr_text: Option<String>,
     pub metadata: serde_json::Value,
 
     // 物理事实特征
@@ -179,9 +191,42 @@ pub struct OmniPerceptionResult {
     pub audio_events: Vec<String>,
     pub geo_address: Option<String>,
 
+    // 级联提示词合成与语义仲裁终局结果 (新增统一透出)
+    #[serde(default)]
+    pub candidate_hypotheses: Vec<CandidateHypothesisItem>,
+    #[serde(default)]
+    pub winning_hypothesis: Option<WinningHypothesisItem>,
+    #[serde(default)]
+    pub activated_dimension_tags: Vec<TagChainItem>,
+    #[serde(default)]
+    pub smart_name: Option<String>,
+    #[serde(default)]
+    pub content_description: Option<String>,
+    #[serde(default)]
+    pub pruned_ambiguous_words: Vec<String>,
+
     pub phash: Option<String>,
     pub is_corrupted: bool,
     pub benchmark: Option<OmniPerceptionBenchmark>,
+}
+
+/// 级联提示词候选假设项 (用于 CLIP 文本向量仲裁)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CandidateHypothesisItem {
+    pub id: String,
+    pub prompt_text: String,
+    pub confidence: f32,
+    pub is_winner: bool,
+    pub slots: serde_json::Value,
+    #[serde(default)]
+    pub bound_tags: Vec<TagChainItem>,
+}
+
+/// 胜出的最佳语义假设项
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WinningHypothesisItem {
+    pub prompt_text: String,
+    pub confidence: f32,
 }
 
 /// 单指标音频转录请求: POST /api/audio/transcribe
@@ -190,6 +235,9 @@ pub struct AudioTranscribeRequest {
     pub file_path: String,
     #[serde(default)]
     pub language: Option<String>,
+    /// 自定义截取转录时长（秒）
+    #[serde(default)]
+    pub duration_seconds: Option<u32>,
 }
 
 /// 单指标音频转录响应
@@ -199,6 +247,23 @@ pub struct AudioTranscribeResponse {
     pub transcript: Option<String>,
     pub events: Vec<String>,
     pub language: Option<String>,
+    pub duration_ms: u64,
+}
+
+/// 音频转标准格式请求 (16kHz Mono PCM WAV + 降噪): POST /api/audio/convert
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioConvertRequest {
+    pub file_path: String,
+    #[serde(default)]
+    pub duration_seconds: Option<u32>,
+}
+
+/// 音频转标准格式响应
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AudioConvertResponse {
+    pub file_path: String,
+    pub output_path: String,
+    pub duration_seconds: u32,
     pub duration_ms: u64,
 }
 

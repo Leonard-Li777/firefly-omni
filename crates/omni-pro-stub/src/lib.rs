@@ -370,6 +370,47 @@ pub mod vision {
             (Vec::new(), Vec::new(), None)
         }
 
+        pub fn extract_clip_image_embedding(
+            _img: &image::DynamicImage,
+            _lang: Option<&str>,
+        ) -> Option<Vec<f32>> {
+            None
+        }
+
+        pub fn classify_mutual_exclusive_groups(
+            _image_embedding: &[f32],
+            _lang: Option<&str>,
+        ) -> Vec<(String, f32, &'static str)> {
+            Vec::new()
+        }
+
+        pub fn apply_mutual_exclusion_gating(
+            _tags: &mut Vec<String>,
+            _clip_mutual_tags: &[(String, f32, &'static str)],
+            _content_rating: Option<&str>,
+            _sensitive_types: &[String],
+            _quality_score: Option<f32>,
+        ) {}
+
+        pub fn synthesize_cascade_hypotheses_and_arbitrate(
+            _file_path: &str,
+            _system_dimension_tags: &[String],
+            _ram_tags: &[omni_core::TagChainItem],
+            _mobilenet_tags: &[String],
+            _nsfw_tags: &[String],
+            _image_embedding: Option<&[f32]>,
+            _lang: Option<&str>,
+        ) -> (
+            Vec<omni_core::CandidateHypothesisItem>,
+            Option<omni_core::WinningHypothesisItem>,
+            Vec<omni_core::TagChainItem>,
+            Option<String>,
+            Option<String>,
+            Vec<String>,
+        ) {
+            (Vec::new(), None, Vec::new(), None, None, Vec::new())
+        }
+
         pub fn derive_nsfw_high_confidence_tags(
             _tags: &[String],
             _rating: Option<&str>,
