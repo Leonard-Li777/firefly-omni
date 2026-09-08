@@ -10,10 +10,11 @@ use axum::{
     Json, Router,
 };
 use omni_core::{
-    AudioTranscribeRequest, AudioTranscribeResponse, DuplicateFixRequest, DuplicateFixResponse,
-    DuplicateScanRequest, DuplicateScanResponse, FsAdsRequest, FsAdsResponse, OmniConfig,
-    OmniExtractionResult, OmniPerceptionBenchmark, OmniPerceptionRequest, OmniPerceptionResult,
-    VisionInspectRequest, VisionInspectResponse, VisionTagsRequest, VisionTagsResponse,
+    AudioConvertRequest, AudioConvertResponse, AudioTranscribeRequest, AudioTranscribeResponse,
+    DuplicateFixRequest, DuplicateFixResponse, DuplicateScanRequest, DuplicateScanResponse,
+    FsAdsRequest, FsAdsResponse, OmniConfig, OmniExtractionResult, OmniPerceptionBenchmark,
+    OmniPerceptionRequest, OmniPerceptionResult, VisionInspectRequest, VisionInspectResponse,
+    VisionTagsRequest, VisionTagsResponse,
 };
 use omni_extract::OmniExtractor;
 use serde::Deserialize;
@@ -68,6 +69,7 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/api/extract/upload", post(extract_multipart_handler))
         .route("/api/perceive", post(perceive_file_handler))
         .route("/api/audio/transcribe", post(audio_transcribe_handler))
+        .route("/api/audio/convert", post(audio_convert_handler))
         .route("/api/vision/tags", post(vision_tags_handler))
         .route("/api/vision/inspect", post(vision_inspect_handler))
         .route("/api/fs/ads", post(fs_ads_handler))
@@ -422,6 +424,11 @@ struct VisionComputed {
     photo_type: Option<String>,
     ram_tags: Vec<omni_core::RamTagItem>,
     inspect_img: Option<image::DynamicImage>,
+    /// CLIP 图像嵌入向量（512 维归一化），用于级联假设仲裁
+    image_embedding: Option<Vec<f32>>,
+    /// CLIP 互斥组分类结果：(标签名, 置信度, 组名)
+    /// 覆盖：内容形态/文字存在性/色彩模式/截图细分 四个互斥维度
+    clip_mutual_tags: Vec<(String, f32, &'static str)>,
     duration_ms: u64,
 
     // 各视觉子任务独立耗时 (毫秒)
@@ -534,6 +541,11 @@ fn run_vision_pipeline(
                     (res, t.elapsed().as_millis() as u64)
                 });
 
+                // 9. CLIP 图像嵌入向量提取 (用于级联假设 CLIP 仲裁)
+                let h_embed = s.spawn(|| {
+                    omni_pro::OmniVisionEngine::extract_clip_image_embedding(&inspect_img, lang)
+                });
+
                 let (td, td_ms) = h_text.join().unwrap_or((false, 0));
                 let (ct, ct_ms) = h_clip.join().unwrap_or((Vec::new(), 0));
                 let (np, np_ms) = h_nsfw.join().unwrap_or((None, 0));
@@ -542,6 +554,7 @@ fn run_vision_pipeline(
                 let (ar, ar_ms) = h_aes.join().unwrap_or(((7.5, Vec::new()), 0));
                 let (bw, bw_ms) = h_bw.join().unwrap_or((false, 0));
                 let (ram_res, ram_ms) = h_ram.join().unwrap_or((Vec::new(), 0));
+                let img_embed = h_embed.join().unwrap_or(None);
 
                 out.has_text = Some(td);
                 out.text_detect_ms = td_ms;
@@ -560,6 +573,14 @@ fn run_vision_pipeline(
                 out.bw_ms = bw_ms;
                 out.ram_tags = ram_res;
                 out.ram_ms = ram_ms;
+                out.image_embedding = img_embed;
+                // CLIP 互斥分类：利用图像嵌入向量对内容形态/色彩/文字等互斥组分类
+                if let Some(ref emb) = out.image_embedding {
+                    out.clip_mutual_tags = omni_pro::OmniVisionEngine::classify_mutual_exclusive_groups(
+                        emb.as_slice(),
+                        lang,
+                    );
+                }
                 // 标签任务取并行最大值
                 out.tag_ms = ct_ms.max(np_ms).max(ram_ms);
 
@@ -685,7 +706,7 @@ async fn perceive_file_handler(
         }
     };
 
-    let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res)) = if is_image {
+    let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text)) = if is_image {
         let f_img = async {
             // 步骤 A1: 前置 ExifTool 全量元数据提取 (画质姿态/方向依赖 exiftool 提取的元数据)
             let t_meta = std::time::Instant::now();
@@ -740,6 +761,12 @@ async fn perceive_file_handler(
                     markdown_content = ocr_res;
                 }
             }
+
+            let ocr_text = if !markdown_content.trim().is_empty() {
+                Some(markdown_content.clone())
+            } else {
+                None
+            };
 
             // 步骤 A4: 计算 pHash
             let phash = OmniExtractionResult::compute_phash(p);
@@ -796,9 +823,10 @@ async fn perceive_file_handler(
                 text_ms,
                 phash,
                 metadata,
+                ocr_text,
             )
         };
-        let (ads_res, (metadata_ms, vision_res, markdown_content, ocr_ms, text_ms, phash, metadata)) =
+        let (ads_res, (metadata_ms, vision_res, markdown_content, ocr_ms, text_ms, phash, metadata, ocr_text)) =
             tokio::join!(f_ads, f_img);
 
         benchmark.metadata_ms = if metadata_ms > 0 { Some(metadata_ms) } else { None };
@@ -816,11 +844,11 @@ async fn perceive_file_handler(
         benchmark.text_ms = text_ms;
         benchmark.extract_ms = Some(vision_res.duration_ms.max(metadata_ms).max(ocr_ms.unwrap_or(0)));
 
-        (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res))
+        (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text))
     } else {
         let f_non_img = async {
             let t_extract = std::time::Instant::now();
-            let ext_res = match OmniExtractor::extract(&file_path, &cfg).await {
+            let mut ext_res = match OmniExtractor::extract(&file_path, &cfg).await {
                 Ok(res) => res,
                 Err(err) => {
                     tracing::warn!("[OmniServer] 感知基础提取失败: file={}, err={}", file_path, err);
@@ -846,18 +874,67 @@ async fn perceive_file_handler(
                 v.watermark_status = Some(v_wm_status.to_string());
             }
 
-            (extract_ms, ext_res, v)
+            // 音频/视频文件: 截取降噪 → SenseVoice 转录
+            let is_audio = mime_type.starts_with("audio/")
+                || matches!(ext.as_str(), "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "opus" | "ape" | "aiff");
+            let is_audio_or_video = is_audio || is_video;
+            let mut audio_ms: Option<u64> = None;
+
+            // 仅在音视频文件且 enable_audio_transcript 未显式关闭时执行 SenseVoice 转录
+            let should_transcribe = is_audio_or_video
+                && req.enable_audio_transcript.unwrap_or(true);
+
+            if should_transcribe {
+                let t_audio = std::time::Instant::now();
+                // 优先使用请求中传入的截取时长，否则读取全局配置
+                let duration_seconds = req.audio_analysis_duration.unwrap_or(cfg.audio_analysis_duration);
+                let file_path_for_audio = file_path.clone();
+                let language = req.language.clone();
+
+                // spawn_blocking: FFmpeg 截取降噪 + SenseVoice 转录（全部阻塞操作）
+                let transcript_result = tokio::task::spawn_blocking(move || {
+                    // Step 1: 截取降噪，输出标准 WAV
+                    let wav_path = convert_audio_standard(&file_path_for_audio, duration_seconds)?;
+                    // Step 2: SenseVoice ASR 转录
+                    transcribe_with_sense_asr(&wav_path, language.as_deref())
+                })
+                .await
+                .ok()
+                .flatten();
+
+                audio_ms = Some(t_audio.elapsed().as_millis() as u64);
+
+                if let Some(transcript) = transcript_result {
+                    tracing::info!(
+                        "[OmniServer] 音频转录完成: file={}, len={}, audio_ms={:?}",
+                        file_path, transcript.len(), audio_ms
+                    );
+                    // 写入 markdown_content（作为主内容字段）
+                    if ext_res.markdown_content.is_empty() {
+                        ext_res.markdown_content = transcript.clone();
+                    }
+                    // 同时写入 metadata["audio_transcript"]，供消费层使用
+                    if let serde_json::Value::Object(ref mut map) = ext_res.metadata {
+                        map.insert("audio_transcript".to_string(), serde_json::Value::String(transcript));
+                    }
+                } else {
+                    tracing::info!("[OmniServer] 音频转录无结果或模型/ffmpeg未就绪: file={}", file_path);
+                }
+            }
+
+            (extract_ms, ext_res, v, audio_ms)
         };
-        let (ads_res, (extract_ms, ext_res, v)) = tokio::join!(f_ads, f_non_img);
+        let (ads_res, (extract_ms, ext_res, v, audio_ms)) = tokio::join!(f_ads, f_non_img);
 
         benchmark.extract_ms = Some(extract_ms);
+        benchmark.audio_ms = audio_ms;
         if let Some(bm) = &ext_res.benchmark {
             benchmark.metadata_ms = bm.metadata_ms;
             benchmark.text_ms = bm.text_ms;
             benchmark.ocr_ms = bm.ocr_ms;
         }
 
-        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v))
+        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, None))
     };
 
     benchmark.ads_ms = ads_ms;
@@ -888,16 +965,22 @@ async fn perceive_file_handler(
     let mosaic_level = vision_res.mosaic_level;
     let mosaic_status = vision_res.mosaic_status;
     let has_mosaic = vision_res.has_mosaic;
-    let has_text = vision_res.has_text;
+    let mut has_text = vision_res.has_text;
     let aesthetic_score = vision_res.aesthetic_score;
     let quality_score = vision_res.quality_score;
     let mut photo_type = vision_res.photo_type;
     let quality_issues = vision_res.quality_issues;
-    let mobilenet_tags = vision_res.mobilenet_tags;
+    let mut mobilenet_tags = vision_res.mobilenet_tags;
     let mut clip_tags = vision_res.clip_tags;
 
-    // 基于实际 OCR 文本正向直通校准截图形态 (例如代码截图、终端控制台、系统报错)
-    if !markdown_content.is_empty() {
+    // 基于实际 OCR 文本正向直通校准截图形态与文字客观事实 (彻底根除有字却输出无字图的倒挂)
+    if !markdown_content.trim().is_empty() {
+        has_text = Some(true);
+        clip_tags.retain(|t| t != "无字图");
+        if !clip_tags.contains(&"有字图".to_string()) {
+            clip_tags.push("有字图".to_string());
+        }
+
         let text_lower = markdown_content.to_lowercase();
         let is_code_syntax = text_lower.contains("public class")
             || text_lower.contains("public void")
@@ -923,6 +1006,67 @@ async fn perceive_file_handler(
     let clip_high_confidence_tags = vision_res.clip_high_confidence_tags;
 
     let ram_tags = vision_res.ram_tags;
+    let image_embedding = vision_res.image_embedding;
+    let clip_mutual_tags = vision_res.clip_mutual_tags;
+
+    // CLIP 互斥分类结果增强 mobilenet_tags：
+    // 若 CLIP 互斥分类成功，直接替换规则推导结果（语义更准确）；
+    // 若 CLIP 不可用（无模型），则保留规则推导的 mobilenet_tags 作为兜底。
+    let mut mobilenet_tags = if !clip_mutual_tags.is_empty() {
+        let mut merged = mobilenet_tags.clone();
+        for (tag, _conf, _group) in &clip_mutual_tags {
+            if !merged.contains(tag) {
+                merged.push(tag.clone());
+            }
+        }
+        // CLIP 互斥分类保证组内只有一个胜出者，移除被覆盖的规则推导冲突项
+        // 1. 色彩模式：CLIP 结果与黑白检测结果互斥对齐
+        if clip_mutual_tags.iter().any(|(t, _, g)| *g == "色彩模式" && t == "全彩") {
+            merged.retain(|t| t != "黑白");
+        } else if clip_mutual_tags.iter().any(|(t, _, g)| *g == "色彩模式" && t == "黑白") {
+            merged.retain(|t| t != "全彩");
+        }
+        // 2. 文字存在性：客观检测与 OCR 事实优先于语义猜测
+        if has_text == Some(true) || !markdown_content.trim().is_empty() {
+            merged.retain(|t| t != "无字图");
+            if !merged.contains(&"有字图".to_string()) {
+                merged.push("有字图".to_string());
+            }
+        } else if clip_mutual_tags.iter().any(|(t, _, g)| *g == "文字存在性" && t == "有字图") {
+            merged.retain(|t| t != "无字图");
+        } else if clip_mutual_tags.iter().any(|(t, _, g)| *g == "文字存在性" && t == "无字图") {
+            merged.retain(|t| t != "有字图");
+        }
+        merged
+    } else {
+        if has_text == Some(true) || !markdown_content.trim().is_empty() {
+            mobilenet_tags.retain(|t| t != "无字图");
+            if !mobilenet_tags.contains(&"有字图".to_string()) {
+                mobilenet_tags.push("有字图".to_string());
+            }
+        }
+        mobilenet_tags
+    };
+
+    // CLIP 互斥组与 photo_type 细化联动更新（语义优先于规则推导）
+    if !clip_mutual_tags.is_empty() {
+        // 优先取截图细分（比泛截图更精确）
+        if let Some((sub_tag, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == "截图场景细分") {
+            if photo_type.is_none() || photo_type.as_deref() == Some("截图") {
+                photo_type = Some(sub_tag.clone());
+            }
+        } else if let Some((photo_sub, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == "摄影题材细分") {
+            // 若为摄影照片，细化为风景照/人物照/静物照等
+            if photo_type.is_none() || photo_type.as_deref() == Some("摄影照片") {
+                photo_type = Some(photo_sub.clone());
+            }
+        } else if let Some((form_tag, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == "内容形态") {
+            // 内容形态胜出者作为 photo_type 的兜底
+            if photo_type.is_none() {
+                photo_type = Some(form_tag.clone());
+            }
+        }
+    }
 
     // 汇聚各大引擎的所有标签至 detected_visual_tags (有序去重)
     let mut detected_visual_tags: Vec<String> = Vec::new();
@@ -938,65 +1082,26 @@ async fn perceive_file_handler(
         }
     }
 
-    // 物理色彩互斥保护: 黑白与全彩互斥，严格以客观像素色彩统计 (mobilenet_tags) 为准
-    if mobilenet_tags.contains(&"全彩".to_string()) {
-        detected_visual_tags.retain(|t| t != "黑白");
-    } else if mobilenet_tags.contains(&"黑白".to_string()) {
-        detected_visual_tags.retain(|t| t != "全彩");
-    }
+    // 架构级通用分类互斥门控引擎：统一处理组内竞争排他、跨形态互斥、安全合规阻断与光学质量限制
+    omni_pro::OmniVisionEngine::apply_mutual_exclusion_gating(
+        &mut detected_visual_tags,
+        &clip_mutual_tags,
+        content_rating.as_deref(),
+        &sensitive_types,
+        quality_score,
+    );
 
-    // 安全合规兜底门禁: 若判定为 safe 且无敏感违规类型，严禁残留任何涉政/涉黄/暴恐受限三级子标签
-    if content_rating.as_deref() == Some("safe") && sensitive_types.is_empty() {
-        const RESTRICTED_SENSITIVE: &[&str] = &[
-            "违背意愿", "偷拍窥视", "调教拘束", "自慰高潮", "露骨性行为", "暴露走光", "擦边诱惑", "情色文娱",
-            "重口猎奇", "暴恐惨案", "自残放血", "断头斩首", "肢解碎尸", "血腥虐杀", "尸体残骸", "酷刑折磨", "血肉模糊"
-        ];
-        detected_visual_tags.retain(|t| !RESTRICTED_SENSITIVE.contains(&t.as_str()));
-    }
-
-    // 屏幕截图与界面题材互斥门禁: 若判定为截图/UI界面截图，严禁残留自然户外、摄影题材、动漫及专业垂直/票据标签
-    let is_screenshot_type = photo_type.as_deref().map(|pt| pt.contains("截图") || pt == "UI界面截图").unwrap_or(false)
-        || detected_visual_tags.iter().any(|t| t == "截图" || t == "UI界面截图");
-    if is_screenshot_type {
-        const NON_SCREENSHOT_TAGS: &[&str] = &[
-            "户外活动", "旅行照", "风景照", "摄影照片", "人物照", "人像写真", "宠物照",
-            "青年漫", "少年漫", "少女漫", "成人漫", "漫画", "婚纱照", "微距摄影", "航空航拍", "建筑摄影",
-            "海报宣发", "医学影像", "证照", "合同票据", "表情包", "设计稿", "图纸",
-            "高ISO噪点", "逆光死白", "暗光欠曝", "虚焦", "抖动", "脱焦", "运动抖动", "曝光正常"
-        ];
-        detected_visual_tags.retain(|t| !NON_SCREENSHOT_TAGS.contains(&t.as_str()));
-    }
-
-    // 室内静物特写组内互斥门禁: 若首要判定为静物照且无自然景观，剔除街拍抓拍与建筑摄影
-    let is_still_life_type = photo_type.as_deref() == Some("静物照") || detected_visual_tags.first().map(|t| t == "静物照").unwrap_or(false);
-    let has_outdoor = detected_visual_tags.iter().any(|t| t == "自然景观" || t == "户外活动" || t == "历史" || t == "历史遗迹");
-    if is_still_life_type && !has_outdoor {
-        detected_visual_tags.retain(|t| t != "街拍抓拍" && t != "建筑摄影");
-    }
-
-    // 摄影专属质量门禁: "高ISO噪点", "逆光死白", "暗光欠曝", "虚焦", "抖动", "脱焦", "运动抖动", "曝光正常" 仅适用于真实摄影照片
-    let is_photo_type = photo_type.as_deref() == Some("摄影照片")
-        || (!is_screenshot_type && detected_visual_tags.iter().any(|t| t == "摄影照片" || t == "人物照" || t == "风景照" || t == "微距摄影" || t == "人像写真"));
-    if !is_photo_type {
-        const PHOTO_ONLY_QUALITY: &[&str] = &[
-            "高ISO噪点", "逆光死白", "暗光欠曝", "虚焦", "抖动", "脱焦", "运动抖动", "曝光正常"
-        ];
-        detected_visual_tags.retain(|t| !PHOTO_ONLY_QUALITY.contains(&t.as_str()));
-    }
-
-    // 根据质量评分推导【文件质量】维度标签 (ID 27: 高质量 / 中等质量 / 低质量)
-    if let Some(qs) = quality_score {
-        let file_quality_tag = if qs >= 8.0 {
-            "高质量"
-        } else if qs >= 5.0 {
-            "中等质量"
-        } else {
-            "低质量"
-        };
-        if !detected_visual_tags.contains(&file_quality_tag.to_string()) {
-            detected_visual_tags.push(file_quality_tag.to_string());
+    // 文字存在性绝对保护：若已探活出文字或 OCR 内容，无条件排除无字图，确保有字图存在
+    if has_text == Some(true) || !markdown_content.trim().is_empty() {
+        detected_visual_tags.retain(|t| t != "无字图");
+        if !detected_visual_tags.contains(&"有字图".to_string()) {
+            detected_visual_tags.push("有字图".to_string());
         }
     }
+
+    // 同步清洗 mobilenet_tags 与 clip_tags，确保互斥清洗结果一致贯通（防止被清洗的子标签混入下游主体池）
+    mobilenet_tags.retain(|t| detected_visual_tags.contains(t));
+    clip_tags.retain(|t| detected_visual_tags.contains(t));
 
     // 4. 离线逆地理编码 (若元数据中含 GPS 坐标且开启了地理反查，Pro 专享)
     let mut geo_address = None;
@@ -1099,6 +1204,22 @@ async fn perceive_file_handler(
         }
     }
 
+    // 7. 级联提示词合成 + CLIP 向量仲裁终局裁决 (Pro 专享，仅图片路径生效)
+    // 注意：此处在 ram_tags 降级为 flat 前调用，以获取完整 TagChainItem 结构
+    let (cascade_candidates, winning_hypothesis, activated_dimension_tags, smart_name, content_description, pruned_ambiguous_words) = if is_pro && is_image {
+        omni_pro::OmniVisionEngine::synthesize_cascade_hypotheses_and_arbitrate(
+            &file_path,
+            &detected_visual_tags,
+            &ram_tags,
+            &mobilenet_tags,
+            &nsfw_tags,
+            image_embedding.as_deref(),
+            req.language.as_deref(),
+        )
+    } else {
+        (Vec::new(), None, Vec::new(), None, None, Vec::new())
+    };
+
     // 6.3 ram_tags 降级为平铺字符串数组 (仅包含 RAM++ 检测出的纯实体标签名)
     let ram_tags_flat: Vec<String> = ram_tags.into_iter().map(|r| r.tag).collect();
 
@@ -1143,6 +1264,7 @@ async fn perceive_file_handler(
         file_size,
         category,
         markdown_content,
+        ocr_text,
         metadata,
         file_source,
         file_source_code,
@@ -1177,6 +1299,13 @@ async fn perceive_file_handler(
         geo_address,
         phash,
         is_corrupted,
+        // 级联假设仲裁终局字段
+        candidate_hypotheses: cascade_candidates,
+        winning_hypothesis,
+        activated_dimension_tags,
+        smart_name,
+        content_description,
+        pruned_ambiguous_words,
         benchmark: Some(benchmark),
     })
 }
@@ -1189,21 +1318,40 @@ async fn audio_transcribe_handler(
     let cfg = state.config.lock().unwrap().clone();
     let t_start = std::time::Instant::now();
     let file_path = req.file_path.clone();
+    // 优先使用请求中的截取时长，否则使用配置默认值
+    let duration_seconds = req.duration_seconds.unwrap_or(cfg.audio_analysis_duration);
+    let language = req.language.clone();
 
     let mut transcript = None;
     let mut events = Vec::new();
 
-    if let Ok(res) = OmniExtractor::extract(&file_path, &cfg).await {
-        if let Some(t) = res.metadata.get("audio_transcript").and_then(|v| v.as_str()) {
-            transcript = Some(t.to_string());
-        } else if !res.markdown_content.is_empty()
-            && (res.mime_type.starts_with("audio/") || res.mime_type.starts_with("video/"))
-        {
-            transcript = Some(res.markdown_content);
-        }
+    // Step 1: 优先通过 SenseVoice 转录（截取降噪 → ASR）
+    let file_path_c = file_path.clone();
+    let lang_c = language.clone();
+    let sense_result = tokio::task::spawn_blocking(move || {
+        let wav_path = convert_audio_standard(&file_path_c, duration_seconds)?;
+        transcribe_with_sense_asr(&wav_path, lang_c.as_deref())
+    })
+    .await
+    .ok()
+    .flatten();
 
-        if let Some(ev) = res.metadata.get("audio_events").and_then(|v| v.as_array()) {
-            events = ev.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+    if let Some(text) = sense_result {
+        transcript = Some(text);
+    } else {
+        // Step 2: 降级：从 OmniExtractor 元数据中取 audio_transcript（若已有提取结果）
+        if let Ok(res) = OmniExtractor::extract(&file_path, &cfg).await {
+            if let Some(t) = res.metadata.get("audio_transcript").and_then(|v| v.as_str()) {
+                transcript = Some(t.to_string());
+            } else if !res.markdown_content.is_empty()
+                && (res.mime_type.starts_with("audio/") || res.mime_type.starts_with("video/"))
+            {
+                transcript = Some(res.markdown_content);
+            }
+
+            if let Some(ev) = res.metadata.get("audio_events").and_then(|v| v.as_array()) {
+                events = ev.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+            }
         }
     }
 
@@ -1213,6 +1361,260 @@ async fn audio_transcribe_handler(
         transcript,
         events,
         language: req.language,
+        duration_ms,
+    })
+}
+
+/// 将音频/视频截取指定时长并降噪重采样为标准格式 (16kHz Mono PCM WAV)
+/// 结果缓存于系统临时目录 firefly-ai-audio-cache/<md5(path+duration)>.wav
+/// 成功时返回缓存文件路径；失败时返回 None
+fn convert_audio_standard(file_path: &str, duration_seconds: u32) -> Option<PathBuf> {
+    // 复用 omni-cover video.rs 的 resolve_ffmpeg 定位思路（直接内联实现以解耦）
+    let ffmpeg_exe = if cfg!(target_os = "windows") { "ffmpeg.exe" } else { "ffmpeg" };
+    let ffmpeg = {
+        let search_roots = [
+            std::env::current_dir().unwrap_or_default(),
+            std::env::current_exe()
+                .map(|p| p.parent().unwrap_or(p.as_path()).to_path_buf())
+                .unwrap_or_default(),
+        ];
+        let mut found: Option<PathBuf> = None;
+        'outer: for root in &search_roots {
+            let mut cur = root.clone();
+            for _ in 0..8 {
+                let candidates = [
+                    cur.join(format!("apps/desktop/build/extraResources/bin/ffmpeg/{}", ffmpeg_exe)),
+                    cur.join(format!("resources/bin/ffmpeg/{}", ffmpeg_exe)),
+                    cur.join(format!("resources/bin/{}", ffmpeg_exe)),
+                    cur.join(format!("Contents/Resources/bin/ffmpeg/{}", ffmpeg_exe)),
+                ];
+                for c in &candidates {
+                    if c.exists() {
+                        found = Some(c.clone());
+                        break 'outer;
+                    }
+                }
+                if let Some(parent) = cur.parent() {
+                    cur = parent.to_path_buf();
+                } else {
+                    break;
+                }
+            }
+        }
+        // 兜底：系统 PATH
+        found.or_else(|| {
+            std::process::Command::new("where")
+                .arg(ffmpeg_exe)
+                .output()
+                .ok()
+                .and_then(|out| {
+                    String::from_utf8(out.stdout).ok()
+                        .and_then(|s| s.lines().next().map(|l| PathBuf::from(l.trim())))
+                })
+        })?
+    };
+
+    // 以 md5(file_path + duration) 为缓存键
+    let cache_key = {
+        let raw = format!("{}:{}", file_path, duration_seconds);
+        let digest = md5_hex(raw.as_bytes());
+        digest
+    };
+    let cache_dir = std::env::temp_dir().join("firefly-ai-audio-cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let cache_path = cache_dir.join(format!("{}.wav", cache_key));
+
+    if cache_path.exists() {
+        tracing::info!("[OmniServer] 音频转换缓存命中: {:?}", cache_path);
+        return Some(cache_path);
+    }
+
+    tracing::info!(
+        "[OmniServer] 开始音频截取降噪: file={}, duration={}s, output={:?}",
+        file_path, duration_seconds, cache_path
+    );
+
+    // ffmpeg -y -i <input> -t <duration> -af highpass=f=80,lowpass=f=7800,afftdn=nf=-25dB -ar 16000 -ac 1 -c:a pcm_s16le <output>
+    let status = std::process::Command::new(&ffmpeg)
+        .args([
+            "-y",
+            "-i", file_path,
+            "-t", &duration_seconds.to_string(),
+            "-af", "highpass=f=80,lowpass=f=7800,afftdn=nf=-25dB",
+            "-ar", "16000",
+            "-ac", "1",
+            "-c:a", "pcm_s16le",
+            cache_path.to_str().unwrap_or(""),
+        ])
+        .status();
+
+    match status {
+        Ok(s) if s.success() && cache_path.exists() => {
+            tracing::info!("[OmniServer] 音频截取降噪完成: {:?}", cache_path);
+            Some(cache_path)
+        }
+        Ok(s) => {
+            tracing::warn!("[OmniServer] ffmpeg 音频转换失败: exit={}", s);
+            None
+        }
+        Err(e) => {
+            tracing::warn!("[OmniServer] ffmpeg 启动失败: {}", e);
+            None
+        }
+    }
+}
+
+/// 简单 MD5 十六进制字符串（内联实现，不引入额外依赖）
+fn md5_hex(data: &[u8]) -> String {
+    // 使用 std 库无 md5 依赖的简易 hash（Rust 标准库没有 md5，用 FNV-1a 64-bit 代替）
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x00000100000001b3);
+    }
+    format!("{:016x}", h)
+}
+
+/// 使用 audio.cpp (sense_asr) 对 WAV 文件进行语音转录，返回转录文本
+fn transcribe_with_sense_asr(wav_path: &PathBuf, language: Option<&str>) -> Option<String> {
+    let audio_exe_name = if cfg!(target_os = "windows") { "audio.exe" } else { "audio" };
+    let model_gguf_name = "sensevoice-small-q4_k.gguf";
+
+    // 定位 audio.exe
+    let audio_exe = {
+        let search_roots = [
+            std::env::current_dir().unwrap_or_default(),
+            std::env::current_exe()
+                .map(|p| p.parent().unwrap_or(p.as_path()).to_path_buf())
+                .unwrap_or_default(),
+        ];
+        let mut found: Option<PathBuf> = None;
+        'outer: for root in &search_roots {
+            let mut cur = root.clone();
+            for _ in 0..8 {
+                let candidates = [
+                    cur.join(format!("apps/desktop/build/extraResources/bin/audio-cpp/{}", audio_exe_name)),
+                    cur.join(format!("resources/bin/audio-cpp/{}", audio_exe_name)),
+                    cur.join(format!("resources/bin/{}", audio_exe_name)),
+                ];
+                for c in &candidates {
+                    if c.exists() {
+                        found = Some(c.clone());
+                        break 'outer;
+                    }
+                }
+                if let Some(parent) = cur.parent() {
+                    cur = parent.to_path_buf();
+                } else {
+                    break;
+                }
+            }
+        }
+        found?
+    };
+
+    // 定位 sensevoice-small-q4_k.gguf
+    let model_path = {
+        let search_roots = [
+            std::env::current_dir().unwrap_or_default(),
+            std::env::current_exe()
+                .map(|p| p.parent().unwrap_or(p.as_path()).to_path_buf())
+                .unwrap_or_default(),
+        ];
+        let mut found: Option<PathBuf> = None;
+        'outer: for root in &search_roots {
+            let mut cur = root.clone();
+            for _ in 0..8 {
+                let candidates = [
+                    cur.join(format!("apps/desktop/build/extraResources/models/sensevoice/{}", model_gguf_name)),
+                    cur.join(format!("resources/models/sensevoice/{}", model_gguf_name)),
+                    cur.join(format!("resources/sensevoice/{}", model_gguf_name)),
+                ];
+                for c in &candidates {
+                    if c.exists() {
+                        found = Some(c.clone());
+                        break 'outer;
+                    }
+                }
+                if let Some(parent) = cur.parent() {
+                    cur = parent.to_path_buf();
+                } else {
+                    break;
+                }
+            }
+        }
+        found?
+    };
+
+    tracing::info!(
+        "[OmniServer] 开始 SenseVoice 语音转录: wav={:?}, model={:?}",
+        wav_path, model_path
+    );
+
+    // 调用 audio.cpp CLI: audio --task asr --family sense_asr --model <gguf> --audio <wav>
+    let mut cmd = std::process::Command::new(&audio_exe);
+    cmd.args([
+        "--task", "asr",
+        "--family", "sense_asr",
+        "--model", model_path.to_str().unwrap_or(""),
+        "--audio", wav_path.to_str().unwrap_or(""),
+    ]);
+    if let Some(lang) = language {
+        // 取前2位作为语言代码
+        let lang_code = &lang[..lang.len().min(2)];
+        cmd.args(["--language", lang_code]);
+    }
+
+    let output = cmd.output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        tracing::warn!("[OmniServer] SenseVoice 转录失败: stderr={}", stderr.trim());
+        return None;
+    }
+
+    let text = stdout.trim().to_string();
+    if text.is_empty() {
+        tracing::info!("[OmniServer] SenseVoice 转录结果为空");
+        None
+    } else {
+        tracing::info!(
+            "[OmniServer] SenseVoice 转录成功: len={}, preview={}...",
+            text.len(),
+            &text[..text.len().min(100)]
+        );
+        Some(text)
+    }
+}
+
+/// 音频标准化转换接口: POST /api/audio/convert
+/// 截取指定时长、降噪、重采样至 16kHz Mono PCM WAV（适配 SenseVoice 等端侧模型）
+async fn audio_convert_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AudioConvertRequest>,
+) -> Json<AudioConvertResponse> {
+    let cfg = state.config.lock().unwrap().clone();
+    let t_start = std::time::Instant::now();
+    let file_path = req.file_path.clone();
+    let duration_seconds = req.duration_seconds.unwrap_or(cfg.audio_analysis_duration);
+
+    let file_path_c = file_path.clone();
+    let output_path = tokio::task::spawn_blocking(move || {
+        convert_audio_standard(&file_path_c, duration_seconds)
+    }).await.ok().flatten();
+
+    let duration_ms = t_start.elapsed().as_millis() as u64;
+    let output_path_str = output_path
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    Json(AudioConvertResponse {
+        file_path,
+        output_path: output_path_str,
+        duration_seconds,
         duration_ms,
     })
 }
