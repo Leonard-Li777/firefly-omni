@@ -244,7 +244,13 @@ async fn cover_handler(
 
 fn get_config_file_path() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
-        let dir = PathBuf::from(appdata).join("firefly-ai-folder");
+        // 目录名优先取主进程注入的 APP_NAME（如 firefly-ai-folder-intl），
+        // 避免硬编码裸 firefly-ai-folder 在 appData 下创建多余目录
+        let app_name = std::env::var("APP_NAME")
+            .ok()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| "firefly-ai-folder".to_string());
+        let dir = PathBuf::from(appdata).join(app_name);
         let _ = std::fs::create_dir_all(&dir);
         dir.join("omni_config.json")
     } else {

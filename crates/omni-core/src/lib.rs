@@ -21,6 +21,9 @@ pub struct OmniConfig {
     /// 全局忽略/排除受保护项目名单（用于 czkawka 查重清理原生排除保护）
     #[serde(default)]
     pub excluded_items: Vec<String>,
+    /// 当前用户界面语言（BCP-47，如 zh-CN），由桌面端 /api/config 同步
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 impl Default for OmniConfig {
@@ -35,6 +38,7 @@ impl Default for OmniConfig {
             analysis_mode: "full".to_string(),
             reuse_basic_analysis_data: true,
             excluded_items: Vec::new(),
+            language: None,
         }
     }
 }
