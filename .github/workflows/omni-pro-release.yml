@@ -95,15 +95,15 @@ jobs:
             artifact_suffix: macos-aarch64
             archive_ext: tar.gz
 
-          # Linux x86_64
+          # Linux x86_64 (使用 musl 静态编译彻底摆脱 glibc 兼容性问题)
           - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             artifact_suffix: linux-x86_64
             archive_ext: tar.gz
 
           # Linux aarch64
           - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             artifact_suffix: linux-aarch64
             archive_ext: tar.gz
 
@@ -131,14 +131,15 @@ jobs:
           workspaces: '.'
           key: ${{ matrix.target }}-pro
 
-      - name: 安装 Linux aarch64 交叉编译工具链
-        if: matrix.target == 'aarch64-unknown-linux-gnu' && runner.os == 'Linux'
+      - name: 安装 Linux musl 与交叉编译工具链
+        if: runner.os == 'Linux'
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y musl-tools
           ARCH=$(uname -m)
-          if [ "$ARCH" != "aarch64" ]; then
-            sudo apt-get update -qq
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ] && [ "$ARCH" != "aarch64" ]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
           fi
 
       - name: 安装 Linux 构建依赖与 libclang
