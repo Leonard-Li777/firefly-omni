@@ -16,6 +16,7 @@ fn setup_test_app_with_geo(geo: Arc<omni_pro::geo::GeoService>) -> Router {
     let state = AppState {
         config: Arc::new(Mutex::new(OmniConfig::default())),
         geo,
+        hownet: Arc::new(omni_pro::hownet::OmniHowNetService::unavailable()),
     };
     create_app_router(state)
 }
@@ -1042,6 +1043,34 @@ async fn test_geo_reverse_request_threshold_overrides() {
     assert_eq!(r["city"], serde_json::Value::Null);
     assert_eq!(r["province"], "Guangdong");
 }
+
+#[tokio::test]
+async fn test_hownet_describe_endpoint_unavailable_graceful() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/hownet/describe")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "word": "买"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["word"], "买");
+    assert_eq!(json["found"], false);
+}
+
 
 
 

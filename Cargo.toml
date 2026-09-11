@@ -14,6 +14,9 @@ members = [
     "omni-pro/crates/omni-cleanup",
     "omni-pro/crates/omni-cover",
     "omni-pro/crates/omni-vision",
+    "omni-pro/crates/omni-hownet",
+    "omni-pro/crates/omni-search",
+    "omni-pro/crates/omni-text",
 ]
 
 [workspace.package]
@@ -40,6 +43,7 @@ image = "0.25"
 encoding_rs = "0.8"
 regex = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [patch.crates-io]
 mupdf-sys = { path = "crates/mupdf-sys" }
@@ -50,4 +54,3 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
-

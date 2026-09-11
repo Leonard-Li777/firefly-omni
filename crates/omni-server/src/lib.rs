@@ -28,6 +28,8 @@ pub struct AppState {
     pub config: Arc<Mutex<OmniConfig>>,
     /// 离线反向地理编码服务（数据集缺失或开源存根时为软不可用实例）
     pub geo: Arc<omni_pro::geo::GeoService>,
+    /// OpenHowNet 语义槽位挖掘与对齐服务（数据集缺失或开源存根时为软不可用实例）
+    pub hownet: Arc<omni_pro::hownet::OmniHowNetService>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +84,7 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/api/file/preview", get(file_preview_handler))
         .route("/api/cover", get(cover_handler))
         .route("/api/geo/reverse", post(geo_reverse_handler))
+        .route("/api/hownet/describe", post(hownet_describe_handler))
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .with_state(state)
 }
@@ -97,12 +100,20 @@ async fn version_handler() -> Json<serde_json::Value> {
     }))
 }
 
-/// 健康检查：附 Pro 模块与地理子系统可用性，供前端 UI 与桌面端启动时探测
+/// 健康检查：附 Pro 模块与地理/HowNet 子系统可用性，供前端 UI 与桌面端启动时探测
 async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let is_pro = omni_pro::is_pro_enabled();
     let geo_available = if is_pro {
         let geo = state.geo.clone();
         tokio::task::spawn_blocking(move || geo.is_available())
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let hownet_available = if is_pro {
+        let hownet = state.hownet.clone();
+        tokio::task::spawn_blocking(move || hownet.is_available())
             .await
             .unwrap_or(false)
     } else {
@@ -114,6 +125,7 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "version": env!("CARGO_PKG_VERSION"),
         "isPro": is_pro,
         "geoAvailable": geo_available,
+        "hownetAvailable": hownet_available,
         "cleanupAvailable": is_pro
     }))
 }
@@ -139,6 +151,44 @@ async fn geo_reverse_handler(
         results: None,
         reason: Some(format!("地理查询任务执行失败: {err}")),
     });
+    Json(outcome)
+}
+
+/// OpenHowNet 语义描述查询与自然语言描述句合成: POST /api/hownet/describe
+async fn hownet_describe_handler(
+    State(state): State<AppState>,
+    Json(req): Json<omni_pro::hownet::HowNetDescribeRequest>,
+) -> Json<omni_pro::hownet::HowNetDescribeResult> {
+    let hownet = state.hownet.clone();
+    let word = req.word.clone();
+    let outcome = tokio::task::spawn_blocking(move || hownet.describe(&word))
+        .await
+        .unwrap_or_else(|err| {
+            Ok(omni_pro::hownet::HowNetDescribeResult {
+                word: req.word.clone(),
+                found: false,
+                is_aligned: false,
+                alignment_level: None,
+                top_concept: None,
+                slots: Vec::new(),
+                synonyms: Vec::new(),
+                antonyms: Vec::new(),
+                description: format!("HowNet 查询任务执行失败: {err}"),
+            })
+        })
+        .unwrap_or_else(|err| {
+            omni_pro::hownet::HowNetDescribeResult {
+                word: req.word.clone(),
+                found: false,
+                is_aligned: false,
+                alignment_level: None,
+                top_concept: None,
+                slots: Vec::new(),
+                synonyms: Vec::new(),
+                antonyms: Vec::new(),
+                description: format!("HowNet 检索内部错误: {err}"),
+            }
+        });
     Json(outcome)
 }
 
@@ -301,9 +351,24 @@ pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
             Arc::new(omni_pro::geo::GeoService::unavailable())
         }
     };
+    // HowNet 知识库发现链：环境变量 → exe 相对目录 → cwd 候选；落空或开源存根时软不可用
+    let hownet = match omni_pro::hownet::discover_hownet_db_path() {
+        Some(path) => {
+            info!("omni-hownet db found at {}", path.display());
+            Arc::new(omni_pro::hownet::OmniHowNetService::open(path).unwrap_or_else(|err| {
+                tracing::warn!("Failed to open omni-hownet db: {err}");
+                omni_pro::hownet::OmniHowNetService::unavailable()
+            }))
+        }
+        None => {
+            info!("omni-hownet db not found or open-core stub mode, hownet subsystem starts unavailable");
+            Arc::new(omni_pro::hownet::OmniHowNetService::unavailable())
+        }
+    };
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),
         geo,
+        hownet,
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本

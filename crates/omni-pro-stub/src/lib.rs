@@ -420,4 +420,110 @@ pub mod vision {
     }
 }
 
-pub use vision::{OCRBoxResult, OmniVisionEngine};
+pub use vision::{OCRBoxResult, OmniVisionEngine};
+
+pub mod hownet {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HowNetEntry {
+        pub id: i64,
+        pub wc: String,
+        pub we: String,
+        pub gc: Option<String>,
+        pub ge: Option<String>,
+        pub rmk: Option<String>,
+        pub is_common: bool,
+        pub rmk_category: Option<String>,
+        pub def: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct WordSlot {
+        pub slot_name: String,
+        pub zh: String,
+        pub target_value: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct RamAlignmentInfo {
+        pub ram_word: String,
+        pub level: i32,
+        pub hownet_entry_id: i64,
+        pub we_alias: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HowNetDescribeResult {
+        pub word: String,
+        pub found: bool,
+        pub is_aligned: bool,
+        pub alignment_level: Option<i32>,
+        pub top_concept: Option<String>,
+        pub slots: Vec<WordSlot>,
+        pub synonyms: Vec<String>,
+        pub antonyms: Vec<String>,
+        pub description: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HowNetDescribeRequest {
+        pub word: String,
+    }
+
+    pub struct OmniHowNetService;
+
+    impl OmniHowNetService {
+        pub fn unavailable() -> Self {
+            Self
+        }
+        pub fn open<P: AsRef<Path>>(_path: P) -> anyhow::Result<Self> {
+            Ok(Self)
+        }
+        pub fn is_available(&self) -> bool {
+            false
+        }
+        pub fn lookup_word(&self, _word: &str) -> anyhow::Result<Option<HowNetEntry>> {
+            Ok(None)
+        }
+        pub fn lookup_by_we(&self, _we: &str) -> anyhow::Result<Option<HowNetEntry>> {
+            Ok(None)
+        }
+        pub fn get_slots(&self, _word: &str) -> anyhow::Result<Vec<WordSlot>> {
+            Ok(Vec::new())
+        }
+        pub fn get_synonyms(&self, _tag: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        pub fn get_antonyms(&self, _word: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        pub fn get_alignment(&self, _ram_word: &str) -> anyhow::Result<Option<RamAlignmentInfo>> {
+            Ok(None)
+        }
+        pub fn describe(&self, word: &str) -> anyhow::Result<HowNetDescribeResult> {
+            Ok(HowNetDescribeResult {
+                word: word.to_string(),
+                found: false,
+                is_aligned: false,
+                alignment_level: None,
+                top_concept: None,
+                slots: Vec::new(),
+                synonyms: Vec::new(),
+                antonyms: Vec::new(),
+                description: format!("Open-core mode: hownet not available for '{}'", word),
+            })
+        }
+    }
+
+    pub fn discover_hownet_db_path() -> Option<PathBuf> {
+        None
+    }
+}
+
