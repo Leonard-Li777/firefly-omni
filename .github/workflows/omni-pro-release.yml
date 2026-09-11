@@ -8,6 +8,15 @@ on:
         description: '发布版本号（如 v0.1.0），留空则使用 Cargo.toml 中的版本'
         required: false
         default: ''
+      desktop_build_region:
+        description: '构建完成后联动触发 Desktop 发版的区域（默认 CN+INTL 全部触发）'
+        required: false
+        type: choice
+        default: 'CN+INTL'
+        options:
+          - 'CN'
+          - 'INTL'
+          - 'CN+INTL'
 
 # 防止同一分支并发构建
 concurrency:
@@ -95,15 +104,18 @@ jobs:
             artifact_suffix: macos-aarch64
             archive_ext: tar.gz
 
-          # Linux x86_64 (使用 gnu 目标：ort-sys 官方预编译库不含 musl，v0.1.2 起即验证过 gnu 目标)
+          # Linux x86_64 (使用 gnu 目标：ort-sys 官方预编译库不含 musl；
+          # 通过 cargo-zigbuild 锚定 glibc 2.17 向下兼容老发行版，如 Debian 10 / RHEL 7)
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            zig_target: x86_64-unknown-linux-gnu.2.17
             artifact_suffix: linux-x86_64
             archive_ext: tar.gz
 
-          # Linux aarch64
+          # Linux aarch64 (同样锚定 glibc 2.17)
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
+            zig_target: aarch64-unknown-linux-gnu.2.17
             artifact_suffix: linux-aarch64
             archive_ext: tar.gz
 
@@ -132,7 +144,7 @@ jobs:
           key: ${{ matrix.target }}-pro
 
       - name: 安装 Linux aarch64 交叉编译工具链
-        if: matrix.target == 'aarch64-unknown-linux-gnu' && runner.os == 'Linux'
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && runner.os == 'Linux' && !matrix.zig_target
         run: |
           ARCH=$(uname -m)
           if [ "$ARCH" != "aarch64" ]; then
@@ -140,6 +152,16 @@ jobs:
             sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
             echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
           fi
+
+      # Linux 使用 cargo-zigbuild 锚定老版 glibc（zig 链接器同时静态链接 libstdc++/libgcc，
+      # 消除 GLIBCXX 符号依赖；产物兼容 glibc 2.17+，向下兼容 Debian 10 / RHEL 7 等）
+      - name: 安装 cargo-zigbuild 与 zig (Linux)
+        if: matrix.zig_target
+        shell: bash
+        run: |
+          pip3 install --quiet cargo-zigbuild
+          cargo zigbuild --help >/dev/null 2>&1 || { echo "❌ cargo-zigbuild 安装失败"; exit 1; }
+          echo "🔍 cargo-zigbuild 已就绪: $(cargo zigbuild --version)"
 
       - name: 安装 Linux 构建依赖与 libclang
         if: runner.os == 'Linux'
@@ -252,11 +274,20 @@ jobs:
       - name: 构建 firefly-omni 二进制 (Pro)
         shell: bash
         run: |
-          cargo build \
-            --manifest-path Cargo.toml \
-            --bin firefly-omni \
-            --release \
-            --target ${{ matrix.target }}
+          if [ -n "${{ matrix.zig_target }}" ]; then
+            # Linux：cargo-zigbuild 锚定老版 glibc（如 2.17），zig 链接器静态链接 libstdc++/libgcc
+            cargo zigbuild \
+              --manifest-path Cargo.toml \
+              --bin firefly-omni \
+              --release \
+              --target ${{ matrix.zig_target }}
+          else
+            cargo build \
+              --manifest-path Cargo.toml \
+              --bin firefly-omni \
+              --release \
+              --target ${{ matrix.target }}
+          fi
         env:
           PKG_CONFIG_ALLOW_CROSS: 1
 
@@ -417,15 +448,24 @@ jobs:
           GITHUB_TOKEN: ${{ env.GH_TOKEN }}
 
   # 联动触发 Desktop 发版工作流（自动拉取新版 omni 引擎并更新 lock.json 发版）
+  # 按 desktop_build_region 参数决定派发区域：CN / INTL / CN+INTL（默认全部）
+  # 仅首次派发携带 update_omni_lock=true，避免多次派发并发竞争写 preset-resources.lock.json
   trigger-desktop-release:
     name: 联动触发 Desktop 发版流水线
     needs: [publish-pro, bump-version]
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJSON(format('[{0}]', github.event.inputs.desktop_build_region == 'CN' && '"CN"' || (github.event.inputs.desktop_build_region == 'INTL' && '"INTL"' || '"CN","INTL"'))) }}
     steps:
       - name: 触发 Desktop 仓库工作流 (firefly-ai-folder-desktop-release.yml)
         uses: actions/github-script@v7
         env:
           NEW_OMNI_VERSION: ${{ needs.bump-version.outputs.version_tag }}
+          REGION: ${{ matrix.region }}
+          # CN 派发始终是首个触发；单选 INTL 时它是唯一派发，同样需要携带 lock 同步
+          IS_FIRST_DISPATCH: ${{ matrix.region == 'CN' || github.event.inputs.desktop_build_region == 'INTL' }}
           HAS_CUSTOM_PAT: ${{ !!(secrets.PRO_SUBMODULE_TOKEN || secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.PAT || secrets.GH_PAT) }}
         with:
           # github-script v7 运行时不再暴露 @octokit/rest，自定义 Token 必须通过 github-token 输入注入
@@ -435,9 +475,12 @@ jobs:
             const targetRepo = 'firefly-ai-folder-desktop';
             const workflowId = 'firefly-ai-folder-desktop-release.yml';
             const omniVersion = process.env.NEW_OMNI_VERSION || '';
+            const region = process.env.REGION || 'CN';
+            // 仅 CN（首个矩阵分支）携带 update_omni_lock，INTL 复用 CN 已同步好的 lock，避免并发竞争
+            const updateOmniLock = process.env.IS_FIRST_DISPATCH === 'true';
 
             core.info(`🚀 Omni 发布完毕！正在触发桌面端发版流水线: ${targetOwner}/${targetRepo} -> ${workflowId}`);
-            core.info(`📌 Omni 引擎版本: ${omniVersion}`);
+            core.info(`📌 Omni 引擎版本: ${omniVersion} | 构建区域: ${region} | 同步 lock: ${updateOmniLock}`);
 
             if (process.env.HAS_CUSTOM_PAT !== 'true') {
               core.warning('⚠️ 未配置跨仓库 PAT（PRO_SUBMODULE_TOKEN / UNISOURCE_RELEASE_TOKEN 等），回退使用 GITHUB_TOKEN，跨仓库触发可能返回 401/403。');
@@ -450,8 +493,8 @@ jobs:
                 workflow_id: workflowId,
                 ref: 'master',
                 inputs: {
-                  update_omni_lock: true,
-                  build_region: 'CN',
+                  update_omni_lock: updateOmniLock,
+                  build_region: region,
                   download_latest_llama: true
                 }
               });
