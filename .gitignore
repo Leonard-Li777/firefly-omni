@@ -8,6 +8,7 @@ build/extraResources/geo
 build/geo-cache
 build/presetResources
 build/libmupdf
+build/
 
 # omni-pro 闭源专业版子模块隔离 (firefly-omni-pro.git)
 omni-pro/
