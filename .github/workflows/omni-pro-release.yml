@@ -104,18 +104,16 @@ jobs:
             artifact_suffix: macos-aarch64
             archive_ext: tar.gz
 
-          # Linux x86_64 (使用 gnu 目标：ort-sys 官方预编译库不含 musl；
-          # 通过 cargo-zigbuild 锚定 glibc 2.17 向下兼容老发行版，如 Debian 10 / RHEL 7)
+          # Linux x86_64 (gnu 目标：ort-sys 官方预编译库仅支持 gnu 且要求 glibc 2.34+，
+          # musl 无预编译库、zigbuild 无法链接 GNU libstdc++ ABI —— 两者均已验证不可行)
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            zig_target: x86_64-unknown-linux-gnu.2.17
             artifact_suffix: linux-x86_64
             archive_ext: tar.gz
 
-          # Linux aarch64 (同样锚定 glibc 2.17)
+          # Linux aarch64
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-            zig_target: aarch64-unknown-linux-gnu.2.17
             artifact_suffix: linux-aarch64
             archive_ext: tar.gz
 
@@ -144,7 +142,7 @@ jobs:
           key: ${{ matrix.target }}-pro
 
       - name: 安装 Linux aarch64 交叉编译工具链
-        if: matrix.target == 'aarch64-unknown-linux-gnu' && runner.os == 'Linux' && !matrix.zig_target
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && runner.os == 'Linux'
         run: |
           ARCH=$(uname -m)
           if [ "$ARCH" != "aarch64" ]; then
@@ -152,16 +150,6 @@ jobs:
             sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
             echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
           fi
-
-      # Linux 使用 cargo-zigbuild 锚定老版 glibc（zig 链接器同时静态链接 libstdc++/libgcc，
-      # 消除 GLIBCXX 符号依赖；产物兼容 glibc 2.17+，向下兼容 Debian 10 / RHEL 7 等）
-      - name: 安装 cargo-zigbuild 与 zig (Linux)
-        if: matrix.zig_target
-        shell: bash
-        run: |
-          pip3 install --quiet cargo-zigbuild
-          cargo zigbuild --help >/dev/null 2>&1 || { echo "❌ cargo-zigbuild 安装失败"; exit 1; }
-          echo "🔍 cargo-zigbuild 已就绪: $(cargo zigbuild --version)"
 
       - name: 安装 Linux 构建依赖与 libclang
         if: runner.os == 'Linux'
@@ -274,20 +262,11 @@ jobs:
       - name: 构建 firefly-omni 二进制 (Pro)
         shell: bash
         run: |
-          if [ -n "${{ matrix.zig_target }}" ]; then
-            # Linux：cargo-zigbuild 锚定老版 glibc（如 2.17），zig 链接器静态链接 libstdc++/libgcc
-            cargo zigbuild \
-              --manifest-path Cargo.toml \
-              --bin firefly-omni \
-              --release \
-              --target ${{ matrix.zig_target }}
-          else
-            cargo build \
-              --manifest-path Cargo.toml \
-              --bin firefly-omni \
-              --release \
-              --target ${{ matrix.target }}
-          fi
+          cargo build \
+            --manifest-path Cargo.toml \
+            --bin firefly-omni \
+            --release \
+            --target ${{ matrix.target }}
         env:
           PKG_CONFIG_ALLOW_CROSS: 1
 
