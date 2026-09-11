@@ -24,10 +24,17 @@ pub struct OmniConfig {
     /// 全局忽略/排除受保护项目名单（用于 czkawka 查重清理原生排除保护）
     #[serde(default)]
     pub excluded_items: Vec<String>,
+    /// 是否启用 Tier 1 端侧文本分析（#615~#618 分块/关键词/向量/槽位全流程，默认开启）
+    #[serde(default = "default_true")]
+    pub enable_text_analysis: bool,
 }
 
 fn default_audio_analysis_duration() -> u32 {
     30
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for OmniConfig {
@@ -43,6 +50,7 @@ impl Default for OmniConfig {
             reuse_basic_analysis_data: true,
             audio_analysis_duration: 30,
             excluded_items: Vec::new(),
+            enable_text_analysis: true,
         }
     }
 }
@@ -85,6 +93,9 @@ pub struct OmniPerceptionRequest {
     pub enable_audio_transcript: Option<bool>,
     #[serde(default)]
     pub enable_geo_reverse: Option<bool>,
+    /// 是否启用 Tier 1 端侧文本分析（可覆盖 OmniConfig.enable_text_analysis，缺省沿用全局配置）
+    #[serde(default)]
+    pub enable_text_analysis: Option<bool>,
     #[serde(default)]
     pub max_content_size_kb: Option<usize>,
     /// 自定义音频截取时长（秒，缺省时读取 OmniConfig.audio_analysis_duration）

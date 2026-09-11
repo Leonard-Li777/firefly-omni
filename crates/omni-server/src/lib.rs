@@ -125,6 +125,16 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
     } else {
         false
     };
+    let search_available = if is_pro {
+        let search = state.search.clone();
+        // 反映索引服务真实可用性：ensure_index 首调会打开/创建索引入口，
+        // 磁盘或权限异常时返回 Err → false（而非仅凭 is_pro 恒真判断）
+        tokio::task::spawn_blocking(move || search.ensure_index().is_ok())
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
     Json(serde_json::json!({
         "status": "ok",
         "server": "firefly-omni",
@@ -132,7 +142,7 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "isPro": is_pro,
         "geoAvailable": geo_available,
         "hownetAvailable": hownet_available,
-        "searchAvailable": is_pro,
+        "searchAvailable": search_available,
         "cleanupAvailable": is_pro
     }))
 }
@@ -372,8 +382,14 @@ pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
             Arc::new(omni_pro::hownet::OmniHowNetService::unavailable())
         }
     };
+    // 索引目录发现链：优先持久化用户数据目录（APPDATA → LOCALAPPDATA → USERPROFILE），
+    // 全部缺失时才降级到系统临时目录（临时目录存在被系统清理导致索引重建的风险，仅作兜底）
     let search_dir = if let Ok(appdata) = std::env::var("APPDATA") {
         PathBuf::from(appdata).join("firefly-ai-folder").join("search_index")
+    } else if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+        PathBuf::from(local_appdata).join("firefly-ai-folder").join("search_index")
+    } else if let Ok(home) = std::env::var("USERPROFILE") {
+        PathBuf::from(home).join(".firefly-ai-folder").join("search_index")
     } else {
         std::env::temp_dir().join("firefly_omni_search_index")
     };
@@ -755,7 +771,9 @@ async fn perceive_file_handler(
     let is_pro = omni_pro::is_pro_enabled();
 
     let p = std::path::Path::new(&file_path);
-    let file_size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    // 一次性读取文件元数据，file_size 与 Tier1 文本分析的 mtime 均复用该结果，避免重复 syscall
+    let file_meta = std::fs::metadata(p).ok();
+    let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let is_corrupted = file_size == 0;
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
 
@@ -1325,24 +1343,32 @@ async fn perceive_file_handler(
 
     // 8. Tier 1 端侧纯 CPU 确定性文本特征与 384 维向量提取 (omni-text 支柱 4)
     // 包含: #615 Chunker, #616 fastText/KeyBERT, #617 bekko-a8m 384d, #618 实体槽位/5W摘要/智能重命名
-    let mtime = std::fs::metadata(p)
-        .and_then(|m| m.modified())
-        .ok()
+    // 开源构建或无配置开关时跳过，避免存根空转下发全零向量并冲击感知 SLO
+    let mtime = file_meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
         .map(|t| chrono::DateTime::<chrono::Utc>::from(t));
     let file_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
 
-    let text_analysis = if !markdown_content.trim().is_empty() {
+    let enable_frontend_text = req.enable_text_analysis.unwrap_or(cfg.enable_text_analysis);
+    let text_analysis = if is_pro && enable_frontend_text && !markdown_content.trim().is_empty() {
         let t_text = std::time::Instant::now();
-        let hownet_svc = Some(&*state.hownet);
-        let res = omni_pro::text::OmniTextEngine::analyze(
-            &markdown_content,
-            &file_name,
-            mtime,
-            hownet_svc,
-        );
+        let text = markdown_content.clone();
+        let fname = file_name.clone();
+        let hownet = state.hownet.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            omni_pro::text::OmniTextEngine::analyze(&text, &fname, mtime, Some(&*hownet))
+        })
+        .await;
         let text_duration = t_text.elapsed().as_millis() as u64;
         benchmark.text_ms = Some(benchmark.text_ms.unwrap_or(0) + text_duration);
-        Some(res)
+        match res {
+            Ok(result) => Some(result),
+            Err(e) => {
+                tracing::error!("[OmniServer] 文本分析任务执行失败: {e}");
+                None
+            }
+        }
     } else {
         None
     };
@@ -1389,12 +1415,12 @@ async fn perceive_file_handler(
         geo_address
     );
 
-    Json(OmniPerceptionResult {
-        file_path,
+    let result = Json(OmniPerceptionResult {
+        file_path: file_path.clone(),
         mime_type,
         file_size,
         category,
-        markdown_content,
+        markdown_content: markdown_content.clone(),
         ocr_text,
         metadata,
         file_source,
@@ -1478,15 +1504,43 @@ async fn text_analyze_handler(
     State(state): State<AppState>,
     Json(req): Json<TextAnalyzeRequest>,
 ) -> Json<omni_pro::text::TextAnalysisResult> {
+    // P4: 开源构建下 omni-pro 为存根（仅空转返回全零向量），直接返回确定性空结果，避免全零 embedding 下发
+    if !omni_pro::is_pro_enabled() {
+        return Json(empty_text_analysis_result());
+    }
     let file_name = req.file_name.unwrap_or_default();
-    let hownet_svc = Some(&*state.hownet);
-    let res = omni_pro::text::OmniTextEngine::analyze(
-        &req.text,
-        &file_name,
-        req.mtime,
-        hownet_svc,
-    );
-    Json(res)
+    let hownet = state.hownet.clone();
+    let text = req.text;
+    let mtime = req.mtime;
+    let res = tokio::task::spawn_blocking(move || {
+        omni_pro::text::OmniTextEngine::analyze(&text, &file_name, mtime, Some(&*hownet))
+    })
+    .await;
+    Json(match res {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("[OmniServer] 文本分析任务执行失败: {e}");
+            // 任务 panic 时返回确定性空结果，避免调用方误判为正常特征
+            empty_text_analysis_result()
+        }
+    })
+}
+
+/// 确定性空文本特征分析结果（panic 兜底 / 开源存根模式共用）
+fn empty_text_analysis_result() -> omni_pro::text::TextAnalysisResult {
+    omni_pro::text::TextAnalysisResult {
+        title: None,
+        language: "zh".to_string(),
+        keywords: Vec::new(),
+        entities: Vec::new(),
+        structured_summary: Default::default(),
+        one_sentence_desc: None,
+        smart_name: None,
+        name_slots: Default::default(),
+        embedding_dense: Vec::new(),
+        chunks: Vec::new(),
+        duration_ms: 0,
+    }
 }
 
 /// 批量构建混合索引请求体: POST /api/search/index
@@ -1512,6 +1566,7 @@ async fn search_index_handler(
     let search = state.search.clone();
     let res = tokio::task::spawn_blocking(move || {
         let mut docs = req.documents;
+        let batch_len = docs.len();
         let embedder = omni_pro::text::BekkoEmbedder::new();
         for doc in &mut docs {
             // 若未提供向量或维度不匹配，自动调用 BekkoEmbedder 补充 384 维向量
@@ -1521,12 +1576,13 @@ async fn search_index_handler(
                 }
             }
         }
-        search.upsert_batch(&docs)
+        // 语义说明：返回本批提交/写入的文档数（而非索引存量），供调用方作为分批进度使用
+        search.upsert_batch(&docs).map(|_| batch_len)
     }).await;
     match res {
-        Ok(Ok(total)) => Json(SearchIndexResponse {
+        Ok(Ok(batch_len)) => Json(SearchIndexResponse {
             success: true,
-            total_indexed: total,
+            total_indexed: batch_len,
             error: None,
         }),
         Ok(Err(e)) => Json(SearchIndexResponse {
