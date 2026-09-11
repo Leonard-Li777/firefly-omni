@@ -17,7 +17,7 @@ use omni_core::{
     VisionTagsRequest, VisionTagsResponse,
 };
 use omni_extract::OmniExtractor;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -30,6 +30,8 @@ pub struct AppState {
     pub geo: Arc<omni_pro::geo::GeoService>,
     /// OpenHowNet 语义槽位挖掘与对齐服务（数据集缺失或开源存根时为软不可用实例）
     pub hownet: Arc<omni_pro::hownet::OmniHowNetService>,
+    /// 工业级混合检索与约束聚类服务 (支柱 5)
+    pub search: Arc<omni_pro::search::OmniSearchService>,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +87,10 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/api/cover", get(cover_handler))
         .route("/api/geo/reverse", post(geo_reverse_handler))
         .route("/api/hownet/describe", post(hownet_describe_handler))
+        .route("/api/text/analyze", post(text_analyze_handler))
+        .route("/api/search/index", post(search_index_handler))
+        .route("/api/search/hybrid", post(search_hybrid_handler))
+        .route("/api/search/cluster", post(search_cluster_handler))
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .with_state(state)
 }
@@ -126,6 +132,7 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "isPro": is_pro,
         "geoAvailable": geo_available,
         "hownetAvailable": hownet_available,
+        "searchAvailable": is_pro,
         "cleanupAvailable": is_pro
     }))
 }
@@ -365,10 +372,17 @@ pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
             Arc::new(omni_pro::hownet::OmniHowNetService::unavailable())
         }
     };
+    let search_dir = if let Ok(appdata) = std::env::var("APPDATA") {
+        PathBuf::from(appdata).join("firefly-ai-folder").join("search_index")
+    } else {
+        std::env::temp_dir().join("firefly_omni_search_index")
+    };
+    let search = Arc::new(omni_pro::search::OmniSearchService::new(search_dir));
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),
         geo,
         hownet,
+        search,
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本
@@ -1309,6 +1323,58 @@ async fn perceive_file_handler(
         .and_then(|g| g.as_str())
         .map(|s| s.to_string());
 
+    // 8. Tier 1 端侧纯 CPU 确定性文本特征与 384 维向量提取 (omni-text 支柱 4)
+    // 包含: #615 Chunker, #616 fastText/KeyBERT, #617 bekko-a8m 384d, #618 实体槽位/5W摘要/智能重命名
+    let mtime = std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t));
+    let file_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+
+    let text_analysis = if !markdown_content.trim().is_empty() {
+        let t_text = std::time::Instant::now();
+        let hownet_svc = Some(&*state.hownet);
+        let res = omni_pro::text::OmniTextEngine::analyze(
+            &markdown_content,
+            &file_name,
+            mtime,
+            hownet_svc,
+        );
+        let text_duration = t_text.elapsed().as_millis() as u64;
+        benchmark.text_ms = Some(benchmark.text_ms.unwrap_or(0) + text_duration);
+        Some(res)
+    } else {
+        None
+    };
+
+    let (text_title, text_keywords, text_entities, text_summary, text_one_desc, text_slots, text_emb, text_smart_name) = match text_analysis {
+        Some(res) => (
+            res.title,
+            res.keywords,
+            res.entities.iter().filter_map(|e| serde_json::to_value(e).ok()).collect(),
+            serde_json::to_value(&res.structured_summary).ok(),
+            res.one_sentence_desc,
+            serde_json::to_value(&res.name_slots).ok(),
+            Some(res.embedding_dense),
+            res.smart_name,
+        ),
+        None => (
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    };
+
+    // 智能重命名回填策略：若图像仲裁没有产出 smart_name，回填文本分析的确定性槽位重命名
+    let smart_name = smart_name.or(text_smart_name);
+    // 概要描述回填策略：若视觉没有给出 content_description，回填文本的一句话描述
+    let content_description = content_description.or_else(|| text_one_desc.clone());
+
     benchmark.total_ms = t_start.elapsed().as_millis() as u64;
 
     tracing::info!(
@@ -1371,8 +1437,199 @@ async fn perceive_file_handler(
         smart_name,
         content_description,
         pruned_ambiguous_words,
+        // Tier 1 端侧纯 CPU 确定性文本特征与向量
+        title: text_title,
+        keywords: text_keywords,
+        entities: text_entities,
+        structured_summary: text_summary,
+        one_sentence_desc: text_one_desc,
+        name_slots: text_slots,
+        embedding_dense: text_emb,
         benchmark: Some(benchmark),
     })
+}
+
+/// 纯文本确定性特征分析请求体: POST /api/text/analyze
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextAnalyzeRequest {
+    pub text: String,
+    pub file_name: Option<String>,
+    pub mtime: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// 纯文本确定性特征与 384 维向量分析 API: POST /api/text/analyze
+async fn text_analyze_handler(
+    State(state): State<AppState>,
+    Json(req): Json<TextAnalyzeRequest>,
+) -> Json<omni_pro::text::TextAnalysisResult> {
+    let file_name = req.file_name.unwrap_or_default();
+    let hownet_svc = Some(&*state.hownet);
+    let res = omni_pro::text::OmniTextEngine::analyze(
+        &req.text,
+        &file_name,
+        req.mtime,
+        hownet_svc,
+    );
+    Json(res)
+}
+
+/// 批量构建混合索引请求体: POST /api/search/index
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchIndexRequest {
+    pub documents: Vec<omni_pro::search::IndexedDocument>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchIndexResponse {
+    pub success: bool,
+    pub total_indexed: usize,
+    pub error: Option<String>,
+}
+
+/// 批量写入双轨混合索引 (USearch 密集向量 + Tantivy BM25): POST /api/search/index
+async fn search_index_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SearchIndexRequest>,
+) -> Json<SearchIndexResponse> {
+    let search = state.search.clone();
+    let res = tokio::task::spawn_blocking(move || search.upsert_batch(&req.documents)).await;
+    match res {
+        Ok(Ok(total)) => Json(SearchIndexResponse {
+            success: true,
+            total_indexed: total,
+            error: None,
+        }),
+        Ok(Err(e)) => Json(SearchIndexResponse {
+            success: false,
+            total_indexed: 0,
+            error: Some(e.to_string()),
+        }),
+        Err(e) => Json(SearchIndexResponse {
+            success: false,
+            total_indexed: 0,
+            error: Some(format!("Task panic: {e}")),
+        }),
+    }
+}
+
+/// 双轨混合检索与加权 RRF 融合重排请求体: POST /api/search/hybrid
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHybridRequest {
+    pub query_text: Option<String>,
+    pub query_embedding: Option<Vec<f32>>,
+    #[serde(default = "default_search_top_k")]
+    pub top_k: usize,
+}
+
+fn default_search_top_k() -> usize {
+    20
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHybridResponse {
+    pub success: bool,
+    pub results: Vec<omni_pro::search::FusedResult>,
+    pub error: Option<String>,
+}
+
+/// 双轨混合检索与 RRF 融合重排: POST /api/search/hybrid
+async fn search_hybrid_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SearchHybridRequest>,
+) -> Json<SearchHybridResponse> {
+    let search = state.search.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        search.search_hybrid(
+            req.query_text.as_deref(),
+            req.query_embedding.as_deref(),
+            req.top_k,
+        )
+    })
+    .await;
+    match res {
+        Ok(Ok(results)) => Json(SearchHybridResponse {
+            success: true,
+            results,
+            error: None,
+        }),
+        Ok(Err(e)) => Json(SearchHybridResponse {
+            success: false,
+            results: Vec::new(),
+            error: Some(e.to_string()),
+        }),
+        Err(e) => Json(SearchHybridResponse {
+            success: false,
+            results: Vec::new(),
+            error: Some(format!("Task panic: {e}")),
+        }),
+    }
+}
+
+/// 提示词引导层次凝聚聚类与目录树生成请求体: POST /api/search/cluster
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchClusterRequest {
+    pub documents: Vec<omni_pro::search::ClusterDocument>,
+    pub prompt_embedding: Option<Vec<f32>>,
+    #[serde(default = "default_distance_threshold")]
+    pub distance_threshold: f32,
+    #[serde(default = "default_max_leaf_size")]
+    pub max_leaf_size: usize,
+}
+
+fn default_distance_threshold() -> f32 {
+    0.4
+}
+
+fn default_max_leaf_size() -> usize {
+    50
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchClusterResponse {
+    pub success: bool,
+    pub result: Option<omni_pro::search::ClusterTreeResult>,
+    pub error: Option<String>,
+}
+
+/// 约束层次聚类多级目录自动归档: POST /api/search/cluster
+async fn search_cluster_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SearchClusterRequest>,
+) -> Json<SearchClusterResponse> {
+    let search = state.search.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        search.cluster(
+            &req.documents,
+            req.prompt_embedding.as_deref(),
+            req.distance_threshold,
+            req.max_leaf_size,
+        )
+    })
+    .await;
+    match res {
+        Ok(Ok(tree)) => Json(SearchClusterResponse {
+            success: true,
+            result: Some(tree),
+            error: None,
+        }),
+        Ok(Err(e)) => Json(SearchClusterResponse {
+            success: false,
+            result: None,
+            error: Some(e.to_string()),
+        }),
+        Err(e) => Json(SearchClusterResponse {
+            success: false,
+            result: None,
+            error: Some(format!("Task panic: {e}")),
+        }),
+    }
 }
 
 /// 单指标音频转录处理: POST /api/audio/transcribe

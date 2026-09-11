@@ -526,4 +526,307 @@ pub mod hownet {
         None
     }
 }
+
+pub mod text {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use std::collections::HashMap;
+
+    pub const EMBEDDING_DIM: usize = 384;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    pub struct DocumentChunk {
+        pub index: usize,
+        pub title: Option<String>,
+        pub content: String,
+        pub char_count: usize,
+        pub has_inlined_ocr: bool,
+    }
+
+    pub struct DocumentChunker;
+    impl DocumentChunker {
+        pub fn extract_leading_core_chunk(markdown: &str, _max_chars: usize) -> String {
+            markdown.to_string()
+        }
+        pub fn chunk_document(markdown: &str, _chunk_size_chars: usize) -> Vec<DocumentChunk> {
+            vec![DocumentChunk {
+                index: 0,
+                title: None,
+                content: markdown.to_string(),
+                char_count: markdown.chars().count(),
+                has_inlined_ocr: false,
+            }]
+        }
+    }
+
+    pub fn format_inlined_ocr(ocr_text: &str) -> String {
+        ocr_text.to_string()
+    }
+
+    pub fn replace_image_placeholders(markdown: &str, _ocr_map: &HashMap<String, String>) -> String {
+        markdown.to_string()
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct LanguageDetectionResult {
+        pub lang: String,
+        pub confidence: f32,
+        pub duration_us: u64,
+    }
+
+    pub struct LanguageDetector;
+    impl LanguageDetector {
+        pub fn detect(_text: &str) -> LanguageDetectionResult {
+            LanguageDetectionResult {
+                lang: "zh".to_string(),
+                confidence: 0.5,
+                duration_us: 0,
+            }
+        }
+    }
+
+    pub struct TextTokenizer;
+    impl TextTokenizer {
+        pub fn extract_candidate_keywords(_text: &str, _lang: &str) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    pub struct BekkoEmbedder;
+    impl BekkoEmbedder {
+        pub fn new() -> Self {
+            Self
+        }
+        pub fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0f32; EMBEDDING_DIM])
+        }
+        pub fn batch_embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![0.0f32; EMBEDDING_DIM]; texts.len()])
+        }
+        pub fn cosine_similarity(_a: &[f32], _b: &[f32]) -> f32 {
+            0.0
+        }
+    }
+
+    pub struct KeyBertExtractor;
+    impl KeyBertExtractor {
+        pub fn extract_keywords(
+            _doc_text: &str,
+            candidates: &[String],
+            _embedder: &BekkoEmbedder,
+            top_k: usize,
+            _diversity: f32,
+        ) -> Vec<String> {
+            candidates.iter().take(top_k).cloned().collect()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExtractedEntity {
+        pub category: String,
+        pub value: String,
+        pub confidence: f32,
+    }
+
+    pub struct EntitySlotExtractor;
+    impl EntitySlotExtractor {
+        pub fn extract_entities(
+            _text: &str,
+            _file_name: &str,
+            _mtime: Option<DateTime<Utc>>,
+        ) -> Vec<ExtractedEntity> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+    pub struct StructuredSummaryItem {
+        pub what: Option<String>,
+        pub who: Option<String>,
+        pub where_loc: Option<String>,
+        pub when: Option<String>,
+        pub why: Option<String>,
+        pub key_points: Vec<String>,
+    }
+
+    pub struct SlotEngine;
+    impl SlotEngine {
+        pub fn generate_5w_summary(
+            _entities: &[ExtractedEntity],
+            keywords: &[String],
+        ) -> StructuredSummaryItem {
+            StructuredSummaryItem {
+                what: keywords.first().cloned(),
+                who: None,
+                where_loc: None,
+                when: None,
+                why: None,
+                key_points: keywords.to_vec(),
+            }
+        }
+        pub fn generate_one_sentence_desc(_summary: &StructuredSummaryItem) -> Option<String> {
+            None
+        }
+        pub fn generate_smart_name(
+            _entities: &[ExtractedEntity],
+            _keywords: &[String],
+            _original_file_name: &str,
+        ) -> (Option<String>, serde_json::Value) {
+            (None, serde_json::json!({}))
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct TextAnalysisResult {
+        pub title: Option<String>,
+        pub language: String,
+        pub keywords: Vec<String>,
+        pub entities: Vec<ExtractedEntity>,
+        pub structured_summary: StructuredSummaryItem,
+        pub one_sentence_desc: Option<String>,
+        pub smart_name: Option<String>,
+        pub name_slots: serde_json::Value,
+        pub embedding_dense: Vec<f32>,
+        pub chunks: Vec<DocumentChunk>,
+        pub duration_ms: u64,
+    }
+
+    pub struct OmniTextEngine;
+    impl OmniTextEngine {
+        pub fn analyze(
+            _text: &str,
+            _file_name: &str,
+            _mtime: Option<DateTime<Utc>>,
+            _hownet: Option<&super::hownet::OmniHowNetService>,
+        ) -> TextAnalysisResult {
+            TextAnalysisResult {
+                title: None,
+                language: "zh".to_string(),
+                keywords: Vec::new(),
+                entities: Vec::new(),
+                structured_summary: StructuredSummaryItem::default(),
+                one_sentence_desc: None,
+                smart_name: None,
+                name_slots: serde_json::json!({}),
+                embedding_dense: vec![0.0f32; EMBEDDING_DIM],
+                chunks: Vec::new(),
+                duration_ms: 0,
+            }
+        }
+    }
+}
+
+pub mod search {
+    use super::*;
+
+    pub const EMBEDDING_DIM: usize = 384;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct IndexedDocument {
+        pub fingerprint: String,
+        pub embedding: Vec<f32>,
+        pub searchable_text: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HybridHit {
+        pub fingerprint: String,
+        pub dense_distance: Option<f32>,
+        pub bm25_score: Option<f32>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FusedResult {
+        pub fingerprint: String,
+        pub rrf_score: f32,
+        pub final_score: f32,
+        pub dense_rank: Option<usize>,
+        pub bm25_rank: Option<usize>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ClusterDocument {
+        pub fingerprint: String,
+        pub embedding: Vec<f32>,
+        pub keywords: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ClusterGroup {
+        pub fingerprints: Vec<String>,
+        pub folder_name: String,
+        pub path: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ClusterTreeResult {
+        pub clusters: Vec<ClusterGroup>,
+        pub other_files: Vec<String>,
+        pub duration_ms: u64,
+    }
+
+    pub fn constrained_hac(
+        _docs: &[ClusterDocument],
+        _prompt_embedding: Option<&[f32]>,
+        _distance_threshold: f32,
+        _max_leaf_size: usize,
+    ) -> anyhow::Result<ClusterTreeResult> {
+        Ok(ClusterTreeResult {
+            clusters: Vec::new(),
+            other_files: Vec::new(),
+            duration_ms: 0,
+        })
+    }
+
+    pub struct OmniSearchService;
+
+    impl Default for OmniSearchService {
+        fn default() -> Self {
+            Self
+        }
+    }
+
+    impl OmniSearchService {
+        pub fn new<P: AsRef<std::path::Path>>(_index_dir: P) -> Self {
+            Self
+        }
+        pub fn is_available(&self) -> bool {
+            false
+        }
+        pub fn ensure_index(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        pub fn upsert_batch(&self, _docs: &[IndexedDocument]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        pub fn search_hybrid(
+            &self,
+            _query_text: Option<&str>,
+            _query_embedding: Option<&[f32]>,
+            _top_k: usize,
+        ) -> anyhow::Result<Vec<FusedResult>> {
+            Ok(Vec::new())
+        }
+        pub fn cluster(
+            &self,
+            _docs: &[ClusterDocument],
+            _prompt_embedding: Option<&[f32]>,
+            _distance_threshold: f32,
+            _max_leaf_size: usize,
+        ) -> anyhow::Result<ClusterTreeResult> {
+            Ok(ClusterTreeResult {
+                clusters: Vec::new(),
+                other_files: Vec::new(),
+                duration_ms: 0,
+            })
+        }
+    }
+}
+
 

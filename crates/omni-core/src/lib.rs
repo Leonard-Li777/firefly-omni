@@ -205,6 +205,22 @@ pub struct OmniPerceptionResult {
     #[serde(default)]
     pub pruned_ambiguous_words: Vec<String>,
 
+    // Tier 1 端侧纯 CPU 确定性文本特征与向量
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default)]
+    pub entities: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub structured_summary: Option<serde_json::Value>,
+    #[serde(default)]
+    pub one_sentence_desc: Option<String>,
+    #[serde(default)]
+    pub name_slots: Option<serde_json::Value>,
+    #[serde(default)]
+    pub embedding_dense: Option<Vec<f32>>,
+
     pub phash: Option<String>,
     pub is_corrupted: bool,
     pub benchmark: Option<OmniPerceptionBenchmark>,
