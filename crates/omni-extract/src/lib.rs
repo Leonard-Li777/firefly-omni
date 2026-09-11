@@ -39,7 +39,7 @@ impl OmniExtractor {
                 "magika": {
                     "label": if ext.is_empty() { "bin" } else { &ext },
                     "mime_type": mime_type,
-                    "group": if mime_type.starts_with("image/") { "image" } else if mime_type.starts_with("application/pdf") || ext == "docx" || ext == "xlsx" || ext == "pptx" { "document font" } else if mime_type.starts_with("audio/") { "audio" } else if mime_type.starts_with("video/") { "video" } else { "code/text" },
+                    "group": determine_file_group(&ext, &mime_type),
                     "name": format!("Magika Identified Format ({})", mime_type),
                     "score": 0.995,
                     "description": format!("Magika Neural Network Classification for {}", mime_type),
@@ -118,7 +118,16 @@ impl OmniExtractor {
             }
 
             if let Some(val) = exiftool_map.get("Title") { doc_meta.insert("title".into(), val.clone()); }
-            if let Some(val) = exiftool_map.get("Author").or_else(|| exiftool_map.get("Creator")) { doc_meta.insert("author".into(), val.clone()); }
+            if let Some((clean_author, authors_list)) = extract_and_clean_authors(&[
+                exiftool_map.get("Author"),
+                exiftool_map.get("Creator"),
+                exiftool_map.get("Artist"),
+                exiftool_map.get("By-line"),
+            ]) {
+                doc_meta.insert("author".into(), clean_author.into());
+                doc_meta.insert("authors".into(), serde_json::Value::Array(authors_list.iter().map(|a| serde_json::Value::String(a.clone())).collect()));
+                result.metadata["authors"] = serde_json::Value::Array(authors_list.into_iter().map(serde_json::Value::String).collect());
+            }
             if let Some(val) = exiftool_map.get("Subject") { doc_meta.insert("subject".into(), val.clone()); }
             if let Some(val) = exiftool_map.get("Keywords") { doc_meta.insert("keywords".into(), val.clone()); }
             if let Some(val) = exiftool_map.get("Creator") { doc_meta.insert("creator".into(), val.clone()); }
@@ -227,6 +236,19 @@ impl OmniExtractor {
             if let Some(val) = exiftool_map.get("Title") { audio_meta.entry("title".to_string()).or_insert(val.clone()); }
             if let Some(val) = exiftool_map.get("Artist") { audio_meta.entry("artist".to_string()).or_insert(val.clone()); }
             if let Some(val) = exiftool_map.get("Album") { audio_meta.entry("album".to_string()).or_insert(val.clone()); }
+
+            // 音频艺术家清洗与多作者拆分
+            let artist_val = audio_meta.get("artist").and_then(|v| v.as_str()).map(String::from);
+            if let Some(artist_str) = artist_val {
+                let (clean_artist, artists_list) = clean_and_split_authors(&artist_str);
+                if !artists_list.is_empty() {
+                    audio_meta.insert("artist".into(), clean_artist.into());
+                    audio_meta.insert("artists".into(), serde_json::Value::Array(artists_list.iter().map(|a| serde_json::Value::String(a.clone())).collect()));
+                    if result.metadata.get("authors").is_none() {
+                        result.metadata["authors"] = serde_json::Value::Array(artists_list.into_iter().map(serde_json::Value::String).collect());
+                    }
+                }
+            }
 
             result.metadata["audio"] = serde_json::Value::Object(audio_meta);
         }
@@ -1396,11 +1418,197 @@ fn truncate_string(s: &str, max_bytes: usize) -> String {
     }
 }
 
+/// 作者清洗与多分隔符拆分规则 (Omni 提取清洗归位)
+/// 自动识别常见分隔符（中英文逗号、分号、顿号、斜杠、&、and），过滤垃圾签名（admin、word 等），并去重
+pub fn clean_and_split_authors(raw: &str) -> (String, Vec<String>) {
+    let raw_trimmed = raw.trim();
+    if raw_trimmed.is_empty() {
+        return (String::new(), Vec::new());
+    }
+
+    // 黑名单关键词列表（大小写不敏感）
+    const BLACKLIST: &[&str] = &[
+        "unknown", "admin", "administrator", "user", "author", "creator",
+        "microsoft", "microsoft office", "microsoft word", "microsoft excel",
+        "microsoft powerpoint", "wps", "wps office", "adobe", "acrobat",
+        "windows user", "null", "undefined", "none", "anonymous", "test",
+        "未命名", "未知", "管理员"
+    ];
+
+    let is_noisy = |name: &str| -> bool {
+        let lower = name.trim().to_lowercase();
+        if lower.is_empty() || lower.len() < 2 || lower.len() > 64 {
+            return true;
+        }
+        // 检查是否全由纯符号或数字组成
+        if lower.chars().all(|c| !c.is_alphabetic()) {
+            return true;
+        }
+        for bad in BLACKLIST {
+            if lower == *bad || lower.starts_with(&format!("{} ", bad)) || lower.ends_with(&format!(" {}", bad)) {
+                return true;
+            }
+        }
+        false
+    };
+
+    // 多字符切分
+    let delimiters = [',', '，', ';', '；', '、', '/', '\\', '|', '\n', '\r'];
+    let mut parts = Vec::new();
+    for seg in raw_trimmed.split(|c| delimiters.contains(&c)) {
+        // 对 " & " 或 " and " 二次切分
+        for sub in seg.split(" & ") {
+            for sub2 in sub.split(" and ") {
+                let trimmed = sub2.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`');
+                if !is_noisy(trimmed) {
+                    parts.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    // 有序去重
+    let mut deduped: Vec<String> = Vec::new();
+    for p in parts {
+        if !deduped.iter().any(|x| x.eq_ignore_ascii_case(&p)) {
+            deduped.push(p);
+        }
+    }
+
+    let joined = deduped.join(", ");
+    (joined, deduped)
+}
+
+/// 从多个候选元数据字段中提取并清洗作者
+pub fn extract_and_clean_authors(values: &[Option<&serde_json::Value>]) -> Option<(String, Vec<String>)> {
+    for val_opt in values {
+        if let Some(val) = val_opt {
+            let raw_str = match val {
+                serde_json::Value::String(s) => s.as_str(),
+                _ => continue,
+            };
+            let (joined, list) = clean_and_split_authors(raw_str);
+            if !list.is_empty() {
+                return Some((joined, list));
+            }
+        }
+    }
+    None
+}
+
+/// 根据扩展名与 MIME 类型判定权威 FileGroup（优先扩展名字典，未命中由 Magika / MIME 补齐）
+pub fn determine_file_group(ext: &str, mime_type: &str) -> &'static str {
+    let clean_ext = ext.trim().trim_start_matches('.').to_lowercase();
+
+    // 1. 优先按照扩展名映射
+    match clean_ext.as_str() {
+        // 图片
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "ico" | "tiff" | "tif"
+        | "avif" | "heic" | "heif" | "raw" | "cr2" | "nef" | "arw" | "dng" | "psd" | "ai"
+        | "jxl" | "jp2" => return "image",
+
+        // 视频
+        "mp4" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "webm" | "m4v" | "3gp" | "mts" | "m2ts"
+        | "rmvb" | "vob" => return "video",
+
+        // ts 扩展名：若明确为视频流则判定为 video，否则默认归类为 TypeScript code
+        "ts" => {
+            if mime_type.starts_with("video/") || mime_type.contains("mp2t") {
+                return "video";
+            } else {
+                return "code";
+            }
+        }
+
+        // 音频
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "ape" | "wma" | "opus" | "aiff"
+        | "mid" | "midi" => return "audio",
+
+        // 办公文档
+        "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
+        | "rtf" | "pdf" | "csv" | "tsv" | "pages" | "numbers" | "key" => return "document",
+
+        // 电子书
+        "epub" | "mobi" | "azw3" | "fb2" | "djvu" | "cbr" | "cbz" => return "ebook",
+
+        // 源代码与工程
+        "js" | "jsx" | "tsx" | "py" | "java" | "c" | "cpp" | "cc" | "cxx" | "h" | "hpp"
+        | "rs" | "go" | "php" | "rb" | "swift" | "kt" | "kts" | "scala" | "cs" | "html" | "htm"
+        | "css" | "scss" | "less" | "vue" | "svelte" | "sh" | "bash" | "ps1" | "bat" | "cmd"
+        | "json" | "xml" | "yaml" | "yml" | "toml" | "sql" | "lua" | "dart" | "zig" => return "code",
+
+        // 纯文本
+        "txt" | "md" | "markdown" | "log" | "diff" | "patch" | "tex" | "rst" | "asciidoc" => return "text",
+
+        // 压缩包
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "tgz" | "iso" | "z" => return "archive",
+
+        // 可执行程序
+        "exe" | "msi" | "apk" | "app" | "dmg" | "deb" | "rpm" | "bin" | "dll" | "so" | "dylib" => return "executable",
+
+        // 字体
+        "ttf" | "otf" | "woff" | "woff2" | "eot" | "ttc" => return "font",
+
+        // 磁盘镜像
+        "img" | "vhd" | "vhdx" | "vmdk" | "qcow2" => return "diskimage",
+
+        // 数据库
+        "db" | "sqlite" | "sqlite3" | "mdb" | "accdb" => return "database",
+
+        // 模型
+        "onnx" | "gguf" | "safetensors" | "pt" | "pth" => return "model",
+
+        _ => {}
+    }
+
+    // 2. 扩展名未命中，由 MIME 类型补齐
+    if mime_type.starts_with("image/") {
+        "image"
+    } else if mime_type.starts_with("video/") {
+        "video"
+    } else if mime_type.starts_with("audio/") {
+        "audio"
+    } else if mime_type.starts_with("text/") {
+        "text"
+    } else if mime_type == "application/pdf" || mime_type.contains("officedocument") || mime_type.contains("msword") || mime_type.contains("ms-excel") || mime_type.contains("ms-powerpoint") {
+        "document"
+    } else if mime_type.contains("zip") || mime_type.contains("compressed") || mime_type.contains("tar") || mime_type.contains("archive") {
+        "archive"
+    } else if mime_type.contains("font") {
+        "font"
+    } else {
+        "unknown"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::io::Write;
+
+    #[test]
+    fn test_clean_and_split_authors() {
+        let raw = "张三, 李四; 王五 / Microsoft Word, admin & 赵六 and 孙七";
+        let (joined, list) = clean_and_split_authors(raw);
+        assert_eq!(list, vec!["张三", "李四", "王五", "赵六", "孙七"]);
+        assert_eq!(joined, "张三, 李四, 王五, 赵六, 孙七");
+
+        let noisy = "Administrator; unknown, Microsoft Office";
+        let (joined_noisy, list_noisy) = clean_and_split_authors(noisy);
+        assert!(list_noisy.is_empty());
+        assert!(joined_noisy.is_empty());
+    }
+
+    #[test]
+    fn test_determine_file_group() {
+        assert_eq!(determine_file_group("png", "application/octet-stream"), "image");
+        assert_eq!(determine_file_group(".docx", "application/octet-stream"), "document");
+        assert_eq!(determine_file_group("mp3", "application/octet-stream"), "audio");
+        assert_eq!(determine_file_group("py", "application/octet-stream"), "code");
+        assert_eq!(determine_file_group("xyz_unknown", "image/webp"), "image");
+        assert_eq!(determine_file_group("", "application/pdf"), "document");
+    }
 
     #[test]
     fn test_replace_embedded_image_ocr() {
