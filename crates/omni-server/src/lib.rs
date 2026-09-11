@@ -1444,9 +1444,24 @@ async fn perceive_file_handler(
         structured_summary: text_summary,
         one_sentence_desc: text_one_desc,
         name_slots: text_slots,
-        embedding_dense: text_emb,
+        embedding_dense: text_emb.clone(),
         benchmark: Some(benchmark),
-    })
+    });
+
+    // 跨支柱自动索引 (Pillar 4 -> Pillar 5): 若感知产出了稠密特征向量且有文本，自动异步入库双轨混合索引
+    if let (Some(ref emb), false) = (&text_emb, markdown_content.trim().is_empty()) {
+        let indexed_doc = omni_pro::search::IndexedDocument {
+            fingerprint: file_path.clone(),
+            embedding: emb.clone(),
+            searchable_text: format!("{}\n{}", file_name, markdown_content),
+        };
+        let search_arc = state.search.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = search_arc.upsert_batch(&[indexed_doc]);
+        });
+    }
+
+    result
 }
 
 /// 纯文本确定性特征分析请求体: POST /api/text/analyze
@@ -1495,7 +1510,19 @@ async fn search_index_handler(
     Json(req): Json<SearchIndexRequest>,
 ) -> Json<SearchIndexResponse> {
     let search = state.search.clone();
-    let res = tokio::task::spawn_blocking(move || search.upsert_batch(&req.documents)).await;
+    let res = tokio::task::spawn_blocking(move || {
+        let mut docs = req.documents;
+        let embedder = omni_pro::text::BekkoEmbedder::new();
+        for doc in &mut docs {
+            // 若未提供向量或维度不匹配，自动调用 BekkoEmbedder 补充 384 维向量
+            if doc.embedding.len() != omni_pro::search::EMBEDDING_DIM {
+                if let Ok(vec) = embedder.embed(&doc.searchable_text) {
+                    doc.embedding = vec;
+                }
+            }
+        }
+        search.upsert_batch(&docs)
+    }).await;
     match res {
         Ok(Ok(total)) => Json(SearchIndexResponse {
             success: true,
@@ -1544,9 +1571,18 @@ async fn search_hybrid_handler(
 ) -> Json<SearchHybridResponse> {
     let search = state.search.clone();
     let res = tokio::task::spawn_blocking(move || {
+        // 跨支柱补缝：若未显式提供 query_embedding，但提供了 query_text，自动通过 BekkoEmbedder 计算 384 维特征向量
+        let query_emb = match (req.query_embedding, req.query_text.as_deref()) {
+            (Some(emb), _) => Some(emb),
+            (None, Some(text)) if !text.trim().is_empty() => {
+                omni_pro::text::BekkoEmbedder::new().embed(text).ok()
+            }
+            _ => None,
+        };
+
         search.search_hybrid(
             req.query_text.as_deref(),
-            req.query_embedding.as_deref(),
+            query_emb.as_deref(),
             req.top_k,
         )
     })
@@ -1575,6 +1611,7 @@ async fn search_hybrid_handler(
 #[serde(rename_all = "camelCase")]
 pub struct SearchClusterRequest {
     pub documents: Vec<omni_pro::search::ClusterDocument>,
+    pub prompt: Option<String>,
     pub prompt_embedding: Option<Vec<f32>>,
     #[serde(default = "default_distance_threshold")]
     pub distance_threshold: f32,
@@ -1605,9 +1642,18 @@ async fn search_cluster_handler(
 ) -> Json<SearchClusterResponse> {
     let search = state.search.clone();
     let res = tokio::task::spawn_blocking(move || {
+        // 跨支柱补缝：若未显式提供 prompt_embedding，但提供了自然语言 prompt，自动通过 BekkoEmbedder 计算聚类引导向量
+        let prompt_emb = match (req.prompt_embedding, req.prompt.as_deref()) {
+            (Some(emb), _) => Some(emb),
+            (None, Some(p)) if !p.trim().is_empty() => {
+                omni_pro::text::BekkoEmbedder::new().embed(p).ok()
+            }
+            _ => None,
+        };
+
         search.cluster(
             &req.documents,
-            req.prompt_embedding.as_deref(),
+            prompt_emb.as_deref(),
             req.distance_threshold,
             req.max_leaf_size,
         )
