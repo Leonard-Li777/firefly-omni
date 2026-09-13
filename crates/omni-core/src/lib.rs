@@ -27,6 +27,9 @@ pub struct OmniConfig {
     /// 是否启用 Tier 1 端侧文本分析（#615~#618 分块/关键词/向量/槽位全流程，默认开启）
     #[serde(default = "default_true")]
     pub enable_text_analysis: bool,
+    /// 当前用户界面语言（BCP-47，如 zh-CN），由桌面端 /api/config 同步
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 fn default_audio_analysis_duration() -> u32 {
@@ -51,6 +54,7 @@ impl Default for OmniConfig {
             audio_analysis_duration: 30,
             excluded_items: Vec::new(),
             enable_text_analysis: true,
+            language: None,
         }
     }
 }

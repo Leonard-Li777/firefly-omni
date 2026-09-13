@@ -3933,7 +3933,7 @@ dependencies = [
 
 [[package]]
 name = "omni-cleanup"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -3948,7 +3948,7 @@ dependencies = [
 
 [[package]]
 name = "omni-cli"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -3963,7 +3963,7 @@ dependencies = [
 
 [[package]]
 name = "omni-core"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "serde",
@@ -3974,7 +3974,7 @@ dependencies = [
 
 [[package]]
 name = "omni-cover"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "image",
@@ -3991,7 +3991,7 @@ dependencies = [
 
 [[package]]
 name = "omni-extract"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anydoc",
  "anyhow",
@@ -4016,7 +4016,7 @@ dependencies = [
 
 [[package]]
 name = "omni-geo"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "flate2",
  "serde",
@@ -4025,7 +4025,7 @@ dependencies = [
 
 [[package]]
 name = "omni-hownet"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -4037,7 +4037,7 @@ dependencies = [
 
 [[package]]
 name = "omni-mcp"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "omni-core",
@@ -4051,7 +4051,7 @@ dependencies = [
 
 [[package]]
 name = "omni-node"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "napi",
  "napi-derive",
@@ -4064,7 +4064,7 @@ dependencies = [
 
 [[package]]
 name = "omni-pro"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "image",
@@ -4085,7 +4085,7 @@ dependencies = [
 
 [[package]]
 name = "omni-pro-stub"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4098,7 +4098,7 @@ dependencies = [
 
 [[package]]
 name = "omni-search"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "kodama",
@@ -4112,7 +4112,7 @@ dependencies = [
 
 [[package]]
 name = "omni-server"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -4133,7 +4133,7 @@ dependencies = [
 
 [[package]]
 name = "omni-text"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4152,7 +4152,7 @@ dependencies = [
 
 [[package]]
 name = "omni-vision"
-version = "0.1.3"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "image",
