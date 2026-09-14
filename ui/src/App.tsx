@@ -23,8 +23,14 @@ import {
   Video,
   XCircle,
   MapPin,
-  Globe2
+  Globe2,
+  Sparkles,
+  BookOpen,
+  FolderTree
 } from 'lucide-react'
+import { TextSlotTab } from './components/TextSlotTab'
+import { HowNetTab } from './components/HowNetTab'
+import { SearchClusterTab } from './components/SearchClusterTab'
 
 // ---- 离线反向地理编码 (/api/geo/reverse) 相关类型 ----
 interface GeoPointResult {
@@ -130,7 +136,7 @@ export default function App() {
   const [isPro, setIsPro] = useState<boolean>(false)
   const [geoAvailable, setGeoAvailable] = useState<boolean | null>(null)
   const [cleanupAvailable, setCleanupAvailable] = useState<boolean>(false)
-  const [activeTab, setActiveTab] = useState<'inspector' | 'cleanup' | 'geo' | 'config'>('inspector')
+  const [activeTab, setActiveTab] = useState<'inspector' | 'cleanup' | 'geo' | 'config' | 'text' | 'hownet' | 'search'>('inspector')
   const [inspectorSection, setInspectorSection] = useState<'all' | 'magika' | 'exif' | 'text' | 'ocr'>('all')
   const [files, setFiles] = useState<ExtractionResult[]>([])
   const [selectedFileIndex, setSelectedFileIndex] = useState<number | null>(null)
@@ -153,7 +159,7 @@ export default function App() {
   const [strategyBadNames, setStrategyBadNames] = useState<boolean>(false)
   const [strategyExifRemover, setStrategyExifRemover] = useState<boolean>(false)
   const [strategyVideoOptimizer, setStrategyVideoOptimizer] = useState<boolean>(false)
-  const [nameIssuesMode, setNameIssuesMode] = useState<'multilingual' | 'strict_ascii'>('multilingual')
+  const [nameIssuesMode] = useState<'multilingual' | 'strict_ascii'>('multilingual')
 
   const [minSimilarity, setMinSimilarity] = useState<number>(9.0)
   const [scanning, setScanning] = useState<boolean>(false)
@@ -316,7 +322,8 @@ export default function App() {
           paths: pathsArray,
           strategies,
           min_similarity: minSimilarity,
-          check_video: strategyVideo
+          check_video: strategyVideo,
+          name_issues_mode: nameIssuesMode
         }),
         signal: controller.signal
       })
@@ -842,24 +849,24 @@ MIME Type: application/pdf
         </div>
 
         {/* Navigation Tabs */}
-        <nav className="flex space-x-1 bg-slate-800/60 p-1 rounded-xl border border-slate-700/50">
+        <nav className="flex items-center space-x-1 bg-slate-800/60 p-1 rounded-xl border border-slate-700/50 flex-wrap">
           <button
             onClick={() => setActiveTab('inspector')}
-            className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all ${
+            className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-all ${
               activeTab === 'inspector'
                 ? 'bg-amber-500 text-slate-950 font-semibold shadow-md'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
           >
             <FileCode className="w-4 h-4 inline mr-1.5" />
-            Extraction Inspector (提纯与预览)
+            文件提纯 (Inspector)
           </button>
 
           {/* Pro Feature: 智能文件清理与治理 */}
           {cleanupAvailable && (
             <button
               onClick={() => setActiveTab('cleanup')}
-              className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center space-x-1.5 ${
+              className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center space-x-1.5 ${
                 activeTab === 'cleanup'
                   ? 'bg-amber-500 text-slate-950 font-semibold shadow-md'
                   : 'text-slate-400 hover:text-slate-200'
@@ -875,28 +882,67 @@ MIME Type: application/pdf
           {isPro && (
             <button
               onClick={() => setActiveTab('geo')}
-              className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center space-x-1.5 ${
+              className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center space-x-1.5 ${
                 activeTab === 'geo'
                   ? 'bg-amber-500 text-slate-950 font-semibold shadow-md'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
               <MapPin className="w-4 h-4 inline mr-1" />
-              <span>Geo 地理逆编码</span>
+              <span>Geo 逆编码</span>
               <span className="text-[10px] uppercase font-mono font-bold bg-amber-400/20 text-amber-300 border border-amber-400/40 px-1 py-0.2 rounded">PRO</span>
             </button>
           )}
 
+          {/* Dev Testbench: 文本分析与槽位更名 */}
+          <button
+            onClick={() => setActiveTab('text')}
+            className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center space-x-1.5 ${
+              activeTab === 'text'
+                ? 'bg-sky-500 text-slate-950 font-semibold shadow-md'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Sparkles className="w-4 h-4 inline mr-1" />
+            <span>Text & Slot</span>
+          </button>
+
+          {/* Dev Testbench: HowNet 语义底座 */}
+          <button
+            onClick={() => setActiveTab('hownet')}
+            className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center space-x-1.5 ${
+              activeTab === 'hownet'
+                ? 'bg-indigo-500 text-slate-950 font-semibold shadow-md'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <BookOpen className="w-4 h-4 inline mr-1" />
+            <span>HowNet 语义</span>
+          </button>
+
+          {/* Dev Testbench: 双轨混合检索与 HAC 聚类 */}
+          <button
+            onClick={() => setActiveTab('search')}
+            className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center space-x-1.5 ${
+              activeTab === 'search'
+                ? 'bg-purple-500 text-slate-950 font-semibold shadow-md'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <FolderTree className="w-4 h-4 inline mr-1" />
+            <span>检索与聚类</span>
+          </button>
+
           <button
             onClick={() => setActiveTab('config')}
-            className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all ${
+            className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-all ${
               activeTab === 'config'
                 ? 'bg-amber-500 text-slate-950 font-semibold shadow-md'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
           >
             <Settings className="w-4 h-4 inline mr-1.5" />
-            Engine Settings
+            引擎设置 (Settings)
           </button>
         </nav>
 
@@ -2448,6 +2494,23 @@ MIME Type: application/pdf
                 </button>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* 开发者测试工作台 Tab 渲染 */}
+        {activeTab === 'text' && (
+          <div className="lg:col-span-12 min-h-0 overflow-y-auto w-full h-full pb-8 pr-1">
+            <TextSlotTab />
+          </div>
+        )}
+        {activeTab === 'hownet' && (
+          <div className="lg:col-span-12 min-h-0 overflow-y-auto w-full h-full pb-8 pr-1">
+            <HowNetTab />
+          </div>
+        )}
+        {activeTab === 'search' && (
+          <div className="lg:col-span-12 min-h-0 overflow-y-auto w-full h-full pb-8 pr-1">
+            <SearchClusterTab />
           </div>
         )}
       </main>

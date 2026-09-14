@@ -14,9 +14,6 @@ members = [
     "omni-pro/crates/omni-cleanup",
     "omni-pro/crates/omni-cover",
     "omni-pro/crates/omni-vision",
-    "omni-pro/crates/omni-hownet",
-    "omni-pro/crates/omni-search",
-    "omni-pro/crates/omni-text",
 ]
 
 [workspace.package]

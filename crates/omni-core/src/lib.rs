@@ -5,6 +5,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 基础分析与配置规范 (对齐 Desktop ConfigKey)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OmniConfig {
     pub enable_office_cover: bool,
     /// 文档 OCR 识别数量上限（Office 内嵌图数 / PDF 页数），0 表示不识别，-1 表示不限
