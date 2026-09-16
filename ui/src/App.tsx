@@ -26,11 +26,16 @@ import {
   Globe2,
   Sparkles,
   BookOpen,
-  FolderTree
+  FolderTree,
+  GitBranch,
+  Tag,
+  Boxes,
+  CheckCircle2
 } from 'lucide-react'
 import { TextSlotTab } from './components/TextSlotTab'
 import { HowNetTab } from './components/HowNetTab'
 import { SearchClusterTab } from './components/SearchClusterTab'
+import { TaxonomyTab } from './components/TaxonomyTab'
 
 // ---- 离线反向地理编码 (/api/geo/reverse) 相关类型 ----
 interface GeoPointResult {
@@ -83,14 +88,48 @@ const GEO_PRESETS: Array<{ label: string; value: string }> = [
 // 支持的界面语言选项（BCP-47 标签，服务端归一化到基础子码）
 const GEO_LANGUAGE_OPTIONS = ['en', 'zh-CN', 'ja-JP', 'ko-KR', 'fr-FR', 'de-DE', 'es-ES', 'ru-RU', 'pt-PT', 'ar-EG']
 
+export interface TagChainItem {
+  code: string
+  name: string
+  confidence: number
+}
+
+export interface CandidateHypothesisItem {
+  hypothesis: string
+  score: number
+  cosine_global?: number
+  cosine_desc?: number
+  has_cross_modal?: boolean
+  slot_breakdown?: Record<string, string>
+}
+
 interface ApiResponseData {
   file_path?: string
   mime_type?: string
   file_size?: number
   markdown_content?: string
+  ocr_text?: string
   metadata?: any
   phash?: string
   is_corrupted?: boolean
+  // 三阶段全模态融合结果字段
+  fused_tags?: TagChainItem[]
+  visual_tags?: TagChainItem[]
+  candidate_hypotheses?: CandidateHypothesisItem[]
+  winning_hypothesis?: string
+  smart_name?: string
+  content_description?: string
+  photo_type?: string
+  quality_score?: number
+  aesthetic_score?: number
+  has_watermark?: boolean
+  watermark_level?: number
+  has_mosaic?: boolean
+  mosaic_level?: number
+  security_level?: string
+  workflow_state?: string
+  geo_address?: string
+  benchmark?: any
 }
 
 interface ExtractionResult {
@@ -136,8 +175,8 @@ export default function App() {
   const [isPro, setIsPro] = useState<boolean>(false)
   const [geoAvailable, setGeoAvailable] = useState<boolean | null>(null)
   const [cleanupAvailable, setCleanupAvailable] = useState<boolean>(false)
-  const [activeTab, setActiveTab] = useState<'inspector' | 'cleanup' | 'geo' | 'config' | 'text' | 'hownet' | 'search'>('inspector')
-  const [inspectorSection, setInspectorSection] = useState<'all' | 'magika' | 'exif' | 'text' | 'ocr'>('all')
+  const [activeTab, setActiveTab] = useState<'inspector' | 'cleanup' | 'geo' | 'config' | 'text' | 'hownet' | 'search' | 'taxonomy'>('inspector')
+  const [inspectorSection, setInspectorSection] = useState<'all' | 'fused' | 'magika' | 'exif' | 'text' | 'ocr'>('all')
   const [files, setFiles] = useState<ExtractionResult[]>([])
   const [selectedFileIndex, setSelectedFileIndex] = useState<number | null>(null)
   const [copied, setCopied] = useState(false)
@@ -423,10 +462,15 @@ export default function App() {
     if (!singleFilePath.trim()) return
     setInspectingSingleFile(true)
     try {
-      const res = await fetch('/api/extract', {
+      const res = await fetch('/api/perceive', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file_path: singleFilePath })
+        body: JSON.stringify({
+          file_path: singleFilePath.trim(),
+          enable_visual_tags: true,
+          enable_text_analysis: true,
+          enable_geo_reverse: true
+        })
       })
       if (res.ok) {
         const data = await res.json()
@@ -435,9 +479,71 @@ export default function App() {
           is_corrupted: data.is_corrupted,
           file_size: data.file_size
         })
+
+        // 同时将全模态感知结果注入 Inspector 列表并置为选中
+        const fName = singleFilePath.trim().split(/[/\\]/).pop() || singleFilePath
+        const newResult: ExtractionResult = {
+          fileName: fName,
+          fileSize: data.file_size || 0,
+          mimeType: data.mime_type || 'application/octet-stream',
+          detectionSource: 'Omni Multimodal Phase 1~3',
+          phash: data.phash,
+          extractedText: data.markdown_content || data.ocr_text || '',
+          status: 'success',
+          lastAnalyzedAt: new Date().toLocaleTimeString(),
+          apiResponse: data
+        }
+
+        setFiles(prev => {
+          const filtered = prev.filter(f => f.fileName !== fName)
+          return [newResult, ...filtered]
+        })
+        setSelectedFileIndex(0)
       }
-    } catch {
-      // Ignore
+    } catch (e: any) {
+      console.error('全模态感知调用异常:', e)
+    } finally {
+      setInspectingSingleFile(false)
+    }
+  }
+
+  const handleInspectSingleFileDirect = async (targetPath: string) => {
+    setSingleFilePath(targetPath)
+    setInspectingSingleFile(true)
+    try {
+      const res = await fetch('/api/perceive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          file_path: targetPath.trim(),
+          enable_visual_tags: true,
+          enable_text_analysis: true,
+          enable_geo_reverse: true
+        })
+      })
+      if (res.ok) {
+        const data = await res.json()
+        const fName = targetPath.trim().split(/[/\\]/).pop() || targetPath
+        const newResult: ExtractionResult = {
+          fileName: fName,
+          fileSize: data.file_size || 0,
+          mimeType: data.mime_type || 'application/octet-stream',
+          detectionSource: 'Omni Multimodal Phase 1~3',
+          phash: data.phash,
+          extractedText: data.markdown_content || data.ocr_text || '',
+          status: 'success',
+          lastAnalyzedAt: new Date().toLocaleTimeString(),
+          apiResponse: data
+        }
+
+        setFiles(prev => {
+          const filtered = prev.filter(f => f.fileName !== fName)
+          return [newResult, ...filtered]
+        })
+        setSelectedFileIndex(0)
+      }
+    } catch (e) {
+      console.error('触发感知失败:', e)
     } finally {
       setInspectingSingleFile(false)
     }
@@ -933,6 +1039,22 @@ MIME Type: application/pdf
             <span>检索与聚类</span>
           </button>
 
+          {/* Core Feature: 常驻受控标签底座与动态父级推荐 (Taxonomy) */}
+          <button
+            onClick={() => setActiveTab('taxonomy')}
+            className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center space-x-1.5 ${
+              activeTab === 'taxonomy'
+                ? 'bg-indigo-500 text-white font-semibold shadow-md shadow-indigo-500/30'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <GitBranch className="w-4 h-4 inline mr-1 text-indigo-400" />
+            <span>语义标签底座</span>
+            <span className="text-[10px] uppercase font-mono font-bold bg-indigo-400/20 text-indigo-300 border border-indigo-400/40 px-1 py-0.2 rounded">
+              Task 626
+            </span>
+          </button>
+
           <button
             onClick={() => setActiveTab('config')}
             className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-all ${
@@ -1149,6 +1271,17 @@ MIME Type: application/pdf
                         >
                           <Eye className="w-3.5 h-3.5 mr-1" />
                           OCR
+                        </button>
+                        <button
+                          onClick={() => setInspectorSection('fused')}
+                          className={`px-2.5 py-1 rounded-lg transition-all flex items-center ${
+                            inspectorSection === 'fused'
+                              ? 'bg-emerald-500 text-slate-950 font-bold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          <Tag className="w-3.5 h-3.5 mr-1 text-emerald-400" />
+                          融合标签 (Phase 3)
                         </button>
                       </div>
 
@@ -1486,6 +1619,190 @@ MIME Type: application/pdf
                             </div>
                           )}
                         </div>
+                      </div>
+                    )}
+
+                    {/* Zone 5: 全模态三阶段融合决策与标签体系 (Phase 3 Fused Tags & Arbitration) */}
+                    {(inspectorSection === 'all' || inspectorSection === 'fused') && (
+                      <div className={`bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-4 min-h-0 overflow-hidden ${
+                        inspectorSection === 'all' ? 'md:col-span-2' : ''
+                      }`}>
+                        <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
+                          <span className="text-xs font-bold text-emerald-400 flex items-center">
+                            <Tag className="w-4 h-4 mr-1.5 text-emerald-400" />
+                            5. 全模态三阶段融合决策与标签体系 (Phase 3 Fused Tags & Arbitration)
+                          </span>
+                          <div className="flex items-center space-x-2">
+                            <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 font-mono">
+                              Task 626 & PRD §4.1
+                            </span>
+                            {selectedFile.fileName && (
+                              <button
+                                onClick={() => handleInspectSingleFileDirect(selectedFile.fileName)}
+                                className="text-[10px] px-2 py-0.5 rounded bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-300 border border-indigo-500/40 font-mono flex items-center transition-all"
+                                title="通过 /api/perceive 重新执行全模态三阶段闭环"
+                              >
+                                <Zap className="w-3 h-3 mr-1 text-amber-400" />
+                                触发 /api/perceive
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Top: 智能命名与一句话描述 */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          <div className="bg-slate-900/60 p-3 rounded-xl border border-slate-800">
+                            <span className="text-[10px] font-bold text-amber-400 uppercase tracking-wider block mb-1">
+                              胜出智能文件命名 (smart_name)
+                            </span>
+                            <div className="text-xs font-mono font-bold text-slate-100 truncate flex items-center">
+                              <Sparkles className="w-3.5 h-3.5 mr-1.5 text-amber-400 flex-shrink-0" />
+                              <span className="truncate">{selectedFile.apiResponse?.smart_name || selectedFile.fileName}</span>
+                            </div>
+                            <span className="text-[10px] text-slate-500 mt-1 block">
+                              基于 SlotEngine 纯 CPU 槽位矩阵与 bekko-a8m 交叉打分选出
+                            </span>
+                          </div>
+
+                          <div className="bg-slate-900/60 p-3 rounded-xl border border-slate-800">
+                            <span className="text-[10px] font-bold text-sky-400 uppercase tracking-wider block mb-1">
+                              内容一句话描述 (content_description)
+                            </span>
+                            <div className="text-xs text-slate-200 line-clamp-2">
+                              {selectedFile.apiResponse?.content_description || selectedFile.apiResponse?.winning_hypothesis || '暂无详细一句话语义描述'}
+                            </div>
+                            {selectedFile.apiResponse?.winning_hypothesis && (
+                              <span className="text-[10px] text-indigo-400 font-mono mt-1 block truncate">
+                                胜出假设: {selectedFile.apiResponse.winning_hypothesis}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Middle: 终极融合完美标签集 (fused_tags) */}
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-bold text-slate-300 flex items-center">
+                              <CheckCircle2 className="w-3.5 h-3.5 mr-1.5 text-emerald-400" />
+                              终极落库权威标签集 (fused_tags: 第一落库权威)
+                            </span>
+                            <span className="text-[10px] text-slate-500 font-mono">
+                              共 {selectedFile.apiResponse?.fused_tags?.length || 0} 个有效维度标签
+                            </span>
+                          </div>
+
+                          {selectedFile.apiResponse?.fused_tags && selectedFile.apiResponse.fused_tags.length > 0 ? (
+                            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5">
+                              {selectedFile.apiResponse.fused_tags.map((tag, tIdx) => (
+                                <div
+                                  key={tIdx}
+                                  className="bg-slate-900/90 border border-emerald-500/30 hover:border-emerald-500/60 rounded-xl p-2.5 transition-all flex flex-col justify-between space-y-1.5"
+                                >
+                                  <div className="flex items-start justify-between gap-1">
+                                    <span className="font-bold text-xs text-slate-100 truncate" title={tag.name}>
+                                      {tag.name}
+                                    </span>
+                                    <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex-shrink-0">
+                                      {(tag.confidence * 100).toFixed(0)}%
+                                    </span>
+                                  </div>
+                                  <div className="text-[10px] font-mono text-slate-400 truncate" title={tag.code}>
+                                    {tag.code}
+                                  </div>
+                                  <div className="flex items-center justify-between text-[9px] text-slate-500 pt-1 border-t border-slate-800">
+                                    <span>
+                                      {tag.code.startsWith('dim.6') || tag.code.startsWith('dim.26') || tag.code.startsWith('dim.124') || tag.code.startsWith('dim.125') ? '🔒 单选互斥胜出' : '✨ 多选并存'}
+                                    </span>
+                                    {tag.confidence >= 0.85 && (
+                                      <span className="text-amber-400 font-semibold">⚡ 互证奖励</span>
+                                    )}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="p-4 rounded-xl bg-slate-900/40 border border-slate-800 text-center text-slate-500 text-xs">
+                              (当前分析未产生融合标签，请点击右上角“触发 /api/perceive”进行全模态深度感知)
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Bottom: SlotEngine 候选短语矩阵与双锚点打分 (Candidate Hypotheses Matrix) */}
+                        {selectedFile.apiResponse?.candidate_hypotheses && selectedFile.apiResponse.candidate_hypotheses.length > 0 && (
+                          <div className="space-y-2 pt-2 border-t border-slate-800">
+                            <span className="text-xs font-bold text-slate-300 flex items-center">
+                              <Boxes className="w-3.5 h-3.5 mr-1.5 text-indigo-400" />
+                              SlotEngine 候选短语矩阵与双锚点几何打分 (E_global ⊗ E_desc)
+                            </span>
+                            <div className="overflow-x-auto">
+                              <table className="w-full text-[11px] font-mono text-left text-slate-300">
+                                <thead className="bg-slate-900/80 text-slate-400 uppercase text-[10px]">
+                                  <tr>
+                                    <th className="p-2 rounded-l">候选短语/描述假设</th>
+                                    <th className="p-2 text-center">综合得分 S(Ti)</th>
+                                    <th className="p-2 text-center">E_global 余弦</th>
+                                    <th className="p-2 text-center">E_desc 余弦</th>
+                                    <th className="p-2 text-center">跨模态互证</th>
+                                    <th className="p-2 rounded-r text-center">状态</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-800/60">
+                                  {selectedFile.apiResponse.candidate_hypotheses.map((hyp, hIdx) => {
+                                    const isWin = selectedFile.apiResponse?.winning_hypothesis === hyp.hypothesis || hIdx === 0
+                                    return (
+                                      <tr key={hIdx} className={isWin ? 'bg-indigo-950/40 text-slate-100 font-bold' : 'hover:bg-slate-900/40'}>
+                                        <td className="p-2 truncate max-w-xs">{hyp.hypothesis}</td>
+                                        <td className="p-2 text-center text-emerald-400 font-bold">{(hyp.score * 100).toFixed(1)}%</td>
+                                        <td className="p-2 text-center text-slate-400">{hyp.cosine_global !== undefined ? hyp.cosine_global.toFixed(3) : '-'}</td>
+                                        <td className="p-2 text-center text-slate-400">{hyp.cosine_desc !== undefined ? hyp.cosine_desc.toFixed(3) : '-'}</td>
+                                        <td className="p-2 text-center">
+                                          {hyp.has_cross_modal ? (
+                                            <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[9px]">
+                                              +0.20
+                                            </span>
+                                          ) : (
+                                            <span className="text-slate-600">-</span>
+                                          )}
+                                        </td>
+                                        <td className="p-2 text-center">
+                                          {isWin ? (
+                                            <span className="px-2 py-0.5 rounded bg-indigo-500/30 text-indigo-300 border border-indigo-500/50 text-[10px]">
+                                              🏆 胜出
+                                            </span>
+                                          ) : (
+                                            <span className="text-slate-500 text-[10px]">候补</span>
+                                          )}
+                                        </td>
+                                      </tr>
+                                    )
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Benchmark 时延指标条 */}
+                        {selectedFile.apiResponse?.benchmark && (
+                          <div className="p-2.5 rounded-xl bg-slate-900/60 border border-slate-800/80 flex flex-wrap items-center justify-between text-[11px] font-mono text-slate-400 gap-2">
+                            <span className="font-bold text-slate-300">全模态性能 SLO 指标:</span>
+                            {selectedFile.apiResponse.benchmark.total_ms !== undefined && (
+                              <span className="text-emerald-400 font-bold">总耗时: {selectedFile.apiResponse.benchmark.total_ms}ms</span>
+                            )}
+                            {selectedFile.apiResponse.benchmark.magika_ms !== undefined && (
+                              <span>Magika: {selectedFile.apiResponse.benchmark.magika_ms}ms</span>
+                            )}
+                            {selectedFile.apiResponse.benchmark.vision_ms !== undefined && (
+                              <span>视觉模型: {selectedFile.apiResponse.benchmark.vision_ms}ms</span>
+                            )}
+                            {selectedFile.apiResponse.benchmark.ocr_ms !== undefined && (
+                              <span>OCR: {selectedFile.apiResponse.benchmark.ocr_ms}ms</span>
+                            )}
+                            {selectedFile.apiResponse.benchmark.text_ms !== undefined && (
+                              <span>文本分析: {selectedFile.apiResponse.benchmark.text_ms}ms</span>
+                            )}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -2511,6 +2828,11 @@ MIME Type: application/pdf
         {activeTab === 'search' && (
           <div className="lg:col-span-12 min-h-0 overflow-y-auto w-full h-full pb-8 pr-1">
             <SearchClusterTab />
+          </div>
+        )}
+        {activeTab === 'taxonomy' && (
+          <div className="lg:col-span-12 min-h-0 overflow-y-auto w-full h-full pb-8 pr-1">
+            <TaxonomyTab />
           </div>
         )}
       </main>

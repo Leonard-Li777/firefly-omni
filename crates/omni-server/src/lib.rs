@@ -91,6 +91,7 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/api/search/index", post(search_index_handler))
         .route("/api/search/hybrid", post(search_hybrid_handler))
         .route("/api/search/cluster", post(search_cluster_handler))
+        .route("/api/taxonomy/resolve-parent", post(taxonomy_resolve_parent_handler))
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .with_state(state)
 }
@@ -1178,7 +1179,7 @@ async fn perceive_file_handler(
         .chain(mobilenet_tags.iter())
         .chain(nsfw_tags.iter())
         .chain(quality_issues.iter())
-        .chain(ram_tags.iter().map(|r| &r.tag))
+        .chain(ram_tags.iter().map(|r| &r.name))
     {
         if !detected_visual_tags.contains(tag) {
             detected_visual_tags.push(tag.clone());
@@ -1284,23 +1285,22 @@ async fn perceive_file_handler(
 
     // 6.1 首先将已具备完整维度与逻辑泛维度的 RAM++ 标签加入
     for r in &ram_tags {
-        if !structured_visual_tags.iter().any(|t| t.tag.eq_ignore_ascii_case(&r.tag)) {
+        if !structured_visual_tags.iter().any(|t| t.name.eq_ignore_ascii_case(&r.name)) {
             structured_visual_tags.push(r.clone());
         }
     }
 
     // 6.2 将其他各大引擎的有效视觉标签 (经过互斥门禁过滤的 detected_visual_tags) 统一映射为 TagChainItem
     for raw_tag in &detected_visual_tags {
-        if !structured_visual_tags.iter().any(|t| t.tag.eq_ignore_ascii_case(raw_tag)) {
+        if !structured_visual_tags.iter().any(|t| t.name.eq_ignore_ascii_case(raw_tag)) {
             let item = if is_pro {
                 omni_pro::OmniVisionEngine::resolve_tag_to_chain_item(raw_tag, 0.92)
             } else {
                 omni_core::TagChainItem {
-                    tag: raw_tag.clone(),
+                    code: format!("dim.28.{}", raw_tag),
+                    name: raw_tag.clone(),
                     confidence: 0.92,
-                    dimension_id: 28,
-                    dimension_name: "内容标签".to_string(),
-                    logic_pan_dimension: raw_tag.clone(),
+                    parent_code: None,
                 }
             };
             structured_visual_tags.push(item);
@@ -1324,7 +1324,7 @@ async fn perceive_file_handler(
     };
 
     // 6.3 ram_tags 降级为平铺字符串数组 (仅包含 RAM++ 检测出的纯实体标签名)
-    let ram_tags_flat: Vec<String> = ram_tags.into_iter().map(|r| r.tag).collect();
+    let ram_tags_flat: Vec<String> = ram_tags.into_iter().map(|r| r.name).collect();
 
     let audio_transcript = metadata
         .get("audio_transcript")
@@ -1402,21 +1402,53 @@ async fn perceive_file_handler(
         ),
     };
 
-    // 智能重命名回填策略：若图像仲裁没有产出 smart_name，回填文本分析的确定性槽位重命名
-    let smart_name = smart_name.or(text_smart_name);
-    // 概要描述回填策略：若视觉没有给出 content_description，回填文本的一句话描述
-    let content_description = content_description.or_else(|| text_one_desc.clone());
+    // 9. 第三阶段: 双锚点交叉向量验证与多模态终局融合 (Task 626)
+    // 汇聚第二阶段收集到的所有多模态异构信息为 MultimodalContext
+    let multimodal_ctx = omni_core::MultimodalContext {
+        file_path: file_path.clone(),
+        file_name: file_name.clone(),
+        mime_type: mime_type.clone(),
+        document_text: if !is_image && !markdown_content.trim().is_empty() { Some(markdown_content.clone()) } else { None },
+        ocr_text: ocr_text.clone(),
+        audio_transcript: audio_transcript.clone(),
+        visual_tags: structured_visual_tags.clone(),
+        exif_metadata: metadata.clone(),
+        is_image,
+        is_document: !is_image && !is_video,
+        is_audio_or_video: is_video || audio_transcript.is_some(),
+    };
+
+    let fusion_outcome = if is_pro {
+        omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate(&multimodal_ctx)
+    } else {
+        omni_pro::text::FusedPerceptionOutcome {
+            smart_name: None,
+            content_description: None,
+            fused_tags: structured_visual_tags.clone(),
+            candidate_hypotheses: Vec::new(),
+        }
+    };
+
+    // 终局智能重命名与描述：优先取第三阶段双锚点交叉验证胜出者，平滑回退
+    let smart_name = fusion_outcome.smart_name.or(smart_name).or(text_smart_name);
+    let content_description = fusion_outcome.content_description.or(content_description).or_else(|| text_one_desc.clone());
+    let fused_tags = if !fusion_outcome.fused_tags.is_empty() {
+        fusion_outcome.fused_tags
+    } else {
+        structured_visual_tags.clone()
+    };
 
     benchmark.total_ms = t_start.elapsed().as_millis() as u64;
 
     tracing::info!(
-        "[OmniServer] 原生多模态感知完成: file={}, 耗时={}ms, watermark_level={:?}, mosaic_level={:?}, has_text={:?}, visual_tags_count={}, ram_tags={:?}, geo={:?}",
+        "[OmniServer] 原生多模态感知完成: file={}, 耗时={}ms, watermark_level={:?}, mosaic_level={:?}, has_text={:?}, visual_tags_count={}, fused_tags_count={}, ram_tags={:?}, geo={:?}",
         file_path,
         benchmark.total_ms,
         watermark_level,
         mosaic_level,
         has_text,
         structured_visual_tags.len(),
+        fused_tags.len(),
         ram_tags_flat,
         geo_address
     );
@@ -1463,9 +1495,10 @@ async fn perceive_file_handler(
         phash,
         is_corrupted,
         // 级联假设仲裁终局字段
-        candidate_hypotheses: cascade_candidates,
+        candidate_hypotheses: if !fusion_outcome.candidate_hypotheses.is_empty() { fusion_outcome.candidate_hypotheses } else { cascade_candidates },
         winning_hypothesis,
         activated_dimension_tags,
+        fused_tags,
         smart_name,
         content_description,
         pruned_ambiguous_words,
@@ -1547,6 +1580,64 @@ fn empty_text_analysis_result() -> omni_pro::text::TextAnalysisResult {
         chunks: Vec::new(),
         duration_ms: 0,
     }
+}
+
+/// 语义标签父级求解请求体: POST /api/taxonomy/resolve-parent
+#[derive(Deserialize)]
+pub struct ResolveParentRequest {
+    pub tag_name: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub context_hint: Option<String>,
+}
+
+/// 语义标签父级求解响应体 (严格对齐 PRD §4.3 B 契约)
+#[derive(Serialize)]
+pub struct ResolveParentResponse {
+    pub success: bool,
+    pub parent_code: String,
+    pub parent_name: String,
+    pub confidence: f32,
+    pub suggested_depth: u32,
+    pub materialized_paths: Vec<omni_pro::text::MaterializedPathItem>,
+}
+
+/// 语义标签父级推荐与物化路径推导 API: POST /api/taxonomy/resolve-parent
+async fn taxonomy_resolve_parent_handler(
+    Json(req): Json<ResolveParentRequest>,
+) -> Json<ResolveParentResponse> {
+    let outcome = tokio::task::spawn_blocking(move || {
+        let base = omni_pro::text::TaxonomyVectorBase::global();
+        base.resolve_parent(
+            &req.tag_name,
+            req.language.as_deref(),
+            req.context_hint.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| {
+        omni_pro::text::ResolveParentOutcome {
+            success: true,
+            parent_code: "dim.topic".to_string(),
+            parent_name: "主题内容".to_string(),
+            confidence: 0.50,
+            suggested_depth: 2,
+            materialized_paths: vec![omni_pro::text::MaterializedPathItem {
+                code_path: "/dimension/topic/dim.topic".to_string(),
+                name_path: "/通用维度/主题内容".to_string(),
+            }],
+        }
+    });
+
+    Json(ResolveParentResponse {
+        success: outcome.success,
+        parent_code: outcome.parent_code,
+        parent_name: outcome.parent_name,
+        confidence: outcome.confidence,
+        suggested_depth: outcome.suggested_depth,
+        materialized_paths: outcome.materialized_paths,
+    })
 }
 
 /// 批量构建混合索引请求体: POST /api/search/index

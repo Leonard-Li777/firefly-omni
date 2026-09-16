@@ -1080,6 +1080,99 @@ async fn test_hownet_describe_endpoint_unavailable_graceful() {
     assert_eq!(json["found"], false);
 }
 
+#[tokio::test]
+async fn test_taxonomy_resolve_parent_technical_term() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/taxonomy/resolve-parent")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "tag_name": "深度强化学习",
+                        "language": "zh-CN",
+                        "context_hint": "计算机与人工智能技术文档"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
+    assert_eq!(json["success"], true);
+    assert_eq!(json["parent_code"], "tech.ai");
+    assert_eq!(json["parent_name"], "人工智能");
+    assert!(json["confidence"].as_f64().unwrap() >= 0.65);
+    assert!(json["suggested_depth"].as_u64().unwrap() >= 2);
 
+    let paths = json["materialized_paths"].as_array().expect("materialized_paths 数组");
+    assert!(!paths.is_empty(), "物化路径非空");
+    let code_path = paths[0]["code_path"].as_str().unwrap();
+    assert!(code_path.contains("tech.ai"));
+}
+
+#[tokio::test]
+async fn test_taxonomy_resolve_parent_unknown_fallback() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/taxonomy/resolve-parent")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "tag_name": "xyz987未知杂乱编码"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["success"], true);
+    assert_eq!(json["parent_code"], "dim.topic");
+    assert_eq!(json["parent_name"], "主题内容");
+    assert!(json["confidence"].as_f64().unwrap() < 0.65);
+}
+
+#[tokio::test]
+async fn test_taxonomy_resolve_parent_empty_input() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/taxonomy/resolve-parent")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "tag_name": "   ",
+                        "language": "zh-CN"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["success"], true);
+    assert_eq!(json["parent_code"], "dim.topic");
+}

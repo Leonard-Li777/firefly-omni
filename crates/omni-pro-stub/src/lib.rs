@@ -291,11 +291,10 @@ pub mod vision {
 
         pub fn resolve_tag_to_chain_item(tag: &str, confidence: f32) -> omni_core::TagChainItem {
             omni_core::TagChainItem {
-                tag: tag.to_string(),
+                code: format!("dim.28.{}", tag),
+                name: tag.to_string(),
                 confidence,
-                dimension_id: 28,
-                dimension_name: "内容标签".to_string(),
-                logic_pan_dimension: tag.to_string(),
+                parent_code: None,
             }
         }
 
@@ -674,6 +673,11 @@ pub mod text {
         ) -> (Option<String>, serde_json::Value) {
             (None, serde_json::json!({}))
         }
+        pub fn generate_candidate_matrix(
+            _ctx: &omni_core::MultimodalContext,
+        ) -> Vec<omni_core::CandidateHypothesisItem> {
+            Vec::new()
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -689,6 +693,26 @@ pub mod text {
         pub embedding_dense: Vec<f32>,
         pub chunks: Vec<DocumentChunk>,
         pub duration_ms: u64,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct FusedPerceptionOutcome {
+        pub smart_name: Option<String>,
+        pub content_description: Option<String>,
+        pub fused_tags: Vec<omni_core::TagChainItem>,
+        pub candidate_hypotheses: Vec<omni_core::CandidateHypothesisItem>,
+    }
+
+    pub struct OmniMultimodalFusionEngine;
+    impl OmniMultimodalFusionEngine {
+        pub fn fuse_and_arbitrate(ctx: &omni_core::MultimodalContext) -> FusedPerceptionOutcome {
+            FusedPerceptionOutcome {
+                smart_name: None,
+                content_description: None,
+                fused_tags: ctx.visual_tags.clone(),
+                candidate_hypotheses: Vec::new(),
+            }
+        }
     }
 
     pub struct OmniTextEngine;
@@ -711,6 +735,50 @@ pub mod text {
                 embedding_dense: vec![0.0f32; EMBEDDING_DIM],
                 chunks: Vec::new(),
                 duration_ms: 0,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct MaterializedPathItem {
+        pub code_path: String,
+        pub name_path: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ResolveParentOutcome {
+        pub success: bool,
+        pub parent_code: String,
+        pub parent_name: String,
+        pub confidence: f32,
+        pub suggested_depth: u32,
+        pub materialized_paths: Vec<MaterializedPathItem>,
+    }
+
+    #[derive(Clone, Default)]
+    pub struct TaxonomyVectorBase;
+
+    impl TaxonomyVectorBase {
+        pub fn global() -> &'static TaxonomyVectorBase {
+            static INSTANCE: TaxonomyVectorBase = TaxonomyVectorBase;
+            &INSTANCE
+        }
+        pub fn resolve_parent(
+            &self,
+            _tag_name: &str,
+            _language: Option<&str>,
+            _context_hint: Option<&str>,
+        ) -> ResolveParentOutcome {
+            ResolveParentOutcome {
+                success: true,
+                parent_code: "dim.topic".to_string(),
+                parent_name: "主题内容".to_string(),
+                confidence: 0.50,
+                suggested_depth: 2,
+                materialized_paths: vec![MaterializedPathItem {
+                    code_path: "/dimension/topic/dim.topic".to_string(),
+                    name_path: "/通用维度/主题内容".to_string(),
+                }],
             }
         }
     }

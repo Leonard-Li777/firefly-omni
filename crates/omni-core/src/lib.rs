@@ -134,14 +134,15 @@ pub struct OmniPerceptionBenchmark {
     pub ram_ms: Option<u64>,
 }
 
-/// 统一多模态标签链项 (包含真实受控物理维度与逻辑泛维度容器，用于 visual_tags 标签链)
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// 统一多模态标签链项 (仅输出标签 code、名称 name 与置信度 confidence，由 Desktop 端反查清洗落盘)
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TagChainItem {
-    pub tag: String,
+    pub code: String,
+    #[serde(alias = "tag")]
+    pub name: String,
     pub confidence: f32,
-    pub dimension_id: u32,
-    pub dimension_name: String,
-    pub logic_pan_dimension: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_code: Option<String>,
 }
 
 /// 兼容别名: RamTagItem 指向统一 TagChainItem
@@ -214,6 +215,9 @@ pub struct OmniPerceptionResult {
     pub winning_hypothesis: Option<WinningHypothesisItem>,
     #[serde(default)]
     pub activated_dimension_tags: Vec<TagChainItem>,
+    /// 第三阶段双锚点交叉向量验证与互斥门禁融合出的终极完美标签集 (第一落库权威)
+    #[serde(default)]
+    pub fused_tags: Vec<TagChainItem>,
     #[serde(default)]
     pub smart_name: Option<String>,
     #[serde(default)]
@@ -259,6 +263,22 @@ pub struct CandidateHypothesisItem {
 pub struct WinningHypothesisItem {
     pub prompt_text: String,
     pub confidence: f32,
+}
+
+/// 标准多模态语义上下文结构 (供第三阶段融合仲裁使用)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MultimodalContext {
+    pub file_path: String,
+    pub file_name: String,
+    pub mime_type: String,
+    pub document_text: Option<String>,
+    pub ocr_text: Option<String>,
+    pub audio_transcript: Option<String>,
+    pub visual_tags: Vec<TagChainItem>,
+    pub exif_metadata: serde_json::Value,
+    pub is_image: bool,
+    pub is_document: bool,
+    pub is_audio_or_video: bool,
 }
 
 /// 单指标音频转录请求: POST /api/audio/transcribe
