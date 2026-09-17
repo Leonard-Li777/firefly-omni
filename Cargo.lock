@@ -3968,8 +3968,10 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -4122,8 +4124,10 @@ dependencies = [
  "omni-core",
  "omni-extract",
  "omni-pro",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tower",
@@ -4145,6 +4149,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
@@ -4163,6 +4168,7 @@ dependencies = [
  "ort-sys",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tracing",
 ]
 

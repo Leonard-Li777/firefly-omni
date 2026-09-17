@@ -19,6 +19,8 @@ image.workspace = true
 chrono.workspace = true
 tokio-stream = "0.1"
 futures-util = "0.3"
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
+tempfile = "3"

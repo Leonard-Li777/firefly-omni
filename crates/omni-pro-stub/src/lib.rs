@@ -291,7 +291,7 @@ pub mod vision {
 
         pub fn resolve_tag_to_chain_item(tag: &str, confidence: f32) -> omni_core::TagChainItem {
             omni_core::TagChainItem {
-                code: format!("dim.28.{}", tag),
+                code: format!("builtin.{}", tag),
                 name: tag.to_string(),
                 confidence,
                 parent_code: None,
@@ -771,13 +771,13 @@ pub mod text {
         ) -> ResolveParentOutcome {
             ResolveParentOutcome {
                 success: true,
-                parent_code: "dim.topic".to_string(),
+                parent_code: "builtin.zhu_ti_nei_rong.13364ec8".to_string(),
                 parent_name: "主题内容".to_string(),
                 confidence: 0.50,
                 suggested_depth: 2,
                 materialized_paths: vec![MaterializedPathItem {
-                    code_path: "/dimension/topic/dim.topic".to_string(),
-                    name_path: "/通用维度/主题内容".to_string(),
+                    code_path: "/topic/builtin.zhu_ti_nei_rong.13364ec8".to_string(),
+                    name_path: "/通用/主题内容".to_string(),
                 }],
             }
         }

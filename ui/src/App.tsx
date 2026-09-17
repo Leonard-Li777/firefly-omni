@@ -36,6 +36,7 @@ import { TextSlotTab } from './components/TextSlotTab'
 import { HowNetTab } from './components/HowNetTab'
 import { SearchClusterTab } from './components/SearchClusterTab'
 import { TaxonomyTab } from './components/TaxonomyTab'
+import { isParentMultiSelect } from './components/taxonomy-mutex'
 
 // ---- 离线反向地理编码 (/api/geo/reverse) 相关类型 ----
 interface GeoPointResult {
@@ -92,6 +93,8 @@ export interface TagChainItem {
   code: string
   name: string
   confidence: number
+  /** 所属受控父级 code（三分区契约，用于互斥语义判定） */
+  parent_code?: string
 }
 
 export interface CandidateHypothesisItem {
@@ -1711,7 +1714,7 @@ MIME Type: application/pdf
                                   </div>
                                   <div className="flex items-center justify-between text-[9px] text-slate-500 pt-1 border-t border-slate-800">
                                     <span>
-                                      {tag.code.startsWith('dim.6') || tag.code.startsWith('dim.26') || tag.code.startsWith('dim.124') || tag.code.startsWith('dim.125') ? '🔒 单选互斥胜出' : '✨ 多选并存'}
+                                      {isParentMultiSelect(tag.parent_code) ? '✨ 多选并存' : '🔒 单选互斥胜出'}
                                     </span>
                                     {tag.confidence >= 0.85 && (
                                       <span className="text-amber-400 font-semibold">⚡ 互证奖励</span>

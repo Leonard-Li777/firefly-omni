@@ -16,6 +16,9 @@ enum Commands {
     Serve {
         #[arg(short, long, default_value = "127.0.0.1:9190")]
         addr: String,
+        /// 桌面端 SQLite 数据库路径（仅以只读方式打开 OMW 标签词库；缺省时 OMW 子系统软不可用）
+        #[arg(long)]
+        db_path: Option<String>,
     },
     /// 提取指定文件的信息与 Markdown 文本
     Extract {
@@ -32,9 +35,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Serve { addr }) => {
+        Some(Commands::Serve { addr, db_path }) => {
             let socket_addr: SocketAddr = addr.parse()?;
-            omni_server::start_server(socket_addr).await?;
+            let db_path = db_path.as_deref().map(std::path::PathBuf::from);
+            omni_server::start_server(socket_addr, db_path).await?;
         }
         Some(Commands::Extract { file }) => {
             let config = omni_core::OmniConfig::default();

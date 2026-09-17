@@ -18,8 +18,104 @@ fn setup_test_app_with_geo(geo: Arc<omni_pro::geo::GeoService>) -> Router {
         geo,
         hownet: Arc::new(omni_pro::hownet::OmniHowNetService::unavailable()),
         search: Arc::new(omni_pro::search::OmniSearchService::default()),
+        omw: omni_server::OmwDb::unavailable(),
     };
     create_app_router(state)
+}
+
+/// 以「启动期 --db-path 直连」方式构造测试路由（复刻 start_server 的 OmwDb::connect 接线）
+fn setup_test_app_with_omw_db(path: &std::path::Path) -> Router {
+    let omw = omni_server::OmwDb::unavailable();
+    omw.connect(path).expect("启动期 --db-path 应能只读打开 SQLite");
+    let state = AppState {
+        config: Arc::new(Mutex::new(OmniConfig::default())),
+        geo: Arc::new(omni_pro::geo::GeoService::unavailable()),
+        hownet: Arc::new(omni_pro::hownet::OmniHowNetService::unavailable()),
+        search: Arc::new(omni_pro::search::OmniSearchService::default()),
+        omw,
+    };
+    create_app_router(state)
+}
+
+/// 构造一个带标记值的临时 SQLite 数据库（仅用于 OMW 直连夹具）
+fn create_omw_fixture_db(dir: &std::path::Path, marker: i64) -> (std::path::PathBuf, rusqlite::Connection) {
+    let path = dir.join(format!("omw_api_fixture_{marker}.db"));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY, marker INTEGER NOT NULL);")
+        .unwrap();
+    conn.execute("INSERT INTO probe (marker) VALUES (?1)", rusqlite::params![marker])
+        .unwrap();
+    (path, conn)
+}
+
+/// 构造覆盖全部 5 个 OMW 端点的最小共享 SQLite 数据库
+fn create_omw_api_fixture(dir: &std::path::Path) -> (std::path::PathBuf, rusqlite::Connection) {
+    let path = dir.join("omw_endpoint_fixture.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE omw_synsets (id TEXT PRIMARY KEY, ili TEXT, pos TEXT NOT NULL, lexfile TEXT, \
+            definition TEXT, dc_identifier TEXT, meta TEXT NOT NULL DEFAULT '{}');
+         CREATE TABLE omw_lexical_entries (id TEXT PRIMARY KEY, synset_id TEXT NOT NULL, \
+            language TEXT NOT NULL, lemma TEXT NOT NULL, pos TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}');
+         CREATE TABLE omw_relations (source_id TEXT NOT NULL, target_id TEXT NOT NULL, \
+            rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_id, target_id, rel_type));
+         CREATE TABLE omw_sense_relations (source_entry_id TEXT NOT NULL, target_entry_id TEXT NOT NULL, \
+            rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_entry_id, target_entry_id, rel_type));
+         CREATE TABLE antonym_pairs (id INTEGER PRIMARY KEY AUTOINCREMENT, word_a TEXT NOT NULL, \
+            word_b TEXT NOT NULL, source TEXT NOT NULL, language TEXT NOT NULL DEFAULT 'cmn', \
+            status TEXT NOT NULL DEFAULT 'auto', meta TEXT NOT NULL DEFAULT '{}', UNIQUE (word_a, word_b, language));
+         CREATE TABLE file_tags (code TEXT PRIMARY KEY, name TEXT NOT NULL, parent_codes TEXT NOT NULL DEFAULT '[]');",
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO omw_synsets (id, ili, pos, lexfile, definition, dc_identifier, meta) VALUES
+            ('o-dog.n', 'i1', 'n', 'noun.animal', 'a domesticated canine', 'dc1', '{\"k\":1}'),
+            ('o-animal.n', 'i2', 'n', 'noun.animal', 'a living organism', NULL, '{}'),
+            ('o-organism.n', 'i3', 'n', 'noun.animal', NULL, NULL, '{}'),
+            ('o-plant.n', 'i4', 'n', 'noun.plant', 'a photosynthetic organism', NULL, '{}');
+         INSERT INTO omw_lexical_entries (id, synset_id, language, lemma, pos) VALUES
+            ('e1', 'o-dog.n', 'en', 'dog', 'n'),
+            ('e2', 'o-dog.n', 'en', 'domestic dog', 'n'),
+            ('e3', 'o-animal.n', 'en', 'animal', 'n'),
+            ('e4', 'o-plant.n', 'en', 'plant', 'n');
+         INSERT INTO omw_relations (source_id, target_id, rel_type) VALUES
+            ('o-dog.n', 'o-animal.n', 'hypernym'),
+            ('o-animal.n', 'o-organism.n', 'hypernym'),
+            ('o-dog.n', 'o-animal.n', 'hyponym');
+         INSERT INTO omw_sense_relations (source_entry_id, target_entry_id, rel_type) VALUES
+            ('e3', 'e4', 'antonym');
+         INSERT INTO antonym_pairs (word_a, word_b, source, language) VALUES
+            ('dog', 'cat', 'antonym.txt', 'cmn');
+         INSERT INTO file_tags (code, name, parent_codes) VALUES
+            ('builtin.dog', '狗', '[\"omw.o-dog.n\", \"builtin.pet\"]'),
+            ('builtin.pet', '宠物', '[\"omw.o-dog.n\"]'),
+            ('builtin.cat', '猫', '[\"omw.o-dog.n\"]'),
+            ('builtin.unrelated', '无关', '[]');",
+    )
+    .unwrap();
+    (path, conn)
+}
+
+async fn body_json(response: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn reconnect(router: &Router, db_path: serde_json::Value) -> serde_json::Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/reconnect")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({ "dbPath": db_path })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await
 }
 
 /// 内嵌密封夹具：与 omni-geo 集成测试同构的最小数据集（零网络、零外部文件）
@@ -896,8 +992,123 @@ async fn test_health_reports_geo_unavailable_when_dataset_missing() {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
-    // 数据集未配置 → geoAvailable 必须为 false（软降级，不影响整体健康）
-    assert_eq!(json["geoAvailable"], false);
+    assert_eq!(json["server"], "firefly-omni");
+    assert_eq!(json["version"], omni_core::VERSION);
+}
+
+// ==================== POST /api/reconnect 只读直连与热重连契约测试 ====================
+
+#[tokio::test]
+async fn test_health_reports_omw_unavailable_without_db_path() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["status"], "ok");
+    // 未传入 --db-path / 未调用 reconnect → omwAvailable 必须为 false（软降级，不影响整体健康）
+    assert_eq!(json["omwAvailable"], false);
+}
+
+/// #648 验收：omni-server 启动接收 --db-path 直接打开 SQLite（不依赖 POST /api/reconnect）
+#[tokio::test]
+async fn test_startup_db_path_connects_omw_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _writable) = create_omw_api_fixture(dir.path());
+    // 模拟 start_server：进程启动时即通过 --db-path 建立只读连接
+    let app = setup_test_app_with_omw_db(&path);
+
+    // 未调用任何 reconnect，health 即应报告 omwAvailable = true
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let health = body_json(response).await;
+    assert_eq!(health["omwAvailable"], true);
+
+    // 且启动期连接句柄可直接执行 OMW 查询
+    let json = post_json(
+        &app,
+        "/api/v1/omw/lookup",
+        serde_json::json!({ "word": "dog", "language": "en" }),
+    )
+    .await;
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "o-dog.n");
+}
+
+#[tokio::test]
+async fn test_reconnect_hot_swap_and_disconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path_a, _wa) = create_omw_fixture_db(dir.path(), 111);
+    let (path_b, _wb) = create_omw_fixture_db(dir.path(), 222);
+    let app = setup_test_app();
+
+    // 初始不可用
+    let health = body_json(
+        app.clone()
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(health["omwAvailable"], false);
+
+    // 重连至 A → 可用
+    let json = reconnect(&app, serde_json::json!(path_a.to_string_lossy().to_string())).await;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["omwAvailable"], true);
+    assert_eq!(json["dbPath"], path_a.to_string_lossy().to_string());
+
+    // 热切换至 B：同一进程内动态替换 DB，无需重启
+    let json = reconnect(&app, serde_json::json!(path_b.to_string_lossy().to_string())).await;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["omwAvailable"], true);
+    assert_eq!(json["dbPath"], path_b.to_string_lossy().to_string());
+
+    // 断开（dbPath: null）→ 恢复不可用态
+    let json = reconnect(&app, serde_json::Value::Null).await;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["omwAvailable"], false);
+    assert_eq!(json["dbPath"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn test_reconnect_empty_path_treated_as_disconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path_a, _wa) = create_omw_fixture_db(dir.path(), 5);
+    let app = setup_test_app();
+
+    let json = reconnect(&app, serde_json::json!(path_a.to_string_lossy().to_string())).await;
+    assert_eq!(json["omwAvailable"], true);
+
+    // 空串同样视为断开
+    let json = reconnect(&app, serde_json::json!("   ")).await;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["omwAvailable"], false);
+}
+
+#[tokio::test]
+async fn test_reconnect_invalid_path_soft_fail_keeps_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path_a, _wa) = create_omw_fixture_db(dir.path(), 5);
+    let app = setup_test_app();
+
+    let json = reconnect(&app, serde_json::json!(path_a.to_string_lossy().to_string())).await;
+    assert_eq!(json["omwAvailable"], true);
+
+    // 打不开的路径 → 200 + status:error，原连接保持可用未被破坏
+    let bad = dir.path().join("no_such_database.db").to_string_lossy().to_string();
+    let json = reconnect(&app, serde_json::json!(bad)).await;
+    assert_eq!(json["status"], "error");
+    assert_eq!(json["omwAvailable"], true, "原连接应保持可用，未被失败重连破坏");
+    assert!(json["reason"].as_str().is_some_and(|r| !r.is_empty()));
 }
 
 #[tokio::test]
@@ -1143,7 +1354,7 @@ async fn test_taxonomy_resolve_parent_unknown_fallback() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["success"], true);
-    assert_eq!(json["parent_code"], "dim.topic");
+    assert_eq!(json["parent_code"], "builtin.zhu_ti_nei_rong.13364ec8");
     assert_eq!(json["parent_name"], "主题内容");
     assert!(json["confidence"].as_f64().unwrap() < 0.65);
 }
@@ -1169,10 +1380,267 @@ async fn test_taxonomy_resolve_parent_empty_input() {
         .await
         .unwrap();
 
+
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["success"], true);
-    assert_eq!(json["parent_code"], "dim.topic");
+    assert_eq!(json["parent_code"], "builtin.zhu_ti_nei_rong.13364ec8");
+}
+
+// ==================== POST /api/v1/omw/* OMW 核心查询端点 ====================
+
+async fn post_json(router: &Router, path: &str, body: serde_json::Value) -> serde_json::Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await
+}
+
+#[tokio::test]
+async fn test_omw_lookup_returns_synset_with_deduped_lemmas() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app();
+    // 热重连至 OMW 夹具
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    let json = post_json(&app, "/api/v1/omw/lookup", serde_json::json!({"word": "dog", "language": "en"})).await;
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "o-dog.n");
+    assert_eq!(rows[0]["pos"], "n");
+    assert_eq!(rows[0]["definition"], "a domesticated canine");
+    let lemmas: Vec<&str> = rows[0]["lemmas"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(lemmas, vec!["dog", "domestic dog"]);
+    assert_eq!(rows[0]["meta"]["k"], 1);
+}
+
+#[tokio::test]
+async fn test_omw_lookup_case_insensitive_and_english_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    // 大小写不敏感
+    assert_eq!(
+        post_json(&app, "/api/v1/omw/lookup", serde_json::json!({"word": "DOG", "language": "en"})).await.as_array().unwrap().len(),
+        1
+    );
+    // 目标语言无该 lemma 时回退英文
+    assert_eq!(
+        post_json(&app, "/api/v1/omw/lookup", serde_json::json!({"word": "dog", "language": "cmn"})).await.as_array().unwrap().len(),
+        1
+    );
+    assert!(post_json(&app, "/api/v1/omw/lookup", serde_json::json!({"word": "no-such-word", "language": "en"})).await.is_array());
+    let empty: serde_json::Value = post_json(&app, "/api/v1/omw/lookup", serde_json::json!({"word": "no-such-word", "language": "en"})).await;
+    assert!(empty.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_omw_hierarchy_walks_hypernym_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    let json = post_json(&app, "/api/v1/omw/hierarchy", serde_json::json!({"synsetId": "o-dog.n"})).await;
+    let nodes = json.as_array().unwrap();
+    let ids: Vec<&str> = nodes.iter().map(|n| n["synsetId"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["o-animal.n", "o-organism.n"]);
+    assert!(nodes.iter().all(|n| n["relType"] == "hypernym"));
+    let lemmas: Vec<&str> = nodes[0]["lemmas"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(lemmas, vec!["animal"]);
+}
+
+#[tokio::test]
+async fn test_omw_antonyms_prefers_antonym_pairs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    let json = post_json(&app, "/api/v1/omw/antonyms", serde_json::json!({"word": "dog", "language": "cmn"})).await;
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["antonym"], "cat");
+    assert_eq!(rows[0]["source"], "antonym.txt");
+    assert_eq!(rows[0]["language"], "cmn");
+}
+
+#[tokio::test]
+async fn test_omw_antonyms_falls_back_to_omw_sense_relations() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    let json = post_json(&app, "/api/v1/omw/antonyms", serde_json::json!({"word": "animal", "language": "en"})).await;
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["antonym"], "plant");
+    assert_eq!(rows[0]["source"], "omw_sense_relations");
+}
+
+#[tokio::test]
+async fn test_omw_describe_returns_omw_definition() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    let json = post_json(&app, "/api/v1/omw/describe", serde_json::json!({"word": "dog", "language": "en"})).await;
+    assert_eq!(json, "a domesticated canine");
+}
+
+#[tokio::test]
+async fn test_omw_describe_returns_null_when_no_definition() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    // organism 的 definition 为 NULL，HowNet 不可用 → null
+    let json = post_json(&app, "/api/v1/omw/describe", serde_json::json!({"word": "organism", "language": "en"})).await;
+    assert!(json.is_null());
+}
+
+#[tokio::test]
+async fn test_omw_mapping_reverses_builtin_tags_sharing_omw_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    let json = post_json(&app, "/api/v1/omw/mapping", serde_json::json!({"tagName": "狗"})).await;
+    let rows = json.as_array().unwrap();
+    let codes: Vec<&str> = rows.iter().map(|r| r["tagCode"].as_str().unwrap()).collect();
+    // 共享 omw.o-dog.n 的兄弟标签，排除输入标签自身
+    assert_eq!(codes, vec!["builtin.cat", "builtin.pet"]);
+    assert!(rows.iter().all(|r| r["matchLevel"] == 1 && r["confidence"] == 1.0));
+}
+
+#[tokio::test]
+async fn test_omw_mapping_returns_empty_for_unknown_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    let json = post_json(&app, "/api/v1/omw/mapping", serde_json::json!({"tagName": "未知"}))
+        .await;
+    assert!(json.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_omw_endpoints_soft_fail_when_omw_unavailable() {
+    let app = setup_test_app();
+    // 未调用 reconnect → omwAvailable 为 false，查询回退空结果
+    let json = post_json(&app, "/api/v1/omw/lookup", serde_json::json!({"word": "dog"}))
+        .await;
+    assert!(json.as_array().unwrap().is_empty());
+}
+
+// ==================== GET /api/v1/omw/tree & unmapped-stats (#650 树懒加载与统计) ====================
+
+async fn get_json(router: &Router, path: &str) -> serde_json::Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await
+}
+
+#[tokio::test]
+async fn test_omw_tree_returns_single_layer_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    // omw 概念码作为根：返回直接引用该概念的 builtin.* 子标签（按 code 排序，仅一层）
+    let json = get_json(&app, "/api/v1/omw/tree?root=omw.o-dog.n&depth=1").await;
+    let rows = json.as_array().unwrap();
+    let codes: Vec<&str> = rows.iter().map(|r| r["code"].as_str().unwrap()).collect();
+    assert_eq!(codes, vec!["builtin.cat", "builtin.dog", "builtin.pet"]);
+    assert!(rows.iter().all(|r| r["source"] == "builtin"));
+    // parent_codes 完整回传供前端递归推导 depth
+    assert_eq!(rows[1]["parentCodes"], serde_json::json!(["omw.o-dog.n", "builtin.pet"]));
+
+    // builtin 根：返回挂载其下的子标签
+    let nested = get_json(&app, "/api/v1/omw/tree?root=builtin.pet&depth=1").await;
+    let nested_codes: Vec<&str> = nested
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(nested_codes, vec!["builtin.dog"]);
+}
+
+#[tokio::test]
+async fn test_omw_tree_returns_empty_for_unknown_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    let json = get_json(&app, "/api/v1/omw/tree?root=omw.no-such.n").await;
+    assert!(json.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_omw_unmapped_stats_excludes_referenced_synsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    // o-dog.n 被 file_tags 引用 → 排除；其余 3 个 synset 未映射
+    let json = get_json(&app, "/api/v1/omw/unmapped-stats").await;
+
+    let by_lexfile = json["byLexfile"].as_array().unwrap();
+    assert_eq!(by_lexfile.len(), 2);
+    assert_eq!(by_lexfile[0]["key"], "noun.animal");
+    assert_eq!(by_lexfile[0]["count"], 2);
+    assert_eq!(by_lexfile[1]["key"], "noun.plant");
+    assert_eq!(by_lexfile[1]["count"], 1);
+
+    let by_top = json["byTopAncestor"].as_array().unwrap();
+    assert_eq!(by_top[0]["key"], "noun.animal");
+    assert_eq!(by_top[0]["count"], 2);
+    assert_eq!(by_top[1]["key"], "noun.plant");
+    assert_eq!(by_top[1]["count"], 1);
+}
+
+#[tokio::test]
+async fn test_omw_tree_and_stats_soft_fail_when_unavailable() {
+    let app = setup_test_app();
+    // 未 reconnect → 树返回空数组，统计返回空分组而非报错
+    let tree = get_json(&app, "/api/v1/omw/tree?root=omw.o-dog.n").await;
+    assert!(tree.as_array().unwrap().is_empty());
+
+    let stats = get_json(&app, "/api/v1/omw/unmapped-stats").await;
+    assert_eq!(stats["byLexfile"], serde_json::json!([]));
+    assert_eq!(stats["byTopAncestor"], serde_json::json!([]));
 }
