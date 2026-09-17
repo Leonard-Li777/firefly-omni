@@ -1339,7 +1339,7 @@ async fn perceive_file_handler(
     // CLIP 互斥分类结果增强 mobilenet_tags：
     // 若 CLIP 互斥分类成功，直接替换规则推导结果（语义更准确）；
     // 若 CLIP 不可用（无模型），则保留规则推导的 mobilenet_tags 作为兜底。
-    let mut mobilenet_tags = if !clip_mutual_tags.is_empty() {
+    let mobilenet_tags = if !clip_mutual_tags.is_empty() {
         let mut merged = mobilenet_tags.clone();
         for (tag, _conf, _group) in &clip_mutual_tags {
             if !merged.contains(tag) {
