@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// 受控标签跨语言身份（别名 → code）
+pub mod tag_identity;
+
 /// Omni 核心引擎版本号
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

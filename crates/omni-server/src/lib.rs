@@ -10,6 +10,7 @@ use axum::{
     Json, Router,
 };
 use omni_core::{
+    tag_identity::{normalize_tag_set_to_codes, tag_matches_concept},
     AudioConvertRequest, AudioConvertResponse, AudioTranscribeRequest, AudioTranscribeResponse,
     DuplicateFixRequest, DuplicateFixResponse, DuplicateScanRequest, DuplicateScanResponse,
     FsAdsRequest, FsAdsResponse, OmniConfig, OmniExtractionResult, OmniPerceptionBenchmark,
@@ -23,6 +24,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
+mod omw_db;
+pub use omw_db::OmwDb;
+
+mod omw_query;
+use omw_query::{
+    OmwAntonymResult, OmwAntonymsRequest, OmwDescribeRequest, OmwHierarchyRequest, OmwLookupRequest,
+    OmwMappingRequest, OmwSynsetNode, OmwSynsetResult, OmwTagResult, OmwTreeRequest, TreeNode,
+    UnmappedStats,
+};
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Mutex<OmniConfig>>,
@@ -32,6 +43,8 @@ pub struct AppState {
     pub hownet: Arc<omni_pro::hownet::OmniHowNetService>,
     /// 工业级混合检索与约束聚类服务 (支柱 5)
     pub search: Arc<omni_pro::search::OmniSearchService>,
+    /// OMW 多语言标签词库只读连接池（未传入 --db-path 时为软不可用实例）
+    pub omw: OmwDb,
 }
 
 #[derive(Deserialize)]
@@ -42,6 +55,14 @@ pub struct ExtractRequest {
 #[derive(Deserialize)]
 pub struct FilePreviewRequest {
     pub path: String,
+}
+
+/// OMW 词库热重连请求体: POST /api/reconnect（dbPath 为 null/空串时表示断开直连）
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconnectRequest {
+    #[serde(default)]
+    pub db_path: Option<String>,
 }
 
 /// 反向地理编码请求体: POST /api/geo/reverse
@@ -92,6 +113,14 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/api/search/hybrid", post(search_hybrid_handler))
         .route("/api/search/cluster", post(search_cluster_handler))
         .route("/api/taxonomy/resolve-parent", post(taxonomy_resolve_parent_handler))
+        .route("/api/reconnect", post(reconnect_omw_handler))
+        .route("/api/v1/omw/lookup", post(omw_lookup_handler))
+        .route("/api/v1/omw/hierarchy", post(omw_hierarchy_handler))
+        .route("/api/v1/omw/antonyms", post(omw_antonyms_handler))
+        .route("/api/v1/omw/describe", post(omw_describe_handler))
+        .route("/api/v1/omw/mapping", post(omw_mapping_handler))
+        .route("/api/v1/omw/tree", get(omw_tree_handler))
+        .route("/api/v1/omw/unmapped-stats", get(omw_unmapped_stats_handler))
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .with_state(state)
 }
@@ -136,6 +165,11 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
     } else {
         false
     };
+    // OMW 词库可用性：实际执行一次 SELECT 1 探测只读连接（与 is_pro 无关，直连会话独立）
+    let omw = state.omw.clone();
+    let omw_available = tokio::task::spawn_blocking(move || omw.validate())
+        .await
+        .unwrap_or(false);
     Json(serde_json::json!({
         "status": "ok",
         "server": "firefly-omni",
@@ -144,7 +178,8 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "geoAvailable": geo_available,
         "hownetAvailable": hownet_available,
         "searchAvailable": search_available,
-        "cleanupAvailable": is_pro
+        "cleanupAvailable": is_pro,
+        "omwAvailable": omw_available
     }))
 }
 
@@ -208,6 +243,176 @@ async fn hownet_describe_handler(
             }
         });
     Json(outcome)
+}
+
+/// OMW 词库热重连: POST /api/reconnect
+///
+/// 支撑桌面端多语言切换：接收 `{ "dbPath": "..." }` 原子替换只读连接池，无需重启服务进程；
+/// dbPath 为 null/空串时断开直连恢复初始不可用态。失败时保持原连接不变（软失败 200 回传）。
+async fn reconnect_omw_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ReconnectRequest>,
+) -> Json<serde_json::Value> {
+    let db_path = req.db_path.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let result = match db_path {
+        Some(path) => state.omw.connect(path),
+        None => {
+            state.omw.disconnect();
+            Ok(())
+        }
+    };
+
+    match result {
+        Ok(()) => Json(serde_json::json!({
+            "status": "ok",
+            "omwAvailable": state.omw.is_available(),
+            "dbPath": state.omw.db_path().map(|p| p.to_string_lossy().to_string()),
+            "reason": null
+        })),
+        Err(err) => Json(serde_json::json!({
+            "status": "error",
+            // 失败时原连接保持不变，如实反映当前真实可用性
+            "omwAvailable": state.omw.is_available(),
+            "dbPath": state.omw.db_path().map(|p| p.to_string_lossy().to_string()),
+            "reason": err.to_string()
+        })),
+    }
+}
+
+/// OMW 只读查询统一软失败包装
+///
+/// 连接未配置（未传 --db-path / 已 disconnect）、查询报错或阻塞任务 panic 时，
+/// 一律记录 warn 日志并回退默认值，与桌面端 `omw*` 方法「出错返回空结果」的语义一致；
+/// 真实可用性由 `/health` 的 `omwAvailable` 单独反映。
+async fn omw_query_or_default<T, F>(omw: OmwDb, label: &'static str, default: T, query: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || omw.with_conn(query)).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) => {
+            tracing::warn!("OMW {label} 查询失败，回退默认结果: {err}");
+            default
+        }
+        Err(err) => {
+            tracing::warn!("OMW {label} 查询任务执行失败，回退默认结果: {err}");
+            default
+        }
+    }
+}
+
+/// OMW 词汇查 synset: POST /api/v1/omw/lookup
+async fn omw_lookup_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OmwLookupRequest>,
+) -> Json<Vec<OmwSynsetResult>> {
+    let language = req.language.unwrap_or_else(|| "en".to_string());
+    let word = req.word;
+    Json(
+        omw_query_or_default(state.omw.clone(), "lookup", Vec::new(), move |conn| {
+            omw_query::lookup(conn, &word, &language)
+        })
+        .await,
+    )
+}
+
+/// OMW 层级链查询: POST /api/v1/omw/hierarchy
+async fn omw_hierarchy_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OmwHierarchyRequest>,
+) -> Json<Vec<OmwSynsetNode>> {
+    let synset_id = req.synset_id;
+    Json(
+        omw_query_or_default(state.omw.clone(), "hierarchy", Vec::new(), move |conn| {
+            omw_query::hierarchy(conn, &synset_id)
+        })
+        .await,
+    )
+}
+
+/// OMW 反义词查询: POST /api/v1/omw/antonyms
+async fn omw_antonyms_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OmwAntonymsRequest>,
+) -> Json<Vec<OmwAntonymResult>> {
+    let language = req.language.unwrap_or_else(|| "cmn".to_string());
+    let word = req.word;
+    Json(
+        omw_query_or_default(state.omw.clone(), "antonyms", Vec::new(), move |conn| {
+            omw_query::antonyms(conn, &word, &language)
+        })
+        .await,
+    )
+}
+
+/// OMW 概念描述生成: POST /api/v1/omw/describe
+///
+/// 两级组合：优先返回 OMW definition（英文库命中），缺失时（如 OMW-cmn 无 gloss）
+/// 回退 HowNet 义原短语描述；两者皆无则返回 null。
+async fn omw_describe_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OmwDescribeRequest>,
+) -> Json<Option<String>> {
+    let language = req.language.unwrap_or_else(|| "en".to_string());
+    let word = req.word.clone();
+    let omw_desc = omw_query_or_default(state.omw.clone(), "describe", None, move |conn| {
+        omw_query::describe(conn, &word, &language)
+    })
+    .await;
+    if omw_desc.is_some() {
+        return Json(omw_desc);
+    }
+
+    // HowNet 兜底：仅在 Pro 数据集可用时命中，开源存根/无词条返回 null
+    let hownet = state.hownet.clone();
+    let word = req.word;
+    let desc = tokio::task::spawn_blocking(move || hownet.describe(&word))
+        .await
+        .unwrap_or_else(|err| Err(anyhow::anyhow!("HowNet 查询任务执行失败: {err}")))
+        .ok()
+        .filter(|result| result.found && !result.description.trim().is_empty())
+        .map(|result| result.description);
+    Json(desc)
+}
+
+/// OMW 标签映射反查: POST /api/v1/omw/mapping（零桥表依赖，见 omw_query::mapping）
+async fn omw_mapping_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OmwMappingRequest>,
+) -> Json<Vec<OmwTagResult>> {
+    let tag_name = req.tag_name;
+    Json(
+        omw_query_or_default(state.omw.clone(), "mapping", Vec::new(), move |conn| {
+            omw_query::mapping(conn, &tag_name)
+        })
+        .await,
+    )
+}
+
+/// OMW 统一标签树单层懒加载: GET /api/v1/omw/tree?root={code}&depth=1
+async fn omw_tree_handler(
+    State(state): State<AppState>,
+    Query(req): Query<OmwTreeRequest>,
+) -> Json<Vec<TreeNode>> {
+    Json(
+        omw_query_or_default(state.omw.clone(), "tree", Vec::new(), move |conn| {
+            omw_query::tree(conn, &req.root, req.depth)
+        })
+        .await,
+    )
+}
+
+/// OMW 未映射概念聚合统计: GET /api/v1/omw/unmapped-stats
+async fn omw_unmapped_stats_handler(
+    State(state): State<AppState>,
+) -> Json<UnmappedStats> {
+    Json(
+        omw_query_or_default(state.omw.clone(), "unmapped-stats", UnmappedStats { by_lexfile: Vec::new(), by_top_ancestor: Vec::new() }, move |conn| {
+            omw_query::unmapped_stats(conn)
+        })
+        .await,
+    )
 }
 
 /// 根据文件扩展名推断浏览器可直接预览的多模态 MIME 类型（仅允许图片/视频/音频）
@@ -362,7 +567,7 @@ fn save_config_to_disk(cfg: &OmniConfig) {
     }
 }
 
-pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
+pub async fn start_server(addr: SocketAddr, db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let initial_config = load_config_from_disk();
     // 地理数据集发现链：环境变量 → exe 相对目录 → cwd 候选；落空或开源存根时软不可用
     let geo = match omni_pro::geo::discover_dataset_path() {
@@ -401,11 +606,22 @@ pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
         std::env::temp_dir().join("firefly_omni_search_index")
     };
     let search = Arc::new(omni_pro::search::OmniSearchService::new(search_dir));
+    // OMW 词库直连：传入 --db-path 时以只读方式打开；未传入或打开失败时软不可用，不影响整体启动
+    let omw = OmwDb::unavailable();
+    if let Some(path) = &db_path {
+        match omw.connect(path) {
+            Ok(()) => info!("omw db connected read-only at {}", path.display()),
+            Err(err) => {
+                tracing::warn!("omw db open failed ({}), omw subsystem starts unavailable", err)
+            }
+        }
+    }
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),
         geo,
         hownet,
         search,
+        omw,
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本
@@ -706,8 +922,11 @@ fn run_vision_pipeline(
                     omni_pro::OmniVisionEngine::derive_mobilenet_tags(aspect, td, bw);
 
                 // 无字图排版门禁：若未探活出文本内容，严禁打上依赖排版文字的海报宣发或截图标签
+                // Spec D9：闭环规则按概念 code 匹配，兼容中英别名
                 if !td {
-                    out.clip_tags.retain(|t| t != "海报宣发" && t != "截图");
+                    out.clip_tags.retain(|t| {
+                        !tag_matches_concept(t, "海报宣发") && !tag_matches_concept(t, "截图")
+                    });
                 }
 
                 // CLIP 高置信度标签直接截取 Top 5，消除第 2 次模型重复推理
@@ -715,7 +934,11 @@ fn run_vision_pipeline(
 
                 // 漫画细分标签形态门禁：仅当内容明确具有动漫/漫画/插画特征时，才根据版式推导条漫/页漫
                 let is_anime_art = out.clip_tags.iter().any(|t| {
-                    t == "二次元" || t == "动漫" || t == "插画" || t == "漫画" || t == "手绘"
+                    tag_matches_concept(t, "二次元")
+                        || tag_matches_concept(t, "动漫")
+                        || tag_matches_concept(t, "插画")
+                        || tag_matches_concept(t, "漫画")
+                        || tag_matches_concept(t, "手绘")
                 });
                 if is_anime_art {
                     if aspect < 0.45 {
@@ -1080,8 +1303,8 @@ async fn perceive_file_handler(
     // 基于实际 OCR 文本正向直通校准截图形态与文字客观事实 (彻底根除有字却输出无字图的倒挂)
     if !markdown_content.trim().is_empty() {
         has_text = Some(true);
-        clip_tags.retain(|t| t != "无字图");
-        if !clip_tags.contains(&"有字图".to_string()) {
+        clip_tags.retain(|t| !tag_matches_concept(t, "无字图"));
+        if !clip_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
             clip_tags.push("有字图".to_string());
         }
 
@@ -1100,8 +1323,8 @@ async fn perceive_file_handler(
             || text_lower.contains("fn main");
         if is_code_syntax {
             photo_type = Some("代码截图".to_string());
-            if !clip_tags.contains(&"代码截图".to_string()) {
-                clip_tags.retain(|t| t != "聊天截图");
+            if !clip_tags.iter().any(|t| tag_matches_concept(t, "代码截图")) {
+                clip_tags.retain(|t| !tag_matches_concept(t, "聊天截图"));
                 clip_tags.push("代码截图".to_string());
             }
         }
@@ -1124,28 +1347,38 @@ async fn perceive_file_handler(
             }
         }
         // CLIP 互斥分类保证组内只有一个胜出者，移除被覆盖的规则推导冲突项
-        // 1. 色彩模式：CLIP 结果与黑白检测结果互斥对齐
-        if clip_mutual_tags.iter().any(|(t, _, g)| *g == "色彩模式" && t == "全彩") {
-            merged.retain(|t| t != "黑白");
-        } else if clip_mutual_tags.iter().any(|(t, _, g)| *g == "色彩模式" && t == "黑白") {
-            merged.retain(|t| t != "全彩");
+        // 1. 色彩模式：CLIP 结果与黑白检测结果互斥对齐（概念 code 匹配，兼容中英）
+        if clip_mutual_tags.iter().any(|(t, _, g)| *g == "色彩模式" && tag_matches_concept(t, "全彩"))
+        {
+            merged.retain(|t| !tag_matches_concept(t, "黑白"));
+        } else if clip_mutual_tags
+            .iter()
+            .any(|(t, _, g)| *g == "色彩模式" && tag_matches_concept(t, "黑白"))
+        {
+            merged.retain(|t| !tag_matches_concept(t, "全彩"));
         }
         // 2. 文字存在性：客观检测与 OCR 事实优先于语义猜测
         if has_text == Some(true) || !markdown_content.trim().is_empty() {
-            merged.retain(|t| t != "无字图");
-            if !merged.contains(&"有字图".to_string()) {
+            merged.retain(|t| !tag_matches_concept(t, "无字图"));
+            if !merged.iter().any(|t| tag_matches_concept(t, "有字图")) {
                 merged.push("有字图".to_string());
             }
-        } else if clip_mutual_tags.iter().any(|(t, _, g)| *g == "文字存在性" && t == "有字图") {
-            merged.retain(|t| t != "无字图");
-        } else if clip_mutual_tags.iter().any(|(t, _, g)| *g == "文字存在性" && t == "无字图") {
-            merged.retain(|t| t != "有字图");
+        } else if clip_mutual_tags
+            .iter()
+            .any(|(t, _, g)| *g == "文字存在性" && tag_matches_concept(t, "有字图"))
+        {
+            merged.retain(|t| !tag_matches_concept(t, "无字图"));
+        } else if clip_mutual_tags
+            .iter()
+            .any(|(t, _, g)| *g == "文字存在性" && tag_matches_concept(t, "无字图"))
+        {
+            merged.retain(|t| !tag_matches_concept(t, "有字图"));
         }
         merged
     } else {
         if has_text == Some(true) || !markdown_content.trim().is_empty() {
-            mobilenet_tags.retain(|t| t != "无字图");
-            if !mobilenet_tags.contains(&"有字图".to_string()) {
+            mobilenet_tags.retain(|t| !tag_matches_concept(t, "无字图"));
+            if !mobilenet_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
                 mobilenet_tags.push("有字图".to_string());
             }
         }
@@ -1197,15 +1430,26 @@ async fn perceive_file_handler(
 
     // 文字存在性绝对保护：若已探活出文字或 OCR 内容，无条件排除无字图，确保有字图存在
     if has_text == Some(true) || !markdown_content.trim().is_empty() {
-        detected_visual_tags.retain(|t| t != "无字图");
-        if !detected_visual_tags.contains(&"有字图".to_string()) {
+        detected_visual_tags.retain(|t| !tag_matches_concept(t, "无字图"));
+        if !detected_visual_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
             detected_visual_tags.push("有字图".to_string());
         }
     }
 
+    // Spec D12：统一归一为稳定 code 后再做集合同步，保证 zh/en 输入幂等
+    let detected_visual_tags = normalize_tag_set_to_codes(&detected_visual_tags);
+    let clip_tags = normalize_tag_set_to_codes(&clip_tags);
+    let mobilenet_tags = normalize_tag_set_to_codes(&mobilenet_tags);
+
     // 同步清洗 mobilenet_tags 与 clip_tags，确保互斥清洗结果一致贯通（防止被清洗的子标签混入下游主体池）
-    mobilenet_tags.retain(|t| detected_visual_tags.contains(t));
-    clip_tags.retain(|t| detected_visual_tags.contains(t));
+    let mobilenet_tags: Vec<String> = mobilenet_tags
+        .into_iter()
+        .filter(|t| detected_visual_tags.contains(t))
+        .collect();
+    let clip_tags: Vec<String> = clip_tags
+        .into_iter()
+        .filter(|t| detected_visual_tags.contains(t))
+        .collect();
 
     // 4. 离线逆地理编码 (若元数据中含 GPS 坐标且开启了地理反查，Pro 专享)
     let mut geo_address = None;
@@ -1297,7 +1541,7 @@ async fn perceive_file_handler(
                 omni_pro::OmniVisionEngine::resolve_tag_to_chain_item(raw_tag, 0.92)
             } else {
                 omni_core::TagChainItem {
-                    code: format!("dim.28.{}", raw_tag),
+                    code: format!("builtin.{}", raw_tag),
                     name: raw_tag.clone(),
                     confidence: 0.92,
                     parent_code: None,
@@ -1619,13 +1863,13 @@ async fn taxonomy_resolve_parent_handler(
     .unwrap_or_else(|_| {
         omni_pro::text::ResolveParentOutcome {
             success: true,
-            parent_code: "dim.topic".to_string(),
+            parent_code: "builtin.zhu_ti_nei_rong.13364ec8".to_string(),
             parent_name: "主题内容".to_string(),
             confidence: 0.50,
             suggested_depth: 2,
             materialized_paths: vec![omni_pro::text::MaterializedPathItem {
-                code_path: "/dimension/topic/dim.topic".to_string(),
-                name_path: "/通用维度/主题内容".to_string(),
+                code_path: "/topic/builtin.zhu_ti_nei_rong.13364ec8".to_string(),
+                name_path: "/通用/主题内容".to_string(),
             }],
         }
     });
