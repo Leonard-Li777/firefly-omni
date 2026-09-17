@@ -2,7 +2,7 @@
 //!
 //! Spec: issue-omni-i18n-tag-identity-spec
 //! - 多别名（zh/en/...）→ 同一 code（期望复用）
-//! - code 源为英文规范名：builtin.{en_slug}.{sha256(enName)[..8]}
+//! - code 源为英文规范名：builtin.{en_slug}（方案 B，无 hash；闭环登记 + 别名复用）
 //! - 未命中别名时由调用方派生 _ext，禁止向量模糊还原
 
 use std::collections::HashMap;
@@ -34,15 +34,16 @@ fn sanitize_en_slug(raw: &str) -> String {
     trimmed
 }
 
-/// 以英文规范名派生 builtin code（方案 A）
+/// 以英文规范名派生 builtin code（方案 B：builtin.{en_slug}，无 hash）
+/// slug 为空时过渡 h_{hash}；唯一性由构建门禁与别名表保证。
 pub fn en_builtin_code(en_name: &str) -> String {
     let trimmed = en_name.trim();
     let slug = sanitize_en_slug(trimmed);
-    let hash = content_hash8(trimmed);
     if slug.is_empty() {
+        let hash = content_hash8(trimmed);
         format!("builtin.h_{}", &hash[..hash.len().min(10)])
     } else {
-        format!("builtin.{}.{}", slug, hash)
+        format!("builtin.{}", slug)
     }
 }
 
@@ -218,8 +219,10 @@ mod tests {
     #[test]
     fn en_builtin_code_matches_ts_algorithm_shape() {
         let code = en_builtin_code("Screenshot");
-        assert!(code.starts_with("builtin.screenshot."));
+        // 方案 B：无 hash
+        assert_eq!(code, "builtin.screenshot");
         assert_eq!(code, en_builtin_code("Screenshot"));
+        assert_eq!(en_builtin_code("Source Code"), "builtin.source_code");
     }
 
     #[test]
