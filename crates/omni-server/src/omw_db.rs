@@ -78,10 +78,25 @@ impl OmwDb {
 
     /// 连接（或热切换至）指定数据库：
     /// 先以新路径探测打开一次，成功后原子替换池内路径并清空旧句柄，
+    /// 并自动热载入数据库内的 tag_aliases 表至 omni_core::tag_identity。
     /// 失败时保持原状态不变，避免把一个可用的池切到打不开的库。
     pub fn connect<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
         let probe = open_readonly_connection(path)?;
+
+        // 热载入 tag_aliases 到 omni_core::tag_identity 动态别名缓冲
+        if let Ok(mut stmt) = probe.prepare("SELECT lemma, tag_code FROM tag_aliases") {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }) {
+                let entries: Vec<(String, String)> = rows.filter_map(|r| r.ok()).collect();
+                if !entries.is_empty() {
+                    tracing::info!("[OmwDb] 成功热载入多语言别名 {} 条至 tag_identity", entries.len());
+                    omni_core::tag_identity::load_aliases_from_entries(entries);
+                }
+            }
+        }
+
         let mut guard = self
             .inner
             .lock()
@@ -92,12 +107,13 @@ impl OmwDb {
         Ok(())
     }
 
-    /// 断开直连：清空路径与全部只读句柄，恢复初始不可用态
+    /// 断开直连：清空路径与全部只读句柄，恢复初始不可用态，并清空动态别名
     pub fn disconnect(&self) {
         if let Ok(mut guard) = self.inner.lock() {
             guard.path = None;
             guard.avail.clear();
         }
+        omni_core::tag_identity::clear_dynamic_aliases();
     }
 
     /// 借出只读连接执行查询后自动归还

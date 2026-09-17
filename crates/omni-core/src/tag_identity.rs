@@ -230,8 +230,54 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("ui screenshot", "UI Screenshot"),
     ("chat screenshot", "Chat Screenshot"),
     ("confidential", "Confidential"),
-    ("source code", "Source Code"),
+    ("长图", "Long Image"),
+    ("正方形图", "Square Image"),
+    ("横图", "Horizontal Image"),
+    ("竖图", "Vertical Image"),
+    ("横屏", "Landscape"),
+    ("竖屏", "Portrait"),
+    ("主题内容", "Topic"),
+    ("topic", "Topic"),
+    ("long image", "Long Image"),
+    ("square image", "Square Image"),
+    ("horizontal image", "Horizontal Image"),
+    ("vertical image", "Vertical Image"),
 ];
+
+use std::sync::RwLock;
+
+static DYNAMIC_ALIASES: OnceLock<RwLock<HashMap<String, &'static str>>> = OnceLock::new();
+
+fn dynamic_aliases() -> &'static RwLock<HashMap<String, &'static str>> {
+    DYNAMIC_ALIASES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// 动态批量载入受控标签别名（由 SQLite 连接时读取 tag_aliases 表注入，或从 json 载入）
+/// 传入 (lemma, tag_code)
+pub fn load_aliases_from_entries<I, S1, S2>(entries: I)
+where
+    I: IntoIterator<Item = (S1, S2)>,
+    S1: AsRef<str>,
+    S2: AsRef<str>,
+{
+    if let Ok(mut map) = dynamic_aliases().write() {
+        for (lemma, code) in entries {
+            let norm_lemma = normalize_lemma(lemma.as_ref());
+            if norm_lemma.is_empty() {
+                continue;
+            }
+            let leaked_code: &'static str = Box::leak(code.as_ref().to_string().into_boxed_str());
+            map.insert(norm_lemma, leaked_code);
+        }
+    }
+}
+
+/// 清空动态别名字典（用于热切换或断开连接时）
+pub fn clear_dynamic_aliases() {
+    if let Ok(mut map) = dynamic_aliases().write() {
+        map.clear();
+    }
+}
 
 fn alias_map() -> &'static HashMap<String, String> {
     static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
@@ -259,6 +305,13 @@ fn en_to_code() -> &'static HashMap<String, String> {
 /// 别名/规范名 → builtin code（精确字典，非向量）
 pub fn builtin_tag_code(tag: &str) -> Option<&'static str> {
     let key = normalize_lemma(tag);
+    // 1. 优先查动态载入字典（DB/JSON 热载入轨）
+    if let Ok(dyn_map) = dynamic_aliases().read() {
+        if let Some(&code) = dyn_map.get(&key) {
+            return Some(code);
+        }
+    }
+    // 2. 回退查静态内置别名字典（静态底座保底轨）
     let en = alias_map().get(&key)?;
     // 再取 code 的 'static 引用
     en_to_code().get(en.as_str()).map(|s| s.as_str())
@@ -382,5 +435,16 @@ mod tests {
         let b = derive_ext_tag_code("go");
         assert_ne!(a, b);
         assert!(a.starts_with("_ext."));
+    }
+
+    #[test]
+    fn dynamic_aliases_injection_and_lookup() {
+        load_aliases_from_entries(vec![
+            ("特种发票", "builtin.invoice"),
+            ("Special Tax Invoice", "builtin.invoice"),
+        ]);
+        assert_eq!(builtin_tag_code("特种发票"), Some("builtin.invoice"));
+        assert_eq!(builtin_tag_code("Special Tax Invoice"), Some("builtin.invoice"));
+        assert_eq!(normalize_tag_to_code("特种发票"), "builtin.invoice");
     }
 }

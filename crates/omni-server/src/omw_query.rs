@@ -177,8 +177,35 @@ fn lemmas_of(conn: &Connection, synset_id: &str) -> Result<Vec<String>> {
     Ok(lemmas)
 }
 
+/// 语言代码归一化（BCP-47 / locale -> OMW 词典原生语言代码）
+pub fn normalize_omw_language(lang: &str) -> &'static str {
+    let clean = lang.trim().to_lowercase();
+    if clean.starts_with("zh") || clean == "cmn" {
+        "cmn"
+    } else if clean.starts_with("en") || clean == "eng" {
+        "en"
+    } else if clean.starts_with("ja") || clean == "jpn" {
+        "jpn"
+    } else if clean.starts_with("fr") || clean == "fra" {
+        "fra"
+    } else if clean.starts_with("de") || clean == "deu" {
+        "deu"
+    } else if clean.starts_with("es") || clean == "spa" {
+        "spa"
+    } else if clean.starts_with("pt") || clean == "por" {
+        "por"
+    } else if clean.starts_with("ru") || clean == "rus" {
+        "rus"
+    } else if clean.starts_with("it") || clean == "ita" {
+        "ita"
+    } else {
+        "en"
+    }
+}
+
 /// 词汇查 synset：按 lemma 忽略大小写匹配，目标语言缺失时回退英文
 pub fn lookup(conn: &Connection, word: &str, language: &str) -> Result<Vec<OmwSynsetResult>> {
+    let lang = normalize_omw_language(language);
     let mut stmt = conn.prepare(
         "SELECT DISTINCT s.id, s.ili, s.pos, s.lexfile, s.definition, s.dc_identifier, s.meta
          FROM omw_lexical_entries e
@@ -188,7 +215,7 @@ pub fn lookup(conn: &Connection, word: &str, language: &str) -> Result<Vec<OmwSy
          LIMIT ?3",
     )?;
 
-    let rows = stmt.query_map(params![word, language, LOOKUP_LIMIT], |row| {
+    let rows = stmt.query_map(params![word, lang, LOOKUP_LIMIT], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
@@ -277,14 +304,15 @@ pub fn hierarchy(conn: &Connection, synset_id: &str) -> Result<Vec<OmwSynsetNode
 
 /// 反义词查询：优先 `antonym_pairs`（人工/词表来源），无结果时回退 `omw_sense_relations`
 pub fn antonyms(conn: &Connection, word: &str, language: &str) -> Result<Vec<OmwAntonymResult>> {
+    let lang = normalize_omw_language(language);
     let mut results = Vec::new();
 
     let mut pairs_stmt = conn.prepare(
         "SELECT word_a, word_b, source, language
          FROM antonym_pairs
-         WHERE (word_a = ?1 OR word_b = ?1) AND language = ?2",
+         WHERE (word_a = ?1 OR word_b = ?1) AND (language = ?2 OR language = ?3)",
     )?;
-    let pairs = pairs_stmt.query_map(params![word, language], |row| {
+    let pairs = pairs_stmt.query_map(params![word, language, lang], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -293,12 +321,12 @@ pub fn antonyms(conn: &Connection, word: &str, language: &str) -> Result<Vec<Omw
         ))
     })?;
     for pair in pairs {
-        let (word_a, word_b, source, lang) = pair?;
+        let (word_a, word_b, source, p_lang) = pair?;
         results.push(OmwAntonymResult {
             word: word.to_string(),
             antonym: if word_a == word { word_b } else { word_a },
             source,
-            language: lang,
+            language: p_lang,
         });
     }
 
@@ -317,7 +345,7 @@ pub fn antonyms(conn: &Connection, word: &str, language: &str) -> Result<Vec<Omw
                 word: word.to_string(),
                 antonym: sense?,
                 source: "omw_sense_relations".to_string(),
-                language: language.to_string(),
+                language: lang.to_string(),
             });
         }
     }
@@ -337,29 +365,95 @@ pub fn describe(conn: &Connection, word: &str, language: &str) -> Result<Option<
     Ok(None)
 }
 
-/// 标签映射反查（零桥表依赖）：按 `file_tags.parent_codes` 找到共享同一 OMW 父级概念的
-/// `builtin.*` 标签。
+/// 标签映射反查（零桥表依赖，打通 tag_aliases 多语言别名）：
+/// 按 `file_tags.parent_codes` 找到共享同一 OMW 父级概念的 `builtin.*` 标签。
 ///
-/// 语义（#649）：`tagName` → 该标签父级中的 `omw.*` 概念 → 反查所有以这些概念为父级的
-/// `builtin.*` 标签。等价于「同一 OMW 概念下的兄弟标签」，用于替代已废除的
-/// `tag_omw_mapping` 桥表正反查。
+/// 语义（#649 / Q4-A）：
+/// 输入 `tagName`（可为当前语言名、任意语言别名或标准 code）
+/// → 归一定位目标标签与其父级 `omw.*` 概念
+/// → 反查所有以这些概念为父级的兄弟 `builtin.*` 标签。
 pub fn mapping(conn: &Connection, tag_name: &str) -> Result<Vec<OmwTagResult>> {
-    // 1) 取出同名标签（大小写不敏感）的全部 parent_codes，合并为一个 JSON 数组
-    let mut stmt = conn.prepare("SELECT code, parent_codes FROM file_tags WHERE name = ?1 COLLATE NOCASE")?;
-    let rows = stmt.query_map(params![tag_name], |row| {
+    let clean_tag = tag_name.trim();
+    let mut self_codes: Vec<String> = Vec::new();
+    let mut parent_codes: Vec<String> = Vec::new();
+
+    // 1) 优先按 name 或 code 直接查 file_tags
+    let mut stmt = conn.prepare("SELECT code, parent_codes FROM file_tags WHERE name = ?1 COLLATE NOCASE OR code = ?1 COLLATE NOCASE")?;
+    let rows = stmt.query_map(params![clean_tag], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
 
-    let mut self_codes: Vec<String> = Vec::new();
-    let mut parent_codes: Vec<String> = Vec::new();
     for row in rows {
         let (code, parents) = row?;
-        self_codes.push(code);
+        if !self_codes.contains(&code) {
+            self_codes.push(code);
+        }
         if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&parents) {
             for item in items {
-                if let Some(code) = item.as_str() {
-                    if !parent_codes.contains(&code.to_string()) {
-                        parent_codes.push(code.to_string());
+                if let Some(c) = item.as_str() {
+                    if !parent_codes.contains(&c.to_string()) {
+                        parent_codes.push(c.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) 如果在 file_tags 没有按名称命中，尝试查 tag_aliases 表（若表存在）
+    if self_codes.is_empty() {
+        let has_alias_table: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tag_aliases'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if has_alias_table {
+            let mut alias_stmt = conn.prepare(
+                "SELECT DISTINCT tag_code FROM tag_aliases WHERE lemma = ?1 COLLATE NOCASE",
+            )?;
+            let alias_codes = alias_stmt
+                .query_map(params![clean_tag], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect::<Vec<String>>();
+
+            for code in alias_codes {
+                if !self_codes.contains(&code) {
+                    self_codes.push(code.clone());
+                }
+                // 查出该 tag_code 在 file_tags 中的 parent_codes
+                let mut p_stmt = conn.prepare("SELECT parent_codes FROM file_tags WHERE code = ?1")?;
+                let p_rows = p_stmt.query_map(params![code], |row| row.get::<_, String>(0))?;
+                for p in p_rows.flatten() {
+                    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&p) {
+                        for item in items {
+                            if let Some(c) = item.as_str() {
+                                if !parent_codes.contains(&c.to_string()) {
+                                    parent_codes.push(c.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3) 若依然未查到，尝试利用 omni_core::tag_identity 字典保底解析 code
+    if self_codes.is_empty() {
+        if let Some(code) = omni_core::tag_identity::builtin_tag_code(clean_tag) {
+            self_codes.push(code.to_string());
+            let mut p_stmt = conn.prepare("SELECT parent_codes FROM file_tags WHERE code = ?1")?;
+            let p_rows = p_stmt.query_map(params![code], |row| row.get::<_, String>(0))?;
+            for p in p_rows.flatten() {
+                if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&p) {
+                    for item in items {
+                        if let Some(c) = item.as_str() {
+                            if !parent_codes.contains(&c.to_string()) {
+                                parent_codes.push(c.to_string());
+                            }
+                        }
                     }
                 }
             }
@@ -372,7 +466,7 @@ pub fn mapping(conn: &Connection, tag_name: &str) -> Result<Vec<OmwTagResult>> {
     }
     let parents_json = serde_json::to_string(&parent_codes).context("序列化 parent_codes 失败")?;
 
-    // 2) 反向查询：parent_codes 与这些 OMW 概念相交的 builtin.* 标签
+    // 4) 反向查询：parent_codes 与这些 OMW 概念相交的 builtin.* 标签
     let mut rev_stmt = conn.prepare(
         "SELECT DISTINCT t.code, t.name
          FROM file_tags t, json_each(t.parent_codes) AS j
