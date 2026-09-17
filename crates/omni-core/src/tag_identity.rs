@@ -121,6 +121,48 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("手绘", "Hand Drawn"),
     ("代码", "Code"),
     ("保密", "Confidential"),
+    // 视觉门控补充
+    ("名人", "Celebrity"),
+    ("社会名流", "Celebrity"),
+    ("历史遗迹", "Historic Site"),
+    ("户外活动", "Outdoor Activity"),
+    ("夜景照", "Night Photo"),
+    ("怀旧", "Nostalgic"),
+    ("建筑摄影", "Architecture Photo"),
+    ("微距摄影", "Macro Photo"),
+    ("街拍抓拍", "Street Photo"),
+    ("航空航拍", "Aerial Photo"),
+    ("青年漫", "Youth Comic"),
+    ("少年漫", "Boys Comic"),
+    ("少女漫", "Girls Comic"),
+    ("成人漫", "Adult Comic"),
+    ("实拍", "Real Shot"),
+    ("CG渲染", "CG Render"),
+    ("AI生成", "AI Generated"),
+    ("绘画", "Painting"),
+    ("应用图标", "App Icon"),
+    ("高饱和鲜艳", "High Saturation"),
+    ("暖色调", "Warm Tone"),
+    ("冷色调", "Cool Tone"),
+    ("中性黑白灰", "Neutral Gray"),
+    ("透明背景", "Transparent Background"),
+    ("实景背景", "Real Scene Background"),
+    ("人物主体", "Human Subject"),
+    ("动物宠物", "Animal Pet"),
+    ("植物花草", "Plant Flower"),
+    ("静物商品", "Still Life Product"),
+    ("环境建筑", "Environment Building"),
+    ("无人空镜", "Empty Scene"),
+    ("单人", "Single Person"),
+    ("双人", "Two Persons"),
+    ("多人合影", "Group Photo"),
+    ("色情", "Pornography"),
+    ("血腥", "Gore"),
+    ("涉政", "Political Sensitive"),
+    ("违规", "Violation"),
+    ("高ISO噪点", "High ISO Noise"),
+    ("逆光死白", "Backlight Blowout"),
+    ("暗光欠曝", "Underexposed"),
     // 英文模型直出别名（归一到同一概念）
     ("text", "Text"),
     ("document", "Document"),
@@ -143,7 +185,22 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("illustration", "Illustration"),
     ("comic", "Comic"),
     ("portrait", "Portrait"),
+    ("person photo", "Person Photo"),
+    ("still life photo", "Still Life Photo"),
+    ("natural landscape", "Natural Landscape"),
+    ("scenery photo", "Scenery Photo"),
+    ("travel photo", "Travel Photo"),
+    ("night photo", "Night Photo"),
+    ("real shot", "Real Shot"),
+    ("cg render", "CG Render"),
+    ("painting", "Painting"),
     ("photo", "Photo"),
+    ("black and white", "Black And White"),
+    ("full color", "Full Color"),
+    ("pornography", "Pornography"),
+    ("image with text", "Image With Text"),
+    ("image without text", "Image Without Text"),
+    ("ui screenshot", "UI Screenshot"),
     ("landscape", "Natural Landscape"),
     ("code screenshot", "Code Screenshot"),
     ("ui screenshot", "UI Screenshot"),
@@ -267,6 +324,32 @@ mod tests {
         // 不同原串同 slug 时 hash 不同
         let c2 = normalize_tag_to_code("Deep Reinforcement Learning");
         assert_ne!(code, c2);
+    }
+
+    #[test]
+    fn p0_vision_gating_concept_matching() {
+        // 英文模型输出与中文规则 canonical 对齐（vision 门控语义）
+        assert!(tag_matches_concept("Screenshot", "截图"));
+        assert!(tag_matches_concept("Portrait", "人像写真"));
+        assert!(tag_matches_concept("Person Photo", "人物照"));
+        assert!(tag_matches_concept("Natural Landscape", "自然景观"));
+        assert!(tag_matches_concept("Image Without Text", "无字图"));
+        assert!(tag_matches_concept("Design Draft", "设计稿"));
+        assert!(!tag_matches_concept("Screenshot", "人像写真"));
+
+        // zh/en 候选集经归一后 code 集合一致（P0）
+        let zh = vec![
+            "截图".to_string(),
+            "人像写真".to_string(),
+            "无字图".to_string(),
+        ];
+        let en = vec![
+            "Screenshot".to_string(),
+            "Portrait".to_string(),
+            "Image Without Text".to_string(),
+        ];
+        assert_eq!(normalize_tag_set_to_codes(&zh), normalize_tag_set_to_codes(&en));
+        assert_eq!(en_builtin_code("Screenshot"), "builtin.screenshot");
     }
 
     #[test]
