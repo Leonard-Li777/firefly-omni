@@ -53,26 +53,25 @@ fn create_omw_api_fixture(dir: &std::path::Path) -> (std::path::PathBuf, rusqlit
     let path = dir.join("omw_endpoint_fixture.db");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
-        "CREATE TABLE omw_synsets (id TEXT PRIMARY KEY, ili TEXT, pos TEXT NOT NULL, lexfile TEXT, \
-            definition TEXT, dc_identifier TEXT, meta TEXT NOT NULL DEFAULT '{}');
+        "CREATE TABLE omw_synsets (id TEXT PRIMARY KEY, pos TEXT NOT NULL, lexfile TEXT, \
+            meta TEXT NOT NULL DEFAULT '{}');
          CREATE TABLE omw_lexical_entries (id TEXT PRIMARY KEY, synset_id TEXT NOT NULL, \
             language TEXT NOT NULL, lemma TEXT NOT NULL, pos TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}');
          CREATE TABLE omw_relations (source_id TEXT NOT NULL, target_id TEXT NOT NULL, \
             rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_id, target_id, rel_type));
          CREATE TABLE omw_sense_relations (source_entry_id TEXT NOT NULL, target_entry_id TEXT NOT NULL, \
             rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_entry_id, target_entry_id, rel_type));
-         CREATE TABLE antonym_pairs (id INTEGER PRIMARY KEY AUTOINCREMENT, word_a TEXT NOT NULL, \
-            word_b TEXT NOT NULL, source TEXT NOT NULL, language TEXT NOT NULL DEFAULT 'cmn', \
-            status TEXT NOT NULL DEFAULT 'auto', meta TEXT NOT NULL DEFAULT '{}', UNIQUE (word_a, word_b, language));
+         CREATE TABLE antonym_pairs (word_a TEXT NOT NULL, word_b TEXT NOT NULL, \
+            meta TEXT NOT NULL DEFAULT '{}', UNIQUE (word_a, word_b));
          CREATE TABLE file_tags (code TEXT PRIMARY KEY, name TEXT NOT NULL, parent_codes TEXT NOT NULL DEFAULT '[]');",
     )
     .unwrap();
     conn.execute_batch(
-        "INSERT INTO omw_synsets (id, ili, pos, lexfile, definition, dc_identifier, meta) VALUES
-            ('o-dog.n', 'i1', 'n', 'noun.animal', 'a domesticated canine', 'dc1', '{\"k\":1}'),
-            ('o-animal.n', 'i2', 'n', 'noun.animal', 'a living organism', NULL, '{}'),
-            ('o-organism.n', 'i3', 'n', 'noun.animal', NULL, NULL, '{}'),
-            ('o-plant.n', 'i4', 'n', 'noun.plant', 'a photosynthetic organism', NULL, '{}');
+        "INSERT INTO omw_synsets (id, pos, lexfile, meta) VALUES
+            ('o-dog.n', 'n', 'noun.animal', '{\"k\":1}'),
+            ('o-animal.n', 'n', 'noun.animal', '{}'),
+            ('o-organism.n', 'n', 'noun.animal', '{}'),
+            ('o-plant.n', 'n', 'noun.plant', '{}');
          INSERT INTO omw_lexical_entries (id, synset_id, language, lemma, pos) VALUES
             ('e1', 'o-dog.n', 'en', 'dog', 'n'),
             ('e2', 'o-dog.n', 'en', 'domestic dog', 'n'),
@@ -84,8 +83,8 @@ fn create_omw_api_fixture(dir: &std::path::Path) -> (std::path::PathBuf, rusqlit
             ('o-dog.n', 'o-animal.n', 'hyponym');
          INSERT INTO omw_sense_relations (source_entry_id, target_entry_id, rel_type) VALUES
             ('e3', 'e4', 'antonym');
-         INSERT INTO antonym_pairs (word_a, word_b, source, language) VALUES
-            ('dog', 'cat', 'antonym.txt', 'cmn');
+         INSERT INTO antonym_pairs (word_a, word_b) VALUES
+            ('dog', 'cat');
          INSERT INTO file_tags (code, name, parent_codes) VALUES
             ('builtin.dog', '狗', '[\"omw.o-dog.n\", \"builtin.pet\"]'),
             ('builtin.pet', '宠物', '[\"omw.o-dog.n\"]'),
@@ -1466,22 +1465,22 @@ async fn test_omw_hierarchy_walks_hypernym_chain() {
 }
 
 #[tokio::test]
-async fn test_omw_antonyms_prefers_antonym_pairs() {
+async fn test_omw_antonyms_pairs_fallback_when_no_sense() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _conn) = create_omw_api_fixture(dir.path());
     let app = setup_test_app();
     reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
 
+    // dog 仅在词面表中有反义，图谱无 → 兜底 antonym_pairs
     let json = post_json(&app, "/api/v1/omw/antonyms", serde_json::json!({"word": "dog", "language": "cmn"})).await;
     let rows = json.as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["antonym"], "cat");
-    assert_eq!(rows[0]["source"], "antonym.txt");
-    assert_eq!(rows[0]["language"], "cmn");
+    assert_eq!(rows[0]["source"], "antonym_pairs");
 }
 
 #[tokio::test]
-async fn test_omw_antonyms_falls_back_to_omw_sense_relations() {
+async fn test_omw_antonyms_prefers_omw_sense_relations() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _conn) = create_omw_api_fixture(dir.path());
     let app = setup_test_app();
@@ -1495,14 +1494,15 @@ async fn test_omw_antonyms_falls_back_to_omw_sense_relations() {
 }
 
 #[tokio::test]
-async fn test_omw_describe_returns_omw_definition() {
+async fn test_omw_describe_returns_null_without_definition_column() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _conn) = create_omw_api_fixture(dir.path());
     let app = setup_test_app();
     reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
 
+    // definition 列已裁（字段治理）；describe 不再依赖库内 definition
     let json = post_json(&app, "/api/v1/omw/describe", serde_json::json!({"word": "dog", "language": "en"})).await;
-    assert_eq!(json, "a domesticated canine");
+    assert!(json.is_null() || json.as_str().is_none() || json.as_str() == Some(""));
 }
 
 #[tokio::test]
