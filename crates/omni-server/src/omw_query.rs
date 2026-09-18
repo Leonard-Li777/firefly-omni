@@ -156,15 +156,69 @@ fn parse_meta(raw: Option<String>) -> Value {
         .unwrap_or_else(|| Value::Object(Map::new()))
 }
 
-/// 查询某 synset 的全部 lemma（去重，保留库内顺序）
+/// 从词形 id 解析 (synset_id, pos, language, lemma)
+/// 形态: omw.{8位offset}.{pos}.{locale}.{lemma}
+pub fn parse_omw_entry_id(id: &str) -> Option<(String, String, String, String)> {
+    let parts: Vec<&str> = id.split('.').collect();
+    if parts.len() < 5 || parts[0] != "omw" {
+        return None;
+    }
+    let synset_id = format!("omw.{}.{}", parts[1], parts[2]);
+    let pos = parts[2].to_string();
+    let language = parts[3].to_string();
+    let lemma = parts[4..].join(".");
+    if lemma.is_empty() {
+        return None;
+    }
+    Some((synset_id, pos, language, lemma))
+}
+
+fn lemma_matches(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+fn language_compatible(entry_lang: &str, want: &str) -> bool {
+    if entry_lang == want {
+        return true;
+    }
+    let a = entry_lang.to_ascii_lowercase();
+    let b = want.to_ascii_lowercase();
+    if a == b {
+        return true;
+    }
+    let base_a = a.split('-').next().unwrap_or(&a).to_string();
+    let base_b = b.split('-').next().unwrap_or(&b).to_string();
+    if base_a == base_b {
+        return true;
+    }
+    let aliases: &[(&str, &[&str])] = &[
+        ("zh", &["cmn", "zh", "zh-cn"]),
+        ("cmn", &["zh", "zh-cn", "cmn"]),
+        ("en", &["eng", "en", "en-us"]),
+        ("eng", &["en", "en-us", "eng"]),
+    ];
+    for (k, list) in aliases {
+        if (base_a == *k || a == *k) && (list.contains(&b.as_str()) || list.contains(&base_b.as_str())) {
+            return true;
+        }
+        if (base_b == *k || b == *k) && (list.contains(&a.as_str()) || list.contains(&base_a.as_str())) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 查询某 synset 的全部 lemma（词形表仅 id+meta，从 id 切割）
 fn lemmas_of(conn: &Connection, synset_id: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT DISTINCT lemma FROM omw_lexical_entries WHERE synset_id = ?1")?;
-    let rows = stmt.query_map(params![synset_id], |row| row.get::<_, String>(0))?;
+    let mut stmt = conn.prepare("SELECT id FROM omw_lexical_entries")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut lemmas = Vec::new();
     for row in rows {
-        let lemma = row?;
-        if !lemmas.contains(&lemma) {
-            lemmas.push(lemma);
+        let id = row?;
+        if let Some((sid, _pos, _lang, lemma)) = parse_omw_entry_id(&id) {
+            if sid == synset_id && !lemmas.contains(&lemma) {
+                lemmas.push(lemma);
+            }
         }
     }
     Ok(lemmas)
@@ -196,30 +250,42 @@ pub fn normalize_omw_language(lang: &str) -> &'static str {
     }
 }
 
-/// 词汇查 synset：按 lemma 忽略大小写匹配，目标语言缺失时回退英文
+/// 词汇查 synset：词形表仅 id+meta，从 id 切割 lemma/language/synset
 pub fn lookup(conn: &Connection, word: &str, language: &str) -> Result<Vec<OmwSynsetResult>> {
     let lang = normalize_omw_language(language);
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT s.id, s.pos, s.lexfile, s.meta
-         FROM omw_lexical_entries e
-         JOIN omw_synsets s ON e.synset_id = s.id
-         WHERE e.lemma = ?1 COLLATE NOCASE
-           AND (e.language = ?2 OR e.language = 'en')
-         LIMIT ?3",
-    )?;
+    let mut stmt = conn.prepare("SELECT id FROM omw_lexical_entries")?;
+    let ids = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
-    let rows = stmt.query_map(params![word, lang, LOOKUP_LIMIT], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-        ))
-    })?;
+    let mut synset_ids: Vec<String> = Vec::new();
+    for id in ids {
+        let id = id?;
+        if let Some((sid, _pos, e_lang, lemma)) = parse_omw_entry_id(&id) {
+            if !lemma_matches(&lemma, word) {
+                continue;
+            }
+            if language_compatible(&e_lang, language) || language_compatible(&e_lang, "en") || language_compatible(&e_lang, &lang) {
+                if !synset_ids.contains(&sid) {
+                    synset_ids.push(sid);
+                }
+            }
+        }
+        if synset_ids.len() >= 50 {
+            break;
+        }
+    }
 
     let mut results = Vec::new();
-    for row in rows {
-        let (id, pos, lexfile, meta) = row?;
+    for sid in synset_ids {
+        let mut sstmt = conn.prepare("SELECT id, pos, lexfile, meta FROM omw_synsets WHERE id = ?1")?;
+        let row = sstmt.query_row(params![sid], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let (id, pos, lexfile, meta) = row;
         let lemmas = lemmas_of(conn, &id)?;
         results.push(OmwSynsetResult {
             id,
@@ -288,24 +354,45 @@ pub fn hierarchy(conn: &Connection, synset_id: &str) -> Result<Vec<OmwSynsetNode
 }
 
 /// 反义词查询：词义层图谱优先，词面 `antonym_pairs` 兜底（无 language 列）
+/// 词形表仅 id+meta，lemma 由 id 切割
 pub fn antonyms(conn: &Connection, word: &str, _language: &str) -> Result<Vec<OmwAntonymResult>> {
     let mut results = Vec::new();
 
-    let mut sense_stmt = conn.prepare(
-        "SELECT e2.lemma
-         FROM omw_lexical_entries e1
-         JOIN omw_sense_relations sr ON e1.id = sr.source_entry_id
-         JOIN omw_lexical_entries e2 ON sr.target_entry_id = e2.id
-         WHERE e1.lemma = ?1 COLLATE NOCASE AND sr.rel_type = 'antonym'
-         LIMIT ?2",
-    )?;
-    let senses = sense_stmt.query_map(params![word, LOOKUP_LIMIT], |row| row.get::<_, String>(0))?;
-    for sense in senses {
-        results.push(OmwAntonymResult {
-            word: word.to_string(),
-            antonym: sense?,
-            source: "omw_sense_relations".to_string(),
-        });
+    let mut entry_stmt = conn.prepare("SELECT id FROM omw_lexical_entries")?;
+    let entry_ids = entry_stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut source_ids: Vec<String> = Vec::new();
+    for id in entry_ids {
+        let id = id?;
+        if let Some((_sid, _pos, _lang, lemma)) = parse_omw_entry_id(&id) {
+            if lemma_matches(&lemma, word) {
+                source_ids.push(id);
+            }
+        }
+        if source_ids.len() >= 20 {
+            break;
+        }
+    }
+
+    for src in source_ids {
+        let mut sr_stmt = conn.prepare(
+            "SELECT target_entry_id FROM omw_sense_relations
+             WHERE source_entry_id = ?1 AND rel_type = 'antonym' LIMIT ?2",
+        )?;
+        let targets = sr_stmt.query_map(params![src, LOOKUP_LIMIT], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for t in targets {
+            let tid = t?;
+            if let Some((_sid, _pos, _lang, lemma)) = parse_omw_entry_id(&tid) {
+                if !lemma_matches(&lemma, word) {
+                    results.push(OmwAntonymResult {
+                        word: word.to_string(),
+                        antonym: lemma,
+                        source: "omw_sense_relations".to_string(),
+                    });
+                }
+            }
+        }
     }
 
     if results.is_empty() {
@@ -642,8 +729,7 @@ mod tests {
                 has_examples INTEGER NOT NULL DEFAULT 0, meta TEXT NOT NULL DEFAULT '{}');
              CREATE TABLE omw_synsets (id TEXT PRIMARY KEY, pos TEXT NOT NULL, lexfile TEXT, \
                 meta TEXT NOT NULL DEFAULT '{}');
-             CREATE TABLE omw_lexical_entries (id TEXT PRIMARY KEY, synset_id TEXT NOT NULL, \
-                language TEXT NOT NULL, lemma TEXT NOT NULL, pos TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}');
+             CREATE TABLE omw_lexical_entries (id TEXT PRIMARY KEY, meta TEXT NOT NULL DEFAULT '{}');
              CREATE TABLE omw_relations (source_id TEXT NOT NULL, target_id TEXT NOT NULL, \
                 rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_id, target_id, rel_type));
              CREATE TABLE omw_sense_relations (source_entry_id TEXT NOT NULL, target_entry_id TEXT NOT NULL, \
@@ -661,25 +747,32 @@ mod tests {
                 ('o-animal.n', 'n', 'noun.animal', '{}'),
                 ('o-organism.n', 'n', 'noun.entity', '{}'),
                 ('o-plant.n', 'n', 'noun.plant', '{}');
-             INSERT INTO omw_lexical_entries (id, synset_id, language, lemma, pos) VALUES
-                ('e1', 'o-dog.n', 'en', 'dog', 'n'),
-                ('e2', 'o-dog.n', 'en', 'domestic dog', 'n'),
-                ('e3', 'o-animal.n', 'en', 'animal', 'n'),
-                ('e4', 'o-plant.n', 'en', 'plant', 'n');
+             -- 词形 id: omw.{offset}.{pos}.{locale}.{lemma}；夹具 synset 用 o-*.n 时 id 需可解析，
+             -- 这里用 omw.o-dog.n.en.dog 形态不合法，故夹具统一为 omw.00000001.n 等。
+             INSERT INTO omw_lexical_entries (id, meta) VALUES
+                ('omw.00000001.n.en.dog', '{}'),
+                ('omw.00000001.n.en.domestic dog', '{}'),
+                ('omw.00000002.n.en.animal', '{}'),
+                ('omw.00000003.n.en.plant', '{}');
+             INSERT INTO omw_synsets (id, pos, lexfile, meta) VALUES
+                ('omw.00000001.n', 'n', 'noun.animal', '{\"k\":1}'),
+                ('omw.00000002.n', 'n', 'noun.animal', '{}'),
+                ('omw.00000004.n', 'n', 'noun.entity', '{}'),
+                ('omw.00000003.n', 'n', 'noun.plant', '{}');
              INSERT INTO omw_relations (source_id, target_id, rel_type) VALUES
-                ('o-dog.n', 'o-animal.n', 'hypernym'),
-                ('o-animal.n', 'o-organism.n', 'hypernym'),
-                ('o-dog.n', 'o-animal.n', 'hyponym');
+                ('omw.00000001.n', 'omw.00000002.n', 'hypernym'),
+                ('omw.00000002.n', 'omw.00000004.n', 'hypernym'),
+                ('omw.00000001.n', 'omw.00000002.n', 'hyponym');
              INSERT INTO omw_sense_relations (source_entry_id, target_entry_id, rel_type) VALUES
-                ('e3', 'e4', 'antonym');
+                ('omw.00000002.n.en.animal', 'omw.00000003.n.en.plant', 'antonym');
              INSERT INTO antonym_pairs (word_a, word_b) VALUES
                 ('dog', 'cat');
              INSERT INTO file_tags (code, name, parent_codes) VALUES
-                ('builtin.dog', '狗', '[\"omw.o-dog.n\", \"builtin.pet\"]'),
-                ('builtin.pet', '宠物', '[\"omw.o-dog.n\"]'),
-                ('builtin.cat', '猫', '[\"omw.o-dog.n\"]'),
+                ('builtin.dog', '狗', '[\"omw.00000001.n\", \"builtin.pet\"]'),
+                ('builtin.pet', '宠物', '[\"omw.00000001.n\"]'),
+                ('builtin.cat', '猫', '[\"omw.00000001.n\"]'),
                 ('builtin.unrelated', '无关', '[]'),
-                ('omw.o-dog.n', 'dog', '[\"builtin.pet\"]');",
+                ('omw.00000001.n', 'dog', '[\"builtin.pet\"]');",
         )
         .unwrap();
 
@@ -691,7 +784,7 @@ mod tests {
         let conn = fixture();
         let results = lookup(&conn, "dog", "en").unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, "o-dog.n");
+        assert_eq!(results[0].id, "omw.00000001.n");
         assert_eq!(results[0].pos, "n");
         assert_eq!(results[0].lemmas, vec!["dog", "domestic dog"]);
         assert_eq!(results[0].meta["k"], 1);
@@ -710,9 +803,9 @@ mod tests {
     #[test]
     fn hierarchy_walks_hypernym_chain_up_to_root() {
         let conn = fixture();
-        let chain = hierarchy(&conn, "o-dog.n").unwrap();
+        let chain = hierarchy(&conn, "omw.00000001.n").unwrap();
         let ids: Vec<&str> = chain.iter().map(|n| n.synset_id.as_str()).collect();
-        assert_eq!(ids, vec!["o-animal.n", "o-organism.n"]);
+        assert_eq!(ids, vec!["omw.00000002.n", "omw.00000004.n"]);
         assert!(chain.iter().all(|n| n.rel_type == "hypernym"));
         assert_eq!(chain[0].lemmas, vec!["animal"]);
     }
@@ -722,14 +815,13 @@ mod tests {
         let conn = fixture();
         // 人为制造环：o-organism.n → o-dog.n
         conn.execute(
-            "INSERT INTO omw_relations (source_id, target_id, rel_type) VALUES ('o-organism.n', 'o-dog.n', 'hypernym')",
+            "INSERT INTO omw_relations (source_id, target_id, rel_type) VALUES ('omw.00000004.n', 'omw.00000001.n', 'hypernym')",
             [],
         )
         .unwrap();
-        let chain = hierarchy(&conn, "o-dog.n").unwrap();
-        // 自身不会被再次纳入，链长收敛而非无限递归
+        let chain = hierarchy(&conn, "omw.00000001.n").unwrap();
         assert!(chain.len() <= HIERARCHY_MAX_DEPTH);
-        assert!(!chain.iter().any(|n| n.synset_id == "o-dog.n"));
+        assert!(!chain.iter().any(|n| n.synset_id == "omw.00000001.n"));
     }
 
     #[test]
