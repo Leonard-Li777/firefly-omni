@@ -109,18 +109,13 @@ pub struct UnmappedGroup {
 }
 
 /// 词汇查询结果（对齐桌面端 `OmwSynsetResult`）
+/// 已裁 ili/definition/dc_identifier（wayfinder 字段治理）
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OmwSynsetResult {
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ili: Option<String>,
     pub pos: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lexfile: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub definition: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dc_identifier: Option<String>,
     pub meta: Value,
     pub lemmas: Vec<String>,
 }
@@ -132,18 +127,16 @@ pub struct OmwSynsetNode {
     pub synset_id: String,
     pub rel_type: String,
     pub pos: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub definition: Option<String>,
     pub lemmas: Vec<String>,
 }
 
 /// 反义词结果（对齐桌面端 `OmwAntonymResult`）
+/// source 为固定枚举：omw_sense_relations | antonym_pairs
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OmwAntonymResult {
     pub word: String,
     pub antonym: String,
     pub source: String,
-    pub language: String,
 }
 
 /// 标签映射结果（对齐桌面端 `OmwTagResult`）
@@ -207,7 +200,7 @@ pub fn normalize_omw_language(lang: &str) -> &'static str {
 pub fn lookup(conn: &Connection, word: &str, language: &str) -> Result<Vec<OmwSynsetResult>> {
     let lang = normalize_omw_language(language);
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT s.id, s.ili, s.pos, s.lexfile, s.definition, s.dc_identifier, s.meta
+        "SELECT DISTINCT s.id, s.pos, s.lexfile, s.meta
          FROM omw_lexical_entries e
          JOIN omw_synsets s ON e.synset_id = s.id
          WHERE e.lemma = ?1 COLLATE NOCASE
@@ -218,26 +211,20 @@ pub fn lookup(conn: &Connection, word: &str, language: &str) -> Result<Vec<OmwSy
     let rows = stmt.query_map(params![word, lang, LOOKUP_LIMIT], |row| {
         Ok((
             row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
             row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, Option<String>>(6)?,
         ))
     })?;
 
     let mut results = Vec::new();
     for row in rows {
-        let (id, ili, pos, lexfile, definition, dc_identifier, meta) = row?;
+        let (id, pos, lexfile, meta) = row?;
         let lemmas = lemmas_of(conn, &id)?;
         results.push(OmwSynsetResult {
             id,
-            ili,
             pos,
             lexfile,
-            definition,
-            dc_identifier,
             meta: parse_meta(meta),
             lemmas,
         });
@@ -251,7 +238,7 @@ pub fn lookup(conn: &Connection, word: &str, language: &str) -> Result<Vec<OmwSy
 /// 的硬约束，故按需单层下钻由 #650 的 `GET /api/v1/omw/tree` 承担。
 pub fn hierarchy(conn: &Connection, synset_id: &str) -> Result<Vec<OmwSynsetNode>> {
     let mut stmt = conn.prepare(
-        "SELECT r.rel_type, s.id, s.pos, s.definition
+        "SELECT r.rel_type, s.id, s.pos
          FROM omw_relations r
          JOIN omw_synsets s ON r.target_id = s.id
          WHERE r.source_id = ?1 AND r.rel_type = 'hypernym'
@@ -268,13 +255,12 @@ pub fn hierarchy(conn: &Connection, synset_id: &str) -> Result<Vec<OmwSynsetNode
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
             ))
         })?;
 
         let mut next: Option<String> = None;
         for parent in parents {
-            let (rel_type, id, pos, definition) = parent?;
+            let (rel_type, id, pos) = parent?;
             // 成环保护：已访问过的节点直接跳过，不重复进入链
             if visited.contains(&id) {
                 continue;
@@ -285,7 +271,6 @@ pub fn hierarchy(conn: &Connection, synset_id: &str) -> Result<Vec<OmwSynsetNode
                 synset_id: id.clone(),
                 rel_type,
                 pos,
-                definition,
                 lemmas,
             });
             if next.is_none() {
@@ -302,50 +287,42 @@ pub fn hierarchy(conn: &Connection, synset_id: &str) -> Result<Vec<OmwSynsetNode
     Ok(chain)
 }
 
-/// 反义词查询：优先 `antonym_pairs`（人工/词表来源），无结果时回退 `omw_sense_relations`
-pub fn antonyms(conn: &Connection, word: &str, language: &str) -> Result<Vec<OmwAntonymResult>> {
-    let lang = normalize_omw_language(language);
+/// 反义词查询：词义层图谱优先，词面 `antonym_pairs` 兜底（无 language 列）
+pub fn antonyms(conn: &Connection, word: &str, _language: &str) -> Result<Vec<OmwAntonymResult>> {
     let mut results = Vec::new();
 
-    let mut pairs_stmt = conn.prepare(
-        "SELECT word_a, word_b, source, language
-         FROM antonym_pairs
-         WHERE (word_a = ?1 OR word_b = ?1) AND (language = ?2 OR language = ?3)",
+    let mut sense_stmt = conn.prepare(
+        "SELECT e2.lemma
+         FROM omw_lexical_entries e1
+         JOIN omw_sense_relations sr ON e1.id = sr.source_entry_id
+         JOIN omw_lexical_entries e2 ON sr.target_entry_id = e2.id
+         WHERE e1.lemma = ?1 COLLATE NOCASE AND sr.rel_type = 'antonym'
+         LIMIT ?2",
     )?;
-    let pairs = pairs_stmt.query_map(params![word, language, lang], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    for pair in pairs {
-        let (word_a, word_b, source, p_lang) = pair?;
+    let senses = sense_stmt.query_map(params![word, LOOKUP_LIMIT], |row| row.get::<_, String>(0))?;
+    for sense in senses {
         results.push(OmwAntonymResult {
             word: word.to_string(),
-            antonym: if word_a == word { word_b } else { word_a },
-            source,
-            language: p_lang,
+            antonym: sense?,
+            source: "omw_sense_relations".to_string(),
         });
     }
 
     if results.is_empty() {
-        let mut sense_stmt = conn.prepare(
-            "SELECT e2.lemma
-             FROM omw_lexical_entries e1
-             JOIN omw_sense_relations sr ON e1.id = sr.source_entry_id
-             JOIN omw_lexical_entries e2 ON sr.target_entry_id = e2.id
-             WHERE e1.lemma = ?1 COLLATE NOCASE AND sr.rel_type = 'antonym'
-             LIMIT ?2",
+        let mut pairs_stmt = conn.prepare(
+            "SELECT word_a, word_b
+             FROM antonym_pairs
+             WHERE word_a = ?1 OR word_b = ?1",
         )?;
-        let senses = sense_stmt.query_map(params![word, LOOKUP_LIMIT], |row| row.get::<_, String>(0))?;
-        for sense in senses {
+        let pairs = pairs_stmt.query_map(params![word], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for pair in pairs {
+            let (word_a, word_b) = pair?;
             results.push(OmwAntonymResult {
                 word: word.to_string(),
-                antonym: sense?,
-                source: "omw_sense_relations".to_string(),
-                language: lang.to_string(),
+                antonym: if word_a == word { word_b } else { word_a },
+                source: "antonym_pairs".to_string(),
             });
         }
     }
