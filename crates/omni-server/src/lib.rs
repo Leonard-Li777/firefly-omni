@@ -117,7 +117,7 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/api/v1/omw/lookup", post(omw_lookup_handler))
         .route("/api/v1/omw/hierarchy", post(omw_hierarchy_handler))
         .route("/api/v1/omw/antonyms", post(omw_antonyms_handler))
-        .route("/api/v1/omw/describe", post(omw_describe_handler))
+        // 概念描述句生成 API 已按 wayfinder #669 删除（definition 列亦已裁）
         .route("/api/v1/omw/mapping", post(omw_mapping_handler))
         .route("/api/v1/omw/tree", get(omw_tree_handler))
         .route("/api/v1/omw/unmapped-stats", get(omw_unmapped_stats_handler))
@@ -346,34 +346,14 @@ async fn omw_antonyms_handler(
     )
 }
 
-/// OMW 概念描述生成: POST /api/v1/omw/describe
-///
-/// 两级组合：优先返回 OMW definition（英文库命中），缺失时（如 OMW-cmn 无 gloss）
-/// 回退 HowNet 义原短语描述；两者皆无则返回 null。
+/// OMW 概念描述句 API 已退役（wayfinder #669 / 决策包：删除 omwGenerateDescription 等价物）。
+/// 路由 `/api/v1/omw/describe` 已摘除；本函数保留仅为避免编译引用断裂，恒返回 null。
+#[allow(dead_code)]
 async fn omw_describe_handler(
-    State(state): State<AppState>,
-    Json(req): Json<OmwDescribeRequest>,
+    State(_state): State<AppState>,
+    Json(_req): Json<OmwDescribeRequest>,
 ) -> Json<Option<String>> {
-    let language = req.language.unwrap_or_else(|| "en".to_string());
-    let word = req.word.clone();
-    let omw_desc = omw_query_or_default(state.omw.clone(), "describe", None, move |conn| {
-        omw_query::describe(conn, &word, &language)
-    })
-    .await;
-    if omw_desc.is_some() {
-        return Json(omw_desc);
-    }
-
-    // HowNet 兜底：仅在 Pro 数据集可用时命中，开源存根/无词条返回 null
-    let hownet = state.hownet.clone();
-    let word = req.word;
-    let desc = tokio::task::spawn_blocking(move || hownet.describe(&word))
-        .await
-        .unwrap_or_else(|err| Err(anyhow::anyhow!("HowNet 查询任务执行失败: {err}")))
-        .ok()
-        .filter(|result| result.found && !result.description.trim().is_empty())
-        .map(|result| result.description);
-    Json(desc)
+    Json(None)
 }
 
 /// OMW 标签映射反查: POST /api/v1/omw/mapping（零桥表依赖，见 omw_query::mapping）

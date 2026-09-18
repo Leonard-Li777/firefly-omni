@@ -640,28 +640,27 @@ mod tests {
             "CREATE TABLE omw_languages (code TEXT PRIMARY KEY, label TEXT NOT NULL, \
                 has_hierarchy INTEGER NOT NULL DEFAULT 0, has_definitions INTEGER NOT NULL DEFAULT 0, \
                 has_examples INTEGER NOT NULL DEFAULT 0, meta TEXT NOT NULL DEFAULT '{}');
-             CREATE TABLE omw_synsets (id TEXT PRIMARY KEY, ili TEXT, pos TEXT NOT NULL, lexfile TEXT, \
-                definition TEXT, dc_identifier TEXT, meta TEXT NOT NULL DEFAULT '{}');
+             CREATE TABLE omw_synsets (id TEXT PRIMARY KEY, pos TEXT NOT NULL, lexfile TEXT, \
+                meta TEXT NOT NULL DEFAULT '{}');
              CREATE TABLE omw_lexical_entries (id TEXT PRIMARY KEY, synset_id TEXT NOT NULL, \
                 language TEXT NOT NULL, lemma TEXT NOT NULL, pos TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}');
              CREATE TABLE omw_relations (source_id TEXT NOT NULL, target_id TEXT NOT NULL, \
                 rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_id, target_id, rel_type));
              CREATE TABLE omw_sense_relations (source_entry_id TEXT NOT NULL, target_entry_id TEXT NOT NULL, \
                 rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_entry_id, target_entry_id, rel_type));
-             CREATE TABLE antonym_pairs (id INTEGER PRIMARY KEY AUTOINCREMENT, word_a TEXT NOT NULL, \
-                word_b TEXT NOT NULL, source TEXT NOT NULL, language TEXT NOT NULL DEFAULT 'cmn', \
-                status TEXT NOT NULL DEFAULT 'auto', meta TEXT NOT NULL DEFAULT '{}', UNIQUE (word_a, word_b, language));
+             CREATE TABLE antonym_pairs (word_a TEXT NOT NULL, word_b TEXT NOT NULL, \
+                meta TEXT NOT NULL DEFAULT '{}', UNIQUE (word_a, word_b));
              CREATE TABLE file_tags (code TEXT PRIMARY KEY, name TEXT NOT NULL, parent_codes TEXT NOT NULL DEFAULT '[]');",
         )
         .unwrap();
 
         conn.execute_batch(
             "INSERT INTO omw_languages (code, label) VALUES ('en', 'English'), ('cmn', '中文');
-             INSERT INTO omw_synsets (id, ili, pos, lexfile, definition, dc_identifier, meta) VALUES
-                ('o-dog.n', 'i1', 'n', 'noun.animal', 'a domesticated canine', 'dc1', '{\"k\":1}'),
-                ('o-animal.n', 'i2', 'n', 'noun.animal', 'a living organism', NULL, '{}'),
-                ('o-organism.n', 'i3', 'n', 'noun.entity', NULL, NULL, '{}'),
-                ('o-plant.n', 'i4', 'n', 'noun.plant', 'a photosynthetic organism', NULL, '{}');
+             INSERT INTO omw_synsets (id, pos, lexfile, meta) VALUES
+                ('o-dog.n', 'n', 'noun.animal', '{\"k\":1}'),
+                ('o-animal.n', 'n', 'noun.animal', '{}'),
+                ('o-organism.n', 'n', 'noun.entity', '{}'),
+                ('o-plant.n', 'n', 'noun.plant', '{}');
              INSERT INTO omw_lexical_entries (id, synset_id, language, lemma, pos) VALUES
                 ('e1', 'o-dog.n', 'en', 'dog', 'n'),
                 ('e2', 'o-dog.n', 'en', 'domestic dog', 'n'),
@@ -673,8 +672,8 @@ mod tests {
                 ('o-dog.n', 'o-animal.n', 'hyponym');
              INSERT INTO omw_sense_relations (source_entry_id, target_entry_id, rel_type) VALUES
                 ('e3', 'e4', 'antonym');
-             INSERT INTO antonym_pairs (word_a, word_b, source, language) VALUES
-                ('dog', 'cat', 'antonym.txt', 'cmn');
+             INSERT INTO antonym_pairs (word_a, word_b) VALUES
+                ('dog', 'cat');
              INSERT INTO file_tags (code, name, parent_codes) VALUES
                 ('builtin.dog', '狗', '[\"omw.o-dog.n\", \"builtin.pet\"]'),
                 ('builtin.pet', '宠物', '[\"omw.o-dog.n\"]'),
@@ -694,7 +693,6 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "o-dog.n");
         assert_eq!(results[0].pos, "n");
-        assert_eq!(results[0].definition.as_deref(), Some("a domesticated canine"));
         assert_eq!(results[0].lemmas, vec!["dog", "domestic dog"]);
         assert_eq!(results[0].meta["k"], 1);
     }
@@ -735,17 +733,16 @@ mod tests {
     }
 
     #[test]
-    fn antonyms_prefers_antonym_pairs() {
+    fn antonyms_pairs_fallback_when_no_sense() {
         let conn = fixture();
         let results = antonyms(&conn, "dog", "cmn").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].antonym, "cat");
-        assert_eq!(results[0].source, "antonym.txt");
-        assert_eq!(results[0].language, "cmn");
+        assert_eq!(results[0].source, "antonym_pairs");
     }
 
     #[test]
-    fn antonyms_falls_back_to_omw_sense_relations() {
+    fn antonyms_prefers_omw_sense_relations() {
         let conn = fixture();
         let results = antonyms(&conn, "animal", "en").unwrap();
         assert_eq!(results.len(), 1);
@@ -754,14 +751,10 @@ mod tests {
     }
 
     #[test]
-    fn describe_returns_first_non_empty_definition() {
+    fn describe_returns_none_without_definition_column() {
         let conn = fixture();
-        assert_eq!(
-            describe(&conn, "dog", "en").unwrap().as_deref(),
-            Some("a domesticated canine")
-        );
-        // 定义为空/不存在的词返回 None（HowNet 兜底由 handler 负责）
-        assert_eq!(describe(&conn, "organism", "en").unwrap(), None);
+        // definition 列已裁（字段治理）
+        assert_eq!(describe(&conn, "dog", "en").unwrap(), None);
         assert_eq!(describe(&conn, "no-such-word", "en").unwrap(), None);
     }
 
