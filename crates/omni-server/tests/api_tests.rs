@@ -19,6 +19,7 @@ fn setup_test_app_with_geo(geo: Arc<omni_pro::geo::GeoService>) -> Router {
         hownet: Arc::new(omni_pro::hownet::OmniHowNetService::unavailable()),
         search: Arc::new(omni_pro::search::OmniSearchService::default()),
         omw: omni_server::OmwDb::unavailable(),
+        vector: Arc::new(omni_server::VectorEngine::in_memory()),
     };
     create_app_router(state)
 }
@@ -33,6 +34,7 @@ fn setup_test_app_with_omw_db(path: &std::path::Path) -> Router {
         hownet: Arc::new(omni_pro::hownet::OmniHowNetService::unavailable()),
         search: Arc::new(omni_pro::search::OmniSearchService::default()),
         omw,
+        vector: Arc::new(omni_server::VectorEngine::in_memory()),
     };
     create_app_router(state)
 }

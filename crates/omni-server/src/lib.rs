@@ -133,13 +133,18 @@ pub fn create_app_router(state: AppState) -> Router {
             // ADR-0038 / PRD #679: 只读语义包与向量引擎专用服务化出口 (Pro 独占 🔒)
             .route("/api/v1/taxonomy/tree", get(routes::taxonomy::taxonomy_tree_handler))
             .route("/api/v1/taxonomy/aliases", get(routes::taxonomy::taxonomy_aliases_handler))
+            .route("/api/taxonomy/fast-recognize", post(routes::taxonomy::fast_recognize_handler))
+            .route("/api/v1/taxonomy/fast-recognize", post(routes::taxonomy::fast_recognize_handler))
             .route("/api/v1/vector/upsert", post(routes::vector::vector_upsert_handler))
             .route("/api/v1/vector/search", post(routes::vector::vector_search_handler))
             .route(
                 "/api/v1/vector/delete",
                 axum::routing::delete(routes::vector::vector_delete_handler)
                     .post(routes::vector::vector_delete_handler),
-            );
+            )
+            // ADR-0039 / Ticket 1: 高速未分析文件秒搜与密集向量段落对齐
+            .route("/api/v1/search/fs", get(routes::fs_search::fs_search_handler))
+            .route("/api/v1/vector/match-passages", post(routes::vector::match_passages_handler));
     }
 
     router

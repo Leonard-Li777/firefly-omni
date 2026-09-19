@@ -24,7 +24,12 @@ zstd = { workspace = true }
 aes-gcm = { workspace = true }
 crc32fast = { workspace = true }
 rand = { workspace = true }
+ignore = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
 
 [dev-dependencies]
 tower = { workspace = true }
 tempfile = "3"
+urlencoding = "2.1"
