@@ -897,4 +897,299 @@ pub mod search {
     }
 }
 
+pub mod semantic_loader {
+    use std::path::{Path, PathBuf};
+
+    pub struct SemanticPackLoader;
+
+    impl SemanticPackLoader {
+        pub fn resolve_derived_key() -> [u8; 32] {
+            [0u8; 32]
+        }
+        pub fn discover_pack_path() -> Option<PathBuf> {
+            None
+        }
+        pub fn load_from_file<P: AsRef<Path>>(_path: P) -> anyhow::Result<rusqlite::Connection> {
+            anyhow::bail!("Open-core mode: semantic pack requires omni-pro");
+        }
+        pub fn load_pack_raw_from_file<P: AsRef<Path>>(_path: P) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("Open-core mode: semantic pack requires omni-pro");
+        }
+        pub fn load_from_bytes(_bytes: &[u8]) -> anyhow::Result<rusqlite::Connection> {
+            anyhow::bail!("Open-core mode: semantic pack requires omni-pro");
+        }
+        pub fn create_semantic_pack(_sqlite_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("Open-core mode: semantic pack requires omni-pro");
+        }
+    }
+}
+
+pub mod vector_engine {
+    use serde::{Deserialize, Serialize};
+    use std::path::Path;
+
+    pub const VECTOR_DIM: usize = 384;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VectorMatchResult {
+        pub file_fingerprint: String,
+        pub score: f32,
+    }
+
+    pub type VectorMatch = VectorMatchResult;
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VectorUpsertItem {
+        pub file_fingerprint: String,
+        pub vector: Vec<f32>,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VectorUpsertRequest {
+        pub items: Vec<VectorUpsertItem>,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VectorSearchRequest {
+        pub vector: Vec<f32>,
+        #[serde(default = "default_top_k")]
+        pub top_k: usize,
+        pub threshold: Option<f32>,
+    }
+
+    fn default_top_k() -> usize {
+        10
+    }
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VectorDeleteRequest {
+        pub file_fingerprints: Vec<String>,
+    }
+
+    pub struct VectorEngine;
+
+    impl VectorEngine {
+        pub fn open<P: AsRef<Path>>(_dir: P) -> anyhow::Result<Self> {
+            Ok(Self)
+        }
+        pub fn open_default() -> anyhow::Result<Self> {
+            Ok(Self)
+        }
+        pub fn in_memory() -> Self {
+            Self
+        }
+        pub fn count(&self) -> usize {
+            0
+        }
+        pub fn upsert(&self, _fingerprint: &str, _vec: &[f32]) -> anyhow::Result<()> {
+            anyhow::bail!("Open-core mode: vector engine requires omni-pro");
+        }
+        pub fn search(
+            &self,
+            _query: &[f32],
+            _top_k: usize,
+            _threshold: Option<f32>,
+        ) -> anyhow::Result<Vec<VectorMatchResult>> {
+            Ok(Vec::new())
+        }
+        pub fn delete(&self, _fingerprints: &[String]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+    }
+}
+
+pub mod omw_db {
+    use std::path::{Path, PathBuf};
+
+    #[derive(Clone)]
+    pub struct OmwDb;
+
+    impl OmwDb {
+        pub fn unavailable() -> Self {
+            Self
+        }
+        pub fn open_read_only<P: AsRef<Path>>(_path: P) -> anyhow::Result<Self> {
+            anyhow::bail!("Open-core mode: omw requires omni-pro");
+        }
+        pub fn load_pack_bytes(&self, _pack_bytes: &[u8]) -> anyhow::Result<()> {
+            anyhow::bail!("Open-core mode: omw requires omni-pro");
+        }
+        pub fn is_available(&self) -> bool {
+            false
+        }
+        pub fn db_path(&self) -> Option<PathBuf> {
+            None
+        }
+        pub fn validate(&self) -> bool {
+            false
+        }
+        pub fn with_conn<F, T>(&self, _f: F) -> anyhow::Result<T>
+        where
+            F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T>,
+        {
+            anyhow::bail!("Open-core mode: omw requires omni-pro");
+        }
+        pub fn reconnect<P: AsRef<Path>>(&self, _new_path: Option<P>) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+    }
+}
+
+pub mod omw_query {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TreeNode {
+        pub code: String,
+        pub name: String,
+        pub parent_codes: Vec<String>,
+        pub source: String,
+        pub depth: i64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TaxonomyNode {
+        pub code: String,
+        pub name: String,
+        pub parent_code: Option<String>,
+        pub children: Vec<TaxonomyNode>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TaxonomyTreeResponse {
+        pub locale: String,
+        pub root_nodes: Vec<TaxonomyNode>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct AliasEntry {
+        pub lemma: String,
+        pub tag_code: String,
+        pub confidence: f32,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TaxonomyAliasesResponse {
+        pub locale: String,
+        pub aliases: Vec<AliasEntry>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct GroupCount {
+        pub key: String,
+        pub count: i64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct UnmappedStats {
+        pub by_lexfile: Vec<GroupCount>,
+        pub by_top_ancestor: Vec<GroupCount>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwSynsetResult {
+        pub id: String,
+        pub pos: String,
+        pub lemmas: Vec<String>,
+        pub definition: Option<String>,
+        pub meta: serde_json::Value,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwTagResult {
+        pub tag_code: String,
+        pub tag_name: String,
+        pub match_level: i32,
+        pub confidence: f64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwAntonymResult {
+        pub word: String,
+        pub antonym: String,
+        pub source: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwSynsetNode {
+        pub synset_id: String,
+        pub rel_type: String,
+        pub lemmas: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwLookupRequest {
+        pub word: String,
+        pub language: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwHierarchyRequest {
+        pub synset_id: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwAntonymsRequest {
+        pub word: String,
+        pub language: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwDescribeRequest {
+        pub word: String,
+        pub language: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwMappingRequest {
+        pub tag_name: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwTreeRequest {
+        pub root: String,
+        #[serde(default = "default_tree_depth")]
+        pub depth: i64,
+    }
+
+    fn default_tree_depth() -> i64 {
+        1
+    }
+}
+
+pub use semantic_loader::SemanticPackLoader;
+pub use vector_engine::{
+    VectorDeleteRequest, VectorEngine, VectorMatch, VectorMatchResult, VectorSearchRequest,
+    VectorUpsertItem, VectorUpsertRequest, VECTOR_DIM,
+};
+pub use omw_db::OmwDb;
+pub use omw_query::{
+    AliasEntry, GroupCount, OmwAntonymResult, OmwAntonymsRequest, OmwDescribeRequest,
+    OmwHierarchyRequest, OmwLookupRequest, OmwMappingRequest, OmwSynsetNode, OmwSynsetResult,
+    OmwTagResult, OmwTreeRequest, TaxonomyAliasesResponse, TaxonomyNode, TaxonomyTreeResponse,
+    TreeNode, UnmappedStats,
+};
+
 

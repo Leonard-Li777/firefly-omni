@@ -24,15 +24,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-mod omw_db;
-pub use omw_db::OmwDb;
-
-mod omw_query;
-use omw_query::{
+pub use omni_pro::{OmwDb, SemanticPackLoader, VectorEngine, VectorMatch, VECTOR_DIM};
+use omni_pro::omw_query;
+use omni_pro::{
     OmwAntonymResult, OmwAntonymsRequest, OmwDescribeRequest, OmwHierarchyRequest, OmwLookupRequest,
     OmwMappingRequest, OmwSynsetNode, OmwSynsetResult, OmwTagResult, OmwTreeRequest, TreeNode,
     UnmappedStats,
 };
+
+pub mod routes;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -45,6 +45,8 @@ pub struct AppState {
     pub search: Arc<omni_pro::search::OmniSearchService>,
     /// OMW 多语言标签词库只读连接池（未传入 --db-path 时为软不可用实例）
     pub omw: OmwDb,
+    /// 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 bekko-a8m 384 维，闭源优先 🔒)
+    pub vector: Arc<VectorEngine>,
 }
 
 #[derive(Deserialize)]
@@ -83,7 +85,8 @@ pub struct GeoReverseRequest {
 }
 
 pub fn create_app_router(state: AppState) -> Router {
-    Router::new()
+    // 1. 基础开源接口 (Open-Core Endpoints)
+    let mut router = Router::new()
         .route(
             "/health",
             get(health_handler),
@@ -91,36 +94,55 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/api/version", get(version_handler))
         .route("/api/config", get(get_config).post(update_config).put(update_config))
         .route("/api/extract", post(extract_file_handler))
-        .route("/api/extract/upload", post(extract_multipart_handler))
-        .route("/api/perceive", post(perceive_file_handler))
-        .route("/api/audio/transcribe", post(audio_transcribe_handler))
-        .route("/api/audio/convert", post(audio_convert_handler))
-        .route("/api/vision/tags", post(vision_tags_handler))
-        .route("/api/vision/inspect", post(vision_inspect_handler))
-        .route("/api/fs/ads", post(fs_ads_handler))
-        .route("/api/cleanup/scan", post(cleanup_scan_handler))
-        .route("/api/cleanup/scan/stream", post(cleanup_scan_stream_handler))
-        .route("/api/cleanup/fix", post(cleanup_fix_handler))
-        .route("/api/duplicate/scan", post(cleanup_scan_handler))
-        .route("/api/duplicate/scan/stream", post(cleanup_scan_stream_handler))
-        .route("/api/duplicate/fix", post(cleanup_fix_handler))
-        .route("/api/file/preview", get(file_preview_handler))
-        .route("/api/cover", get(cover_handler))
-        .route("/api/geo/reverse", post(geo_reverse_handler))
-        .route("/api/hownet/describe", post(hownet_describe_handler))
-        .route("/api/text/analyze", post(text_analyze_handler))
-        .route("/api/search/index", post(search_index_handler))
-        .route("/api/search/hybrid", post(search_hybrid_handler))
-        .route("/api/search/cluster", post(search_cluster_handler))
-        .route("/api/taxonomy/resolve-parent", post(taxonomy_resolve_parent_handler))
-        .route("/api/reconnect", post(reconnect_omw_handler))
-        .route("/api/v1/omw/lookup", post(omw_lookup_handler))
-        .route("/api/v1/omw/hierarchy", post(omw_hierarchy_handler))
-        .route("/api/v1/omw/antonyms", post(omw_antonyms_handler))
-        // 概念描述句生成 API 已按 wayfinder #669 删除（definition 列亦已裁）
-        .route("/api/v1/omw/mapping", post(omw_mapping_handler))
-        .route("/api/v1/omw/tree", get(omw_tree_handler))
-        .route("/api/v1/omw/unmapped-stats", get(omw_unmapped_stats_handler))
+        .route("/api/extract/upload", post(extract_multipart_handler));
+
+    // 2. 闭源专业版专享接口 (Closed-Source Pro Endpoints 🔒: 一次开发闭源优先)
+    // 依据项目架构准则：除以上四个基础接口外，其余全部归属 Pro 闭源优先体系
+    if omni_pro::is_pro_enabled() {
+        router = router
+            .route("/api/perceive", post(perceive_file_handler))
+            .route("/api/audio/transcribe", post(audio_transcribe_handler))
+            .route("/api/audio/convert", post(audio_convert_handler))
+            .route("/api/vision/tags", post(vision_tags_handler))
+            .route("/api/vision/inspect", post(vision_inspect_handler))
+            .route("/api/fs/ads", post(fs_ads_handler))
+            .route("/api/cleanup/scan", post(cleanup_scan_handler))
+            .route("/api/cleanup/scan/stream", post(cleanup_scan_stream_handler))
+            .route("/api/cleanup/fix", post(cleanup_fix_handler))
+            .route("/api/duplicate/scan", post(cleanup_scan_handler))
+            .route("/api/duplicate/scan/stream", post(cleanup_scan_stream_handler))
+            .route("/api/duplicate/fix", post(cleanup_fix_handler))
+            .route("/api/file/preview", get(file_preview_handler))
+            .route("/api/cover", get(cover_handler))
+            .route("/api/geo/reverse", post(geo_reverse_handler))
+            .route("/api/hownet/describe", post(hownet_describe_handler))
+            .route("/api/text/analyze", post(text_analyze_handler))
+            .route("/api/search/index", post(search_index_handler))
+            .route("/api/search/hybrid", post(search_hybrid_handler))
+            .route("/api/search/cluster", post(search_cluster_handler))
+            .route("/api/taxonomy/resolve-parent", post(taxonomy_resolve_parent_handler))
+            .route("/api/reconnect", post(reconnect_omw_handler))
+            .route("/api/v1/omw/lookup", post(omw_lookup_handler))
+            .route("/api/v1/omw/hierarchy", post(omw_hierarchy_handler))
+            .route("/api/v1/omw/antonyms", post(omw_antonyms_handler))
+            // 概念描述句生成 API 已按 wayfinder #669 退役（恒返回 null）
+            .route("/api/v1/omw/describe", post(omw_describe_handler))
+            .route("/api/v1/omw/mapping", post(omw_mapping_handler))
+            .route("/api/v1/omw/tree", get(omw_tree_handler))
+            .route("/api/v1/omw/unmapped-stats", get(omw_unmapped_stats_handler))
+            // ADR-0038 / PRD #679: 只读语义包与向量引擎专用服务化出口 (Pro 独占 🔒)
+            .route("/api/v1/taxonomy/tree", get(routes::taxonomy::taxonomy_tree_handler))
+            .route("/api/v1/taxonomy/aliases", get(routes::taxonomy::taxonomy_aliases_handler))
+            .route("/api/v1/vector/upsert", post(routes::vector::vector_upsert_handler))
+            .route("/api/v1/vector/search", post(routes::vector::vector_search_handler))
+            .route(
+                "/api/v1/vector/delete",
+                axum::routing::delete(routes::vector::vector_delete_handler)
+                    .post(routes::vector::vector_delete_handler),
+            );
+    }
+
+    router
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .with_state(state)
 }
@@ -586,8 +608,20 @@ pub async fn start_server(addr: SocketAddr, db_path: Option<PathBuf>) -> anyhow:
         std::env::temp_dir().join("firefly_omni_search_index")
     };
     let search = Arc::new(omni_pro::search::OmniSearchService::new(search_dir));
-    // OMW 词库直连：传入 --db-path 时以只读方式打开；未传入或打开失败时软不可用，不影响整体启动
+    // OMW 词库直连与只读包零磁盘内存挂载 (ADR-0038 / PRD #679: 闭源优先 🔒)
     let omw = OmwDb::unavailable();
+    if let Some(pack_path) = SemanticPackLoader::discover_pack_path() {
+        match SemanticPackLoader::load_pack_raw_from_file(&pack_path) {
+            Ok(bytes) => {
+                match omw.load_pack_bytes(&bytes) {
+                    Ok(()) => info!("semantic.pack zero-disk mounted to OmwDb from {}", pack_path.display()),
+                    Err(err) => tracing::warn!("Failed to mount semantic.pack: {err}"),
+                }
+            }
+            Err(err) => tracing::warn!("Failed to load semantic.pack at {}: {err}", pack_path.display()),
+        }
+    }
+
     if let Some(path) = &db_path {
         match omw.connect(path) {
             Ok(()) => info!("omw db connected read-only at {}", path.display()),
@@ -596,12 +630,20 @@ pub async fn start_server(addr: SocketAddr, db_path: Option<PathBuf>) -> anyhow:
             }
         }
     }
+
+    // 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 bekko-a8m 384 维)
+    let vector = Arc::new(VectorEngine::open_default().unwrap_or_else(|err| {
+        tracing::warn!("Failed to open default vector engine ({err}), falling back to memory");
+        VectorEngine::in_memory()
+    }));
+
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),
         geo,
         hownet,
         search,
         omw,
+        vector,
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本

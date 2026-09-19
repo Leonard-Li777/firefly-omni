@@ -20,6 +20,10 @@ chrono.workspace = true
 tokio-stream = "0.1"
 futures-util = "0.3"
 rusqlite = { workspace = true }
+zstd = { workspace = true }
+aes-gcm = { workspace = true }
+crc32fast = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }

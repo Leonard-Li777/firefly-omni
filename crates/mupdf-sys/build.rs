@@ -3,6 +3,26 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
+    // 自动探测并设置预置 libclang 路径，保证 Windows MSVC 与 bindgen 兼容
+    let mut clang_cur = env::current_dir().unwrap_or_default();
+    for _ in 0..6 {
+        let preset_libclang = clang_cur.join("apps/omni/build/presetResources/libclang/bin");
+        if preset_libclang.exists() {
+            env::set_var("LIBCLANG_PATH", &preset_libclang);
+            println!("cargo:rustc-env=LIBCLANG_PATH={}", preset_libclang.display());
+            break;
+        }
+        let preset_rel = clang_cur.join("build/presetResources/libclang/bin");
+        if preset_rel.exists() {
+            env::set_var("LIBCLANG_PATH", &preset_rel);
+            println!("cargo:rustc-env=LIBCLANG_PATH={}", preset_rel.display());
+            break;
+        }
+        if !clang_cur.pop() {
+            break;
+        }
+    }
+
     let mut target_dir: Option<PathBuf> = None;
 
     if let Ok(lib_dir) = env::var("MUPDF_LIB") {
