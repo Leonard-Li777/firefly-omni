@@ -388,3 +388,43 @@ fn query_canonical_and_aliases(
     }
     Ok(map)
 }
+
+/// POST /api/taxonomy/fast-recognize 与 POST /api/v1/taxonomy/fast-recognize
+/// 端侧纯 CPU 两阶段快速语义标签识别端点 (Slice 3, Issue #680)
+pub async fn fast_recognize_handler(
+    State(state): State<AppState>,
+    Json(ctx): Json<omni_pro::text::FastRecognizeContext>,
+) -> Json<omni_pro::text::FastRecognizeResponse> {
+    let embedder = omni_pro::text::BekkoEmbedder::new();
+
+    // 尝试获取常驻预固化向量表（带全局缓存）
+    static GLOBAL_VECTOR_TABLE: std::sync::OnceLock<Option<omni_pro::text::PrecomputedVectorTable>> =
+        std::sync::OnceLock::new();
+    let vector_table_ref = GLOBAL_VECTOR_TABLE.get_or_init(|| {
+        omni_pro::semantic_loader::SemanticPackLoader::load_dense_embeddings().ok()
+    });
+
+    let res = state.omw.with_conn(|conn| {
+        Ok(omni_pro::text::FastTagRecognizer::recognize(
+            &ctx,
+            Some(conn),
+            vector_table_ref.as_ref(),
+            &embedder,
+        ))
+    });
+
+    match res {
+        Ok(outcome) => Json(outcome),
+        Err(err) => {
+            tracing::warn!("[fast_recognize_handler] 数据库离线或任务异常，执行降级纯文本识别: {err}");
+            let outcome = omni_pro::text::FastTagRecognizer::recognize(
+                &ctx,
+                None,
+                vector_table_ref.as_ref(),
+                &embedder,
+            );
+            Json(outcome)
+        }
+    }
+}
+

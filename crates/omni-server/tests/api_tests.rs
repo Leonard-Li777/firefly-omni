@@ -1422,7 +1422,8 @@ async fn test_omw_lookup_returns_synset_with_deduped_lemmas() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], "o-dog.n");
     assert_eq!(rows[0]["pos"], "n");
-    assert_eq!(rows[0]["definition"], "a domesticated canine");
+    // definition 字段已在瘦身治理中裁撤，恒为 null 或不存在
+    assert!(rows[0].get("definition").map_or(true, |v| v.is_null()));
     let lemmas: Vec<&str> = rows[0]["lemmas"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
     assert_eq!(lemmas, vec!["dog", "domestic dog"]);
     assert_eq!(rows[0]["meta"]["k"], 1);
@@ -1646,3 +1647,62 @@ async fn test_omw_tree_and_stats_soft_fail_when_unavailable() {
     assert_eq!(stats["byLexfile"], serde_json::json!([]));
     assert_eq!(stats["byTopAncestor"], serde_json::json!([]));
 }
+
+#[tokio::test]
+async fn test_fast_recognize_api_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, conn) = create_omw_api_fixture(dir.path());
+    conn.execute(
+        "INSERT INTO omw_lexical_entries (id, synset_id, language, lemma, pos, meta) VALUES ('omw.0001.zh.苹果', 'o-dog.n', 'zh', '苹果', 'n', '{}')",
+        [],
+    ).unwrap();
+
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    let req_body = serde_json::json!({
+        "fileName": "苹果发布会.md",
+        "text": "苹果公司发布最新一代电脑硬件产品",
+        "language": "zh",
+        "threshold": 0.05
+    });
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/taxonomy/fast-recognize")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+
+    println!("[API TEST] fast-recognize json: {:?}", json);
+    assert!(json["elapsedMs"].as_f64().unwrap() <= 25.0);
+    let tags = json["tags"].as_array().unwrap();
+    assert!(!tags.is_empty());
+    assert_eq!(tags[0]["lemma"], "苹果");
+
+    // 验证 /api/v1/taxonomy/fast-recognize 兼容性
+    let resp_v1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/taxonomy/fast-recognize")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp_v1.status(), StatusCode::OK);
+}
+
