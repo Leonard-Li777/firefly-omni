@@ -308,12 +308,53 @@ pub struct MatchPassagesResponse {
     pub error: Option<String>,
 }
 
+/// 段落嵌入进程级缓存：key = 文本 FNV-1a 哈希，value = L2 归一化 384d 向量
+/// 用于 match-passages 重复候选段落命中时跳过 ONNX 冷推理，对齐 ADR-0039「按需动态计算」性能契约
+static PASSAGE_EMBED_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Vec<f32>>>> =
+    std::sync::OnceLock::new();
+
+const PASSAGE_EMBED_CACHE_MAX: usize = 8192;
+
+fn passage_cache() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Vec<f32>>> {
+    PASSAGE_EMBED_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn fnv1a64(text: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// 获取段落向量：优先命中进程级缓存，否则调用 BekkoEmbedder（常驻 OnceLock 会话）并回填
+fn embed_passage_cached(
+    embedder: &omni_pro::text::BekkoEmbedder,
+    passage: &str,
+) -> anyhow::Result<Vec<f32>> {
+    let key = fnv1a64(passage);
+    if let Ok(cache) = passage_cache().lock() {
+        if let Some(v) = cache.get(&key) {
+            return Ok(v.clone());
+        }
+    }
+    let vec = embedder.embed(passage)?;
+    if let Ok(mut cache) = passage_cache().lock() {
+        if cache.len() >= PASSAGE_EMBED_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(key, vec.clone());
+    }
+    Ok(vec)
+}
+
 /// 密集向量段落对齐处理器: POST /api/v1/vector/match-passages
 ///
 /// 依据 ADR-0039 与 PRD 0039 契约：
 /// 1. 仅对 query 编码 1 次生成 384 维特征向量；
-/// 2. 利用 bekko-a8m 模型与余弦相似度对各文件的候选段落进行批量点积打分；
-/// 3. 返回最佳匹配段落及其下标与相似度，单次耗时控制在 10~15ms 以内。
+/// 2. 利用 bekko-a8m 常驻会话对候选段落批量打分（段落向量进程级缓存，重复候选零推理）；
+/// 3. 返回最佳匹配段落及其下标与相似度；小样本冷路径目标 <15ms，缓存命中路径为纯点积。
 pub async fn match_passages_handler(
     Json(req): Json<MatchPassagesRequest>,
 ) -> Result<Json<MatchPassagesResponse>, (StatusCode, Json<MatchPassagesResponse>)> {
@@ -342,7 +383,7 @@ pub async fn match_passages_handler(
             let mut best_text = String::new();
 
             for (idx, passage) in item.passages.iter().enumerate() {
-                let p_vec = embedder.embed(passage)?;
+                let p_vec = embed_passage_cached(&embedder, passage)?;
                 let sim = omni_pro::text::BekkoEmbedder::cosine_similarity(&query_vec, &p_vec);
                 if sim > best_sim {
                     best_sim = sim;

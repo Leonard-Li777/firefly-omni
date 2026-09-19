@@ -101,6 +101,7 @@ async fn test_fast_fs_search_walk_and_limit() {
     );
     assert_eq!(search_resp.items.len(), 2, "返回结果条目数必须严格受 limit=2 截断约束");
     assert_eq!(search_resp.total, 2);
+    assert_eq!(search_resp.returned, 2);
     assert!(search_resp.source == "fast_walk" || search_resp.source == "everything");
 
     for item in &search_resp.items {
@@ -152,6 +153,7 @@ async fn test_fast_fs_search_walk_and_limit() {
     let empty_q_resp: FsSearchResponse = serde_json::from_slice(&bytes_empty_q).unwrap();
     assert_eq!(empty_q_resp.items.len(), 0);
     assert_eq!(empty_q_resp.total, 0);
+    assert_eq!(empty_q_resp.returned, 0);
 
     // 4. 验证不存在目录防御：返回 404 NOT_FOUND
     let req_not_found = Request::builder()
@@ -232,7 +234,7 @@ async fn test_vector_match_passages_alignment() {
     assert!(!m2.best_passage.is_empty());
     assert!(m2.similarity >= -1.0 && m2.similarity <= 1.0);
 
-    // 性能契约检验: 单次请求耗时 < 15ms (CI 与 Debug 环境容忍单次冷启动波动放宽至 30ms)
+    // 性能契约检验: Release <15ms；Debug/CI 允许冷启动波动放宽至 40ms
     let max_allowed_ms = if cfg!(debug_assertions) { 40 } else { 15 };
     assert!(
         match_resp.duration_ms <= max_allowed_ms,
@@ -275,4 +277,56 @@ async fn test_vector_match_passages_empty_and_robustness() {
     assert_eq!(match_resp.matches[0].best_passage_index, 0);
     assert_eq!(match_resp.matches[0].similarity, 0.0);
     assert!(match_resp.matches[0].best_passage.is_empty());
+}
+
+#[tokio::test]
+async fn test_vector_match_passages_cache_hit_is_fast() {
+    let app = setup_test_app();
+
+    let payload = serde_json::json!({
+        "query": "缓存命中路径验证",
+        "items": [{
+            "fileFingerprint": "fp_cache",
+            "passages": [
+                "缓存命中路径验证：同一段落在第二次请求时应直接使用进程级向量缓存。",
+                "无关段落：办公室绿植养护说明。"
+            ]
+        }]
+    });
+
+    // 第一次：冷路径，填充段落缓存
+    let req1 = Request::builder()
+        .uri("/api/v1/vector/match-passages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let b1 = axum::body::to_bytes(resp1.into_body(), usize::MAX).await.unwrap();
+    let cold: MatchPassagesResponse = serde_json::from_slice(&b1).unwrap();
+
+    // 第二次：热路径（段落向量缓存命中）
+    let req2 = Request::builder()
+        .uri("/api/v1/vector/match-passages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let resp2 = app.oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let b2 = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+    let hot: MatchPassagesResponse = serde_json::from_slice(&b2).unwrap();
+
+    println!(
+        "cache 冷路径: {}ms, 热路径: {}ms",
+        cold.duration_ms, hot.duration_ms
+    );
+    assert_eq!(hot.matches[0].best_passage_index, cold.matches[0].best_passage_index);
+    assert!(
+        hot.duration_ms <= cold.duration_ms.max(5),
+        "缓存命中路径耗时不应高于冷路径: hot={}ms cold={}ms",
+        hot.duration_ms,
+        cold.duration_ms
+    );
 }
