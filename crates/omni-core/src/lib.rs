@@ -3,6 +3,29 @@ use serde::{Deserialize, Serialize};
 /// 受控标签跨语言身份（别名 → code）
 pub mod tag_identity;
 
+/// 编译/运行期受控标签宏：开发时书写中文或英文直观名称，自动解析为系统标准 tag_code
+///
+/// 示例：`tag_code!("截图")` → `"builtin.screenshot"`
+#[macro_export]
+macro_rules! tag_code {
+    ($name:expr) => {{
+        $crate::tag_identity::builtin_tag_code($name).unwrap_or_else(|| {
+            // 若为静态受控标签未命中，回退至归一逻辑
+            $crate::tag_identity::builtin_tag_code($name).unwrap_or("builtin.unknown")
+        })
+    }};
+}
+
+/// 运行时受控标签多语言展示宏：将 tag_code 转化为指定母语的自然展示词
+///
+/// 示例：`tag_display!("builtin.screenshot", "en")` → `"Screenshot"`
+#[macro_export]
+macro_rules! tag_display {
+    ($code:expr, $lang:expr) => {{
+        $crate::tag_identity::tag_display($code, $lang)
+    }};
+}
+
 /// Omni 核心引擎版本号
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -282,6 +305,7 @@ pub struct MultimodalContext {
     pub is_image: bool,
     pub is_document: bool,
     pub is_audio_or_video: bool,
+    pub language: Option<String>,
 }
 
 /// 单指标音频转录请求: POST /api/audio/transcribe

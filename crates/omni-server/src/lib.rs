@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use omni_core::{
-    tag_identity::{normalize_tag_set_to_codes, tag_matches_concept},
+    tag_identity::{normalize_tag_set_to_codes, normalize_tag_to_code, tag_matches_concept},
     AudioConvertRequest, AudioConvertResponse, AudioTranscribeRequest, AudioTranscribeResponse,
     DuplicateFixRequest, DuplicateFixResponse, DuplicateScanRequest, DuplicateScanResponse,
     FsAdsRequest, FsAdsResponse, OmniConfig, OmniExtractionResult, OmniPerceptionBenchmark,
@@ -1464,18 +1464,29 @@ async fn perceive_file_handler(
     }
 
     // Spec D12：统一归一为稳定 code 后再做集合同步，保证 zh/en 输入幂等
+    // 修复(问题2)：normalize 前先保留「原始名 → code」映射，供 6.2 步骤反查真实展示名
+    let detected_visual_tag_name_to_code: std::collections::HashMap<String, String> = detected_visual_tags
+        .iter()
+        .map(|name| (name.clone(), normalize_tag_to_code(name)))
+        .collect();
     let detected_visual_tags = normalize_tag_set_to_codes(&detected_visual_tags);
-    let clip_tags = normalize_tag_set_to_codes(&clip_tags);
-    let mobilenet_tags = normalize_tag_set_to_codes(&mobilenet_tags);
 
+    // 修复(问题4)：clip/mobilenet 只用 code 集合做内部比对，保留原始名供输出
     // 同步清洗 mobilenet_tags 与 clip_tags，确保互斥清洗结果一致贯通（防止被清洗的子标签混入下游主体池）
+    // 输出保留原始中文/英文名（debug 字段，与 ram_tags 保持一致）
     let mobilenet_tags: Vec<String> = mobilenet_tags
         .into_iter()
-        .filter(|t| detected_visual_tags.contains(t))
+        .filter(|name| {
+            let code = normalize_tag_to_code(name);
+            detected_visual_tags.contains(&code)
+        })
         .collect();
     let clip_tags: Vec<String> = clip_tags
         .into_iter()
-        .filter(|t| detected_visual_tags.contains(t))
+        .filter(|name| {
+            let code = normalize_tag_to_code(name);
+            detected_visual_tags.contains(&code)
+        })
         .collect();
 
     // 4. 离线逆地理编码 (若元数据中含 GPS 坐标且开启了地理反查，Pro 专享)
@@ -1562,14 +1573,27 @@ async fn perceive_file_handler(
     }
 
     // 6.2 将其他各大引擎的有效视觉标签 (经过互斥门禁过滤的 detected_visual_tags) 统一映射为 TagChainItem
-    for raw_tag in &detected_visual_tags {
-        if !structured_visual_tags.iter().any(|t| t.name.eq_ignore_ascii_case(raw_tag)) {
+    // 修复(问题2)：detected_visual_tags 此时为 code 字符串（normalize 后），
+    // 需先从 name→code 映射反查原始展示名，再构建 TagChainItem，防止 name 被写成 code 串
+    for raw_code in &detected_visual_tags {
+        // 按 code 去重（normalize 后 code 已稳定，避免同一概念 zh/en 名称不同但指向同 code 时重复添加）
+        if !structured_visual_tags.iter().any(|t| &t.code == raw_code) {
+            // 从 normalize 前的映射反查原始名（找不到则用 code 作为 fallback）
+            let original_name = detected_visual_tag_name_to_code
+                .iter()
+                .find(|(_name, code): &(&String, &String)| code.as_str() == raw_code.as_str())
+                .map(|(name, _code): (&String, &String)| name.clone())
+                .unwrap_or_else(|| raw_code.clone());
             let item = if is_pro {
-                omni_pro::OmniVisionEngine::resolve_tag_to_chain_item(raw_tag, 0.92)
+                // 用原始名查 RAM++ 投影表 / builtin 字典，得到正确的 code + name + parent_code
+                let mut resolved = omni_pro::OmniVisionEngine::resolve_tag_to_chain_item(&original_name, 0.92);
+                // 确保 code 与归一结果一致（防止别名映射漂移）
+                resolved.code = raw_code.clone();
+                resolved
             } else {
                 omni_core::TagChainItem {
-                    code: format!("builtin.{}", raw_tag),
-                    name: raw_tag.clone(),
+                    code: raw_code.clone(),
+                    name: original_name,
                     confidence: 0.92,
                     parent_code: None,
                 }
@@ -1687,6 +1711,7 @@ async fn perceive_file_handler(
         is_image,
         is_document: !is_image && !is_video,
         is_audio_or_video: is_video || audio_transcript.is_some(),
+        language: req.language.clone(),
     };
 
     let fusion_outcome = if is_pro {
@@ -1707,6 +1732,24 @@ async fn perceive_file_handler(
         fusion_outcome.fused_tags
     } else {
         structured_visual_tags.clone()
+    };
+
+    // 问题3修复(omni侧)：对 fused_tags 中 parent_code 为 None 的扩展标签，
+    // 通过 TaxonomyVectorBase bekko-a8m 语义向量推导补全 parent_code，
+    // 避免 desktop 端看到 None 或硬编码回退值。
+    let fused_tags: Vec<omni_core::TagChainItem> = if is_pro {
+        fused_tags.into_iter().map(|mut tag| {
+            if tag.parent_code.is_none() && tag.code.starts_with("_ext.") {
+                let outcome = omni_pro::text::OmniMultimodalFusionEngine::resolve_ext_tag_parent(
+                    &tag.name,
+                    &tag.code,
+                );
+                tag.parent_code = Some(outcome);
+            }
+            tag
+        }).collect()
+    } else {
+        fused_tags
     };
 
     benchmark.total_ms = t_start.elapsed().as_millis() as u64;

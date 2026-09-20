@@ -41,7 +41,7 @@ pub fn en_builtin_code(en_name: &str) -> String {
     let slug = sanitize_en_slug(trimmed);
     if slug.is_empty() {
         let hash = content_hash8(trimmed);
-        format!("builtin.h_{}", &hash[..hash.len().min(10)])
+        format!("builtin.{}", &hash[..hash.len().min(10)])
     } else {
         format!("builtin.{}", slug)
     }
@@ -53,7 +53,7 @@ pub fn derive_ext_tag_code(tag: &str) -> String {
     let hash8 = content_hash8(tag_clean);
     let slug = sanitize_en_slug(tag_clean);
     if slug.is_empty() {
-        format!("_ext.h_{}", &hash8[..hash8.len().min(10)])
+        format!("_ext.{}", &hash8[..hash8.len().min(10)])
     } else {
         format!("_ext.{}.{}", slug, hash8)
     }
@@ -291,6 +291,30 @@ fn alias_map() -> &'static HashMap<String, String> {
     })
 }
 
+fn code_to_canonical_zh() -> &'static HashMap<String, String> {
+    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m = HashMap::new();
+        for (zh, en) in BUILTIN_ALIASES {
+            let code = en_builtin_code(en);
+            m.entry(code).or_insert_with(|| (*zh).to_string());
+        }
+        m
+    })
+}
+
+fn code_to_canonical_en() -> &'static HashMap<String, String> {
+    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m = HashMap::new();
+        for (_, en) in BUILTIN_ALIASES {
+            let code = en_builtin_code(en);
+            m.entry(code).or_insert_with(|| (*en).to_string());
+        }
+        m
+    })
+}
+
 fn en_to_code() -> &'static HashMap<String, String> {
     static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
     MAP.get_or_init(|| {
@@ -300,6 +324,37 @@ fn en_to_code() -> &'static HashMap<String, String> {
         }
         m
     })
+}
+
+/// 将标准 tag_code 反查对应语言的规范展示名称 (若未查到则提取 slug 兜底)
+pub fn tag_display(code: &str, lang: &str) -> String {
+    let clean_code = code.trim();
+    let l = lang.to_lowercase();
+    let is_zh = l.starts_with("zh");
+
+    if is_zh {
+        if let Some(zh) = code_to_canonical_zh().get(clean_code) {
+            return zh.clone();
+        }
+    } else {
+        if let Some(en) = code_to_canonical_en().get(clean_code) {
+            return en.clone();
+        }
+    }
+
+    // 针对 _ext.slug.hash 或 builtin.slug 提取人类可读部分
+    if let Some(stripped) = clean_code.strip_prefix("builtin.") {
+        return stripped.replace('_', " ");
+    }
+    if let Some(stripped) = clean_code.strip_prefix("_ext.") {
+        if let Some(slug) = stripped.split('.').next() {
+            if !slug.is_empty() {
+                return slug.replace('_', " ");
+            }
+        }
+    }
+
+    clean_code.to_string()
 }
 
 /// 别名/规范名 → builtin code（精确字典，非向量）
