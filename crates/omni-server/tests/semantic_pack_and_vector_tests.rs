@@ -181,6 +181,32 @@ fn test_semantic_pack_tamper_proofing() {
 }
 
 #[test]
+fn test_semantic_pack_load_raw_from_file_and_discovery() {
+    let sqlite_bytes = create_test_sqlite_bytes();
+    let pack_bytes = SemanticPackLoader::create_semantic_pack(&sqlite_bytes)
+        .expect("创建 semantic.pack 失败");
+
+    let temp_dir = tempfile::tempdir().expect("创建临时目录失败");
+    let pack_path = temp_dir.path().join("semantic.pack");
+    std::fs::write(&pack_path, &pack_bytes).expect("写入临时 semantic.pack 失败");
+
+    // 验证 load_pack_raw_from_file 能够成功解密解压
+    let raw_bytes = SemanticPackLoader::load_pack_raw_from_file(&pack_path)
+        .expect("从文件解密加载原始 SQLite 失败");
+    assert!(!raw_bytes.is_empty());
+    assert_eq!(&raw_bytes[0..16], b"SQLite format 3\0");
+
+    // 验证真实构建产物（若存在）能够被候选密钥链顺利解密
+    if let Some(real_pack_path) = SemanticPackLoader::discover_pack_path() {
+        println!("发现本地只读语义包: {}", real_pack_path.display());
+        let real_raw_bytes = SemanticPackLoader::load_pack_raw_from_file(&real_pack_path)
+            .expect("解密真实 semantic.pack 失败");
+        assert!(!real_raw_bytes.is_empty());
+        assert_eq!(&real_raw_bytes[0..16], b"SQLite format 3\0");
+    }
+}
+
+#[test]
 fn test_vector_engine_rabitq_and_int8_ann() {
     let temp_dir = tempfile::tempdir().expect("创建临时目录失败");
     let engine = VectorEngine::open(temp_dir.path()).expect("打开向量引擎失败");
@@ -277,6 +303,48 @@ fn setup_test_app_with_pack_and_vector() -> axum::Router {
         vector,
     };
     create_app_router(state)
+}
+
+#[test]
+fn test_taxonomy_aliases_display_cascade_fallback_to_en_us() {
+    // 展示级联：目标语言（zh-CN）无 canonical 时，Omni 返回 name 应回退 en-US，而非露出 code
+    let conn = Connection::open_in_memory().expect("创建内存库失败");
+    conn.execute_batch(
+        "CREATE TABLE file_tags (
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            parent_codes TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE TABLE tag_aliases_zh_CN (
+            tag_code TEXT NOT NULL, lemma TEXT NOT NULL, is_canonical INTEGER NOT NULL DEFAULT 0,
+            n INTEGER NOT NULL DEFAULT 1, count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag_code, lemma)
+        ) WITHOUT ROWID;
+        CREATE TABLE tag_aliases_en_US (
+            tag_code TEXT NOT NULL, lemma TEXT NOT NULL, is_canonical INTEGER NOT NULL DEFAULT 0,
+            n INTEGER NOT NULL DEFAULT 1, count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag_code, lemma)
+        ) WITHOUT ROWID;
+        INSERT INTO file_tags (code, name) VALUES
+            ('builtin.invoice', '发票'),
+            ('omw.02084071.n', 'omw.02084071.n');
+        INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical, count) VALUES
+            ('builtin.invoice', '发票', 1, 10);
+        INSERT INTO tag_aliases_en_US (tag_code, lemma, is_canonical, count) VALUES
+            ('builtin.invoice', 'Invoice', 1, 10),
+            ('omw.02084071.n', 'bill', 1, 8);",
+    )
+    .expect("初始化别名夹具失败");
+
+    let zh = query_taxonomy_aliases(&conn, "zh-CN", None).expect("zh 别名查询失败");
+    // 中文有词形：仍优先中文
+    assert_eq!(zh.canonical_names.get("builtin.invoice").unwrap(), "发票");
+    // 中文缺失的 omw.*：回退英文 canonical，而不是 code/slug
+    assert_eq!(zh.canonical_names.get("omw.02084071.n").unwrap(), "bill");
+
+    let en = query_taxonomy_aliases(&conn, "en-US", None).expect("en 别名查询失败");
+    assert_eq!(en.canonical_names.get("builtin.invoice").unwrap(), "Invoice");
+    assert_eq!(en.canonical_names.get("omw.02084071.n").unwrap(), "bill");
 }
 
 #[tokio::test]

@@ -296,29 +296,119 @@ pub fn query_taxonomy_tree(
     })
 }
 
+/// 表是否存在
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |_| Ok(true),
+    )
+    .unwrap_or(false)
+}
+
+/// 从指定语言分表装载 alias/canonical（支持 prefix 过滤）
+fn load_alias_rows_from_table(
+    conn: &Connection,
+    table: &str,
+    prefix_patterns: Option<&(String, String)>,
+) -> anyhow::Result<(HashMap<String, Vec<String>>, HashMap<String, String>)> {
+    let mut aliases_by_code: HashMap<String, Vec<String>> = HashMap::new();
+    let mut canonical_by_code: HashMap<String, String> = HashMap::new();
+
+    let sql = if prefix_patterns.is_some() {
+        format!(
+            "SELECT tag_code, lemma, is_canonical FROM {table} WHERE (tag_code = ?1 OR tag_code LIKE ?2) ORDER BY is_canonical DESC, count DESC, lemma ASC"
+        )
+    } else {
+        format!(
+            "SELECT tag_code, lemma, is_canonical FROM {table} ORDER BY is_canonical DESC, count DESC, lemma ASC"
+        )
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut raw_items: Vec<(String, String, bool)> = Vec::new();
+    if let Some((exact, pat)) = prefix_patterns {
+        let mut rows = stmt.query(rusqlite::params![exact, pat])?;
+        while let Some(row) = rows.next()? {
+            let tag_code: String = row.get(0)?;
+            let lemma: String = row.get(1)?;
+            let is_canonical: i64 = row.get(2).unwrap_or(0);
+            raw_items.push((tag_code, lemma, is_canonical == 1));
+        }
+    } else {
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let tag_code: String = row.get(0)?;
+            let lemma: String = row.get(1)?;
+            let is_canonical: i64 = row.get(2).unwrap_or(0);
+            raw_items.push((tag_code, lemma, is_canonical == 1));
+        }
+    }
+
+    for (tag_code, lemma, is_canonical) in raw_items {
+        let entry = aliases_by_code.entry(tag_code.clone()).or_default();
+        if !entry.contains(&lemma) {
+            if is_canonical {
+                entry.insert(0, lemma.clone());
+            } else {
+                entry.push(lemma.clone());
+            }
+        }
+        if is_canonical && !canonical_by_code.contains_key(&tag_code) {
+            canonical_by_code.insert(tag_code, lemma);
+        }
+    }
+
+    Ok((aliases_by_code, canonical_by_code))
+}
+
+/// 展示级联：目标语言 canonical 缺失时回退 `tag_aliases_en_US`（不改识别路径）
+fn fill_canonical_from_en_fallback(
+    conn: &Connection,
+    prefix_patterns: Option<&(String, String)>,
+    aliases_by_code: &mut HashMap<String, Vec<String>>,
+    canonical_by_code: &mut HashMap<String, String>,
+) {
+    const EN_TABLE: &str = "tag_aliases_en_US";
+    if !table_exists(conn, EN_TABLE) {
+        return;
+    }
+    let Ok((en_aliases, en_canonical)) = load_alias_rows_from_table(conn, EN_TABLE, prefix_patterns)
+    else {
+        return;
+    };
+    for (code, lemma) in en_canonical {
+        if canonical_by_code.contains_key(&code) {
+            continue;
+        }
+        canonical_by_code.insert(code.clone(), lemma.clone());
+        if !aliases_by_code.contains_key(&code) {
+            aliases_by_code.insert(code, vec![lemma]);
+        }
+    }
+    // 有英文词形但尚无 canonical 的 code：用英文列表首位兜底
+    for (code, list) in en_aliases {
+        if !canonical_by_code.contains_key(&code) {
+            if let Some(first) = list.first() {
+                canonical_by_code.insert(code.clone(), first.clone());
+            }
+        }
+    }
+}
+
 /// 内部逻辑：提取指定 locale 下所有标签的别名和规范展示名 (Issue #684)
 /// 优先使用纯净语言分表 tag_aliases_{lang}，回退旧表 tag_aliases，支持 prefix 过滤
+/// 展示级联（slice 03）：目标语言 canonical 缺失时回退 en-US 母本，避免 UI 露出 code/slug
 pub fn query_taxonomy_aliases(
     conn: &Connection,
     locale: &str,
     prefix_filter: Option<&str>,
 ) -> anyhow::Result<TaxonomyAliasesResponse> {
     let target_table = omni_pro::resolve_tag_aliases_table(locale);
-    let has_target_table: bool = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [target_table],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
+    let has_target_table = table_exists(conn, target_table);
 
     let has_legacy_table: bool = if !has_target_table {
-        conn.query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tag_aliases'",
-            [],
-            |_| Ok(true),
-        )
-        .unwrap_or(false)
+        table_exists(conn, "tag_aliases")
     } else {
         false
     };
@@ -345,49 +435,9 @@ pub fn query_taxonomy_aliases(
     });
 
     if has_target_table {
-        let sql = if prefix_patterns.is_some() {
-            format!(
-                "SELECT tag_code, lemma, is_canonical FROM {target_table} WHERE (tag_code = ?1 OR tag_code LIKE ?2) ORDER BY is_canonical DESC, count DESC, lemma ASC"
-            )
-        } else {
-            format!(
-                "SELECT tag_code, lemma, is_canonical FROM {target_table} ORDER BY is_canonical DESC, count DESC, lemma ASC"
-            )
-        };
-
-        let mut stmt = conn.prepare(&sql)?;
-        let mut raw_items: Vec<(String, String, bool)> = Vec::new();
-        if let Some((ref exact, ref pat)) = prefix_patterns {
-            let mut rows = stmt.query(rusqlite::params![exact, pat])?;
-            while let Some(row) = rows.next()? {
-                let tag_code: String = row.get(0)?;
-                let lemma: String = row.get(1)?;
-                let is_canonical: i64 = row.get(2).unwrap_or(0);
-                raw_items.push((tag_code, lemma, is_canonical == 1));
-            }
-        } else {
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let tag_code: String = row.get(0)?;
-                let lemma: String = row.get(1)?;
-                let is_canonical: i64 = row.get(2).unwrap_or(0);
-                raw_items.push((tag_code, lemma, is_canonical == 1));
-            }
-        }
-
-        for (tag_code, lemma, is_canonical) in raw_items {
-            let entry = aliases_by_code.entry(tag_code.clone()).or_default();
-            if !entry.contains(&lemma) {
-                if is_canonical {
-                    entry.insert(0, lemma.clone());
-                } else {
-                    entry.push(lemma.clone());
-                }
-            }
-            if is_canonical && !canonical_by_code.contains_key(&tag_code) {
-                canonical_by_code.insert(tag_code, lemma);
-            }
-        }
+        let (a, c) = load_alias_rows_from_table(conn, target_table, prefix_patterns.as_ref())?;
+        aliases_by_code.extend(a);
+        canonical_by_code.extend(c);
     } else {
         let sql = if prefix_patterns.is_some() {
             "SELECT tag_code, lemma, is_canonical, locale FROM tag_aliases WHERE (tag_code = ?1 OR tag_code LIKE ?2) ORDER BY is_canonical DESC, lemma ASC"
@@ -448,6 +498,16 @@ pub fn query_taxonomy_aliases(
                 canonical_by_code.insert(code.clone(), first.clone());
             }
         }
+    }
+
+    // 展示级联：目标语言缺 canonical 时回退 en-US（识别路径不受影响）
+    if target_table != "tag_aliases_en_US" {
+        fill_canonical_from_en_fallback(
+            conn,
+            prefix_patterns.as_ref(),
+            &mut aliases_by_code,
+            &mut canonical_by_code,
+        );
     }
 
     let total_tags = aliases_by_code.len();
