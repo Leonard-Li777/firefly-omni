@@ -638,6 +638,68 @@ pub mod text {
         }
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+    pub struct SemanticSlots {
+        pub agent: Option<String>,
+        pub patient: Option<String>,
+        pub function: Option<String>,
+        pub instrument: Option<String>,
+        pub time: Option<String>,
+        pub location: Option<String>,
+        pub doc_type: Option<String>,
+        pub classifier: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub enum GrammarArchetype {
+        ChineseAdverbial,
+        WesternSvoPostposition,
+        EastAsianSovAgglutinative,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct CandidateSentence {
+        pub text: String,
+        pub archetype: GrammarArchetype,
+        pub pattern_id: String,
+        pub slot_coverage: f32,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ScoredSentence {
+        pub sentence: String,
+        pub archetype: GrammarArchetype,
+        pub pattern_id: String,
+        pub similarity: f32,
+        pub composite_score: f32,
+    }
+
+    pub struct ArchetypeGenerator;
+    impl ArchetypeGenerator {
+        pub fn generate_candidates(_slots: &SemanticSlots, _lang: &str) -> Vec<CandidateSentence> {
+            Vec::new()
+        }
+    }
+
+    pub struct SentenceRanker;
+    impl SentenceRanker {
+        pub fn rank_candidates(
+            _candidates: &[CandidateSentence],
+            _reference_text: &str,
+            _embedder: &BekkoEmbedder,
+        ) -> Vec<ScoredSentence> {
+            Vec::new()
+        }
+        pub fn select_best_sentence(
+            _slots: &SemanticSlots,
+            _lang: &str,
+            _reference_text: &str,
+            _embedder: &BekkoEmbedder,
+        ) -> Option<ScoredSentence> {
+            None
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
     pub struct StructuredSummaryItem {
         pub what: Option<String>,
@@ -1177,6 +1239,31 @@ pub mod omw_query {
     fn default_tree_depth() -> i64 {
         1
     }
+
+    pub fn resolve_tag_aliases_table(lang: &str) -> &'static str {
+        let lower = lang.trim().to_lowercase().replace('-', "_");
+        if lower.starts_with("zh") || lower.starts_with("cmn") {
+            "tag_aliases_zh_CN"
+        } else if lower.starts_with("ja") || lower.starts_with("jpn") {
+            "tag_aliases_ja_JP"
+        } else if lower.starts_with("ko") || lower.starts_with("kor") {
+            "tag_aliases_ko_KR"
+        } else if lower.starts_with("fr") || lower.starts_with("fra") {
+            "tag_aliases_fr_FR"
+        } else if lower.starts_with("de") || lower.starts_with("deu") {
+            "tag_aliases_de_DE"
+        } else if lower.starts_with("es") || lower.starts_with("spa") {
+            "tag_aliases_es_ES"
+        } else if lower.starts_with("ru") || lower.starts_with("rus") {
+            "tag_aliases_ru_RU"
+        } else if lower.starts_with("pt") || lower.starts_with("por") {
+            "tag_aliases_pt_PT"
+        } else if lower.starts_with("ar") || lower.starts_with("ara") {
+            "tag_aliases_ar_EG"
+        } else {
+            "tag_aliases_en_US"
+        }
+    }
 }
 
 pub use semantic_loader::SemanticPackLoader;
@@ -1186,10 +1273,10 @@ pub use vector_engine::{
 };
 pub use omw_db::OmwDb;
 pub use omw_query::{
-    AliasEntry, GroupCount, OmwAntonymResult, OmwAntonymsRequest, OmwDescribeRequest,
-    OmwHierarchyRequest, OmwLookupRequest, OmwMappingRequest, OmwSynsetNode, OmwSynsetResult,
-    OmwTagResult, OmwTreeRequest, TaxonomyAliasesResponse, TaxonomyNode, TaxonomyTreeResponse,
-    TreeNode, UnmappedStats,
+    resolve_tag_aliases_table, AliasEntry, GroupCount, OmwAntonymResult, OmwAntonymsRequest,
+    OmwDescribeRequest, OmwHierarchyRequest, OmwLookupRequest, OmwMappingRequest, OmwSynsetNode,
+    OmwSynsetResult, OmwTagResult, OmwTreeRequest, TaxonomyAliasesResponse, TaxonomyNode,
+    TaxonomyTreeResponse, TreeNode, UnmappedStats,
 };
 
 
