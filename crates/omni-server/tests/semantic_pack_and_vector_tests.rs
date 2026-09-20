@@ -31,18 +31,24 @@ fn create_test_sqlite_bytes() -> Vec<u8> {
             name TEXT NOT NULL,
             parent_codes TEXT NOT NULL DEFAULT '[]'
         );
-        CREATE TABLE tag_aliases (
+        CREATE TABLE tag_aliases_zh_CN (
             tag_code TEXT NOT NULL,
-            locale TEXT NOT NULL,
             lemma TEXT NOT NULL,
             is_canonical INTEGER NOT NULL DEFAULT 0,
-            meta TEXT NOT NULL DEFAULT '{}'
-        );
-        CREATE TABLE omw_synsets (
-            id TEXT PRIMARY KEY,
-            pos TEXT NOT NULL,
-            lexfile TEXT
-        );
+            n INTEGER NOT NULL DEFAULT 1,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag_code, lemma)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE tag_aliases_en_US (
+            tag_code TEXT NOT NULL,
+            lemma TEXT NOT NULL,
+            is_canonical INTEGER NOT NULL DEFAULT 0,
+            n INTEGER NOT NULL DEFAULT 1,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag_code, lemma)
+        ) WITHOUT ROWID;
+
         CREATE TABLE omw_relations (
             source_id TEXT NOT NULL,
             target_id TEXT NOT NULL,
@@ -56,22 +62,19 @@ fn create_test_sqlite_bytes() -> Vec<u8> {
             ('builtin.invoice', '发票', '[\"builtin.finance\"]'),
             ('builtin.receipt', '收据', '[\"builtin.finance\"]');
 
-        INSERT INTO tag_aliases (tag_code, locale, lemma, is_canonical) VALUES
-            ('builtin.document', 'zh-CN', '文档', 1),
-            ('builtin.document', 'en-US', 'Document', 1),
-            ('builtin.finance', 'zh-CN', '财务', 1),
-            ('builtin.finance', 'zh-CN', '金融', 0),
-            ('builtin.finance', 'en-US', 'Finance', 1),
-            ('builtin.invoice', 'zh-CN', '发票', 1),
-            ('builtin.invoice', 'zh-CN', '发票单据', 0),
-            ('builtin.invoice', 'en-US', 'Invoice', 1),
-            ('builtin.receipt', 'zh-CN', '收据', 1),
-            ('builtin.receipt', 'en-US', 'Receipt', 1);
+        INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical, n, count) VALUES
+            ('builtin.document', '文档', 1, 1, 100),
+            ('builtin.finance', '财务', 1, 1, 90),
+            ('builtin.finance', '金融', 0, 1, 50),
+            ('builtin.invoice', '发票', 1, 1, 80),
+            ('builtin.invoice', '发票单据', 0, 1, 40),
+            ('builtin.receipt', '收据', 1, 1, 70);
 
-        INSERT INTO omw_synsets (id, pos, lexfile) VALUES
-            ('omw.00000001.n', 'n', 'noun.document'),
-            ('omw.00000002.n', 'n', 'noun.communication'),
-            ('omw.00000003.n', 'n', 'noun.entity');
+        INSERT INTO tag_aliases_en_US (tag_code, lemma, is_canonical, n, count) VALUES
+            ('builtin.document', 'Document', 1, 1, 100),
+            ('builtin.finance', 'Finance', 1, 1, 90),
+            ('builtin.invoice', 'Invoice', 1, 1, 80),
+            ('builtin.receipt', 'Receipt', 1, 1, 70);
 
         INSERT INTO omw_relations (source_id, target_id, rel_type) VALUES
             ('omw.00000001.n', 'omw.00000002.n', 'hypernym'),
@@ -320,6 +323,21 @@ async fn test_http_taxonomy_and_vector_endpoints() {
     let invoice_aliases = aliases_resp.aliases.get("builtin.invoice").unwrap();
     assert!(invoice_aliases.contains(&"发票".to_string()));
     assert!(invoice_aliases.contains(&"发票单据".to_string()));
+
+    // 2.1 GET /api/v1/taxonomy/aliases?locale=zh-CN&prefix=builtin.finance
+    let req_prefix = Request::builder()
+        .uri("/api/v1/taxonomy/aliases?locale=zh-CN&prefix=builtin.finance")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp_prefix = app.clone().oneshot(req_prefix).await.unwrap();
+    assert_eq!(resp_prefix.status(), StatusCode::OK);
+    let body_bytes_prefix = axum::body::to_bytes(resp_prefix.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let prefix_resp: TaxonomyAliasesResponse = serde_json::from_slice(&body_bytes_prefix).unwrap();
+    assert!(prefix_resp.aliases.contains_key("builtin.finance"));
+    assert!(!prefix_resp.aliases.contains_key("builtin.document"));
 
     // 3. POST /api/v1/vector/upsert
     let mut test_vec = vec![0.0f32; VECTOR_DIM];
