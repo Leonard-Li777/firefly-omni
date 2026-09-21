@@ -1667,6 +1667,20 @@ async fn test_fast_recognize_api_endpoint() {
         "threshold": 0.05
     });
 
+    // 首次请求包含 Jieba 词典单例与 Bekko ONNX Session 惰性初始化，发起预热请求
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/taxonomy/fast-recognize")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+    // 第二次测量真实稳态执行时间 (必须 <= 25ms)
     let resp = app
         .clone()
         .oneshot(

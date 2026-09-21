@@ -587,20 +587,8 @@ pub async fn start_server(addr: SocketAddr, db_path: Option<PathBuf>) -> anyhow:
             Arc::new(omni_pro::geo::GeoService::unavailable())
         }
     };
-    // HowNet 知识库发现链：环境变量 → exe 相对目录 → cwd 候选；落空或开源存根时软不可用
-    let hownet = match omni_pro::hownet::discover_hownet_db_path() {
-        Some(path) => {
-            info!("omni-hownet db found at {}", path.display());
-            Arc::new(omni_pro::hownet::OmniHowNetService::open(path).unwrap_or_else(|err| {
-                tracing::warn!("Failed to open omni-hownet db: {err}");
-                omni_pro::hownet::OmniHowNetService::unavailable()
-            }))
-        }
-        None => {
-            info!("omni-hownet db not found or open-core stub mode, hownet subsystem starts unavailable");
-            Arc::new(omni_pro::hownet::OmniHowNetService::unavailable())
-        }
-    };
+    // HowNet 独立数据库已废弃，能力已完全合流至 semantic.pack；保持软不可用存根服务
+    let hownet = Arc::new(omni_pro::hownet::OmniHowNetService::unavailable());
     // 索引目录发现链：优先持久化用户数据目录（APPDATA → LOCALAPPDATA → USERPROFILE），
     // 全部缺失时才降级到系统临时目录（临时目录存在被系统清理导致索引重建的风险，仅作兜底）
     let search_dir = if let Ok(appdata) = std::env::var("APPDATA") {
@@ -1585,7 +1573,7 @@ async fn perceive_file_handler(
                 .map(|(name, _code): (&String, &String)| name.clone())
                 .unwrap_or_else(|| raw_code.clone());
             let item = if is_pro {
-                // 用原始名查 RAM++ 投影表 / builtin 字典，得到正确的 code + name + parent_code
+                // 用原始名查 RAM++ 投影表 / builtin 字典，得到正确的 code + name + parent_codes
                 let mut resolved = omni_pro::OmniVisionEngine::resolve_tag_to_chain_item(&original_name, 0.92);
                 // 确保 code 与归一结果一致（防止别名映射漂移）
                 resolved.code = raw_code.clone();
@@ -1595,7 +1583,7 @@ async fn perceive_file_handler(
                     code: raw_code.clone(),
                     name: original_name,
                     confidence: 0.92,
-                    parent_code: None,
+                    ..Default::default()
                 }
             };
             structured_visual_tags.push(item);
@@ -1623,6 +1611,12 @@ async fn perceive_file_handler(
 
     let audio_transcript = metadata
         .get("audio_transcript")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let lrc = metadata
+        .get("lrc")
+        .or_else(|| metadata.get("audio").and_then(|a| a.get("lrc")))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -1706,11 +1700,12 @@ async fn perceive_file_handler(
         document_text: if !is_image && !markdown_content.trim().is_empty() { Some(markdown_content.clone()) } else { None },
         ocr_text: ocr_text.clone(),
         audio_transcript: audio_transcript.clone(),
+        lrc_text: lrc.clone(),
         visual_tags: structured_visual_tags.clone(),
         exif_metadata: metadata.clone(),
         is_image,
         is_document: !is_image && !is_video,
-        is_audio_or_video: is_video || audio_transcript.is_some(),
+        is_audio_or_video: is_video || audio_transcript.is_some() || lrc.is_some(),
         language: req.language.clone(),
     };
 
@@ -1725,26 +1720,48 @@ async fn perceive_file_handler(
         }
     };
 
+    let candidate_hypotheses = if !fusion_outcome.candidate_hypotheses.is_empty() {
+        fusion_outcome.candidate_hypotheses
+    } else {
+        cascade_candidates
+    };
+
+    // 若第三阶段双锚点融合产生了胜出假设，优先更新 winning_hypothesis
+    let winning_hypothesis = candidate_hypotheses
+        .iter()
+        .find(|c| c.is_winner)
+        .map(|c| omni_core::WinningHypothesisItem {
+            prompt_text: c.prompt_text.clone(),
+            confidence: c.confidence,
+        })
+        .or(winning_hypothesis);
+
     // 终局智能重命名与描述：优先取第三阶段双锚点交叉验证胜出者，平滑回退
     let smart_name = fusion_outcome.smart_name.or(smart_name).or(text_smart_name);
     let content_description = fusion_outcome.content_description.or(content_description).or_else(|| text_one_desc.clone());
+    
+    // 置信度门限控制：低于 0.60 的候选标签严禁透出到接口返回结果中 (日志中已输出完整候选打分)
+    structured_visual_tags.retain(|t| t.confidence >= 0.60);
+
     let fused_tags = if !fusion_outcome.fused_tags.is_empty() {
-        fusion_outcome.fused_tags
+        let mut filtered = fusion_outcome.fused_tags;
+        filtered.retain(|t| t.confidence >= 0.60);
+        filtered
     } else {
         structured_visual_tags.clone()
     };
 
-    // 问题3修复(omni侧)：对 fused_tags 中 parent_code 为 None 的扩展标签，
-    // 通过 TaxonomyVectorBase bekko-a8m 语义向量推导补全 parent_code，
-    // 避免 desktop 端看到 None 或硬编码回退值。
+    // 对 fused_tags 中 parent_codes 为空的扩展标签，
+    // 通过 TaxonomyVectorBase bekko-a8m 语义向量推导补全 parent_codes，
+    // 避免 desktop 端看到空父级或硬编码回退值。
     let fused_tags: Vec<omni_core::TagChainItem> = if is_pro {
         fused_tags.into_iter().map(|mut tag| {
-            if tag.parent_code.is_none() && tag.code.starts_with("_ext.") {
+            if tag.parent_codes.is_empty() && tag.code.starts_with("_ext.") {
                 let outcome = omni_pro::text::OmniMultimodalFusionEngine::resolve_ext_tag_parent(
                     &tag.name,
                     &tag.code,
                 );
-                tag.parent_code = Some(outcome);
+                tag.parent_codes = vec![outcome];
             }
             tag
         }).collect()
@@ -1804,12 +1821,13 @@ async fn perceive_file_handler(
         sensitive_types,
         content_rating,
         audio_transcript,
+        lrc,
         audio_events,
         geo_address,
         phash,
         is_corrupted,
         // 级联假设仲裁终局字段
-        candidate_hypotheses: if !fusion_outcome.candidate_hypotheses.is_empty() { fusion_outcome.candidate_hypotheses } else { cascade_candidates },
+        candidate_hypotheses,
         winning_hypothesis,
         activated_dimension_tags,
         fused_tags,
@@ -1940,6 +1958,7 @@ async fn taxonomy_resolve_parent_handler(
             materialized_paths: vec![omni_pro::text::MaterializedPathItem {
                 code_path: "/topic/builtin.zhu_ti_nei_rong.13364ec8".to_string(),
                 name_path: "/通用/主题内容".to_string(),
+                depth: 2,
             }],
         }
     });

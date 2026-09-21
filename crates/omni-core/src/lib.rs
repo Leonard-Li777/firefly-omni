@@ -160,15 +160,45 @@ pub struct OmniPerceptionBenchmark {
     pub ram_ms: Option<u64>,
 }
 
-/// 统一多模态标签链项 (仅输出标签 code、名称 name 与置信度 confidence，由 Desktop 端反查清洗落盘)
+/// 统一多模态标签链项 (融合语义数据库 file_tags 全字段属性)
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TagChainItem {
     pub code: String,
     #[serde(alias = "tag")]
     pub name: String,
     pub confidence: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_codes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_code: Option<String>,
+    pub materialized_paths: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sememe: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl TagChainItem {
+    pub fn new(code: impl Into<String>, name: impl Into<String>, confidence: f32) -> Self {
+        Self {
+            code: code.into(),
+            name: name.into(),
+            confidence,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_parent(mut self, parent_code: impl Into<String>) -> Self {
+        self.parent_codes = vec![parent_code.into()];
+        self
+    }
 }
 
 /// 兼容别名: RamTagItem 指向统一 TagChainItem
@@ -231,6 +261,8 @@ pub struct OmniPerceptionResult {
     pub sensitive_types: Vec<String>,
     pub content_rating: Option<String>,
     pub audio_transcript: Option<String>,
+    #[serde(default)]
+    pub lrc: Option<String>,
     pub audio_events: Vec<String>,
     pub geo_address: Option<String>,
 
@@ -300,6 +332,7 @@ pub struct MultimodalContext {
     pub document_text: Option<String>,
     pub ocr_text: Option<String>,
     pub audio_transcript: Option<String>,
+    pub lrc_text: Option<String>,
     pub visual_tags: Vec<TagChainItem>,
     pub exif_metadata: serde_json::Value,
     pub is_image: bool,

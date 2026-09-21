@@ -294,7 +294,7 @@ pub mod vision {
                 code: format!("builtin.{}", tag),
                 name: tag.to_string(),
                 confidence,
-                parent_code: None,
+                ..Default::default()
             }
         }
 
@@ -805,6 +805,7 @@ pub mod text {
     pub struct MaterializedPathItem {
         pub code_path: String,
         pub name_path: String,
+        pub depth: u32,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -840,6 +841,7 @@ pub mod text {
                 materialized_paths: vec![MaterializedPathItem {
                     code_path: "/topic/builtin.zhu_ti_nei_rong.13364ec8".to_string(),
                     name_path: "/通用/主题内容".to_string(),
+                    depth: 2,
                 }],
             }
         }

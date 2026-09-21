@@ -224,6 +224,16 @@ impl OmniExtractor {
                     if let Some(genre) = tag.genre() { audio_meta.insert("genre".into(), genre.to_string().into()); }
                     if let Some(track) = tag.track() { audio_meta.insert("track".into(), track.into()); }
                     if let Some(year) = tag.year() { audio_meta.insert("year".into(), year.into()); }
+
+                    // 从 lofty Tag 读取内嵌歌词 (ItemKey::Lyrics)
+                    if let Some(lyrics_item) = tag.get(&lofty::tag::ItemKey::Lyrics) {
+                        if let Some(text) = lyrics_item.value().text() {
+                            let clean_lyrics = extract_pure_lyrics(text);
+                            if !clean_lyrics.is_empty() {
+                                audio_meta.insert("lrc".into(), clean_lyrics.into());
+                            }
+                        }
+                    }
                 }
                 let properties = tagged_file.properties();
                 let secs = properties.duration().as_secs();
@@ -237,6 +247,21 @@ impl OmniExtractor {
             if let Some(val) = exiftool_map.get("Artist") { audio_meta.entry("artist".to_string()).or_insert(val.clone()); }
             if let Some(val) = exiftool_map.get("Album") { audio_meta.entry("album".to_string()).or_insert(val.clone()); }
 
+            // ExifTool 兜底提取歌词
+            if !audio_meta.contains_key("lrc") {
+                let exif_lrc = exiftool_map
+                    .get("Lyrics")
+                    .or_else(|| exiftool_map.get("UnsynchronizedLyrics"))
+                    .or_else(|| exiftool_map.get("SynchronizedLyrics"))
+                    .and_then(|v| v.as_str());
+                if let Some(raw_lrc) = exif_lrc {
+                    let clean = extract_pure_lyrics(raw_lrc);
+                    if !clean.is_empty() {
+                        audio_meta.insert("lrc".into(), clean.into());
+                    }
+                }
+            }
+
             // 音频艺术家清洗与多作者拆分
             let artist_val = audio_meta.get("artist").and_then(|v| v.as_str()).map(String::from);
             if let Some(artist_str) = artist_val {
@@ -248,6 +273,11 @@ impl OmniExtractor {
                         result.metadata["authors"] = serde_json::Value::Array(artists_list.into_iter().map(serde_json::Value::String).collect());
                     }
                 }
+            }
+
+            // 若提取到有效歌词，同时挂载到 result.metadata["lrc"]，供顶层和感知层直接获取
+            if let Some(lrc_val) = audio_meta.get("lrc") {
+                result.metadata["lrc"] = lrc_val.clone();
             }
 
             result.metadata["audio"] = serde_json::Value::Object(audio_meta);
@@ -1479,6 +1509,39 @@ pub fn clean_and_split_authors(raw: &str) -> (String, Vec<String>) {
     (joined, deduped)
 }
 
+/// 萃取纯文本歌词：移除时间轴 `[00:00.00]` 和元数据标签 `[ti:xxx]`、`[ar:xxx]` 等
+pub fn extract_pure_lyrics(text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+
+    use std::sync::OnceLock;
+    static RE_TIMESTAMP: OnceLock<regex::Regex> = OnceLock::new();
+    static RE_TAG: OnceLock<regex::Regex> = OnceLock::new();
+    static RE_EMPTY_BRACKET: OnceLock<regex::Regex> = OnceLock::new();
+
+    let re_ts = RE_TIMESTAMP.get_or_init(|| {
+        regex::Regex::new(r"\[\d{1,2}:\d{2}([:\.]\d{1,3})?\]").unwrap()
+    });
+    let re_tag = RE_TAG.get_or_init(|| {
+        regex::Regex::new(r"(?i)\[[a-z0-9]{1,10}:.*\]").unwrap()
+    });
+    let re_empty = RE_EMPTY_BRACKET.get_or_init(|| {
+        regex::Regex::new(r"\[\s*\]").unwrap()
+    });
+
+    let no_ts = re_ts.replace_all(text, "");
+    let no_tag = re_tag.replace_all(&no_ts, "");
+    let no_empty = re_empty.replace_all(&no_tag, "");
+
+    no_empty
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
 /// 从多个候选元数据字段中提取并清洗作者
 pub fn extract_and_clean_authors(values: &[Option<&serde_json::Value>]) -> Option<(String, Vec<String>)> {
     for val_opt in values {
@@ -1618,7 +1681,7 @@ mod tests {
         map.insert("img2.jpg".to_string(), "Line 1\nLine 2".to_string());
 
         let result = OmniExtractor::replace_embedded_image_ocr(markdown, &map);
-        assert!(result.contains("📷 **[图片内提取文字]**"));
+        assert!(result.contains("📷 **[Image Text / 图片内提取文字]**"));
         assert!(result.contains("识别结果一"));
         assert!(result.contains("> Line 1"));
         assert!(result.contains("> Line 2"));
@@ -1748,6 +1811,18 @@ mod tests {
             assert!(!res.is_corrupted);
             assert!(!res.markdown_content.trim().is_empty());
         }
+    }
+
+    #[test]
+    fn test_extract_pure_lyrics() {
+        let raw = "[ti:海阔天空]\n[ar:Beyond]\n[al:乐与怒]\n[00:00.00]海阔天空 - Beyond\n[00:18.52]今天我 寒夜里看雪飘过\n[00:25.10]怀着冷却了的心窝漂远方\n[00:30.85]风雨里追赶 雾里分不清影踪\n[00:36.52]天空海阔你与我 可会变\n[02:15.00][03:40.00]原谅我这一生不羁放纵爱自由";
+        let clean = extract_pure_lyrics(raw);
+        assert!(!clean.contains("[ti:"));
+        assert!(!clean.contains("[ar:"));
+        assert!(!clean.contains("[00:18.52]"));
+        assert!(!clean.contains("[02:15.00]"));
+        assert!(clean.contains("今天我 寒夜里看雪飘过"));
+        assert!(clean.contains("原谅我这一生不羁放纵爱自由"));
     }
 }
 

@@ -1,6 +1,15 @@
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 
+/// Omni 日志时间格式：仅输出「分:秒」，避免完整时间戳刷屏
+struct MinuteSecondTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for MinuteSecondTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", chrono::Local::now().format("%M:%S"))
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "firefly-omni")]
 #[command(version)]
@@ -31,7 +40,10 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,anydoc=error,lopdf=error,czkawka_core=off,little_exif=off,symphonia=off,symphonia_bundle_mp3=off,symphonia_core=off,symphonia_bundle_flac=off,symphonia_format_isomp4=off,symphonia_format_riff=off"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_timer(MinuteSecondTimer)
+        .init();
     let cli = Cli::parse();
 
     match &cli.command {
