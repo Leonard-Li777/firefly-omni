@@ -393,6 +393,8 @@ fn dynamic_aliases() -> &'static RwLock<HashMap<String, &'static str>> {
 
 /// 动态批量载入受控标签别名（由 SQLite 连接时读取 tag_aliases 表注入，或从 json 载入）
 /// 传入 (lemma, tag_code)
+///
+/// 冲突规则：同一 lemma 同时命中 `omw.*` 与 `builtin.*` 时 **omw.* 优先**（中文概念优先反映射 OMW，禁止无脑 builtin/_ext）。
 pub fn load_aliases_from_entries<I, S1, S2>(entries: I)
 where
     I: IntoIterator<Item = (S1, S2)>,
@@ -405,10 +407,53 @@ where
             if norm_lemma.is_empty() {
                 continue;
             }
-            let leaked_code: &'static str = Box::leak(code.as_ref().to_string().into_boxed_str());
-            map.insert(norm_lemma, leaked_code);
+            let code_ref = code.as_ref();
+            let should_insert = match map.get(&norm_lemma) {
+                Some(existing) => {
+                    let existing_is_omw = existing.starts_with("omw.");
+                    let incoming_is_omw = code_ref.starts_with("omw.");
+                    let existing_is_builtin = existing.starts_with("builtin.");
+                    let incoming_is_builtin = code_ref.starts_with("builtin.");
+                    if incoming_is_omw && existing_is_builtin {
+                        true
+                    } else if existing_is_omw && incoming_is_builtin {
+                        false
+                    } else {
+                        // 同前缀或其它受控形态：后写覆盖
+                        true
+                    }
+                }
+                None => true,
+            };
+            if should_insert {
+                let leaked_code: &'static str = Box::leak(code_ref.to_string().into_boxed_str());
+                map.insert(norm_lemma, leaked_code);
+            }
         }
     }
+}
+
+/// 受控标签 code 反查（运行时归一入口）
+///
+/// 优先级：
+/// 1. 动态别名字典（semantic.pack tag_aliases_{lang} 热载；同 lemma 时 omw.* 已优先）
+/// 2. 静态 builtin 离线字典
+///
+/// 未命中返回 `None`，由调用方派生 `_ext.{slug}.{hash8}`。
+pub fn resolve_controlled_tag_code(tag: &str) -> Option<&'static str> {
+    let key = normalize_lemma(tag);
+    if key.is_empty() {
+        return None;
+    }
+    // 1. 动态轨（含 omw.*）
+    if let Ok(dyn_map) = dynamic_aliases().read() {
+        if let Some(&code) = dyn_map.get(&key) {
+            return Some(code);
+        }
+    }
+    // 2. 静态 builtin 字典（不经过 dynamic 再查，避免语义重复）
+    let en = alias_map().get(&key)?;
+    en_to_code().get(en.as_str()).map(|s| s.as_str())
 }
 
 /// 清空动态别名字典（用于热切换或断开连接时）
@@ -633,6 +678,7 @@ mod tests {
 
     #[test]
     fn dynamic_aliases_injection_and_lookup() {
+        clear_dynamic_aliases();
         load_aliases_from_entries(vec![
             ("特种发票", "builtin.invoice"),
             ("Special Tax Invoice", "builtin.invoice"),
@@ -640,5 +686,29 @@ mod tests {
         assert_eq!(builtin_tag_code("特种发票"), Some("builtin.invoice"));
         assert_eq!(builtin_tag_code("Special Tax Invoice"), Some("builtin.invoice"));
         assert_eq!(normalize_tag_to_code("特种发票"), "builtin.invoice");
+        clear_dynamic_aliases();
+    }
+
+    #[test]
+    fn dynamic_aliases_prefer_omw_over_builtin_for_same_lemma() {
+        clear_dynamic_aliases();
+        // 同 lemma：builtin 先写入，omw 后写入 → 反查必须得到 omw.*
+        load_aliases_from_entries(vec![
+            ("科幻", "builtin.science_fiction"),
+            ("科幻", "omw.00012345.n"),
+        ]);
+        assert_eq!(resolve_controlled_tag_code("科幻"), Some("omw.00012345.n"));
+        // 反向写入顺序：omw 先、builtin 后，仍保持 omw 优先
+        clear_dynamic_aliases();
+        load_aliases_from_entries(vec![
+            ("科幻", "omw.00012345.n"),
+            ("科幻", "builtin.science_fiction"),
+        ]);
+        assert_eq!(resolve_controlled_tag_code("科幻"), Some("omw.00012345.n"));
+        // 静态 builtin 词仍可解析
+        assert!(resolve_controlled_tag_code("截图").unwrap().starts_with("builtin."));
+        // 未知词返回 None，交由调用方派生 _ext
+        assert_eq!(resolve_controlled_tag_code("完全未知的新标签XYZQ"), None);
+        clear_dynamic_aliases();
     }
 }

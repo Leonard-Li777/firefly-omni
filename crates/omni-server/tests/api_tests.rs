@@ -65,7 +65,7 @@ fn create_omw_api_fixture(dir: &std::path::Path) -> (std::path::PathBuf, rusqlit
             rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_entry_id, target_entry_id, rel_type));
          CREATE TABLE antonym_pairs (word_a TEXT NOT NULL, word_b TEXT NOT NULL, \
             meta TEXT NOT NULL DEFAULT '{}', UNIQUE (word_a, word_b));
-         CREATE TABLE file_tags (code TEXT PRIMARY KEY, name TEXT NOT NULL, parent_codes TEXT NOT NULL DEFAULT '[]');",
+         CREATE TABLE file_tags (code TEXT PRIMARY KEY, name TEXT NOT NULL, parent_codes TEXT NOT NULL DEFAULT '[]', source TEXT, sort_order INTEGER DEFAULT 0);",
     )
     .unwrap();
     conn.execute_batch(
@@ -87,7 +87,7 @@ fn create_omw_api_fixture(dir: &std::path::Path) -> (std::path::PathBuf, rusqlit
             ('e3', 'e4', 'antonym');
          INSERT INTO antonym_pairs (word_a, word_b) VALUES
             ('dog', 'cat');
-         INSERT INTO file_tags (code, name, parent_codes) VALUES
+         INSERT INTO file_tags (code, name, parent_codes, source, sort_order) VALUES
             ('builtin.dog', '狗', '[\"omw.o-dog.n\", \"builtin.pet\"]'),
             ('builtin.pet', '宠物', '[\"omw.o-dog.n\"]'),
             ('builtin.cat', '猫', '[\"omw.o-dog.n\"]'),

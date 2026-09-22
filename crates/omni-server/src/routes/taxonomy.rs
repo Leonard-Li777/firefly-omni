@@ -150,9 +150,10 @@ pub fn query_taxonomy_tree(
     // 2. 预载入别名与规范名映射表 (优化展示名注入)
     let alias_map = query_canonical_and_aliases(conn, locale).unwrap_or_default();
 
-    // 3. 查询 file_tags 中的所有标签
+    // 3. 查询 file_tags：读取 pack source/sort_order（创世字段治理，不兼容 category）
+    // TreeNode.source 仍为 code 前缀分区（builtin/omw/_ext/user），供 UI 分区消费
     let mut stmt = conn.prepare(
-        "SELECT code, name, parent_codes FROM file_tags ORDER BY code"
+        "SELECT code, name, parent_codes, source, sort_order FROM file_tags ORDER BY code"
     )?;
 
     struct RawTag {
@@ -160,6 +161,7 @@ pub fn query_taxonomy_tree(
         default_name: String,
         parent_codes: Vec<String>,
         source: String,
+        sort_order: i64,
     }
 
     let mut raw_tags: Vec<RawTag> = Vec::new();
@@ -167,12 +169,15 @@ pub fn query_taxonomy_tree(
         let code: String = row.get(0)?;
         let name: String = row.get(1)?;
         let parent_codes_raw: String = row.get(2).unwrap_or_else(|_| "[]".to_string());
-        Ok((code, name, parent_codes_raw))
+        let source: Option<String> = row.get(3)?;
+        let sort_order: Option<i64> = row.get(4)?;
+        Ok((code, name, parent_codes_raw, source, sort_order))
     })?;
 
     for row in rows {
-        let (code, default_name, parent_codes_raw) = row?;
+        let (code, default_name, parent_codes_raw, pack_source, sort_order) = row?;
         let parent_codes: Vec<String> = serde_json::from_str(&parent_codes_raw).unwrap_or_default();
+        // TreeNode.source = code 前缀分区（与 pack source 语义正交：前者 code 身份，后者 taxonomy 来源）
         let source = if code.starts_with("builtin.") {
             "builtin"
         } else if code.starts_with("omw.") {
@@ -182,11 +187,15 @@ pub fn query_taxonomy_tree(
         } else {
             "user"
         };
+        // builtin 中文命中 omw 时 pack 已回写 sort_order；未写则 0
+        let sort_order = sort_order.unwrap_or(0);
+        let _ = pack_source; // pack source 已在 unmapped_stats / 义原查询面消费；树分区不混用
         raw_tags.push(RawTag {
             code,
             default_name,
             parent_codes,
             source: source.to_string(),
+            sort_order,
         });
     }
 
@@ -213,7 +222,7 @@ pub fn query_taxonomy_tree(
                 parent_code: primary_parent,
                 parent_codes: raw.parent_codes,
                 source: raw.source,
-                sort_order: 0,
+                sort_order: raw.sort_order,
                 children: Vec::new(),
             },
         );

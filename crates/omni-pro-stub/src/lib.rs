@@ -1123,6 +1123,9 @@ pub mod omw_query {
         pub code: String,
         pub name: String,
         pub parent_code: Option<String>,
+        pub parent_codes: Vec<String>,
+        pub source: String,
+        pub sort_order: i64,
         pub children: Vec<TaxonomyNode>,
     }
 

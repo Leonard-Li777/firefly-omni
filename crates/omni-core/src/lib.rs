@@ -9,10 +9,10 @@ pub mod tag_identity;
 #[macro_export]
 macro_rules! tag_code {
     ($name:expr) => {{
-        $crate::tag_identity::builtin_tag_code($name).unwrap_or_else(|| {
-            // 若为静态受控标签未命中，回退至归一逻辑
-            $crate::tag_identity::builtin_tag_code($name).unwrap_or("builtin.unknown")
-        })
+        // 受控反查：动态别名（omw.* 优先）→ 静态 builtin
+        $crate::tag_identity::resolve_controlled_tag_code($name)
+            .or_else(|| $crate::tag_identity::builtin_tag_code($name))
+            .unwrap_or("builtin.unknown")
     }};
 }
 
@@ -171,8 +171,7 @@ pub struct TagChainItem {
     pub parent_codes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialized_paths: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>,
+    // 创世字段治理：pack 来源列已收敛为 source（dimension/tag/hownet/omw），废除 category
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

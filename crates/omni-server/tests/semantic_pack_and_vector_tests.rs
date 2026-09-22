@@ -29,7 +29,9 @@ fn create_test_sqlite_bytes() -> Vec<u8> {
         "CREATE TABLE file_tags (
             code TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            parent_codes TEXT NOT NULL DEFAULT '[]'
+            parent_codes TEXT NOT NULL DEFAULT '[]',
+            source TEXT,
+            sort_order INTEGER DEFAULT 0
         );
         CREATE TABLE tag_aliases_zh_CN (
             tag_code TEXT NOT NULL,
@@ -56,7 +58,7 @@ fn create_test_sqlite_bytes() -> Vec<u8> {
             PRIMARY KEY (source_id, target_id, rel_type)
         );
 
-        INSERT INTO file_tags (code, name, parent_codes) VALUES
+        INSERT INTO file_tags (code, name, parent_codes, source, sort_order) VALUES
             ('builtin.document', '文档', '[]'),
             ('builtin.finance', '财务', '[\"builtin.document\"]'),
             ('builtin.invoice', '发票', '[\"builtin.finance\"]'),
@@ -153,7 +155,7 @@ fn test_semantic_pack_pack_and_zero_disk_mount() {
 
     // 6. 验证强制只读护栏
     let write_res = conn.execute(
-        "INSERT INTO file_tags (code, name) VALUES ('test.hack', '篡改')",
+        "INSERT INTO file_tags (code, name, source, sort_order) VALUES ('test.hack', '篡改', 'omw', 0)",
         [],
     );
     assert!(
@@ -313,7 +315,9 @@ fn test_taxonomy_aliases_display_cascade_fallback_to_en_us() {
         "CREATE TABLE file_tags (
             code TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            parent_codes TEXT NOT NULL DEFAULT '[]'
+            parent_codes TEXT NOT NULL DEFAULT '[]',
+            source TEXT,
+            sort_order INTEGER DEFAULT 0
         );
         CREATE TABLE tag_aliases_zh_CN (
             tag_code TEXT NOT NULL, lemma TEXT NOT NULL, is_canonical INTEGER NOT NULL DEFAULT 0,
@@ -325,7 +329,7 @@ fn test_taxonomy_aliases_display_cascade_fallback_to_en_us() {
             n INTEGER NOT NULL DEFAULT 1, count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (tag_code, lemma)
         ) WITHOUT ROWID;
-        INSERT INTO file_tags (code, name) VALUES
+        INSERT INTO file_tags (code, name, source, sort_order) VALUES
             ('builtin.invoice', '发票'),
             ('omw.02084071.n', 'omw.02084071.n');
         INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical, count) VALUES
