@@ -88,10 +88,10 @@ fn create_omw_api_fixture(dir: &std::path::Path) -> (std::path::PathBuf, rusqlit
          INSERT INTO antonym_pairs (word_a, word_b) VALUES
             ('dog', 'cat');
          INSERT INTO file_tags (code, name, parent_codes, source, sort_order) VALUES
-            ('builtin.dog', '狗', '[\"omw.o-dog.n\", \"builtin.pet\"]'),
-            ('builtin.pet', '宠物', '[\"omw.o-dog.n\"]'),
-            ('builtin.cat', '猫', '[\"omw.o-dog.n\"]'),
-            ('builtin.unrelated', '无关', '[]');",
+            ('builtin.dog', '狗', '[\"omw.o-dog.n\", \"builtin.pet\"]', 'tag', 1),
+            ('builtin.pet', '宠物', '[\"omw.o-dog.n\"]', 'tag', 2),
+            ('builtin.cat', '猫', '[\"omw.o-dog.n\"]', 'tag', 3),
+            ('builtin.unrelated', '无关', '[]', 'tag', 4);",
     )
     .unwrap();
     (path, conn)

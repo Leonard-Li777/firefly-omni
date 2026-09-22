@@ -59,10 +59,10 @@ fn create_test_sqlite_bytes() -> Vec<u8> {
         );
 
         INSERT INTO file_tags (code, name, parent_codes, source, sort_order) VALUES
-            ('builtin.document', '文档', '[]'),
-            ('builtin.finance', '财务', '[\"builtin.document\"]'),
-            ('builtin.invoice', '发票', '[\"builtin.finance\"]'),
-            ('builtin.receipt', '收据', '[\"builtin.finance\"]');
+            ('builtin.document', '文档', '[]', 'dimension', 1),
+            ('builtin.finance', '财务', '[\"builtin.document\"]', 'dimension', 2),
+            ('builtin.invoice', '发票', '[\"builtin.finance\"]', 'tag', 3),
+            ('builtin.receipt', '收据', '[\"builtin.finance\"]', 'tag', 4);
 
         INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical, n, count) VALUES
             ('builtin.document', '文档', 1, 1, 100),
@@ -330,8 +330,8 @@ fn test_taxonomy_aliases_display_cascade_fallback_to_en_us() {
             PRIMARY KEY (tag_code, lemma)
         ) WITHOUT ROWID;
         INSERT INTO file_tags (code, name, source, sort_order) VALUES
-            ('builtin.invoice', '发票'),
-            ('omw.02084071.n', 'omw.02084071.n');
+            ('builtin.invoice', '发票', 'tag', 1),
+            ('omw.02084071.n', 'omw.02084071.n', 'omw', 0);
         INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical, count) VALUES
             ('builtin.invoice', '发票', 1, 10);
         INSERT INTO tag_aliases_en_US (tag_code, lemma, is_canonical, count) VALUES
@@ -377,9 +377,9 @@ async fn test_http_taxonomy_and_vector_endpoints() {
     assert_eq!(tree_resp.root_nodes[0].children[0].code, "builtin.finance");
     assert_eq!(tree_resp.root_nodes[0].children[0].children.len(), 2); // invoice, receipt
 
-    // 2. GET /api/v1/taxonomy/aliases?locale=zh-CN
+    // 2. GET /api/v1/taxonomy/aliases?locale=zh-CN&source=tag,dimension（受控全集镜像 → 行数组）
     let req = Request::builder()
-        .uri("/api/v1/taxonomy/aliases?locale=zh-CN")
+        .uri("/api/v1/taxonomy/aliases?locale=zh-CN&source=tag,dimension")
         .method("GET")
         .body(Body::empty())
         .unwrap();
@@ -390,26 +390,32 @@ async fn test_http_taxonomy_and_vector_endpoints() {
     let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let aliases_resp: TaxonomyAliasesResponse = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(aliases_resp.canonical_names.get("builtin.invoice").unwrap(), "发票");
-    let invoice_aliases = aliases_resp.aliases.get("builtin.invoice").unwrap();
-    assert!(invoice_aliases.contains(&"发票".to_string()));
-    assert!(invoice_aliases.contains(&"发票单据".to_string()));
+    let aliases_rows: Vec<TagAliasRow> = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(aliases_rows
+        .iter()
+        .any(|r| r.tag_code == "builtin.invoice" && r.is_canonical == 1 && r.count == 80));
+    let invoice_lemma: Vec<String> = aliases_rows
+        .iter()
+        .filter(|r| r.tag_code == "builtin.invoice")
+        .map(|r| r.lemma.clone())
+        .collect();
+    assert!(invoice_lemma.contains(&"发票".to_string()));
+    assert!(invoice_lemma.contains(&"发票单据".to_string()));
 
-    // 2.1 GET /api/v1/taxonomy/aliases?locale=zh-CN&prefix=builtin.finance
-    let req_prefix = Request::builder()
-        .uri("/api/v1/taxonomy/aliases?locale=zh-CN&prefix=builtin.finance")
+    // 2.1 GET /api/v1/taxonomy/aliases?locale=zh-CN&codes=builtin.finance（迁移补漏：精确 code）
+    let req_codes = Request::builder()
+        .uri("/api/v1/taxonomy/aliases?locale=zh-CN&codes=builtin.finance")
         .method("GET")
         .body(Body::empty())
         .unwrap();
-    let resp_prefix = app.clone().oneshot(req_prefix).await.unwrap();
-    assert_eq!(resp_prefix.status(), StatusCode::OK);
-    let body_bytes_prefix = axum::body::to_bytes(resp_prefix.into_body(), usize::MAX)
+    let resp_codes = app.clone().oneshot(req_codes).await.unwrap();
+    assert_eq!(resp_codes.status(), StatusCode::OK);
+    let body_bytes_codes = axum::body::to_bytes(resp_codes.into_body(), usize::MAX)
         .await
         .unwrap();
-    let prefix_resp: TaxonomyAliasesResponse = serde_json::from_slice(&body_bytes_prefix).unwrap();
-    assert!(prefix_resp.aliases.contains_key("builtin.finance"));
-    assert!(!prefix_resp.aliases.contains_key("builtin.document"));
+    let codes_rows: Vec<TagAliasRow> = serde_json::from_slice(&body_bytes_codes).unwrap();
+    assert!(codes_rows.iter().any(|r| r.tag_code == "builtin.finance"));
+    assert!(!codes_rows.iter().any(|r| r.tag_code == "builtin.document"));
 
     // 3. POST /api/v1/vector/upsert
     let mut test_vec = vec![0.0f32; VECTOR_DIM];

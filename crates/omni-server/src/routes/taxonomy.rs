@@ -49,16 +49,24 @@ pub struct TaxonomyTreeResponse {
 }
 
 /// 多语言别名查询参数
+/// 依据 tag-aliases-lang-tables 设计文档（C2=(c) 双参并存）：
+/// - `source`：初值镜像，逗号分隔的受控 source 列表（如 `tag,dimension`），仅返回 file_tags.source 命中的受控 code 行；
+/// - `codes`：迁移补漏，逗号分隔的精确 tag_code 列表，未命中 code 不出行；
+/// - `prefix`：兼容保留的旧前缀过滤（`builtin` / `omw`）。
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TaxonomyAliasesQuery {
     /// 语言区域代码，如 zh-CN, zh, en 等。若缺省则回退到 Omni 配置语言或默认 zh-CN
     pub locale: Option<String>,
+    /// 初值镜像：逗号分隔的受控 source 列表（如 `tag,dimension`），仅返回 file_tags.source 命中的行
+    pub source: Option<String>,
+    /// 迁移补漏：逗号分隔的精确 tag_code 列表，未命中 code 不出行
+    pub codes: Option<String>,
     /// 标签前缀过滤（如 "builtin"），若指定则仅返回符合前缀的标签别名
     pub prefix: Option<String>,
 }
 
-/// 批量别名响应结构体
+/// 批量别名响应结构体（map 形式）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaxonomyAliasesResponse {
@@ -68,6 +76,34 @@ pub struct TaxonomyAliasesResponse {
     /// tag_code -> 唯一规范展示名 (Canonical Lemma)
     pub canonical_names: HashMap<String, String>,
     pub total_tags: usize,
+}
+
+/// 别名行数组（对应主库 tag_aliases_{lang} 分表逐列，snake_case 与语义包一致）
+/// 设计文档：响应直接返回 `[{tag_code, lemma, is_canonical, n, count}]`，无需 map 转化。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct TagAliasRow {
+    /// 受控 code（builtin.* / omw.*）
+    pub tag_code: String,
+    /// 该语言词形
+    pub lemma: String,
+    /// 是否规范名
+    pub is_canonical: i64,
+    /// 语义包词频（镜像字段）
+    pub n: i64,
+    /// 语义包文档数（镜像字段）
+    pub count: i64,
+}
+
+/// 解析逗号分隔参数为去空格非空列表
+fn parse_csv_param(raw: Option<&str>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// 获取分类树：GET /api/v1/taxonomy/tree?locale={locale}&root={root}
@@ -95,31 +131,37 @@ pub async fn taxonomy_tree_handler(
     }
 }
 
-/// 获取多语言别名字典：GET /api/v1/taxonomy/aliases?locale={locale}&prefix={prefix}
+/// 获取多语言别名字典：GET /api/v1/taxonomy/aliases?locale={locale}&source={source}&codes={codes}
+/// 依据 tag-aliases-lang-tables 设计文档：返回 tag_aliases_{lang} 行数组（与主库分表逐列一致）。
+/// - `source`（如 tag,dimension）初值镜像受控全集，仅返回 file_tags.source 命中的 code；
+/// - `codes`（逗号分隔精确 code 列表）迁移补漏，未命中 code 不出行。
 pub async fn taxonomy_aliases_handler(
     State(state): State<AppState>,
     Query(query): Query<TaxonomyAliasesQuery>,
-) -> Json<TaxonomyAliasesResponse> {
+) -> Json<Vec<TagAliasRow>> {
     let locale = query
         .locale
         .or_else(|| state.config.lock().ok().and_then(|c| c.language.clone()))
         .unwrap_or_else(|| "zh-CN".to_string());
+    let source = query.source.clone();
+    let codes = query.codes.clone();
     let prefix = query.prefix.clone();
 
     let res = state.omw.with_conn(|conn| {
-        query_taxonomy_aliases(conn, &locale, prefix.as_deref())
+        query_tag_alias_rows(
+            conn,
+            &locale,
+            source.as_deref(),
+            codes.as_deref(),
+            prefix.as_deref(),
+        )
     });
 
     match res {
-        Ok(resp) => Json(resp),
+        Ok(rows) => Json(rows),
         Err(err) => {
             tracing::warn!("[taxonomy_aliases_handler] 查询别名映射异常或未就绪: {err}");
-            Json(TaxonomyAliasesResponse {
-                locale,
-                aliases: HashMap::new(),
-                canonical_names: HashMap::new(),
-                total_tags: 0,
-            })
+            Json(Vec::new())
         }
     }
 }
@@ -543,6 +585,82 @@ fn query_canonical_and_aliases(
         map.insert(code, (canonical, list));
     }
     Ok(map)
+}
+
+/// 内部逻辑：按 locale + source/codes 双参提取 tag_aliases_{lang} 行数组（主库分表镜像契约）
+/// - `source`：逗号分隔受控 source 列表（如 tag,dimension），仅返回 file_tags.source 命中的受控 code 行；
+/// - `codes`：逗号分隔精确 tag_code 列表，未命中 code 不出行；
+/// - `prefix`：兼容保留的旧前缀过滤；
+/// - source/codes 均未指定：返回该语言分表全量行（供旧消费方全量拉取）。
+pub fn query_tag_alias_rows(
+    conn: &Connection,
+    locale: &str,
+    source_filter: Option<&str>,
+    codes_filter: Option<&str>,
+    prefix_filter: Option<&str>,
+) -> anyhow::Result<Vec<TagAliasRow>> {
+    let target_table = omni_pro::resolve_tag_aliases_table(locale);
+    if !table_exists(conn, target_table) {
+        return Ok(Vec::new());
+    }
+
+    let base_columns = "tag_code, lemma, is_canonical, n, count";
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+
+    let codes = parse_csv_param(codes_filter);
+    if !codes.is_empty() {
+        // codes 精确匹配：未命中 code 不出行
+        let placeholders = vec!["?"; codes.len()].join(",");
+        where_parts.push(format!("tag_code IN ({placeholders})"));
+        params.extend(codes);
+    } else {
+        let sources = parse_csv_param(source_filter);
+        if !sources.is_empty() {
+            // source 初值镜像：仅返回 file_tags.source 命中的受控 code 行（生成语义包治理字段）
+            let placeholders = vec!["?"; sources.len()].join(",");
+            where_parts.push(format!(
+                "tag_code IN (SELECT code FROM file_tags WHERE source IN ({placeholders}))"
+            ));
+            params.extend(sources);
+        }
+    }
+
+    if let Some(p) = prefix_filter {
+        let trimmed = p.trim().trim_end_matches('.').trim_end_matches('%');
+        if !trimmed.is_empty() {
+            where_parts.push("(tag_code = ? OR tag_code LIKE ?)".to_string());
+            params.push(trimmed.to_string());
+            params.push(format!("{}.%", trimmed));
+        }
+    }
+
+    let sql = if where_parts.is_empty() {
+        format!(
+            "SELECT {base_columns} FROM {target_table} ORDER BY tag_code, is_canonical DESC, count DESC, lemma ASC"
+        )
+    } else {
+        format!(
+            "SELECT {base_columns} FROM {target_table} WHERE {} ORDER BY is_canonical DESC, count DESC, lemma ASC",
+            where_parts.join(" AND ")
+        )
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    let mut rows_iter = stmt.query(param_refs.as_slice())?;
+
+    let mut rows: Vec<TagAliasRow> = Vec::new();
+    while let Some(row) = rows_iter.next()? {
+        rows.push(TagAliasRow {
+            tag_code: row.get(0)?,
+            lemma: row.get(1)?,
+            is_canonical: row.get(2)?,
+            n: row.get(3)?,
+            count: row.get(4)?,
+        });
+    }
+    Ok(rows)
 }
 
 /// POST /api/taxonomy/fast-recognize 与 POST /api/v1/taxonomy/fast-recognize
