@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 /// 受控标签跨语言身份（别名 → code）
 pub mod tag_identity;
 
+/// (WP5) 图片标签链路阈值集中定义（CLIP/RAM/互斥组 margin/出口 conf），单点可调
+pub mod tag_thresholds;
+
 /// 编译/运行期受控标签宏：开发时书写中文或英文直观名称，自动解析为系统标准 tag_code
 ///
 /// 示例：`tag_code!("截图")` → `"builtin.screenshot"`
@@ -182,6 +185,10 @@ pub struct TagChainItem {
     pub sort_order: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// 打标引擎来源 (WP2a 来源标记，与 pack 语义的 source 字段正交):
+    /// "clip" | "ram" | "physical" | "mutual_group" | "ocr" | "nsfw" | "quality" | "rule"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
 }
 
 impl TagChainItem {

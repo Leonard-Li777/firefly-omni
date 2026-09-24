@@ -11,6 +11,10 @@ use axum::{
 };
 use omni_core::{
     tag_identity::{normalize_tag_set_to_codes, normalize_tag_to_code, tag_matches_concept},
+    tag_thresholds::{
+        EXIT_CONFIDENCE_THRESHOLD, LAYER_FALLBACK_CLIP, LAYER_FALLBACK_OCR,
+        LAYER_FALLBACK_PHYSICAL,
+    },
     AudioConvertRequest, AudioConvertResponse, AudioTranscribeRequest, AudioTranscribeResponse,
     DuplicateFixRequest, DuplicateFixResponse, DuplicateScanRequest, DuplicateScanResponse,
     FsAdsRequest, FsAdsResponse, OmniConfig, OmniExtractionResult, OmniPerceptionBenchmark,
@@ -743,6 +747,8 @@ struct VisionComputed {
     mobilenet_tags: Vec<String>,
     mobilenet_high_confidence_tags: Vec<String>,
     clip_tags: Vec<String>,
+    /// (WP2b) CLIP 标定置信度快照：标签名 → 标定分，供 6.2 TagChainItem.confidence 贯通
+    clip_tag_confs: std::collections::HashMap<String, f32>,
     clip_high_confidence_tags: Vec<String>,
     nsfw_probs: Option<[f32; 5]>,
     watermark_level: Option<u8>,
@@ -814,10 +820,11 @@ fn run_vision_pipeline(
                 });
 
                 // 2. 视觉语义标签 (Chinese-CLIP / Mobile-CLIP)
+                // (WP2b) 带分提取：分数在提取层保留，贯通至 TagChainItem.confidence，杜绝 0.92 硬编码灌水
                 let h_clip = s.spawn(|| {
                     let t = std::time::Instant::now();
                     let res = if enable_visual_tags {
-                        omni_pro::OmniVisionEngine::extract_clip_visual_tags_from_image(
+                        omni_pro::OmniVisionEngine::extract_clip_visual_tags_scored_from_image(
                             &inspect_img,
                             lang,
                             10,
@@ -880,7 +887,7 @@ fn run_vision_pipeline(
                 });
 
                 let (td, td_ms) = h_text.join().unwrap_or((false, 0));
-                let (ct, ct_ms) = h_clip.join().unwrap_or((Vec::new(), 0));
+                let (ct_scored, ct_ms) = h_clip.join().unwrap_or((Vec::new(), 0));
                 let (np, np_ms) = h_nsfw.join().unwrap_or((None, 0));
                 let (wl, wl_ms) = h_wm.join().unwrap_or((0, 0));
                 let (ml, ml_ms) = h_mc.join().unwrap_or((0, 0));
@@ -891,7 +898,9 @@ fn run_vision_pipeline(
 
                 out.has_text = Some(td);
                 out.text_detect_ms = td_ms;
-                out.clip_tags = ct;
+                // (WP2b) 分数快照与标签名拆分：clip_tags 保持 Vec<String> 兼容既有门禁/消歧流程
+                out.clip_tag_confs = ct_scored.iter().cloned().collect();
+                out.clip_tags = ct_scored.into_iter().map(|(t, _)| t).collect();
                 out.clip_ms = ct_ms;
                 out.nsfw_probs = np;
                 out.nsfw_ms = np_ms;
@@ -1314,13 +1323,18 @@ async fn perceive_file_handler(
     let quality_issues = vision_res.quality_issues;
     let mut mobilenet_tags = vision_res.mobilenet_tags;
     let mut clip_tags = vision_res.clip_tags;
+    // (WP2b) CLIP 标定分快照（名 → 分），供 engine map 与 6.2 confidence 贯通
+    let clip_tag_confs = vision_res.clip_tag_confs;
 
     // 基于实际 OCR 文本正向直通校准截图形态与文字客观事实 (彻底根除有字却输出无字图的倒挂)
+    // (WP2a) ocr_forced_tag_names: OCR 事实强制注入的标签名，用于后续 engine 来源标记 (最高物理事实优先级)
+    let mut ocr_forced_tag_names: Vec<String> = Vec::new();
     if !markdown_content.trim().is_empty() {
         has_text = Some(true);
         clip_tags.retain(|t| !tag_matches_concept(t, "无字图"));
         if !clip_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
             clip_tags.push("有字图".to_string());
+            ocr_forced_tag_names.push("有字图".to_string());
         }
 
         let text_lower = markdown_content.to_lowercase();
@@ -1341,6 +1355,7 @@ async fn perceive_file_handler(
             if !clip_tags.iter().any(|t| tag_matches_concept(t, "代码截图")) {
                 clip_tags.retain(|t| !tag_matches_concept(t, "聊天截图"));
                 clip_tags.push("代码截图".to_string());
+                ocr_forced_tag_names.push("代码截图".to_string());
             }
         }
     }
@@ -1434,6 +1449,53 @@ async fn perceive_file_handler(
         }
     }
 
+    // (WP2a) 来源标记 + (WP2b) 置信度贯通：登记 name → (engine, 优先级, 真实分数 Option) 映射，
+    // 优先级 物理事实(ocr) > 互斥组 > 物理规则 > ram > clip > nsfw/quality；
+    // 同名多来源时高优先级覆盖（分数随覆盖项携带），6.2 构建 TagChainItem 时按 original_name 反查
+    let mut tag_engine_map: std::collections::HashMap<String, (&'static str, u8, Option<f32>)> =
+        std::collections::HashMap::new();
+    {
+        let mut register = |name: &str, engine: &'static str, prio: u8, conf: Option<f32>| {
+            match tag_engine_map.get(name) {
+                Some((_, p, _)) if *p >= prio => {}
+                _ => {
+                    tag_engine_map.insert(name.to_string(), (engine, prio, conf));
+                }
+            }
+        };
+        for t in &clip_tags {
+            // CLIP：提取层标定分 (calibrate_clip_score)，无分回退 0.55 起步值
+            register(t, "clip", 2, clip_tag_confs.get(t).copied());
+        }
+        for t in &mobilenet_tags {
+            // 物理规则推导：无模型分数，分层回退 0.90
+            register(t, "physical", 4, None);
+        }
+        for t in &nsfw_tags {
+            register(t, "nsfw", 1, None);
+        }
+        for t in &quality_issues {
+            register(t, "quality", 1, None);
+        }
+        for r in &ram_tags {
+            // RAM++：真实模型置信度直接贯通
+            register(&r.name, "ram", 3, Some(r.confidence));
+        }
+        for (tag, conf, _group) in &clip_mutual_tags {
+            // 互斥组胜出项：组内点积经同一标定函数换算
+            register(
+                tag,
+                "mutual_group",
+                5,
+                Some(omni_pro::OmniVisionEngine::calibrate_clip_score(*conf)),
+            );
+        }
+        for t in &ocr_forced_tag_names {
+            // OCR 物理事实：无模型分数，分层回退 0.99
+            register(t, "ocr", 6, None);
+        }
+    }
+
     // 架构级通用分类互斥门控引擎：统一处理组内竞争排他、跨形态互斥、安全合规阻断与光学质量限制
     omni_pro::OmniVisionEngine::apply_mutual_exclusion_gating(
         &mut detected_visual_tags,
@@ -1441,6 +1503,21 @@ async fn perceive_file_handler(
         content_rating.as_deref(),
         &sensitive_types,
         quality_score,
+    );
+
+    // (WP3) 内容域矩阵门禁：按声明式矩阵（domain_tag_matrix.json）执行
+    // ① 域不适用互斥组胜出项剔除（截图域压制「作品题材设定」→ 清除“体育”类自然内容组噪声）
+    // ② 域不适用来源层整体压制（截图域压制 ram 来源 → 清除“癌症/药物”等 RAM 自然图像模型噪声）
+    // ③ 跨域禁用标签剔除（concept code 匹配，兼容中英别名）
+    let engine_lookup: std::collections::HashMap<String, String> = tag_engine_map
+        .iter()
+        .map(|(name, (engine, _, _))| (name.clone(), engine.to_string()))
+        .collect();
+    omni_pro::OmniVisionEngine::apply_domain_matrix_gating(
+        &mut detected_visual_tags,
+        &clip_mutual_tags,
+        photo_type.as_deref(),
+        &engine_lookup,
     );
 
     // 文字存在性绝对保护：若已探活出文字或 OCR 内容，无条件排除无字图，确保有字图存在
@@ -1475,6 +1552,16 @@ async fn perceive_file_handler(
             let code = normalize_tag_to_code(name);
             detected_visual_tags.contains(&code)
         })
+        .collect();
+    // RAM 对称治理 (P3 来源对称)：与 clip/mobilenet 一致，按 gated 后 code 集回写过滤，
+    // 杜绝原始 ram_tags 经「6.1 直注 / ram_tags_flat / 级联主体池」三条通道绕过互斥门禁
+    let gated_ram_tags: Vec<omni_core::RamTagItem> = ram_tags
+        .iter()
+        .filter(|r| {
+            let code = normalize_tag_to_code(&r.name);
+            detected_visual_tags.contains(&code)
+        })
+        .cloned()
         .collect();
 
     // 4. 离线逆地理编码 (若元数据中含 GPS 坐标且开启了地理反查，Pro 专享)
@@ -1542,7 +1629,7 @@ async fn perceive_file_handler(
 
     // 联动逻辑: 若检出敏感内容 (色情/涉政/血腥/违规) 或 R-18 尺度，强制安全等级联动输出为 "保密" (confidential)
     if !sensitive_types.is_empty()
-        || nsfw_tags.iter().any(|t| t == "色情" || t == "R-18" || t == "R-18G")
+        || nsfw_tags.iter().any(|t| tag_matches_concept(t, "色情") || tag_matches_concept(t, "R-18") || tag_matches_concept(t, "R-18G"))
         || content_rating.as_deref() == Some("r18")
         || content_rating.as_deref() == Some("r18g")
     {
@@ -1554,9 +1641,13 @@ async fn perceive_file_handler(
     let mut structured_visual_tags: Vec<omni_core::TagChainItem> = Vec::new();
 
     // 6.1 首先将已具备完整维度与逻辑泛维度的 RAM++ 标签加入
-    for r in &ram_tags {
+    // (P3 来源对称：只注入互斥门禁后存活的 gated_ram_tags，原始 ram_tags 不得绕过门禁直注)
+    for r in &gated_ram_tags {
         if !structured_visual_tags.iter().any(|t| t.name.eq_ignore_ascii_case(&r.name)) {
-            structured_visual_tags.push(r.clone());
+            let mut item = r.clone();
+            // (WP2a) 标记打标引擎来源
+            item.engine = Some("ram".to_string());
+            structured_visual_tags.push(item);
         }
     }
 
@@ -1572,31 +1663,51 @@ async fn perceive_file_handler(
                 .find(|(_name, code): &(&String, &String)| code.as_str() == raw_code.as_str())
                 .map(|(name, _code): (&String, &String)| name.clone())
                 .unwrap_or_else(|| raw_code.clone());
-            let item = if is_pro {
+            // (WP2b) 分层置信度：优先真实分数（CLIP 标定分 / 互斥组标定分 / RAM 真实分），
+            // 缺失时按引擎分层回退：OCR事实 0.99 > 物理/互斥/NSFW/画质/RAM 0.90 > CLIP 起步 0.55
+            let (engine_name, real_conf) = match tag_engine_map.get(&original_name) {
+                Some((engine, _prio, conf)) => (Some(*engine), *conf),
+                None => (None, None),
+            };
+            let fallback_conf = match engine_name {
+                Some("ocr") => LAYER_FALLBACK_OCR,
+                Some("mutual_group") | Some("physical") | Some("nsfw") | Some("quality")
+                | Some("ram") => LAYER_FALLBACK_PHYSICAL,
+                Some("clip") => LAYER_FALLBACK_CLIP,
+                _ => LAYER_FALLBACK_PHYSICAL,
+            };
+            let confidence = real_conf.unwrap_or(fallback_conf);
+            let mut item = if is_pro {
                 // 用原始名查 RAM++ 投影表 / builtin 字典，得到正确的 code + name + parent_codes
-                let mut resolved = omni_pro::OmniVisionEngine::resolve_tag_to_chain_item(&original_name, 0.92);
+                let mut resolved =
+                    omni_pro::OmniVisionEngine::resolve_tag_to_chain_item(&original_name, confidence);
                 // 确保 code 与归一结果一致（防止别名映射漂移）
                 resolved.code = raw_code.clone();
                 resolved
             } else {
                 omni_core::TagChainItem {
                     code: raw_code.clone(),
-                    name: original_name,
-                    confidence: 0.92,
+                    name: original_name.clone(),
+                    confidence,
                     ..Default::default()
                 }
             };
+            // (WP2a) 按登记的来源映射回填打标引擎
+            if let Some(engine) = engine_name {
+                item.engine = Some(engine.to_string());
+            }
             structured_visual_tags.push(item);
         }
     }
 
     // 7. 级联提示词合成 + CLIP 向量仲裁终局裁决 (Pro 专享，仅图片路径生效)
     // 注意：此处在 ram_tags 降级为 flat 前调用，以获取完整 TagChainItem 结构
+    // (P3 来源对称：级联主体池同样只消费门禁后存活的 gated_ram_tags)
     let (cascade_candidates, winning_hypothesis, activated_dimension_tags, smart_name, content_description, pruned_ambiguous_words) = if is_pro && is_image {
         omni_pro::OmniVisionEngine::synthesize_cascade_hypotheses_and_arbitrate(
             &file_path,
             &detected_visual_tags,
-            &ram_tags,
+            &gated_ram_tags,
             &mobilenet_tags,
             &nsfw_tags,
             image_embedding.as_deref(),
@@ -1606,8 +1717,8 @@ async fn perceive_file_handler(
         (Vec::new(), None, Vec::new(), None, None, Vec::new())
     };
 
-    // 6.3 ram_tags 降级为平铺字符串数组 (仅包含 RAM++ 检测出的纯实体标签名)
-    let ram_tags_flat: Vec<String> = ram_tags.into_iter().map(|r| r.name).collect();
+    // 6.3 ram_tags 降级为平铺字符串数组 (仅包含门禁后存活的 RAM++ 纯实体标签名)
+    let ram_tags_flat: Vec<String> = gated_ram_tags.into_iter().map(|r| r.name).collect();
 
     let audio_transcript = metadata
         .get("audio_transcript")
@@ -1740,12 +1851,12 @@ async fn perceive_file_handler(
     let smart_name = fusion_outcome.smart_name.or(smart_name).or(text_smart_name);
     let content_description = fusion_outcome.content_description.or(content_description).or_else(|| text_one_desc.clone());
     
-    // 置信度门限控制：低于 0.60 的候选标签严禁透出到接口返回结果中 (日志中已输出完整候选打分)
-    structured_visual_tags.retain(|t| t.confidence >= 0.60);
+    // 置信度门限控制：低于 EXIT_CONFIDENCE_THRESHOLD 的候选标签严禁透出到接口返回结果中 (日志中已输出完整候选打分)
+    structured_visual_tags.retain(|t| t.confidence >= EXIT_CONFIDENCE_THRESHOLD);
 
     let fused_tags = if !fusion_outcome.fused_tags.is_empty() {
         let mut filtered = fusion_outcome.fused_tags;
-        filtered.retain(|t| t.confidence >= 0.60);
+        filtered.retain(|t| t.confidence >= EXIT_CONFIDENCE_THRESHOLD);
         filtered
     } else {
         structured_visual_tags.clone()
