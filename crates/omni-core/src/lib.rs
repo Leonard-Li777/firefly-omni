@@ -186,7 +186,7 @@ pub struct TagChainItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// 打标引擎来源 (WP2a 来源标记，与 pack 语义的 source 字段正交):
-    /// "clip" | "ram" | "physical" | "mutual_group" | "ocr" | "nsfw" | "quality" | "rule"
+    /// "clip" | "ram" | "physical" | "mutual_group" | "ocr" | "nsfw" | "quality" | "rule" | "metadata"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
 }
@@ -282,6 +282,12 @@ pub struct OmniPerceptionResult {
     /// 第三阶段双锚点交叉向量验证与互斥门禁融合出的终极完美标签集 (第一落库权威)
     #[serde(default)]
     pub fused_tags: Vec<TagChainItem>,
+    /// 原生元数据抽取直出标签链 (ExifTool/音频/文档/图像元数据 → 受控标签)
+    ///
+    /// 100% 物理确定性事实，置信度 1.0 (物理事实) / 0.95 (规则推导)，
+    /// engine 统一标记为 "metadata"。Desktop 端作为第一权威物理事实无损落库。
+    #[serde(default)]
+    pub meta_tags: Vec<TagChainItem>,
     #[serde(default)]
     pub smart_name: Option<String>,
     #[serde(default)]
