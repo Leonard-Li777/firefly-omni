@@ -51,6 +51,10 @@ jieba-rs = "0.7"
 
 [patch.crates-io]
 mupdf-sys = { path = "crates/mupdf-sys" }
+# Windows/MSVC 兼容修复：上游 usearch 2.26.2 的 build.rs 在 Windows 上硬编码 `/std:c++17`，
+# 与 cxxbridge 生成的 C++ 代码在 MSVC 14.4x 下触发 C2440（指向成员函数类型不相关）编译失败。
+# 本地 vendor 副本改用 `/std:c++20` 完成重载解析，规避该上游缺陷，保证 omni-pro 依赖链可编译。
+usearch = { path = "vendor/usearch" }
 
 [profile.release]
 opt-level = "z"
