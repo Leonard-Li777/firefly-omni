@@ -1898,7 +1898,6 @@ async fn perceive_file_handler(
     // 10. 原生元数据标签抽取 (Task 2)：元数据 + 下沉物理事实 → meta_tags 直出
     // 物理事实置信度 1.0 / 规则推导 0.95，engine 统一为 "metadata"，
     // Desktop 端作为第一权威物理事实无损落库至 file_tags。
-    let quality_score_for_meta = quality_score;
     // 语言细分：由请求语言标识归一到母语展示名 (zh* → 中文 / en* → 英文)
     let language_label: Option<String> = req.language.as_deref().and_then(|l| {
         let lower = l.to_ascii_lowercase();
@@ -1916,7 +1915,7 @@ async fn perceive_file_handler(
             file_source: file_source.clone(),
             workflow_state: workflow_state.clone(),
             security_level: security_level.clone(),
-            quality_score: quality_score_for_meta,
+            quality_score,
             language_label: language_label.clone(),
         };
         omni_extract::OmniMetadataTagExtractor::extract(&ctx)
