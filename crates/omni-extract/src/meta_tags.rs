@@ -158,13 +158,10 @@ impl OmniMetadataTagExtractor {
                     );
                 }
             }
-            // Software / CreatorTool / Producer → 创作软件 (受控反查 Photoshop / Blender 等)
-            for key in ["Software", "software", "CreatorTool", "creator_tool", "Producer"] {
+            // Software / CreatorTool → 创作软件 (受控反查 Photoshop / Blender 等)
+            // Producer 字段常混入机构名，交由文档维度（出品机构）处理，此处不消费
+            for key in ["Software", "software", "CreatorTool", "creator_tool"] {
                 if let Some(val) = Self::get_str(scope, key) {
-                    // 仅提取到具体软件名时产出（Producer 字段常混入机构名，交给文档维度处理）
-                    if key == "Producer" {
-                        continue;
-                    }
                     let name = Self::normalize_software_name(&val);
                     if name.is_empty() {
                         continue;
@@ -336,12 +333,15 @@ impl OmniMetadataTagExtractor {
             s.truncate(idx);
         }
         // 剥离尾部版本号 (如 " 25.0" / " v3.1.4")
+        // 仅当 "v/V" 后紧跟数字时才视为版本前缀剥离，避免误吞词尾字母 (如 "AV" → "A")
         let mut end = s.len();
         let bytes: Vec<char> = s.chars().collect();
         let mut i = bytes.len();
         while i > 0 {
             let c = bytes[i - 1];
-            if c.is_ascii_digit() || c == '.' || c == 'v' || c == 'V' {
+            let is_version_char =
+                c.is_ascii_digit() || c == '.' || ((c == 'v' || c == 'V') && i < bytes.len() && bytes[i].is_ascii_digit());
+            if is_version_char {
                 i -= 1;
             } else {
                 break;
