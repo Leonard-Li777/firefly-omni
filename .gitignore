@@ -1,4 +1,6 @@
 /target
+# 备用/隔离构建目录（规避并发 cargo 锁与缓存污染时使用）
+/target-*
 node_modules/
 dist/
 .DS_Store
@@ -24,5 +26,4 @@ pro/
 *.pem
 *.db
 *.sqlite
-
-
+*/debug/
