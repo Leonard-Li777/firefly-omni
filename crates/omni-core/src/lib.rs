@@ -282,12 +282,14 @@ pub struct OmniPerceptionResult {
     /// 第三阶段双锚点交叉向量验证与互斥门禁融合出的终极完美标签集 (第一落库权威)
     #[serde(default)]
     pub fused_tags: Vec<TagChainItem>,
-    /// 原生元数据抽取直出标签链 (ExifTool/音频/文档/图像元数据 → 受控标签)
+    /// 原生事实标签直出链 (`fact` 组)：元数据直读 (ExifTool/音频/文档/图像) + 下沉既有物理事实
     ///
-    /// 100% 物理确定性事实，置信度 1.0 (物理事实) / 0.95 (规则推导)，
-    /// engine 统一标记为 "metadata"。Desktop 端作为第一权威物理事实无损落库。
+    /// 原名 `meta_tags`，因其中相当一部分标签并非来自元数据（来源/状态/密级/质量/语言为下沉物理事实），
+    /// 与「标签来源分组」概念对齐后更名为 `fact_tags`（见 ADR-0045 §Decision 1）。
+    /// 置信度**扁平统一 0.90**（物理直读与规则推导同级），`engine` 统一标记为 "metadata"。
+    /// Desktop 端作为第一权威事实无损落库。
     #[serde(default)]
-    pub meta_tags: Vec<TagChainItem>,
+    pub fact_tags: Vec<TagChainItem>,
     #[serde(default)]
     pub smart_name: Option<String>,
     #[serde(default)]

@@ -1895,9 +1895,9 @@ async fn perceive_file_handler(
         geo_address
     );
 
-    // 10. 原生元数据标签抽取 (Task 2)：元数据 + 下沉物理事实 → meta_tags 直出
-    // 物理事实置信度 1.0 / 规则推导 0.95，engine 统一为 "metadata"，
-    // Desktop 端作为第一权威物理事实无损落库至 file_tags。
+    // 10. 原生事实标签抽取 (Task 2)：元数据直读 + 下沉物理事实 → fact_tags 直出
+    // 置信度扁平统一 0.90（物理直读与规则推导同级），engine 统一为 "metadata"，
+    // Desktop 端作为第一权威事实无损落库至 file_tags。
     // 语言细分：由请求语言标识归一到母语展示名 (zh* → 中文 / en* → 英文)
     let language_label: Option<String> = req.language.as_deref().and_then(|l| {
         let lower = l.to_ascii_lowercase();
@@ -1909,8 +1909,8 @@ async fn perceive_file_handler(
             None
         }
     });
-    let meta_tags: Vec<omni_core::TagChainItem> = {
-        let ctx = omni_extract::MetadataTagContext {
+    let fact_tags: Vec<omni_core::TagChainItem> = {
+        let ctx = omni_extract::FactTagContext {
             metadata: &metadata,
             file_source: file_source.clone(),
             workflow_state: workflow_state.clone(),
@@ -1918,13 +1918,13 @@ async fn perceive_file_handler(
             quality_score,
             language_label: language_label.clone(),
         };
-        omni_extract::OmniMetadataTagExtractor::extract(&ctx)
+        omni_extract::OmniFactTagExtractor::extract(&ctx)
     };
     tracing::info!(
-        "[元数据抽取:meta_tags] 文件: {}, 产出标签数: {}, 标签: {:?}",
+        "[事实标签抽取:fact_tags] 文件: {}, 产出标签数: {}, 标签: {:?}",
         file_name,
-        meta_tags.len(),
-        meta_tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
+        fact_tags.len(),
+        fact_tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
     );
 
     let result = Json(OmniPerceptionResult {
@@ -1974,7 +1974,7 @@ async fn perceive_file_handler(
         winning_hypothesis,
         activated_dimension_tags,
         fused_tags,
-        meta_tags,
+        fact_tags,
         smart_name,
         content_description,
         pruned_ambiguous_words,
