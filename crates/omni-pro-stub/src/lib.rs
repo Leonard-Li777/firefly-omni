@@ -1000,7 +1000,8 @@ pub mod vector_engine {
     use serde::{Deserialize, Serialize};
     use std::path::Path;
 
-    pub const VECTOR_DIM: usize = 384;
+    /// 向量维度契约：适配腾讯 WeMM-Embedding 2B 多模态模型 (2048 维，ADR-0046)
+    pub const VECTOR_DIM: usize = 2048;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]

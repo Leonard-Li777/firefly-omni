@@ -123,8 +123,9 @@ pub struct OmniPerceptionRequest {
     pub language: Option<String>,
     #[serde(default)]
     pub enable_visual_tags: Option<bool>,
-    #[serde(default)]
-    pub enable_audio_transcript: Option<bool>,
+    /// 是否启用音视频 ASR 语音转录（`enable_audio_transcript` 为历史别名，保留兼容）
+    #[serde(default, alias = "enable_audio_transcript")]
+    pub enable_asr: Option<bool>,
     #[serde(default)]
     pub enable_geo_reverse: Option<bool>,
     /// 是否启用 Tier 1 端侧文本分析（可覆盖 OmniConfig.enable_text_analysis，缺省沿用全局配置）
@@ -266,7 +267,15 @@ pub struct OmniPerceptionResult {
     pub nsfw_high_confidence_tags: Vec<String>,
     pub sensitive_types: Vec<String>,
     pub content_rating: Option<String>,
-    pub audio_transcript: Option<String>,
+    /// ASR 语音转录文本（Issue 0046 §1：由 `audio_transcript` 标准化更名，废弃旧命名）
+    #[serde(default)]
+    pub asr: Option<String>,
+    /// 是否存在有效 ASR 转录文本（去空白后非空）
+    #[serde(default)]
+    pub has_asr: bool,
+    /// ASR 转录文本字符长度（Unicode 标量计数，非字节数）
+    #[serde(default)]
+    pub asr_length: usize,
     #[serde(default)]
     pub lrc: Option<String>,
     pub audio_events: Vec<String>,
@@ -345,6 +354,7 @@ pub struct MultimodalContext {
     pub mime_type: String,
     pub document_text: Option<String>,
     pub ocr_text: Option<String>,
+    /// 语音事实：ASR 转录文本（外部契约字段名为 `asr`，此处沿用内部历史命名以兼容融合引擎）
     pub audio_transcript: Option<String>,
     pub lrc_text: Option<String>,
     pub visual_tags: Vec<TagChainItem>,
@@ -355,10 +365,30 @@ pub struct MultimodalContext {
     pub language: Option<String>,
 }
 
+/// 解析「可参与事实推导的文本正文」（Issue 0046 §1）。
+///
+/// 优先级：复合文档正文（markdown_content）> 纯图片 OCR 文本 > 音视频 ASR 转录。
+///
+/// 纯图片/音视频不再把 OCR/ASR 写入 `markdown_content`（保持正文结构纯粹），
+/// 但文字存在性判定、Tier1 文本分析与混合检索索引仍必须消费这些语义，
+/// 故统一经本函数解析出「有效文本」。抽为纯函数便于单测与跨调用点复用，避免口径漂移。
+pub fn resolve_effective_text(
+    markdown_content: &str,
+    ocr_text: Option<&str>,
+    asr: Option<&str>,
+) -> String {
+    if !markdown_content.trim().is_empty() {
+        return markdown_content.to_string();
+    }
+    if let Some(ocr) = ocr_text.filter(|s| !s.trim().is_empty()) {
+        return ocr.to_string();
+    }
+    asr.unwrap_or_default().to_string()
+}
+
 /// 单指标音频转录请求: POST /api/audio/transcribe
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioTranscribeRequest {
-    pub file_path: String,
+pub struct AudioTranscribeRequest {    pub file_path: String,
     #[serde(default)]
     pub language: Option<String>,
     /// 自定义截取转录时长（秒）

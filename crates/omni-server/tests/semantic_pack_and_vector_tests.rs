@@ -210,10 +210,13 @@ fn test_semantic_pack_load_raw_from_file_and_discovery() {
 
 #[test]
 fn test_vector_engine_rabitq_and_int8_ann() {
+    // 维度契约固定为 WeMM-Embedding 2B 的 2048 维（Issue 0046 §2「替代 bekko-a8m」）
+    assert_eq!(VECTOR_DIM, 2048, "zvec 维度契约必须为 2048 维");
+
     let temp_dir = tempfile::tempdir().expect("创建临时目录失败");
     let engine = VectorEngine::open(temp_dir.path()).expect("打开向量引擎失败");
 
-    // 构造测试向量 (384 维)
+    // 构造测试向量 (VECTOR_DIM 维，随引擎维度契约 = 2048 维)
     let mut base_vec = vec![0.0f32; VECTOR_DIM];
     for i in 0..VECTOR_DIM {
         base_vec[i] = (i as f32).sin();
@@ -233,6 +236,10 @@ fn test_vector_engine_rabitq_and_int8_ann() {
     // 1. 维度契约校验
     assert!(engine.upsert("fp_invalid", &[0.1, 0.2]).is_err());
     assert!(engine.upsert("fp_nan", &vec![f32::NAN; VECTOR_DIM]).is_err());
+    assert!(
+        engine.upsert("fp_legacy_384", &vec![0.5f32; 384]).is_err(),
+        "384 维 bekko-a8m 旧契约向量必须被 2048 维新契约拒绝"
+    );
 
     // 2. 写入特征向量
     engine.upsert("fp_base", &base_vec).expect("写入 base 失败");
