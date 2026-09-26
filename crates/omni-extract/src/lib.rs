@@ -9,9 +9,9 @@ use std::io::Read;
 use std::path::Path;
 use tracing::{info, warn};
 
-/// 原生元数据标签抽取引擎 (Task 2)：元数据 → 受控标签链 `meta_tags`
-pub mod meta_tags;
-pub use meta_tags::{extract_metadata_tags, MetadataTagContext, OmniMetadataTagExtractor, ENGINE_METADATA};
+/// 原生事实标签抽取引擎 (Task 2)：元数据直读 + 下沉物理事实 → 受控标签链 `fact_tags`
+pub mod fact_tags;
+pub use fact_tags::{extract_fact_tags, FactTagContext, OmniFactTagExtractor, ENGINE_METADATA};
 
 /// 文档与元数据全量提取引擎 (完全对齐 Node.js 端全功能 Pipeline)
 pub struct OmniExtractor;

@@ -1,13 +1,17 @@
-//! 原生元数据标签抽取引擎 (Task 2)
+//! 原生事实标签抽取引擎 (Task 2，原「元数据标签抽取」)
 //!
-//! 将元数据匹配 Key 抽取标签的全套逻辑下沉至 Omni 原生层：
+//! 产出**全部** `fact` 组标签（`fact_tags`）——既包含元数据直读，也包含下沉的既有物理事实。
+//! 之所以不再叫 `meta_tags`：这些事实标签**并不都来自元数据**，名称需与「标签来源分组」对齐
+//! （见 ADR-0045 §Decision 1 与根目录 `CONTEXT.md`「标签来源分组」）。
+//!
 //! - 音频维度：Artist / Album / Genre → 作者/歌手、专辑、音乐流派
 //! - 视觉器材与工具维度：Make / Model / Software → 相机品牌、器材型号、创作软件
 //! - 文档维度：Author / Company / Organization → 作者、出品机构
 //! - 下沉既有物理事实：file_source / workflow_state / security_level / 质量等级 / 语言细分
 //!
-//! 所有产出统一封装为 [`omni_core::TagChainItem`]，物理事实置信度 1.0，
-//! 规则推导置信度 0.95，`engine` 统一标记为 `"metadata"`。
+//! 所有产出统一封装为 [`omni_core::TagChainItem`]，置信度**扁平统一为 0.90**
+//! （物理直读与规则推导同级，历史各自的取值一律作废，见 ADR-0045 §Decision 1/2）；
+//! `engine` 统一标记为 `"metadata"`（产出引擎标识，与 `tag_group` 正交）。
 
 use omni_core::tag_thresholds::EXIT_CONFIDENCE_THRESHOLD;
 #[cfg(test)]
@@ -15,17 +19,19 @@ use omni_core::tag_thresholds::LAYER_FALLBACK_PHYSICAL;
 use omni_core::TagChainItem;
 use serde_json::Value;
 
-/// 元数据标签打标引擎标识
+/// 事实标签打标引擎标识（`TagChainItem.engine` 的封闭词表成员之一，与来源分组 `fact` 正交）
 pub const ENGINE_METADATA: &str = "metadata";
 
-/// 物理事实置信度（元数据直读，100% 确定）
-const CONF_PHYSICAL: f32 = 1.0;
-/// 规则推导置信度（阈值映射/后缀判定等）
-const CONF_DERIVED: f32 = 0.95;
+/// 事实标签置信度基准：**扁平 0.90**（ADR-0045 §Decision 1/2）。
+///
+/// 由 1.0 降为 0.90 —— 程序检测无法保证 100% 正确；且「物理事实绝对覆盖律」已改由
+/// **标签来源分组的优先序**（`fact > fused > visual > ai`）保证，不再依赖置信度数值大小。
+/// 事实组内不再区分物理直读与规则推导，故只需一个常量。
+const CONF_FACT: f32 = 0.90;
 
-/// 元数据抽取上下文：承载元数据 JSON 与已确诊的下沉物理事实
+/// 事实标签抽取上下文：承载元数据 JSON 与已确诊的下沉物理事实
 #[derive(Debug, Clone, Default)]
-pub struct MetadataTagContext<'a> {
+pub struct FactTagContext<'a> {
     /// 完整元数据 JSON (含 exiftool / audio / document / image 等子树)
     pub metadata: &'a Value,
     /// 文件来源展示名 (网络下载 / 局域网共享 / 本地磁盘 / 系统文件)
@@ -40,15 +46,15 @@ pub struct MetadataTagContext<'a> {
     pub language_label: Option<String>,
 }
 
-/// 原生元数据标签抽取引擎
-pub struct OmniMetadataTagExtractor;
+/// 原生事实标签抽取引擎
+pub struct OmniFactTagExtractor;
 
-impl OmniMetadataTagExtractor {
-    /// 从元数据 JSON 与下沉物理事实中抽取全套 `meta_tags`
+impl OmniFactTagExtractor {
+    /// 从元数据 JSON 与下沉物理事实中抽取全套 `fact_tags`
     ///
     /// 输出顺序稳定：先元数据实体维度（类别/作者/专辑/流派/器材/软件/机构），
     /// 再下沉物理事实维度（来源/状态/密级/质量/语言），保证 Desktop 侧展示与落库顺序可预期。
-    pub fn extract(ctx: &MetadataTagContext<'_>) -> Vec<TagChainItem> {
+    pub fn extract(ctx: &FactTagContext<'_>) -> Vec<TagChainItem> {
         let mut tags: Vec<TagChainItem> = Vec::new();
 
         // 1. 元数据实体维度抽取 (音频 / 视觉器材 / 文档)
@@ -57,17 +63,17 @@ impl OmniMetadataTagExtractor {
         Self::extract_document_dimensions(ctx.metadata, &mut tags);
 
         // 2. 下沉既有物理事实 (桌面端 Node.js 预检管线既有确诊维度)
-        Self::push_fact(&mut tags, "文件来源", ctx.file_source.as_deref(), "dim.file_source", CONF_PHYSICAL);
-        Self::push_fact(&mut tags, "处理状态", ctx.workflow_state.as_deref(), "dim.workflow_state", CONF_PHYSICAL);
-        Self::push_fact(&mut tags, "安全等级", ctx.security_level.as_deref(), "dim.security_level", CONF_PHYSICAL);
+        Self::push_fact(&mut tags, "文件来源", ctx.file_source.as_deref(), "dim.file_source", CONF_FACT);
+        Self::push_fact(&mut tags, "处理状态", ctx.workflow_state.as_deref(), "dim.workflow_state", CONF_FACT);
+        Self::push_fact(&mut tags, "安全等级", ctx.security_level.as_deref(), "dim.security_level", CONF_FACT);
         Self::push_quality_grade(&mut tags, ctx.quality_score);
-        Self::push_fact(&mut tags, "语言", ctx.language_label.as_deref(), "dim.language", CONF_PHYSICAL);
+        Self::push_fact(&mut tags, "语言", ctx.language_label.as_deref(), "dim.language", CONF_FACT);
 
-        // 出口一致性保障：meta_tags 为确定性物理事实，仍统一校验置信度不低于出口门限
+        // 出口一致性保障：fact_tags 为确定性物理事实，仍统一校验置信度不低于出口门限
         tags.retain(|t| t.confidence >= EXIT_CONFIDENCE_THRESHOLD);
 
         tracing::info!(
-            "[元数据抽取:meta_tags] 抽取完成，标签总数: {}, 明细: {:?}",
+            "[事实标签抽取:fact_tags] 抽取完成，标签总数: {}, 明细: {:?}",
             tags.len(),
             tags.iter().map(|t| (t.name.as_str(), t.code.as_str())).collect::<Vec<_>>()
         );
@@ -92,7 +98,7 @@ impl OmniMetadataTagExtractor {
                         "作者",
                         Self::ext_code("creator", &display),
                         &display,
-                        CONF_PHYSICAL,
+                        CONF_FACT,
                         Some(key),
                         &val,
                     );
@@ -106,7 +112,7 @@ impl OmniMetadataTagExtractor {
                         "专辑",
                         Self::ext_code("album", &val),
                         &val,
-                        CONF_PHYSICAL,
+                        CONF_FACT,
                         Some(key),
                         &val,
                     );
@@ -118,7 +124,7 @@ impl OmniMetadataTagExtractor {
                     let code = omni_core::tag_identity::resolve_controlled_tag_code(&val)
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| Self::ext_code("music_genre", &val));
-                    Self::push_tag(out, "音乐流派", code, &val, CONF_PHYSICAL, Some(key), &val);
+                    Self::push_tag(out, "音乐流派", code, &val, CONF_FACT, Some(key), &val);
                 }
             }
         }
@@ -135,7 +141,7 @@ impl OmniMetadataTagExtractor {
                         "相机品牌",
                         Self::ext_code("camera_brand", &val),
                         &val,
-                        CONF_PHYSICAL,
+                        CONF_FACT,
                         Some(key),
                         &val,
                     );
@@ -152,7 +158,7 @@ impl OmniMetadataTagExtractor {
                         "器材型号",
                         Self::ext_code("camera_model", &val),
                         &val,
-                        CONF_PHYSICAL,
+                        CONF_FACT,
                         Some(key),
                         &val,
                     );
@@ -169,7 +175,7 @@ impl OmniMetadataTagExtractor {
                     let code = omni_core::tag_identity::resolve_controlled_tag_code(&name)
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| Self::ext_code("creation_tool", &name));
-                    Self::push_tag(out, "创作软件", code, &name, CONF_PHYSICAL, Some(key), &val);
+                    Self::push_tag(out, "创作软件", code, &name, CONF_FACT, Some(key), &val);
                 }
             }
         }
@@ -189,7 +195,7 @@ impl OmniMetadataTagExtractor {
                         "出品机构",
                         Self::ext_code("organization", &val),
                         &val,
-                        CONF_DERIVED,
+                        CONF_FACT,
                         Some(key),
                         &val,
                     );
@@ -213,7 +219,7 @@ impl OmniMetadataTagExtractor {
             "文件质量",
             Self::ext_code("file_quality", grade),
             grade,
-            CONF_DERIVED,
+            CONF_FACT,
             Some("quality_score"),
             &score.to_string(),
         );
@@ -247,7 +253,7 @@ impl OmniMetadataTagExtractor {
             ..Default::default()
         };
         tracing::info!(
-            "[元数据抽取:meta_tags] key={}, val={} -> tag={}({}), code={}, conf={:.2}",
+            "[事实标签抽取:fact_tags] key={}, val={} -> tag={}({}), code={}, conf={:.2}",
             source_key.unwrap_or("-"),
             raw_val,
             item.name,
@@ -395,9 +401,9 @@ impl OmniMetadataTagExtractor {
     }
 }
 
-/// 便捷入口：基于元数据 JSON 抽取 `meta_tags`（无下沉物理事实）
-pub fn extract_metadata_tags(metadata: &Value) -> Vec<TagChainItem> {
-    OmniMetadataTagExtractor::extract(&MetadataTagContext {
+/// 便捷入口：基于元数据 JSON 抽取 `fact_tags`（无下沉物理事实）
+pub fn extract_fact_tags(metadata: &Value) -> Vec<TagChainItem> {
+    OmniFactTagExtractor::extract(&FactTagContext {
         metadata,
         ..Default::default()
     })
@@ -418,7 +424,7 @@ mod tests {
                 "Genre": "摇滚"
             }
         });
-        let tags = extract_metadata_tags(&metadata);
+        let tags = extract_fact_tags(&metadata);
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
 
         assert!(names.contains(&"Beyond"), "应提取歌手 Artist，实际: {:?}", names);
@@ -427,7 +433,7 @@ mod tests {
 
         for tag in &tags {
             assert_eq!(tag.engine.as_deref(), Some(ENGINE_METADATA), "engine 应统一为 metadata");
-            assert_eq!(tag.confidence, 1.0, "物理事实置信度应为 1.0: {:?}", tag);
+            assert_eq!(tag.confidence, 0.90, "事实标签置信度应为 0.90: {:?}", tag);
             assert!(!tag.code.is_empty(), "标签必须携带 code: {:?}", tag);
         }
     }
@@ -442,7 +448,7 @@ mod tests {
                 "Software": "Adobe Photoshop 25.0 (Windows)"
             }
         });
-        let tags = extract_metadata_tags(&metadata);
+        let tags = extract_fact_tags(&metadata);
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
 
         assert!(names.contains(&"Canon"), "应提取相机品牌 Make，实际: {:?}", names);
@@ -463,7 +469,7 @@ mod tests {
                 "Company": "腾讯科技有限公司"
             }
         });
-        let tags = extract_metadata_tags(&metadata);
+        let tags = extract_fact_tags(&metadata);
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
 
         assert!(names.contains(&"张三"), "应提取文档作者 Author，实际: {:?}", names);
@@ -474,14 +480,14 @@ mod tests {
         );
 
         let company = tags.iter().find(|t| t.name == "腾讯科技有限公司").unwrap();
-        assert_eq!(company.confidence, 0.95, "规则推导维度置信度应为 0.95");
+        assert_eq!(company.confidence, 0.90, "规则推导事实与物理直读同级，应为 0.90");
     }
 
     /// 下沉物理事实：来源/状态/密级/质量/语言 应随元数据一并产出
     #[test]
     fn test_downshift_physical_facts_and_quality_grade() {
         let metadata = json!({});
-        let tags = OmniMetadataTagExtractor::extract(&MetadataTagContext {
+        let tags = OmniFactTagExtractor::extract(&FactTagContext {
             metadata: &metadata,
             file_source: Some("网络下载".to_string()),
             workflow_state: Some("草稿".to_string()),
@@ -501,7 +507,7 @@ mod tests {
     fn test_quality_grade_thresholds() {
         let metadata = json!({});
         let grade = |score: f32| -> Option<String> {
-            OmniMetadataTagExtractor::extract(&MetadataTagContext {
+            OmniFactTagExtractor::extract(&FactTagContext {
                 metadata: &metadata,
                 quality_score: Some(score),
                 ..Default::default()
@@ -520,7 +526,7 @@ mod tests {
     #[test]
     fn test_noisy_author_filtered() {
         let metadata = json!({ "document": { "Author": "Administrator" } });
-        let tags = extract_metadata_tags(&metadata);
+        let tags = extract_fact_tags(&metadata);
         assert!(
             tags.iter().all(|t| t.name != "Administrator"),
             "噪声作者签名应被过滤: {:?}",
@@ -535,16 +541,16 @@ mod tests {
             "audio": { "artist": "Beyond", "genre": "Rock" },
             "exiftool": { "Model": "Canon EOS R5" }
         });
-        let tags = extract_metadata_tags(&metadata);
+        let tags = extract_fact_tags(&metadata);
         assert!(!tags.is_empty());
         for tag in &tags {
             assert!(
                 tag.confidence >= EXIT_CONFIDENCE_THRESHOLD,
-                "meta_tags 置信度必须 >= 出口门限: {:?}",
+                "fact_tags 置信度必须 >= 出口门限: {:?}",
                 tag
             );
         }
         // 与物理层回退分对齐
-        assert!(CONF_PHYSICAL >= LAYER_FALLBACK_PHYSICAL);
+        assert!(CONF_FACT >= LAYER_FALLBACK_PHYSICAL);
     }
 }

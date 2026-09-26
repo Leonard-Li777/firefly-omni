@@ -207,11 +207,11 @@ pub mod perceive {
         "摄影照片".to_string()
     }
 
-    /// 元数据标签提取存根 (Task 2)：开源构建下不发生原生元数据抽取
+    /// 事实标签提取存根 (Task 2)：开源构建下不发生原生事实标签抽取
     ///
-    /// 与 `omni-extract::meta_tags::OmniMetadataTagExtractor` 保持 API 形制一致，
+    /// 与 `omni-extract::fact_tags::OmniFactTagExtractor` 保持 API 形制一致，
     /// 开源模式恒返回空集合（Pro 版由真实 omni-extract 实现）。
-    pub fn extract_metadata_tags(_metadata: &serde_json::Value) -> Vec<omni_core::TagChainItem> {
+    pub fn extract_fact_tags(_metadata: &serde_json::Value) -> Vec<omni_core::TagChainItem> {
         Vec::new()
     }
 }
@@ -1292,4 +1292,4 @@ pub use omw_query::{
     TaxonomyTreeResponse, TreeNode, UnmappedStats,
 };
 
-
+
