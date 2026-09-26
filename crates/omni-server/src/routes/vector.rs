@@ -1,7 +1,7 @@
 //! vector.rs — 嵌入式向量引擎 HTTP 交互端点 (zvec / RaBitQ / INT8)
 //!
-//! 依据 ADR-0038 与 PRD #679 架构决议：
-//! - POST /api/v1/vector/upsert: 写入/更新特征向量 (适配 bekko-a8m 384 维)；
+//! 依据 ADR-0038 / ADR-0046 与 PRD #679 / 0046 架构决议：
+//! - POST /api/v1/vector/upsert: 写入/更新特征向量 (适配 WeMM-Embedding 2B 2048 维)；
 //! - POST /api/v1/vector/search: < 1ms Top-K ANN 检索 (RaBitQ 初筛 + INT8 重排)；
 //! - DELETE /api/v1/vector/delete: 批量删除特征向量。
 
@@ -47,7 +47,7 @@ pub struct VectorUpsertResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VectorSearchRequest {
-    /// 384 维浮点查询特征向量
+    /// 2048 维浮点查询特征向量（WeMM-Embedding 2B）
     pub vector: Vec<f32>,
     /// 最大召回数 (默认 10)
     #[serde(default = "default_top_k", alias = "top_k")]

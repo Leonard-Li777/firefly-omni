@@ -49,7 +49,7 @@ pub struct AppState {
     pub search: Arc<omni_pro::search::OmniSearchService>,
     /// OMW 多语言标签词库只读连接池（未传入 --db-path 时为软不可用实例）
     pub omw: OmwDb,
-    /// 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 bekko-a8m 384 维，闭源优先 🔒)
+    /// 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 WeMM-Embedding 2B 2048 维，闭源优先 🔒)
     pub vector: Arc<VectorEngine>,
 }
 
@@ -628,7 +628,7 @@ pub async fn start_server(addr: SocketAddr, db_path: Option<PathBuf>) -> anyhow:
         }
     }
 
-    // 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 bekko-a8m 384 维)
+    // 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 WeMM-Embedding 2B 2048 维)
     let vector = Arc::new(VectorEngine::open_default().unwrap_or_else(|err| {
         tracing::warn!("Failed to open default vector engine ({err}), falling back to memory");
         VectorEngine::in_memory()
@@ -1085,9 +1085,12 @@ async fn perceive_file_handler(
             };
 
             // 步骤 A3: 文字提取 (仅当 has_text == Some(true) 时才调用 OCR 识别)
-            let mut markdown_content = String::new();
+            // Issue 0046 §1：纯图片的 OCR 结果独占 `ocr` 字段，`markdown_content` 严格保持空字符串，
+            // 避免把 OCR 文本伪装成「正文」污染排版结构（复合文档方允许原位嵌合 OCR）。
+            let markdown_content = String::new();
             let mut ocr_ms = None;
             let mut text_ms = None;
+            let mut ocr_text: Option<String> = None;
             if vision_res.has_text == Some(true) {
                 let t_ocr = std::time::Instant::now();
                 let p_buf = p.to_path_buf();
@@ -1109,15 +1112,9 @@ async fn perceive_file_handler(
                 ocr_ms = Some(ocr_duration);
                 text_ms = Some(ocr_duration);
                 if !ocr_res.trim().is_empty() {
-                    markdown_content = ocr_res;
+                    ocr_text = Some(ocr_res);
                 }
             }
-
-            let ocr_text = if !markdown_content.trim().is_empty() {
-                Some(markdown_content.clone())
-            } else {
-                None
-            };
 
             // 步骤 A4: 计算 pHash
             let phash = OmniExtractionResult::compute_phash(p);
@@ -1151,11 +1148,11 @@ async fn perceive_file_handler(
             }
             metadata_obj.insert("image".into(), serde_json::Value::Object(img_meta));
 
-            // 如果提取到了文本内容，写入标准的 text_stats
-            if !markdown_content.is_empty() {
-                let lines = markdown_content.lines().count();
-                let words = markdown_content.split_whitespace().count();
-                let chars = markdown_content.chars().count();
+            // 如果提取到了文字识别内容，写入标准的 text_stats（纯图片走 OCR 字段）
+            if let Some(text_for_stats) = ocr_text.as_deref().filter(|s| !s.is_empty()) {
+                let lines = text_for_stats.lines().count();
+                let words = text_for_stats.split_whitespace().count();
+                let chars = text_for_stats.chars().count();
                 let mut text_stats = serde_json::Map::new();
                 text_stats.insert("encoding".into(), "UTF-8".into());
                 text_stats.insert("line_count".into(), lines.into());
@@ -1231,9 +1228,9 @@ async fn perceive_file_handler(
             let is_audio_or_video = is_audio || is_video;
             let mut audio_ms: Option<u64> = None;
 
-            // 仅在音视频文件且 enable_audio_transcript 未显式关闭时执行 SenseVoice 转录
+            // 仅在音视频文件且 enable_asr 未显式关闭时执行 SenseVoice 转录
             let should_transcribe = is_audio_or_video
-                && req.enable_audio_transcript.unwrap_or(true);
+                && req.enable_asr.unwrap_or(true);
 
             if should_transcribe {
                 let t_audio = std::time::Instant::now();
@@ -1260,13 +1257,10 @@ async fn perceive_file_handler(
                         "[OmniServer] 音频转录完成: file={}, len={}, audio_ms={:?}",
                         file_path, transcript.len(), audio_ms
                     );
-                    // 写入 markdown_content（作为主内容字段）
-                    if ext_res.markdown_content.is_empty() {
-                        ext_res.markdown_content = transcript.clone();
-                    }
-                    // 同时写入 metadata["audio_transcript"]，供消费层使用
+                    // Issue 0046 §1：ASR 结果独占 `asr` 字段（不再回填 markdown_content，
+                    // 保证音视频文件的「正文」结构与语音转录事实物理分离）。
                     if let serde_json::Value::Object(ref mut map) = ext_res.metadata {
-                        map.insert("audio_transcript".to_string(), serde_json::Value::String(transcript));
+                        map.insert("asr".to_string(), serde_json::Value::String(transcript));
                     }
                 } else {
                     tracing::info!("[OmniServer] 音频转录无结果或模型/ffmpeg未就绪: file={}", file_path);
@@ -1290,11 +1284,27 @@ async fn perceive_file_handler(
 
     benchmark.ads_ms = ads_ms;
 
-    // 内存零耗时推导: NSFW 敏感内容与高置信度标签 (结合 OCR 提取文本和 CLIP 标签，零二次模型推理)
+    // ASR 语音转录事实（Issue 0046 §1：metadata 键统一为 `asr`）
+    let asr = metadata
+        .get("asr")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty());
+    let has_asr = asr.is_some();
+    let asr_length = asr.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+
+    // 统一「可参与事实推导的文本正文」：
+    // 复合文档正文 > 纯图片 OCR > 音视频 ASR。
+    // 后两者不再写入 markdown_content（保持正文结构纯粹），但必须继续驱动
+    // 文字存在性判定、Tier1 文本分析与混合索引，否则会丢失 OCR/ASR 语义。
+    let effective_text: String =
+        omni_core::resolve_effective_text(&markdown_content, ocr_text.as_deref(), asr.as_deref());
+
+    // 内存零耗时推导: NSFW 敏感内容与高置信度标签 (结合 OCR/ASR 提取文本和 CLIP 标签，零二次模型推理)
     let (nsfw_tags, sensitive_types, content_rating) = if is_pro {
         omni_pro::OmniVisionEngine::derive_nsfw_tags_and_rating_from_probs(
             vision_res.nsfw_probs,
-            &markdown_content,
+            &effective_text,
             &vision_res.clip_tags,
         )
     } else {
@@ -1329,7 +1339,7 @@ async fn perceive_file_handler(
     // 基于实际 OCR 文本正向直通校准截图形态与文字客观事实 (彻底根除有字却输出无字图的倒挂)
     // (WP2a) ocr_forced_tag_names: OCR 事实强制注入的标签名，用于后续 engine 来源标记 (最高物理事实优先级)
     let mut ocr_forced_tag_names: Vec<String> = Vec::new();
-    if !markdown_content.trim().is_empty() {
+    if !effective_text.trim().is_empty() {
         has_text = Some(true);
         clip_tags.retain(|t| !tag_matches_concept(t, "无字图"));
         if !clip_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
@@ -1337,7 +1347,7 @@ async fn perceive_file_handler(
             ocr_forced_tag_names.push("有字图".to_string());
         }
 
-        let text_lower = markdown_content.to_lowercase();
+        let text_lower = effective_text.to_lowercase();
         let is_code_syntax = text_lower.contains("public class")
             || text_lower.contains("public void")
             || text_lower.contains("private boolean")
@@ -1388,7 +1398,7 @@ async fn perceive_file_handler(
             merged.retain(|t| !tag_matches_concept(t, "全彩"));
         }
         // 2. 文字存在性：客观检测与 OCR 事实优先于语义猜测
-        if has_text == Some(true) || !markdown_content.trim().is_empty() {
+        if has_text == Some(true) || !effective_text.trim().is_empty() {
             merged.retain(|t| !tag_matches_concept(t, "无字图"));
             if !merged.iter().any(|t| tag_matches_concept(t, "有字图")) {
                 merged.push("有字图".to_string());
@@ -1406,7 +1416,7 @@ async fn perceive_file_handler(
         }
         merged
     } else {
-        if has_text == Some(true) || !markdown_content.trim().is_empty() {
+        if has_text == Some(true) || !effective_text.trim().is_empty() {
             mobilenet_tags.retain(|t| !tag_matches_concept(t, "无字图"));
             if !mobilenet_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
                 mobilenet_tags.push("有字图".to_string());
@@ -1521,7 +1531,7 @@ async fn perceive_file_handler(
     );
 
     // 文字存在性绝对保护：若已探活出文字或 OCR 内容，无条件排除无字图，确保有字图存在
-    if has_text == Some(true) || !markdown_content.trim().is_empty() {
+    if has_text == Some(true) || !effective_text.trim().is_empty() {
         detected_visual_tags.retain(|t| !tag_matches_concept(t, "无字图"));
         if !detected_visual_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
             detected_visual_tags.push("有字图".to_string());
@@ -1620,7 +1630,7 @@ async fn perceive_file_handler(
     let (workflow_state_code, workflow_state, mut security_level_code, mut security_level) = if is_pro {
         let ws_code = Some(omni_pro::perceive::detect_workflow_state(&file_path, &metadata));
         let ws = ws_code.clone();
-        let sec_code = Some(omni_pro::perceive::detect_security_level(&file_path, &markdown_content));
+        let sec_code = Some(omni_pro::perceive::detect_security_level(&file_path, &effective_text));
         let sec = sec_code.clone();
         (ws_code, ws, sec_code, sec)
     } else {
@@ -1720,11 +1730,6 @@ async fn perceive_file_handler(
     // 6.3 ram_tags 降级为平铺字符串数组 (仅包含门禁后存活的 RAM++ 纯实体标签名)
     let ram_tags_flat: Vec<String> = gated_ram_tags.into_iter().map(|r| r.name).collect();
 
-    let audio_transcript = metadata
-        .get("audio_transcript")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
     let lrc = metadata
         .get("lrc")
         .or_else(|| metadata.get("audio").and_then(|a| a.get("lrc")))
@@ -1757,9 +1762,9 @@ async fn perceive_file_handler(
     let file_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
 
     let enable_frontend_text = req.enable_text_analysis.unwrap_or(cfg.enable_text_analysis);
-    let text_analysis = if is_pro && enable_frontend_text && !markdown_content.trim().is_empty() {
+    let text_analysis = if is_pro && enable_frontend_text && !effective_text.trim().is_empty() {
         let t_text = std::time::Instant::now();
-        let text = markdown_content.clone();
+        let text = effective_text.clone();
         let fname = file_name.clone();
         let hownet = state.hownet.clone();
         let res = tokio::task::spawn_blocking(move || {
@@ -1810,13 +1815,14 @@ async fn perceive_file_handler(
         mime_type: mime_type.clone(),
         document_text: if !is_image && !markdown_content.trim().is_empty() { Some(markdown_content.clone()) } else { None },
         ocr_text: ocr_text.clone(),
-        audio_transcript: audio_transcript.clone(),
+        // 对外契约字段为 `asr`（Issue 0046 §1），MultimodalContext 内部沿用历史名 audio_transcript
+        audio_transcript: asr.clone(),
         lrc_text: lrc.clone(),
         visual_tags: structured_visual_tags.clone(),
         exif_metadata: metadata.clone(),
         is_image,
         is_document: !is_image && !is_video,
-        is_audio_or_video: is_video || audio_transcript.is_some() || lrc.is_some(),
+        is_audio_or_video: is_video || has_asr || lrc.is_some(),
         language: req.language.clone(),
     };
 
@@ -1963,7 +1969,9 @@ async fn perceive_file_handler(
         nsfw_high_confidence_tags,
         sensitive_types,
         content_rating,
-        audio_transcript,
+        asr,
+        has_asr,
+        asr_length,
         lrc,
         audio_events,
         geo_address,
@@ -1990,11 +1998,11 @@ async fn perceive_file_handler(
     });
 
     // 跨支柱自动索引 (Pillar 4 -> Pillar 5): 若感知产出了稠密特征向量且有文本，自动异步入库双轨混合索引
-    if let (Some(ref emb), false) = (&text_emb, markdown_content.trim().is_empty()) {
+    if let (Some(ref emb), false) = (&text_emb, effective_text.trim().is_empty()) {
         let indexed_doc = omni_pro::search::IndexedDocument {
             fingerprint: file_path.clone(),
             embedding: emb.clone(),
-            searchable_text: format!("{}\n{}", file_name, markdown_content),
+            searchable_text: format!("{}\n{}", file_name, effective_text),
         };
         let search_arc = state.search.clone();
         tokio::task::spawn_blocking(move || {
@@ -2337,9 +2345,9 @@ async fn audio_transcribe_handler(
     if let Some(text) = sense_result {
         transcript = Some(text);
     } else {
-        // Step 2: 降级：从 OmniExtractor 元数据中取 audio_transcript（若已有提取结果）
+        // Step 2: 降级：从 OmniExtractor 元数据中取 asr（若已有提取结果）
         if let Ok(res) = OmniExtractor::extract(&file_path, &cfg).await {
-            if let Some(t) = res.metadata.get("audio_transcript").and_then(|v| v.as_str()) {
+            if let Some(t) = res.metadata.get("asr").and_then(|v| v.as_str()) {
                 transcript = Some(t.to_string());
             } else if !res.markdown_content.is_empty()
                 && (res.mime_type.starts_with("audio/") || res.mime_type.starts_with("video/"))
