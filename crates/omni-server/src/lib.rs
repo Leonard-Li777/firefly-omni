@@ -1690,9 +1690,15 @@ async fn perceive_file_handler(
             let mut item = if is_pro {
                 // 用原始名查 RAM++ 投影表 / builtin 字典，得到正确的 code + name + parent_codes
                 let mut resolved =
-                    omni_pro::OmniVisionEngine::resolve_tag_to_chain_item(&original_name, confidence);
-                // 确保 code 与归一结果一致（防止别名映射漂移）
-                resolved.code = raw_code.clone();
+                    omni_pro::OmniVisionEngine::resolve_tag_to_chain_item_with_lang(
+                        &original_name,
+                        confidence,
+                        req.language.as_deref(),
+                    );
+                // 确保 code 与归一结果一致（仅当 raw_code 是合法受控码时才覆盖；若 raw_code 发生 _ext 漂移而 resolved 命中受控码则严格保留受控码）
+                if omni_core::tag_identity::is_controlled_code(raw_code) || !omni_core::tag_identity::is_controlled_code(&resolved.code) {
+                    resolved.code = raw_code.clone();
+                }
                 resolved
             } else {
                 omni_core::TagChainItem {
