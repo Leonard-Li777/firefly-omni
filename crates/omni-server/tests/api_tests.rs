@@ -1355,8 +1355,8 @@ async fn test_taxonomy_resolve_parent_unknown_fallback() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["success"], true);
-    assert_eq!(json["parent_code"], "builtin.topic");
-    assert_eq!(json["parent_name"], "主题内容");
+    assert_eq!(json["parent_code"], "builtin.content_tags");
+    assert_eq!(json["parent_name"], "内容标签");
     assert!(json["confidence"].as_f64().unwrap() < 0.65);
 }
 
@@ -1387,7 +1387,7 @@ async fn test_taxonomy_resolve_parent_empty_input() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["success"], true);
-    assert_eq!(json["parent_code"], "builtin.topic");
+    assert_eq!(json["parent_code"], "builtin.content_tags");
 }
 
 // ==================== POST /api/v1/omw/* OMW 核心查询端点 ====================
