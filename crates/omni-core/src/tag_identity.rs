@@ -442,54 +442,142 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
 use std::sync::RwLock;
 
 static DYNAMIC_ALIASES: OnceLock<RwLock<HashMap<String, &'static str>>> = OnceLock::new();
+static DYNAMIC_ALIASES_BY_LANG: OnceLock<RwLock<HashMap<String, HashMap<String, &'static str>>>> = OnceLock::new();
+static DYNAMIC_CANONICAL_BY_LANG: OnceLock<RwLock<HashMap<String, HashMap<String, &'static str>>>> = OnceLock::new();
 
 fn dynamic_aliases() -> &'static RwLock<HashMap<String, &'static str>> {
     DYNAMIC_ALIASES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+fn dynamic_aliases_by_lang() -> &'static RwLock<HashMap<String, HashMap<String, &'static str>>> {
+    DYNAMIC_ALIASES_BY_LANG.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn dynamic_canonical_by_lang() -> &'static RwLock<HashMap<String, HashMap<String, &'static str>>> {
+    DYNAMIC_CANONICAL_BY_LANG.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// 规约语言标识（支持 "zh-CN", "zh_CN", "zh" -> "zh", "en-US" -> "en" 等）
+pub fn normalize_language_code(lang: &str) -> &'static str {
+    let lower = lang.trim().to_lowercase();
+    if lower.starts_with("zh") {
+        "zh"
+    } else if lower.starts_with("ja") {
+        "ja"
+    } else if lower.starts_with("ko") {
+        "ko"
+    } else if lower.starts_with("fr") {
+        "fr"
+    } else if lower.starts_with("de") {
+        "de"
+    } else if lower.starts_with("es") {
+        "es"
+    } else if lower.starts_with("ru") {
+        "ru"
+    } else if lower.starts_with("pt") {
+        "pt"
+    } else if lower.starts_with("ar") {
+        "ar"
+    } else {
+        "en"
+    }
+}
+
+/// 极速 Unicode 字符集语言识别 (LID)
+/// 对单标签短语执行 100% 确定性零耗时判别 (ADR-0048 / Q1 选项 A)
+pub fn detect_tag_language(raw: &str) -> &'static str {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "en";
+    }
+    for ch in trimmed.chars() {
+        match ch {
+            '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' => return "ja",
+            '\u{AC00}'..='\u{D7AF}' | '\u{1100}'..='\u{11FF}' => return "ko",
+            '\u{0400}'..='\u{04FF}' => return "ru",
+            '\u{0600}'..='\u{06FF}' => return "ar",
+            '\u{4E00}'..='\u{9FFF}' => return "zh",
+            _ => {}
+        }
+    }
+    "en"
+}
+
+/// 按语言分表载入动态别名与权威展示名 (lemma, tag_code, is_canonical)
+///
+/// 冲突规则：同一 lemma 同时命中 `omw.*` 与 `builtin.*` 时 **omw.* 优先**。
+pub fn load_aliases_for_lang<I, S1, S2>(lang: &str, entries: I)
+where
+    I: IntoIterator<Item = (S1, S2, bool)>,
+    S1: AsRef<str>,
+    S2: AsRef<str>,
+{
+    let norm_lang = normalize_language_code(lang).to_string();
+    let mut by_lang_guard = dynamic_aliases_by_lang().write().unwrap();
+    let mut canonical_guard = dynamic_canonical_by_lang().write().unwrap();
+    let mut global_guard = dynamic_aliases().write().unwrap();
+
+    let lang_map = by_lang_guard.entry(norm_lang.clone()).or_insert_with(HashMap::new);
+    let can_map = canonical_guard.entry(norm_lang).or_insert_with(HashMap::new);
+
+    for (lemma, code, is_canonical) in entries {
+        let norm_lemma = normalize_lemma(lemma.as_ref());
+        if norm_lemma.is_empty() {
+            continue;
+        }
+        let code_ref = code.as_ref();
+        let should_insert = match lang_map.get(&norm_lemma) {
+            Some(existing) => {
+                let existing_is_omw = existing.starts_with("omw.");
+                let incoming_is_omw = code_ref.starts_with("omw.");
+                let existing_is_builtin = existing.starts_with("builtin.");
+                let incoming_is_builtin = code_ref.starts_with("builtin.");
+                if incoming_is_omw && existing_is_builtin {
+                    true
+                } else if existing_is_omw && incoming_is_builtin {
+                    false
+                } else {
+                    true
+                }
+            }
+            None => true,
+        };
+
+        if should_insert {
+            let leaked_code: &'static str = Box::leak(code_ref.to_string().into_boxed_str());
+            lang_map.insert(norm_lemma.clone(), leaked_code);
+            global_guard.insert(norm_lemma, leaked_code);
+
+            if is_canonical {
+                let leaked_lemma: &'static str = Box::leak(lemma.as_ref().to_string().into_boxed_str());
+                can_map.insert(code_ref.to_string(), leaked_lemma);
+            }
+        }
+    }
+}
+
 /// 动态批量载入受控标签别名（由 SQLite 连接时读取 tag_aliases 表注入，或从 json 载入）
 /// 传入 (lemma, tag_code)
 ///
-/// 冲突规则：同一 lemma 同时命中 `omw.*` 与 `builtin.*` 时 **omw.* 优先**（中文概念优先反映射 OMW，禁止无脑 builtin/_ext）。
+/// 冲突规则：同一 lemma 同时命中 `omw.*` 与 `builtin.*` 时 **omw.* 优先**。
 pub fn load_aliases_from_entries<I, S1, S2>(entries: I)
 where
     I: IntoIterator<Item = (S1, S2)>,
     S1: AsRef<str>,
     S2: AsRef<str>,
 {
-    if let Ok(mut map) = dynamic_aliases().write() {
-        for (lemma, code) in entries {
-            let norm_lemma = normalize_lemma(lemma.as_ref());
-            if norm_lemma.is_empty() {
-                continue;
-            }
-            let code_ref = code.as_ref();
-            let should_insert = match map.get(&norm_lemma) {
-                Some(existing) => {
-                    let existing_is_omw = existing.starts_with("omw.");
-                    let incoming_is_omw = code_ref.starts_with("omw.");
-                    let existing_is_builtin = existing.starts_with("builtin.");
-                    let incoming_is_builtin = code_ref.starts_with("builtin.");
-                    if incoming_is_omw && existing_is_builtin {
-                        true
-                    } else if existing_is_omw && incoming_is_builtin {
-                        false
-                    } else {
-                        // 同前缀或其它受控形态：后写覆盖
-                        true
-                    }
-                }
-                None => true,
-            };
-            if should_insert {
-                let leaked_code: &'static str = Box::leak(code_ref.to_string().into_boxed_str());
-                map.insert(norm_lemma, leaked_code);
-            }
-        }
+    let mut batch_by_lang: HashMap<&'static str, Vec<(String, String, bool)>> = HashMap::new();
+    for (lemma, code) in entries {
+        let l_str = lemma.as_ref();
+        let lang = detect_tag_language(l_str);
+        batch_by_lang.entry(lang).or_default().push((l_str.to_string(), code.as_ref().to_string(), true));
+    }
+    for (lang, list) in batch_by_lang {
+        load_aliases_for_lang(lang, list);
     }
 }
 
-/// 受控标签 code 反查（运行时归一入口）
+/// 受控标签 code 反查（运行时单语言/全局归一入口）
 ///
 /// 优先级：
 /// 1. 动态别名字典（semantic.pack tag_aliases_{lang} 热载；同 lemma 时 omw.* 已优先）
@@ -512,9 +600,108 @@ pub fn resolve_controlled_tag_code(tag: &str) -> Option<&'static str> {
     en_to_code().get(en.as_str()).map(|s| s.as_str())
 }
 
+/// 识别标签两阶段反查入口 (ADR-0048)
+///
+/// 1. 当前语言分表直查 (tag_aliases_{current_lang})
+/// 2. 未命中时执行 Unicode LID 语言识别
+/// 3. 若识别语言与当前语言不同，反查对应异语分表 (tag_aliases_{detected_lang})
+/// 4. 异语命中后，反向解析当前语言的权威规范名进行就地本地化 (Q2 选项 A)
+///
+/// 返回: Option<(tag_code, Option<canonical_name_in_current_lang>)>
+pub fn resolve_controlled_tag_two_stage(
+    tag: &str,
+    current_lang: Option<&str>,
+) -> Option<(&'static str, Option<String>)> {
+    let key = normalize_lemma(tag);
+    if key.is_empty() {
+        return None;
+    }
+    let curr_lang = normalize_language_code(current_lang.unwrap_or("zh"));
+
+    // ─── 第一阶段：当前语言分表直查 ───
+    if let Ok(by_lang) = dynamic_aliases_by_lang().read() {
+        if let Some(map) = by_lang.get(curr_lang) {
+            if let Some(&code) = map.get(&key) {
+                return Some((code, None));
+            }
+        }
+    }
+    // 查当前语言静态底座
+    if curr_lang == "zh" {
+        if let Some(en) = alias_map().get(&key) {
+            if let Some(code) = en_to_code().get(en.as_str()) {
+                return Some((code.as_str(), None));
+            }
+        }
+    } else if curr_lang == "en" {
+        if let Some(code) = en_to_code().get(&key) {
+            return Some((code.as_str(), None));
+        }
+    }
+
+    // ─── 第二阶段：语言识别 (LID) ───
+    let detected_lang = detect_tag_language(tag);
+    // 若识别出的语言与当前系统语言相同，无需重复查找，直接作为未登录词
+    if detected_lang == curr_lang {
+        return None;
+    }
+
+    // ─── 异语分表反查 ───
+    let mut matched_code: Option<&'static str> = None;
+    if let Ok(by_lang) = dynamic_aliases_by_lang().read() {
+        if let Some(map) = by_lang.get(detected_lang) {
+            if let Some(&code) = map.get(&key) {
+                matched_code = Some(code);
+            }
+        }
+        if matched_code.is_none() && detected_lang != "en" {
+            if let Some(map) = by_lang.get("en") {
+                if let Some(&code) = map.get(&key) {
+                    matched_code = Some(code);
+                }
+            }
+        }
+    }
+
+    // 异语静态底座兜底
+    if matched_code.is_none() {
+        if let Some(en) = alias_map().get(&key) {
+            matched_code = en_to_code().get(en.as_str()).map(|s| s.as_str());
+        }
+    }
+
+    if let Some(code) = matched_code {
+        // ─── 就地本地化：反查当前系统语言的权威规范名 ───
+        let mut canonical_name: Option<String> = None;
+        if let Ok(canon_guard) = dynamic_canonical_by_lang().read() {
+            if let Some(cmap) = canon_guard.get(curr_lang) {
+                if let Some(&name) = cmap.get(code) {
+                    canonical_name = Some(name.to_string());
+                }
+            }
+        }
+        if canonical_name.is_none() {
+            // 静态字典展示名回退
+            let fallback_name = tag_display(code, curr_lang);
+            if fallback_name != code {
+                canonical_name = Some(fallback_name);
+            }
+        }
+        return Some((code, canonical_name));
+    }
+
+    None
+}
+
 /// 清空动态别名字典（用于热切换或断开连接时）
 pub fn clear_dynamic_aliases() {
     if let Ok(mut map) = dynamic_aliases().write() {
+        map.clear();
+    }
+    if let Ok(mut map) = dynamic_aliases_by_lang().write() {
+        map.clear();
+    }
+    if let Ok(mut map) = dynamic_canonical_by_lang().write() {
         map.clear();
     }
 }
@@ -765,6 +952,55 @@ mod tests {
         assert!(resolve_controlled_tag_code("截图").unwrap().starts_with("builtin."));
         // 未知词返回 None，交由调用方派生 _ext
         assert_eq!(resolve_controlled_tag_code("完全未知的新标签XYZQ"), None);
+        clear_dynamic_aliases();
+    }
+
+    #[test]
+    fn test_two_stage_multilingual_resolution() {
+        clear_dynamic_aliases();
+
+        // 1. 测试 LID 判定
+        assert_eq!(detect_tag_language("Connect"), "en");
+        assert_eq!(detect_tag_language("Art"), "en");
+        assert_eq!(detect_tag_language("艺术"), "zh");
+        assert_eq!(detect_tag_language("アニメ"), "ja");
+        assert_eq!(detect_tag_language("그림"), "ko");
+        assert_eq!(detect_tag_language("рисунок"), "ru");
+
+        // 2. 模拟从多语言分表热载入别名
+        load_aliases_for_lang("zh", vec![
+            ("艺术", "omw.01700688-n", true),
+            ("连接", "builtin.connect", true),
+            ("发票", "builtin.invoice", true),
+        ]);
+        load_aliases_for_lang("en", vec![
+            ("art", "omw.01700688-n", true),
+            ("connect", "builtin.connect", true),
+            ("invoice", "builtin.invoice", true),
+        ]);
+
+        // 3. 在中文环境下识别英文 "Art" -> 跨语言命中受控 code，并就地本地化为 "艺术"
+        let outcome_art = resolve_controlled_tag_two_stage("Art", Some("zh-CN"));
+        assert!(outcome_art.is_some());
+        let (code, canon_name) = outcome_art.unwrap();
+        assert_eq!(code, "omw.01700688-n");
+        assert_eq!(canon_name, Some("艺术".to_string()));
+
+        // 4. 在中文环境下识别英文 "Connect" -> 就地本地化为 "连接"
+        let outcome_conn = resolve_controlled_tag_two_stage("Connect", Some("zh"));
+        assert!(outcome_conn.is_some());
+        let (code_conn, canon_conn) = outcome_conn.unwrap();
+        assert_eq!(code_conn, "builtin.connect");
+        assert_eq!(canon_conn, Some("连接".to_string()));
+
+        // 5. 在中文环境下输入未登录的中文生词 -> 判定为 zh，与当前语言相同，不重复查找，返回 None
+        let outcome_zh_unknown = resolve_controlled_tag_two_stage("未知冷门新造词汇", Some("zh"));
+        assert_eq!(outcome_zh_unknown, None);
+
+        // 6. 在中文环境下输入未登录的英文生词 -> 两阶段均未查得，返回 None
+        let outcome_en_unknown = resolve_controlled_tag_two_stage("NonExistentBrandNameX", Some("zh"));
+        assert_eq!(outcome_en_unknown, None);
+
         clear_dynamic_aliases();
     }
 }
