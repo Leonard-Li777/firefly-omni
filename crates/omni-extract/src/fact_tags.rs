@@ -63,11 +63,11 @@ impl OmniFactTagExtractor {
         Self::extract_document_dimensions(ctx.metadata, &mut tags);
 
         // 2. 下沉既有物理事实 (桌面端 Node.js 预检管线既有确诊维度)
-        Self::push_fact(&mut tags, "文件来源", ctx.file_source.as_deref(), "dim.file_source", CONF_FACT);
-        Self::push_fact(&mut tags, "处理状态", ctx.workflow_state.as_deref(), "dim.workflow_state", CONF_FACT);
-        Self::push_fact(&mut tags, "安全等级", ctx.security_level.as_deref(), "dim.security_level", CONF_FACT);
+        Self::push_fact(&mut tags, "文件来源", ctx.file_source.as_deref(), "builtin.file_source", CONF_FACT);
+        Self::push_fact(&mut tags, "处理状态", ctx.workflow_state.as_deref(), "builtin.processing_status", CONF_FACT);
+        Self::push_fact(&mut tags, "安全等级", ctx.security_level.as_deref(), "builtin.security_level", CONF_FACT);
         Self::push_quality_grade(&mut tags, ctx.quality_score);
-        Self::push_fact(&mut tags, "语言", ctx.language_label.as_deref(), "dim.language", CONF_FACT);
+        Self::push_fact(&mut tags, "语言", ctx.language_label.as_deref(), "builtin.language_segmentation", CONF_FACT);
 
         // 出口一致性保障：fact_tags 为确定性物理事实，仍统一校验置信度不低于出口门限
         tags.retain(|t| t.confidence >= EXIT_CONFIDENCE_THRESHOLD);
@@ -101,7 +101,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
-                        Some("dim.creator"),
+                        Some("builtin.author"),
                     );
                 }
             }
@@ -116,7 +116,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
-                        Some("dim.album"),
+                        Some("builtin.audio_segmentation"),
                     );
                 }
             }
@@ -126,7 +126,7 @@ impl OmniFactTagExtractor {
                     let code = omni_core::tag_identity::resolve_controlled_tag_code(&val)
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| Self::ext_code("music_genre", &val));
-                    Self::push_tag(out, "音乐流派", code, &val, CONF_FACT, Some(key), &val, Some("dim.music_genre"));
+                    Self::push_tag(out, "音乐流派", code, &val, CONF_FACT, Some(key), &val, Some("builtin.music_type"));
                 }
             }
         }
@@ -146,7 +146,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
-                        Some("dim.camera_brand"),
+                        Some("builtin.photography_categories"),
                     );
                 }
             }
@@ -164,7 +164,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
-                        Some("dim.camera_model"),
+                        Some("builtin.photography_categories"),
                     );
                 }
             }
@@ -179,7 +179,7 @@ impl OmniFactTagExtractor {
                     let code = omni_core::tag_identity::resolve_controlled_tag_code(&name)
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| Self::ext_code("creation_tool", &name));
-                    Self::push_tag(out, "创作软件", code, &name, CONF_FACT, Some(key), &val, Some("dim.software"));
+                    Self::push_tag(out, "创作软件", code, &name, CONF_FACT, Some(key), &val, Some("builtin.content_tags"));
                 }
             }
         }
@@ -202,7 +202,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
-                        Some("dim.organization"),
+                        Some("builtin.content_tags"),
                     );
                 }
             }
@@ -219,15 +219,18 @@ impl OmniFactTagExtractor {
         } else {
             "低质量"
         };
+        let code = omni_core::tag_identity::resolve_controlled_tag_code(grade)
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| Self::ext_code("document_quality", grade));
         Self::push_tag(
             out,
             "文件质量",
-            Self::ext_code("file_quality", grade),
+            code,
             grade,
             CONF_FACT,
             Some("quality_score"),
             &score.to_string(),
-            Some("dim.file_quality"),
+            Some("builtin.document_quality"),
         );
     }
 
@@ -281,19 +284,30 @@ impl OmniFactTagExtractor {
         out: &mut Vec<TagChainItem>,
         dimension_name: &str,
         value: Option<&str>,
-        code: &str,
+        parent_dim_code: &str,
         confidence: f32,
     ) {
         let Some(val) = value else { return };
+        let clean_val = val.trim();
+        if clean_val.is_empty() {
+            return;
+        }
+        // 优先通过受控词表反查受控 code (omw.* > builtin.*)，未命中时使用 _ext 派生，杜绝拼接 dim.*
+        let code = omni_core::tag_identity::resolve_controlled_tag_code(clean_val)
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| {
+                let parent_slug = parent_dim_code.strip_prefix("builtin.").unwrap_or(parent_dim_code);
+                Self::ext_code(parent_slug, clean_val)
+            });
         Self::push_tag(
             out,
             dimension_name,
-            format!("{}.{}", code, Self::slug(val)),
-            val,
+            code,
+            clean_val,
             confidence,
             Some(dimension_name),
-            val,
-            Some(code),
+            clean_val,
+            Some(parent_dim_code),
         );
     }
 
@@ -514,14 +528,48 @@ mod tests {
             assert!(names.contains(&expected), "应下沉物理事实 {}，实际: {:?}", expected, names);
         }
 
-        // 票 05 断言：所有事实标签均携带确定性的受控消歧父级 via_parent_code
+        // 票 05 断言：所有事实标签均携带确定性的受控消歧父级 via_parent_code，且严禁出现任何 dim. 前缀
         for tag in &tags {
             assert!(
                 tag.via_parent_code.is_some() && !tag.via_parent_code.as_deref().unwrap().is_empty(),
                 "事实标签必须携带非空的经由父 via_parent_code: {:?}",
                 tag
             );
+            assert!(
+                !tag.code.starts_with("dim."),
+                "事实标签 code 严禁以 dim. 开头: {:?}",
+                tag
+            );
+            assert!(
+                !tag.via_parent_code.as_ref().unwrap().starts_with("dim."),
+                "事实标签 via_parent_code 严禁以 dim. 开头: {:?}",
+                tag
+            );
+            for p in &tag.parent_codes {
+                assert!(!p.starts_with("dim."), "parent_codes 严禁包含 dim.: {:?}", tag);
+            }
         }
+
+        // 精确对齐受控 code 与父级 code
+        let net = tags.iter().find(|t| t.name == "网络下载").unwrap();
+        assert_eq!(net.code, "builtin.web_downloads");
+        assert_eq!(net.via_parent_code.as_deref(), Some("builtin.file_source"));
+
+        let draft = tags.iter().find(|t| t.name == "草稿").unwrap();
+        assert_eq!(draft.code, "builtin.draft");
+        assert_eq!(draft.via_parent_code.as_deref(), Some("builtin.processing_status"));
+
+        let internal = tags.iter().find(|t| t.name == "内部").unwrap();
+        assert_eq!(internal.code, "builtin.internal");
+        assert_eq!(internal.via_parent_code.as_deref(), Some("builtin.security_level"));
+
+        let hq = tags.iter().find(|t| t.name == "高质量").unwrap();
+        assert_eq!(hq.code, "builtin.high_quality");
+        assert_eq!(hq.via_parent_code.as_deref(), Some("builtin.document_quality"));
+
+        let zh = tags.iter().find(|t| t.name == "中文").unwrap();
+        assert_eq!(zh.code, "builtin.chinese");
+        assert_eq!(zh.via_parent_code.as_deref(), Some("builtin.language_segmentation"));
     }
 
     /// 质量等级阈值边界映射
