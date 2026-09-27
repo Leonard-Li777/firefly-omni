@@ -65,6 +65,13 @@ pub fn normalize_lemma(lemma: &str) -> String {
     lemma.nfkc().collect::<String>().trim().to_lowercase()
 }
 
+/// 判断 code 是否属于严格受控三分区契约 (builtin.* | omw.* | hownet.*)
+/// 开放集扩展标签 _ext.* 以及旧系统 dim.* 不属于受控标签 code
+#[inline]
+pub fn is_controlled_code(code: &str) -> bool {
+    code.starts_with("builtin.") || code.starts_with("omw.") || code.starts_with("hownet.")
+}
+
 /// 受控别名表：(别名, 英文规范名)
 /// 同一概念的多语言别名必须指向同一 en 规范名。
 const BUILTIN_ALIASES: &[(&str, &str)] = &[
@@ -230,6 +237,17 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("ui screenshot", "UI Screenshot"),
     ("chat screenshot", "Chat Screenshot"),
     ("confidential", "Confidential"),
+    ("exposure is normal", "Normal Exposure"),
+    ("normal exposure", "Normal Exposure"),
+    ("good exposure", "Good Exposure"),
+    ("slight underexposure", "Slight Underexposure"),
+    ("slight overexposure", "Slight Overexposure"),
+    ("high quality", "High Quality"),
+    ("medium quality", "Medium Quality"),
+    ("low quality", "Low Quality"),
+    ("all ages", "All Ages"),
+    ("text-in-image", "Image With Text"),
+    ("text in image", "Image With Text"),
     ("长图", "Long Image"),
     ("正方形图", "Square Image"),
     ("横图", "Horizontal Image"),
@@ -506,12 +524,44 @@ pub fn detect_tag_language(raw: &str) -> &'static str {
 /// 按语言分表载入动态别名与权威展示名 (lemma, tag_code, is_canonical)
 ///
 /// 冲突规则：同一 lemma 同时命中 `omw.*` 与 `builtin.*` 时 **omw.* 优先**。
+/// 全局表（`dynamic_aliases`，供 `resolve_controlled_tag_code` 等旧接口读取）
+/// 与语言分表采用同一 omw.* 优先冲突规则，避免多语言分表热载顺序不同
+/// 导致同名 lemma 全局解析结果漂移（ADR-0048 评审 HIGH-2）。
+/// 指针复用：同一 (lemma, code) 重复载入时复用已泄漏的 `&'static str`，
+/// 不再追加 `Box::leak`（评审 HIGH-3）。
 pub fn load_aliases_for_lang<I, S1, S2>(lang: &str, entries: I)
 where
     I: IntoIterator<Item = (S1, S2, bool)>,
     S1: AsRef<str>,
     S2: AsRef<str>,
 {
+    // 受控前缀优先级：omw.* (3) > hownet.* (2) > builtin.* (1) > 其它/_ext.* (0)
+    fn code_priority(code: &str) -> u8 {
+        if code.starts_with("omw.") {
+            3
+        } else if code.starts_with("hownet.") {
+            2
+        } else if code.starts_with("builtin.") {
+            1
+        } else {
+            0
+        }
+    }
+
+    // 冲突仲裁：返回 true 表示 incoming 应覆盖 existing
+    fn prefer_incoming(existing: &str, incoming: &str) -> bool {
+        let p_existing = code_priority(existing);
+        let p_incoming = code_priority(incoming);
+        if p_incoming > p_existing {
+            true
+        } else if p_incoming < p_existing {
+            false
+        } else {
+            // 同优先级（同为受控或非受控）：后写覆盖
+            true
+        }
+    }
+
     let norm_lang = normalize_language_code(lang).to_string();
     let mut by_lang_guard = dynamic_aliases_by_lang().write().unwrap();
     let mut canonical_guard = dynamic_canonical_by_lang().write().unwrap();
@@ -526,27 +576,32 @@ where
             continue;
         }
         let code_ref = code.as_ref();
+        // 门禁：受控别名表严禁载入 _ext.* 非受控扩展代码
+        if !is_controlled_code(code_ref) {
+            continue;
+        }
         let should_insert = match lang_map.get(&norm_lemma) {
-            Some(existing) => {
-                let existing_is_omw = existing.starts_with("omw.");
-                let incoming_is_omw = code_ref.starts_with("omw.");
-                let existing_is_builtin = existing.starts_with("builtin.");
-                let incoming_is_builtin = code_ref.starts_with("builtin.");
-                if incoming_is_omw && existing_is_builtin {
-                    true
-                } else if existing_is_omw && incoming_is_builtin {
-                    false
-                } else {
-                    true
-                }
-            }
+            Some(existing) => prefer_incoming(existing, code_ref),
             None => true,
         };
 
         if should_insert {
-            let leaked_code: &'static str = Box::leak(code_ref.to_string().into_boxed_str());
+            // 指针复用：语言分表已存在相同 code 时直接复用，避免重复 Box::leak
+            let leaked_code: &'static str = match lang_map.get(&norm_lemma) {
+                Some(&existing) if existing == code_ref => existing,
+                _ => Box::leak(code_ref.to_string().into_boxed_str()),
+            };
             lang_map.insert(norm_lemma.clone(), leaked_code);
-            global_guard.insert(norm_lemma, leaked_code);
+
+            // 全局表独立仲裁（同名 lemma 跨语言分表可能映射不同 code，
+            // 维持 omw.* 优先，其余后写覆盖，与分表规则一致）
+            match global_guard.get(&norm_lemma) {
+                Some(&existing) if existing == leaked_code => {}
+                Some(&existing) if !prefer_incoming(existing, leaked_code) => {}
+                _ => {
+                    global_guard.insert(norm_lemma.clone(), leaked_code);
+                }
+            }
 
             if is_canonical {
                 let leaked_lemma: &'static str = Box::leak(lemma.as_ref().to_string().into_boxed_str());
@@ -589,10 +644,12 @@ pub fn resolve_controlled_tag_code(tag: &str) -> Option<&'static str> {
     if key.is_empty() {
         return None;
     }
-    // 1. 动态轨（含 omw.*）
+    // 1. 动态轨（含 omw.* / hownet.* / builtin.*）
     if let Ok(dyn_map) = dynamic_aliases().read() {
         if let Some(&code) = dyn_map.get(&key) {
-            return Some(code);
+            if is_controlled_code(code) {
+                return Some(code);
+            }
         }
     }
     // 2. 静态 builtin 字典（不经过 dynamic 再查，避免语义重复）
@@ -622,7 +679,9 @@ pub fn resolve_controlled_tag_two_stage(
     if let Ok(by_lang) = dynamic_aliases_by_lang().read() {
         if let Some(map) = by_lang.get(curr_lang) {
             if let Some(&code) = map.get(&key) {
-                return Some((code, None));
+                if is_controlled_code(code) {
+                    return Some((code, None));
+                }
             }
         }
     }
@@ -651,13 +710,17 @@ pub fn resolve_controlled_tag_two_stage(
     if let Ok(by_lang) = dynamic_aliases_by_lang().read() {
         if let Some(map) = by_lang.get(detected_lang) {
             if let Some(&code) = map.get(&key) {
-                matched_code = Some(code);
+                if is_controlled_code(code) {
+                    matched_code = Some(code);
+                }
             }
         }
         if matched_code.is_none() && detected_lang != "en" {
             if let Some(map) = by_lang.get("en") {
                 if let Some(&code) = map.get(&key) {
-                    matched_code = Some(code);
+                    if is_controlled_code(code) {
+                        matched_code = Some(code);
+                    }
                 }
             }
         }
@@ -790,7 +853,9 @@ pub fn builtin_tag_code(tag: &str) -> Option<&'static str> {
     // 1. 优先查动态载入字典（DB/JSON 热载入轨）
     if let Ok(dyn_map) = dynamic_aliases().read() {
         if let Some(&code) = dyn_map.get(&key) {
-            return Some(code);
+            if is_controlled_code(code) {
+                return Some(code);
+            }
         }
     }
     // 2. 回退查静态内置别名字典（静态底座保底轨）
@@ -814,7 +879,7 @@ pub fn normalize_tag_to_code(tag: &str) -> String {
     }
     // 已是合法 code 形态则原样返回
     let t = tag.trim();
-    if t.starts_with("builtin.") || t.starts_with("_ext.") || t.starts_with("omw.") {
+    if t.starts_with("builtin.") || t.starts_with("_ext.") || t.starts_with("omw.") || t.starts_with("hownet.") {
         return t.to_string();
     }
     derive_ext_tag_code(t)
@@ -919,8 +984,12 @@ mod tests {
         assert!(a.starts_with("_ext."));
     }
 
+    // 注意：dynamic_aliases_* 全局字典为进程级共享状态（static RwLock），
+    // 多个测试并行 clear/insert 会互相踩踏（ADR-0048 评审 BLOCKER-1），
+    // 因此所有依赖动态别名字典的用例必须合并进这一个测试，保证顺序执行。
     #[test]
-    fn dynamic_aliases_injection_and_lookup() {
+    fn dynamic_aliases_lifecycle_all_in_one() {
+        // ─── 场景 1：注入与反查 ───
         clear_dynamic_aliases();
         load_aliases_from_entries(vec![
             ("特种发票", "builtin.invoice"),
@@ -929,13 +998,10 @@ mod tests {
         assert_eq!(builtin_tag_code("特种发票"), Some("builtin.invoice"));
         assert_eq!(builtin_tag_code("Special Tax Invoice"), Some("builtin.invoice"));
         assert_eq!(normalize_tag_to_code("特种发票"), "builtin.invoice");
-        clear_dynamic_aliases();
-    }
 
-    #[test]
-    fn dynamic_aliases_prefer_omw_over_builtin_for_same_lemma() {
+        // ─── 场景 2：同 lemma omw.* 优先于 builtin.*（双向写入顺序）───
         clear_dynamic_aliases();
-        // 同 lemma：builtin 先写入，omw 后写入 → 反查必须得到 omw.*
+        // builtin 先写入，omw 后写入 → 反查必须得到 omw.*
         load_aliases_from_entries(vec![
             ("科幻", "builtin.science_fiction"),
             ("科幻", "omw.00012345.n"),
@@ -952,14 +1018,11 @@ mod tests {
         assert!(resolve_controlled_tag_code("截图").unwrap().starts_with("builtin."));
         // 未知词返回 None，交由调用方派生 _ext
         assert_eq!(resolve_controlled_tag_code("完全未知的新标签XYZQ"), None);
-        clear_dynamic_aliases();
-    }
 
-    #[test]
-    fn test_two_stage_multilingual_resolution() {
+        // ─── 场景 3：两阶段跨语言反查与就地本地化 ───
         clear_dynamic_aliases();
 
-        // 1. 测试 LID 判定
+        // 3.1 测试 LID 判定
         assert_eq!(detect_tag_language("Connect"), "en");
         assert_eq!(detect_tag_language("Art"), "en");
         assert_eq!(detect_tag_language("艺术"), "zh");
@@ -967,7 +1030,7 @@ mod tests {
         assert_eq!(detect_tag_language("그림"), "ko");
         assert_eq!(detect_tag_language("рисунок"), "ru");
 
-        // 2. 模拟从多语言分表热载入别名
+        // 3.2 模拟从多语言分表热载入别名
         load_aliases_for_lang("zh", vec![
             ("艺术", "omw.01700688-n", true),
             ("连接", "builtin.connect", true),
@@ -1000,6 +1063,25 @@ mod tests {
         // 6. 在中文环境下输入未登录的英文生词 -> 两阶段均未查得，返回 None
         let outcome_en_unknown = resolve_controlled_tag_two_stage("NonExistentBrandNameX", Some("zh"));
         assert_eq!(outcome_en_unknown, None);
+
+        // ─── 场景 4：核心视觉画质与尺度受控标签 100% 确定性解析与 _ext 防污染 ───
+        assert_eq!(resolve_controlled_tag_code("高质量"), Some("builtin.high_quality"));
+        assert_eq!(resolve_controlled_tag_code("曝光正常"), Some("builtin.normal_exposure"));
+        assert_eq!(resolve_controlled_tag_code("全年龄"), Some("builtin.all_ages"));
+        assert_eq!(resolve_controlled_tag_code("有字图"), Some("builtin.image_with_text"));
+        assert_eq!(resolve_controlled_tag_code("无字图"), Some("builtin.image_without_text"));
+        assert_eq!(normalize_tag_to_code("高质量"), "builtin.high_quality");
+        assert_eq!(normalize_tag_to_code("曝光正常"), "builtin.normal_exposure");
+        assert_eq!(normalize_tag_to_code("全年龄"), "builtin.all_ages");
+        assert_eq!(normalize_tag_to_code("有字图"), "builtin.image_with_text");
+
+        // 验证非法/污染的 _ext.* 绝对无法覆盖已有的受控代码
+        load_aliases_from_entries(vec![
+            ("高质量", "_ext.gaozhiliang.4973d142"),
+            ("曝光正常", "_ext.guang_zhen_chang.ee8a87d9"),
+        ]);
+        assert_eq!(resolve_controlled_tag_code("高质量"), Some("builtin.high_quality"));
+        assert_eq!(resolve_controlled_tag_code("曝光正常"), Some("builtin.normal_exposure"));
 
         clear_dynamic_aliases();
     }
