@@ -1868,23 +1868,40 @@ async fn perceive_file_handler(
         structured_visual_tags.clone()
     };
 
-    // 对 fused_tags 中 parent_codes 为空的扩展标签，
-    // 通过 TaxonomyVectorBase bekko-a8m 语义向量推导补全 parent_codes，
-    // 避免 desktop 端看到空父级或硬编码回退值。
-    let fused_tags: Vec<omni_core::TagChainItem> = if is_pro {
-        fused_tags.into_iter().map(|mut tag| {
-            if tag.parent_codes.is_empty() && tag.code.starts_with("_ext.") {
+    // 票 05：受控标签与扩展标签经由父 (via_parent_code) 与树状父 (parent_codes) 主链回填
+    // 终结「工单 01 已知限制」，确保受控标签行落库时 via_parent_code != ''
+    let backfill_chain_item = |mut tag: omni_core::TagChainItem| -> omni_core::TagChainItem {
+        // 1. 若已有 parent_codes 且 via_parent_code 为空，优先以首个父级作为经由父消歧锚
+        if tag.via_parent_code.is_none() && !tag.parent_codes.is_empty() {
+            tag.via_parent_code = tag.parent_codes.first().cloned();
+        }
+        // 2. 若依然缺失经由父且不是真根节点（受控标签 builtin.* / omw.* / hownet.* 或扩展标签 _ext.*），在 Pro 下通过向量底座推导补全
+        if tag.via_parent_code.is_none() && is_pro {
+            if tag.code.starts_with("_ext.") || tag.code.starts_with("builtin.") || tag.code.starts_with("omw.") || tag.code.starts_with("hownet.") {
                 let outcome = omni_pro::text::OmniMultimodalFusionEngine::resolve_ext_tag_parent(
                     &tag.name,
                     &tag.code,
                 );
-                tag.parent_codes = vec![outcome];
+                if !outcome.is_empty() {
+                    tag.via_parent_code = Some(outcome.clone());
+                    if tag.parent_codes.is_empty() {
+                        tag.parent_codes = vec![outcome];
+                    }
+                }
             }
-            tag
-        }).collect()
-    } else {
-        fused_tags
+        }
+        tag
     };
+
+    let structured_visual_tags: Vec<omni_core::TagChainItem> = structured_visual_tags
+        .into_iter()
+        .map(backfill_chain_item)
+        .collect();
+
+    let fused_tags: Vec<omni_core::TagChainItem> = fused_tags
+        .into_iter()
+        .map(backfill_chain_item)
+        .collect();
 
     benchmark.total_ms = t_start.elapsed().as_millis() as u64;
 
@@ -2081,6 +2098,9 @@ pub struct ResolveParentRequest {
 pub struct ResolveParentResponse {
     pub success: bool,
     pub parent_code: String,
+    /// 语义标签消歧经由父级 code (ADR-0047，与 parent_code 双向对齐)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_parent_code: Option<String>,
     pub parent_name: String,
     pub confidence: f32,
     pub suggested_depth: u32,
@@ -2117,6 +2137,7 @@ async fn taxonomy_resolve_parent_handler(
 
     Json(ResolveParentResponse {
         success: outcome.success,
+        via_parent_code: Some(outcome.parent_code.clone()),
         parent_code: outcome.parent_code,
         parent_name: outcome.parent_name,
         confidence: outcome.confidence,

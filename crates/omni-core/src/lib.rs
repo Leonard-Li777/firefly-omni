@@ -173,6 +173,9 @@ pub struct TagChainItem {
     pub confidence: f32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parent_codes: Vec<String>,
+    /// 本次标注实际经由的消歧父级 code（概念 B 消歧锚；真根为 None 或空串，与概念 A parent_codes 标签树多父数组正交，ADR-0047）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_parent_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialized_paths: Option<String>,
     // 创世字段治理：pack 来源列已收敛为 source（dimension/tag/hownet/omw），废除 category
@@ -204,6 +207,12 @@ impl TagChainItem {
 
     pub fn with_parent(mut self, parent_code: impl Into<String>) -> Self {
         self.parent_codes = vec![parent_code.into()];
+        self
+    }
+
+    /// 链式设置本次实际经由的消歧父级 code（概念 B）
+    pub fn with_via_parent(mut self, via_parent_code: impl Into<String>) -> Self {
+        self.via_parent_code = Some(via_parent_code.into());
         self
     }
 }
@@ -599,3 +608,32 @@ pub fn to_native_path_str<P: AsRef<std::path::Path>>(path: P) -> String {
         raw.replace('\\', "/")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 票 05 契约测试：TagChainItem A/B 两轴语义正交分离（漂移④终结）
+    /// - A 轴：parent_codes 树状 DAG 多父数组
+    /// - B 轴：via_parent_code 本次经由单值消歧锚
+    #[test]
+    fn test_tag_chain_item_ab_axis_separation() {
+        let item = TagChainItem::new("builtin.image.cat", "猫", 0.95)
+            .with_parent("builtin.image.animal")
+            .with_via_parent("builtin.image.mammal");
+
+        // 断言 A 轴与 B 轴取值独立，不再发生「一次值双写」
+        assert_eq!(item.parent_codes, vec!["builtin.image.animal"]);
+        assert_eq!(item.via_parent_code.as_deref(), Some("builtin.image.mammal"));
+
+        // 序列化与反序列化验证
+        let json_str = serde_json::to_string(&item).expect("序列化失败");
+        assert!(json_str.contains("\"via_parent_code\":\"builtin.image.mammal\""));
+        assert!(json_str.contains("\"parent_codes\":[\"builtin.image.animal\"]"));
+
+        let deserialized: TagChainItem = serde_json::from_str(&json_str).expect("反序列化失败");
+        assert_eq!(deserialized.via_parent_code, Some("builtin.image.mammal".to_string()));
+        assert_eq!(deserialized.parent_codes, vec!["builtin.image.animal".to_string()]);
+    }
+}
+

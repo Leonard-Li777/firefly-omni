@@ -101,6 +101,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
+                        Some("dim.creator"),
                     );
                 }
             }
@@ -115,6 +116,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
+                        Some("dim.album"),
                     );
                 }
             }
@@ -124,7 +126,7 @@ impl OmniFactTagExtractor {
                     let code = omni_core::tag_identity::resolve_controlled_tag_code(&val)
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| Self::ext_code("music_genre", &val));
-                    Self::push_tag(out, "音乐流派", code, &val, CONF_FACT, Some(key), &val);
+                    Self::push_tag(out, "音乐流派", code, &val, CONF_FACT, Some(key), &val, Some("dim.music_genre"));
                 }
             }
         }
@@ -144,6 +146,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
+                        Some("dim.camera_brand"),
                     );
                 }
             }
@@ -161,6 +164,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
+                        Some("dim.camera_model"),
                     );
                 }
             }
@@ -175,7 +179,7 @@ impl OmniFactTagExtractor {
                     let code = omni_core::tag_identity::resolve_controlled_tag_code(&name)
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| Self::ext_code("creation_tool", &name));
-                    Self::push_tag(out, "创作软件", code, &name, CONF_FACT, Some(key), &val);
+                    Self::push_tag(out, "创作软件", code, &name, CONF_FACT, Some(key), &val, Some("dim.software"));
                 }
             }
         }
@@ -198,6 +202,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
+                        Some("dim.organization"),
                     );
                 }
             }
@@ -222,6 +227,7 @@ impl OmniFactTagExtractor {
             CONF_FACT,
             Some("quality_score"),
             &score.to_string(),
+            Some("dim.file_quality"),
         );
     }
 
@@ -235,6 +241,7 @@ impl OmniFactTagExtractor {
         confidence: f32,
         source_key: Option<&str>,
         raw_val: &str,
+        via_parent: Option<&str>,
     ) {
         let clean_name = name.trim();
         if clean_name.is_empty() {
@@ -244,21 +251,26 @@ impl OmniFactTagExtractor {
         if out.iter().any(|t| t.name == clean_name) {
             return;
         }
+        let via_parent_code = via_parent.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let parent_codes = via_parent_code.as_ref().map(|p| vec![p.clone()]).unwrap_or_default();
         let item = TagChainItem {
             code,
             name: clean_name.to_string(),
             confidence,
+            parent_codes,
+            via_parent_code,
             engine: Some(ENGINE_METADATA.to_string()),
             source: Some(ENGINE_METADATA.to_string()),
             ..Default::default()
         };
         tracing::info!(
-            "[事实标签抽取:fact_tags] key={}, val={} -> tag={}({}), code={}, conf={:.2}",
+            "[事实标签抽取:fact_tags] key={}, val={} -> tag={}({}), code={}, via_parent={:?}, conf={:.2}",
             source_key.unwrap_or("-"),
             raw_val,
             item.name,
             dimension_name,
             item.code,
+            item.via_parent_code,
             item.confidence
         );
         out.push(item);
@@ -281,6 +293,7 @@ impl OmniFactTagExtractor {
             confidence,
             Some(dimension_name),
             val,
+            Some(code),
         );
     }
 
@@ -499,6 +512,15 @@ mod tests {
 
         for expected in ["网络下载", "草稿", "内部", "高质量", "中文"] {
             assert!(names.contains(&expected), "应下沉物理事实 {}，实际: {:?}", expected, names);
+        }
+
+        // 票 05 断言：所有事实标签均携带确定性的受控消歧父级 via_parent_code
+        for tag in &tags {
+            assert!(
+                tag.via_parent_code.is_some() && !tag.via_parent_code.as_deref().unwrap().is_empty(),
+                "事实标签必须携带非空的经由父 via_parent_code: {:?}",
+                tag
+            );
         }
     }
 
