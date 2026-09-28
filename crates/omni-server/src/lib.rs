@@ -1629,9 +1629,26 @@ async fn perceive_file_handler(
     // 5. 工作流状态与安全等级推断 (输出语言中立机器代码，Pro 专享)
     let (workflow_state_code, workflow_state, mut security_level_code, mut security_level) = if is_pro {
         let ws_code = Some(omni_pro::perceive::detect_workflow_state(&file_path, &metadata));
-        let ws = ws_code.clone();
+        let ws = ws_code.as_deref().map(|c| {
+            match c {
+                "unarchived" | "not_archived" => "未归档".to_string(),
+                "archived" => "已归档".to_string(),
+                "draft" => "草稿".to_string(),
+                "reviewing" => "审核中".to_string(),
+                "completed" => "已完成".to_string(),
+                other => omni_core::get_canonical_concept_name(other).unwrap_or(other).to_string(),
+            }
+        });
         let sec_code = Some(omni_pro::perceive::detect_security_level(&file_path, &effective_text));
-        let sec = sec_code.clone();
+        let sec = sec_code.as_deref().map(|c| {
+            match c {
+                "public" => "公开".to_string(),
+                "internal" => "内部".to_string(),
+                "confidential" => "机密".to_string(),
+                "secret" => "绝密".to_string(),
+                other => omni_core::get_canonical_concept_name(other).unwrap_or(other).to_string(),
+            }
+        });
         (ws_code, ws, sec_code, sec)
     } else {
         (None, None, None, None)
