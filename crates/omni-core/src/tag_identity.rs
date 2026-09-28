@@ -455,6 +455,21 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("audio_segmentation", "Audio Segmentation"),
     ("摄影照片细分", "Photography Categories"),
     ("photography_categories", "Photography Categories"),
+    // 视觉与多模态高频候选词跨语言对齐（避免误被派生为 _ext.* 并确保规范母语本地化）
+    ("艺术", "Painting"),
+    ("art", "Painting"),
+    ("漫画", "Comic"),
+    ("cartoon", "Comic"),
+    ("设计", "Design Draft"),
+    ("design", "Design Draft"),
+    ("肖像", "Portrait"),
+    ("portrait", "Portrait"),
+    ("角色", "Human Subject"),
+    ("人物", "Human Subject"),
+    ("character", "Human Subject"),
+    ("扁平", "Flat Minimalist"),
+    ("flat", "Flat Minimalist"),
+    ("designated", "Design Draft"),
 ];
 
 use std::sync::RwLock;
@@ -674,34 +689,49 @@ pub fn resolve_controlled_tag_two_stage(
         return None;
     }
     let curr_lang = normalize_language_code(current_lang.unwrap_or("zh"));
+    let detected_lang = detect_tag_language(tag);
 
-    // ─── 第一阶段：当前语言分表直查 ───
-    if let Ok(by_lang) = dynamic_aliases_by_lang().read() {
-        if let Some(map) = by_lang.get(curr_lang) {
-            if let Some(&code) = map.get(&key) {
-                if is_controlled_code(code) {
-                    return Some((code, None));
+    // 辅助闭包：反查当前系统语言的权威规范展示名 (Q2 选项 A 就地本地化)
+    let resolve_canonical = |code: &str| -> Option<String> {
+        if let Ok(canon_guard) = dynamic_canonical_by_lang().read() {
+            if let Some(cmap) = canon_guard.get(curr_lang) {
+                if let Some(&name) = cmap.get(code) {
+                    return Some(name.to_string());
                 }
             }
         }
-    }
-    // 查当前语言静态底座
-    if curr_lang == "zh" {
-        if let Some(en) = alias_map().get(&key) {
-            if let Some(code) = en_to_code().get(en.as_str()) {
+        let fallback_name = tag_display(code, curr_lang);
+        if fallback_name != code {
+            Some(fallback_name)
+        } else {
+            None
+        }
+    };
+
+    // ─── 第一阶段：当前语言分表直查 ───
+    if detected_lang == curr_lang {
+        if let Ok(by_lang) = dynamic_aliases_by_lang().read() {
+            if let Some(map) = by_lang.get(curr_lang) {
+                if let Some(&code) = map.get(&key) {
+                    if is_controlled_code(code) {
+                        return Some((code, None));
+                    }
+                }
+            }
+        }
+        // 查当前语言静态底座
+        if curr_lang == "zh" {
+            if let Some(en) = alias_map().get(&key) {
+                if let Some(code) = en_to_code().get(en.as_str()) {
+                    return Some((code.as_str(), None));
+                }
+            }
+        } else if curr_lang == "en" {
+            if let Some(code) = en_to_code().get(&key) {
                 return Some((code.as_str(), None));
             }
         }
-    } else if curr_lang == "en" {
-        if let Some(code) = en_to_code().get(&key) {
-            return Some((code.as_str(), None));
-        }
-    }
-
-    // ─── 第二阶段：语言识别 (LID) ───
-    let detected_lang = detect_tag_language(tag);
-    // 若识别出的语言与当前系统语言相同，无需重复查找，直接作为未登录词
-    if detected_lang == curr_lang {
+        // 相同语言未查得，直接判定为未登录词
         return None;
     }
 
@@ -734,23 +764,7 @@ pub fn resolve_controlled_tag_two_stage(
     }
 
     if let Some(code) = matched_code {
-        // ─── 就地本地化：反查当前系统语言的权威规范名 ───
-        let mut canonical_name: Option<String> = None;
-        if let Ok(canon_guard) = dynamic_canonical_by_lang().read() {
-            if let Some(cmap) = canon_guard.get(curr_lang) {
-                if let Some(&name) = cmap.get(code) {
-                    canonical_name = Some(name.to_string());
-                }
-            }
-        }
-        if canonical_name.is_none() {
-            // 静态字典展示名回退
-            let fallback_name = tag_display(code, curr_lang);
-            if fallback_name != code {
-                canonical_name = Some(fallback_name);
-            }
-        }
-        return Some((code, canonical_name));
+        return Some((code, resolve_canonical(code)));
     }
 
     None
@@ -1082,6 +1096,25 @@ mod tests {
         ]);
         assert_eq!(resolve_controlled_tag_code("高质量"), Some("builtin.high_quality"));
         assert_eq!(resolve_controlled_tag_code("曝光正常"), Some("builtin.normal_exposure"));
+
+        // ─── 场景 5：高频英文视觉/文档候选词在中文环境下的受控两阶段反查与就地本地化 ───
+        let outcome_portrait = resolve_controlled_tag_two_stage("portrait", Some("zh"));
+        assert_eq!(outcome_portrait, Some(("builtin.portrait", Some("人像写真".to_string()))));
+
+        let outcome_draft = resolve_controlled_tag_two_stage("draft", Some("zh"));
+        assert_eq!(outcome_draft, Some(("builtin.draft", Some("草稿".to_string()))));
+
+        let outcome_design = resolve_controlled_tag_two_stage("design", Some("zh"));
+        assert_eq!(outcome_design, Some(("builtin.design_draft", Some("设计稿".to_string()))));
+
+        let outcome_cartoon = resolve_controlled_tag_two_stage("cartoon", Some("zh"));
+        assert_eq!(outcome_cartoon, Some(("builtin.comic", Some("漫画".to_string()))));
+
+        let outcome_character = resolve_controlled_tag_two_stage("character", Some("zh"));
+        assert_eq!(outcome_character, Some(("builtin.human_subject", Some("人物主体".to_string()))));
+
+        let outcome_flat = resolve_controlled_tag_two_stage("flat", Some("zh"));
+        assert_eq!(outcome_flat, Some(("builtin.flat_minimalist", Some("扁平极简".to_string()))));
 
         clear_dynamic_aliases();
     }
