@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 /// 受控标签跨语言身份（别名 → code）
 pub mod tag_identity;
 
+/// AOT 受控概念强类型枚举（PRD-0050）
+pub mod concepts;
+
 /// (WP5) 图片标签链路阈值集中定义（CLIP/RAM/互斥组 margin/出口 conf），单点可调
 pub mod tag_thresholds;
 
