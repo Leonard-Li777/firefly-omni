@@ -640,3 +640,10 @@ mod tests {
     }
 }
 
+/// 依据受控 code 反查中文权威展示名 (Canonical Lemma)
+#[inline(always)]
+pub fn get_canonical_concept_name(code: &str) -> Option<&'static str> {
+    concepts::Concept::from_code(code).map(|item| item.zh_name())
+}
+
+
