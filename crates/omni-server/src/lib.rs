@@ -10,6 +10,7 @@ use axum::{
     Json, Router,
 };
 use omni_core::{
+    concepts::Concept,
     tag_identity::{normalize_tag_set_to_codes, normalize_tag_to_code, tag_matches_concept},
     tag_thresholds::{
         EXIT_CONFIDENCE_THRESHOLD, LAYER_FALLBACK_CLIP, LAYER_FALLBACK_OCR,
@@ -1630,22 +1631,23 @@ async fn perceive_file_handler(
     let (workflow_state_code, workflow_state, mut security_level_code, mut security_level) = if is_pro {
         let ws_code = Some(omni_pro::perceive::detect_workflow_state(&file_path, &metadata));
         let ws = ws_code.as_deref().map(|c| {
+            // 机器码别名 → AOT 中文 Concept 变体（源码中文直写，展示名由构建期字典给出）
             match c {
-                "unarchived" | "not_archived" => "未归档".to_string(),
-                "archived" => "已归档".to_string(),
-                "draft" => "草稿".to_string(),
-                "reviewing" => "审核中".to_string(),
-                "completed" => "已完成".to_string(),
+                "unarchived" | "not_archived" => Concept::未归档.zh_name().to_string(),
+                "archived" => Concept::已归档.zh_name().to_string(),
+                "draft" => Concept::草稿.zh_name().to_string(),
+                "reviewing" => Concept::审核中.zh_name().to_string(),
+                "completed" => Concept::已完成.zh_name().to_string(),
                 other => omni_core::get_canonical_concept_name(other).unwrap_or(other).to_string(),
             }
         });
         let sec_code = Some(omni_pro::perceive::detect_security_level(&file_path, &effective_text));
         let sec = sec_code.as_deref().map(|c| {
             match c {
-                "public" => "公开".to_string(),
-                "internal" => "内部".to_string(),
-                "confidential" => "机密".to_string(),
-                "secret" => "绝密".to_string(),
+                "public" => Concept::公开.zh_name().to_string(),
+                "internal" => Concept::内部.zh_name().to_string(),
+                "confidential" => Concept::机密.zh_name().to_string(),
+                "secret" => Concept::绝密.zh_name().to_string(),
                 other => omni_core::get_canonical_concept_name(other).unwrap_or(other).to_string(),
             }
         });
