@@ -202,14 +202,15 @@ pub fn measure_subtask<T, F: FnOnce() -> T>(name: &'static str, f: F) -> (T, &'s
     (res, name, elapsed)
 }
 
-/// 快捷宏：在 thread scope 中度量执行，返回 (name, res, elapsed_ms)
+/// 快捷宏：在 thread scope 中度量执行，返回 (res, elapsed_ms)
+/// 与视觉流水线 join 处的 (结果, 耗时) 二元组解构约定保持一致
 #[macro_export]
 macro_rules! timed_spawn {
-    ($scope:expr, $name:expr, $task:expr) => {
+    ($scope:expr, $task:expr) => {
         $scope.spawn(|| {
             let start = std::time::Instant::now();
             let res = $task;
-            ($name, res, start.elapsed().as_millis() as u64)
+            (res, start.elapsed().as_millis() as u64)
         })
     };
 }

@@ -829,17 +829,14 @@ fn run_vision_pipeline(
             // 多核并行：7 大视觉算子零拷贝只读引用借用 &inspect_img，独立计时
             std::thread::scope(|s| {
                 // 1. 文本探活 (DBNet / MobileNet 骨干)
-                let h_text = s.spawn(|| {
-                    let t = std::time::Instant::now();
-                    let res = omni_pro::OmniVisionEngine::fast_detect_has_text(&inspect_img);
-                    (res, t.elapsed().as_millis() as u64)
+                let h_text = omni_core::timed_spawn!(s, {
+                    omni_pro::OmniVisionEngine::fast_detect_has_text(&inspect_img)
                 });
 
                 // 2. 视觉语义标签 (Chinese-CLIP / Mobile-CLIP)
                 // (WP2b) 带分提取：分数在提取层保留，贯通至 TagChainItem.confidence，杜绝 0.92 硬编码灌水
-                let h_clip = s.spawn(|| {
-                    let t = std::time::Instant::now();
-                    let res = if enable_visual_tags {
+                let h_clip = omni_core::timed_spawn!(s, {
+                    if enable_visual_tags {
                         omni_pro::OmniVisionEngine::extract_clip_visual_tags_scored_from_image(
                             &inspect_img,
                             lang,
@@ -847,72 +844,69 @@ fn run_vision_pipeline(
                         )
                     } else {
                         Vec::new()
-                    };
-                    (res, t.elapsed().as_millis() as u64)
+                    }
                 });
 
                 // 3. NSFW 模型 5 分类概率推理
-                let h_nsfw = s.spawn(|| {
-                    let t = std::time::Instant::now();
-                    let res = omni_pro::OmniVisionEngine::run_nsfw_model(&inspect_img);
-                    (res, t.elapsed().as_millis() as u64)
+                let h_nsfw = omni_core::timed_spawn!(s, {
+                    omni_pro::OmniVisionEngine::run_nsfw_model(&inspect_img)
                 });
 
                 // 4. 频域水印检测
-                let h_wm = s.spawn(|| {
-                    let t = std::time::Instant::now();
-                    let res = omni_pro::perceive::detect_watermark_level(&inspect_img);
-                    (res, t.elapsed().as_millis() as u64)
+                let h_wm = omni_core::timed_spawn!(s, {
+                    omni_pro::perceive::detect_watermark_level(&inspect_img)
                 });
 
                 // 5. 宏块打码检测
-                let h_mc = s.spawn(|| {
-                    let t = std::time::Instant::now();
-                    let res = omni_pro::perceive::detect_mosaic_level(&inspect_img);
-                    (res, t.elapsed().as_millis() as u64)
+                let h_mc = omni_core::timed_spawn!(s, {
+                    omni_pro::perceive::detect_mosaic_level(&inspect_img)
                 });
 
                 // 6. 物理美学与画质评估 (直接消费前置 ExifTool 提取的 exif_orient！)
-                let h_aes = s.spawn(|| {
-                    let t = std::time::Instant::now();
-                    let res = omni_pro::perceive::evaluate_image_aesthetic_and_quality(&inspect_img, exif_orient);
-                    (res, t.elapsed().as_millis() as u64)
+                let h_aes = omni_core::timed_spawn!(s, {
+                    omni_pro::perceive::evaluate_image_aesthetic_and_quality(&inspect_img, exif_orient)
                 });
 
                 // 7. 黑白全彩检测
-                let h_bw = s.spawn(|| {
-                    let t = std::time::Instant::now();
-                    let res = omni_pro::OmniVisionEngine::detect_is_black_and_white(&inspect_img);
-                    (res, t.elapsed().as_millis() as u64)
+                let h_bw = omni_core::timed_spawn!(s, {
+                    omni_pro::OmniVisionEngine::detect_is_black_and_white(&inspect_img)
                 });
 
                 // 8. RAM++ 细粒度实体与泛维度/泛标签投影提取
-                let h_ram = s.spawn(|| {
-                    let t = std::time::Instant::now();
-                    let res = if enable_visual_tags {
+                let h_ram = omni_core::timed_spawn!(s, {
+                    if enable_visual_tags {
                         omni_pro::OmniVisionEngine::extract_ram_tags(&inspect_img, lang, 10)
                     } else {
                         Vec::new()
+                    }
+                });
+
+                // 9. CLIP 图像嵌入向量提取 (用于级联假设 CLIP 仲裁)，统一走 timed_spawn! 计时宏
+                let h_embed = omni_core::timed_spawn!(s, {
+                    omni_pro::OmniVisionEngine::extract_clip_image_embedding(&inspect_img, lang)
+                });
+
+                // 汇聚并行子任务: panic 时回退默认值并记录日志，避免零耗时误导瓶颈判定
+                macro_rules! join_or_log {
+                    ($handle:expr, $name:literal, $default:expr) => {
+                        match $handle.join() {
+                            Ok(v) => v,
+                            Err(err) => {
+                                tracing::warn!("视觉流水线子任务 {} panic，回退默认值: {:?}", $name, err);
+                                $default
+                            }
+                        }
                     };
-                    (res, t.elapsed().as_millis() as u64)
-                });
-
-                // 9. CLIP 图像嵌入向量提取 (用于级联假设 CLIP 仲裁)
-                let h_embed = s.spawn(|| {
-                    let t = std::time::Instant::now();
-                    let res = omni_pro::OmniVisionEngine::extract_clip_image_embedding(&inspect_img, lang);
-                    (res, t.elapsed().as_millis() as u64)
-                });
-
-                let (td, td_ms) = h_text.join().unwrap_or((false, 0));
-                let (ct_scored, ct_ms) = h_clip.join().unwrap_or((Vec::new(), 0));
-                let (np, np_ms) = h_nsfw.join().unwrap_or((None, 0));
-                let (wl, wl_ms) = h_wm.join().unwrap_or((0, 0));
-                let (ml, ml_ms) = h_mc.join().unwrap_or((0, 0));
-                let (ar, ar_ms) = h_aes.join().unwrap_or(((7.5, Vec::new()), 0));
-                let (bw, bw_ms) = h_bw.join().unwrap_or((false, 0));
-                let (ram_res, ram_ms) = h_ram.join().unwrap_or((Vec::new(), 0));
-                let (img_embed, embed_ms) = h_embed.join().unwrap_or((None, 0));
+                }
+                let (td, td_ms) = join_or_log!(h_text, "text_detect", (false, 0));
+                let (ct_scored, ct_ms) = join_or_log!(h_clip, "clip", (Vec::new(), 0));
+                let (np, np_ms) = join_or_log!(h_nsfw, "nsfw", (None, 0));
+                let (wl, wl_ms) = join_or_log!(h_wm, "watermark", (0, 0));
+                let (ml, ml_ms) = join_or_log!(h_mc, "mosaic", (0, 0));
+                let (ar, ar_ms) = join_or_log!(h_aes, "aesthetic", ((7.5, Vec::new()), 0));
+                let (bw, bw_ms) = join_or_log!(h_bw, "bw", (false, 0));
+                let (ram_res, ram_ms) = join_or_log!(h_ram, "ram", (Vec::new(), 0));
+                let (img_embed, embed_ms) = join_or_log!(h_embed, "clip_embed", (None, 0));
 
                 out.has_text = Some(td);
                 out.text_detect_ms = td_ms;
@@ -944,9 +938,10 @@ fn run_vision_pipeline(
                     );
                     mutual_ms = t_mutual.elapsed().as_millis() as u64;
                 }
-                // 标签任务取并行最大值
-                let tag_max_ms = ct_ms.max(np_ms).max(ram_ms);
-                out.tag_ms = tag_max_ms;
+                // 标签分支挂钟 = 并行段长尾 (CLIP/NSFW/RAM 取 Max) + 串行尾巴 (嵌入→互斥分类)
+                // 嵌入提取与互斥分类在并行 join 之后顺序执行，必须累加进 tag_ms 才能反映真实挂钟瓶颈
+                let tag_wall_ms = ct_ms.max(np_ms).max(ram_ms) + embed_ms + mutual_ms;
+                out.tag_ms = tag_wall_ms;
 
                 // 统一汇总至子任务度量字典
                 out.subtasks.insert("text_detect_ms".to_string(), td_ms);
@@ -959,7 +954,7 @@ fn run_vision_pipeline(
                 out.subtasks.insert("aesthetic_ms".to_string(), ar_ms);
                 out.subtasks.insert("bw_ms".to_string(), bw_ms);
                 out.subtasks.insert("ram_ms".to_string(), ram_ms);
-                out.subtasks.insert("tag_ms".to_string(), tag_max_ms);
+                out.subtasks.insert("tag_ms".to_string(), tag_wall_ms);
 
                 // 零耗时内存推导
                 out.has_watermark = Some(wl > 0);
@@ -1327,15 +1322,17 @@ async fn perceive_file_handler(
     let effective_text: String =
         omni_core::resolve_effective_text(&markdown_content, ocr_text.as_deref(), asr.as_deref());
 
-    // 内存零耗时推导: NSFW 敏感内容与高置信度标签 (结合 OCR/ASR 提取文本和 CLIP 标签，零二次模型推理)
+    // 内存零耗时推导: NSFW 敏感内容与高置信度标签 (结合 OCR/ASR 提取文本和 CLIP 标签，两层漏斗过滤)
     let (nsfw_tags, sensitive_types, content_rating) = if is_pro {
-        omni_pro::OmniVisionEngine::derive_nsfw_tags_and_rating_from_probs(
+        omni_pro::OmniVisionEngine::derive_nsfw_tags_and_rating_full(
             vision_res.nsfw_probs,
             &effective_text,
             &vision_res.clip_tags,
+            req.language.as_deref(),
+            Some(&file_path),
         )
     } else {
-        (Vec::new(), Vec::new(), None)
+        (vec!["全年龄".to_string()], Vec::new(), Some("safe".to_string()))
     };
 
     let nsfw_high_confidence_tags = if is_pro {
