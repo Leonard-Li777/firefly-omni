@@ -516,3 +516,37 @@ async fn test_http_taxonomy_and_vector_endpoints() {
     let search_resp: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(search_resp["matches"].as_array().unwrap().len(), 0);
 }
+
+#[test]
+fn test_two_stage_resolution_on_real_pack() {
+    let pack_path = SemanticPackLoader::discover_pack_path().expect("必须能够发现真实 semantic.pack");
+    let pack_bytes = std::fs::read(&pack_path).expect("读取真实 pack 失败");
+    let omw = OmwDb::unavailable();
+    omw.load_pack_bytes(&pack_bytes).expect("挂载真实 pack 失败");
+
+    // 验证目标高频词汇两阶段反查均命中受控代码 (omw.* / hownet.* / builtin.*) 并就地本地化为非空中文名
+    let words = vec!["Connect", "Next", "Table", "Back", "Elements", "Create", "word"];
+    for w in words {
+        let outcome = omni_core::tag_identity::resolve_controlled_tag_two_stage(w, Some("zh"));
+        assert!(
+            outcome.is_some(),
+            "两阶段反查失败，目标词汇被遗漏未命中受控概念: {w}"
+        );
+        let (code, canon_name) = outcome.unwrap();
+        assert!(
+            omni_core::tag_identity::is_controlled_code(code),
+            "返回的代码必须属于受控体系 (omw/hownet/builtin): word={w}, code={code}"
+        );
+        assert!(
+            canon_name.is_some(),
+            "必须成功反查出当前系统语言规范展示名: word={w}, code={code}"
+        );
+        let name = canon_name.unwrap();
+        assert!(
+            !name.trim().is_empty(),
+            "展示名不能为空: word={w}, code={code}"
+        );
+        println!("✅ 真实语义包两阶段反查成功: '{w}' -> code: '{code}', 中文规范展示名: '{name}'");
+    }
+}
+

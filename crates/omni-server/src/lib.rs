@@ -579,7 +579,11 @@ fn save_config_to_disk(cfg: &OmniConfig) {
     }
 }
 
-pub async fn start_server(addr: SocketAddr, db_path: Option<PathBuf>) -> anyhow::Result<()> {
+pub async fn start_server(
+    addr: SocketAddr,
+    db_path: Option<PathBuf>,
+    pack_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let initial_config = load_config_from_disk();
     // 地理数据集发现链：环境变量 → exe 相对目录 → cwd 候选；落空或开源存根时软不可用
     let geo = match omni_pro::geo::discover_dataset_path() {
@@ -607,26 +611,36 @@ pub async fn start_server(addr: SocketAddr, db_path: Option<PathBuf>) -> anyhow:
     };
     let search = Arc::new(omni_pro::search::OmniSearchService::new(search_dir));
     // OMW 词库直连与只读包零磁盘内存挂载 (ADR-0038 / PRD #679: 闭源优先 🔒)
+    // 规范解耦：--pack-path 专用于只读语义包；--db-path 专用于桌面业务主库
     let omw = OmwDb::unavailable();
-    if let Some(pack_path) = SemanticPackLoader::discover_pack_path() {
-        match SemanticPackLoader::load_pack_raw_from_file(&pack_path) {
+    let mut pack_mounted = false;
+    let pack_to_load = pack_path.or_else(SemanticPackLoader::discover_pack_path);
+    if let Some(target_pack_path) = pack_to_load {
+        match SemanticPackLoader::load_pack_raw_from_file(&target_pack_path) {
             Ok(bytes) => {
                 match omw.load_pack_bytes(&bytes) {
-                    Ok(()) => info!("semantic.pack zero-disk mounted to OmwDb from {}", pack_path.display()),
+                    Ok(()) => {
+                        info!("semantic.pack zero-disk mounted to OmwDb from {}", target_pack_path.display());
+                        pack_mounted = true;
+                    }
                     Err(err) => tracing::warn!("Failed to mount semantic.pack: {err}"),
                 }
             }
-            Err(err) => tracing::warn!("Failed to load semantic.pack at {}: {err}", pack_path.display()),
+            Err(err) => tracing::warn!("Failed to load semantic.pack at {}: {err}", target_pack_path.display()),
         }
     }
 
-    if let Some(path) = &db_path {
-        match omw.connect(path) {
-            Ok(()) => info!("omw db connected read-only at {}", path.display()),
-            Err(err) => {
-                tracing::warn!("omw db open failed ({}), omw subsystem starts unavailable", err)
+    if !pack_mounted {
+        if let Some(path) = &db_path {
+            match omw.connect(path) {
+                Ok(()) => info!("omw db fallback connected read-only at {}", path.display()),
+                Err(err) => {
+                    tracing::warn!("omw db open failed ({}), omw subsystem starts unavailable", err)
+                }
             }
         }
+    } else if let Some(path) = &db_path {
+        info!("semantic.pack mounted into memory; db-path is reserved for desktop master database ({})", path.display());
     }
 
     // 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 WeMM-Embedding 2B 2048 维)
@@ -745,8 +759,8 @@ async fn extract_file_handler(
 #[derive(Default)]
 struct VisionComputed {
     has_text: Option<bool>,
-    mobilenet_tags: Vec<String>,
-    mobilenet_high_confidence_tags: Vec<String>,
+    morphology_tags: Vec<String>,
+    morphology_high_confidence_tags: Vec<String>,
     clip_tags: Vec<String>,
     /// (WP2b) CLIP 标定置信度快照：标签名 → 标定分，供 6.2 TagChainItem.confidence 贯通
     clip_tag_confs: std::collections::HashMap<String, f32>,
@@ -943,8 +957,8 @@ fn run_vision_pipeline(
                 }.to_string());
 
                 let aspect = inspect_img.width() as f32 / inspect_img.height().max(1) as f32;
-                let (mut mobilenet_tags, mobilenet_high_confidence_tags) =
-                    omni_pro::OmniVisionEngine::derive_mobilenet_tags(aspect, td, bw);
+                let (mut morphology_tags, morphology_high_confidence_tags) =
+                    omni_pro::OmniVisionEngine::derive_morphology_tags(aspect, td, bw);
 
                 // 无字图排版门禁：若未探活出文本内容，严禁打上依赖排版文字的海报宣发或截图标签
                 // Spec D9：闭环规则按概念 code 匹配，兼容中英别名
@@ -967,23 +981,23 @@ fn run_vision_pipeline(
                 });
                 if is_anime_art {
                     if aspect < 0.45 {
-                        if !mobilenet_tags.contains(&"条漫".to_string()) {
-                            mobilenet_tags.push("条漫".to_string());
+                        if !morphology_tags.contains(&"条漫".to_string()) {
+                            morphology_tags.push("条漫".to_string());
                         }
                     } else if (aspect >= 0.55 && aspect <= 0.90) || (aspect >= 1.20 && aspect <= 1.60) {
-                        if !mobilenet_tags.contains(&"页漫".to_string()) {
-                            mobilenet_tags.push("页漫".to_string());
+                        if !morphology_tags.contains(&"页漫".to_string()) {
+                            morphology_tags.push("页漫".to_string());
                         }
                     }
                 }
 
-                out.mobilenet_tags = mobilenet_tags;
-                out.mobilenet_high_confidence_tags = mobilenet_high_confidence_tags;
+                out.morphology_tags = morphology_tags;
+                out.morphology_high_confidence_tags = morphology_high_confidence_tags;
 
                 // 图像细分形态分类
                 let p_type = omni_pro::perceive::infer_image_modal_type(
                     &inspect_img,
-                    &out.mobilenet_tags,
+                    &out.morphology_tags,
                     &out.clip_tags,
                     &[],
                     td,
@@ -1332,15 +1346,17 @@ async fn perceive_file_handler(
     let quality_score = vision_res.quality_score;
     let mut photo_type = vision_res.photo_type;
     let quality_issues = vision_res.quality_issues;
-    let mut mobilenet_tags = vision_res.mobilenet_tags;
+    let mut morphology_tags = vision_res.morphology_tags;
     let mut clip_tags = vision_res.clip_tags;
     // (WP2b) CLIP 标定分快照（名 → 分），供 engine map 与 6.2 confidence 贯通
     let clip_tag_confs = vision_res.clip_tag_confs;
 
     // 基于实际 OCR 文本正向直通校准截图形态与文字客观事实 (彻底根除有字却输出无字图的倒挂)
     // (WP2a) ocr_forced_tag_names: OCR 事实强制注入的标签名，用于后续 engine 来源标记 (最高物理事实优先级)
+    // 仅图片路径生效：纯文本/文档正文不是「图面有字」，不得注入有字图等视觉形态标签
     let mut ocr_forced_tag_names: Vec<String> = Vec::new();
-    if !effective_text.trim().is_empty() {
+    let visual_text_fact = is_image && !effective_text.trim().is_empty();
+    if visual_text_fact {
         has_text = Some(true);
         clip_tags.retain(|t| !tag_matches_concept(t, "无字图"));
         if !clip_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
@@ -1370,18 +1386,18 @@ async fn perceive_file_handler(
             }
         }
     }
-    let mobilenet_high_confidence_tags = vision_res.mobilenet_high_confidence_tags;
+    let morphology_high_confidence_tags = vision_res.morphology_high_confidence_tags;
     let clip_high_confidence_tags = vision_res.clip_high_confidence_tags;
 
     let ram_tags = vision_res.ram_tags;
     let image_embedding = vision_res.image_embedding;
     let clip_mutual_tags = vision_res.clip_mutual_tags;
 
-    // CLIP 互斥分类结果增强 mobilenet_tags：
+    // CLIP 互斥分类结果增强 morphology_tags：
     // 若 CLIP 互斥分类成功，直接替换规则推导结果（语义更准确）；
-    // 若 CLIP 不可用（无模型），则保留规则推导的 mobilenet_tags 作为兜底。
-    let mobilenet_tags = if !clip_mutual_tags.is_empty() {
-        let mut merged = mobilenet_tags.clone();
+    // 若 CLIP 不可用（无模型），则保留规则推导的 morphology_tags 作为兜底。
+    let morphology_tags = if !clip_mutual_tags.is_empty() {
+        let mut merged = morphology_tags.clone();
         for (tag, _conf, _group) in &clip_mutual_tags {
             if !merged.contains(tag) {
                 merged.push(tag.clone());
@@ -1398,8 +1414,8 @@ async fn perceive_file_handler(
         {
             merged.retain(|t| !tag_matches_concept(t, "全彩"));
         }
-        // 2. 文字存在性：客观检测与 OCR 事实优先于语义猜测
-        if has_text == Some(true) || !effective_text.trim().is_empty() {
+        // 2. 文字存在性：客观检测与 OCR 事实优先于语义猜测（仅图片路径，避免文本正文误标有字图）
+        if is_image && (has_text == Some(true) || !effective_text.trim().is_empty()) {
             merged.retain(|t| !tag_matches_concept(t, "无字图"));
             if !merged.iter().any(|t| tag_matches_concept(t, "有字图")) {
                 merged.push("有字图".to_string());
@@ -1417,13 +1433,13 @@ async fn perceive_file_handler(
         }
         merged
     } else {
-        if has_text == Some(true) || !effective_text.trim().is_empty() {
-            mobilenet_tags.retain(|t| !tag_matches_concept(t, "无字图"));
-            if !mobilenet_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
-                mobilenet_tags.push("有字图".to_string());
+        if is_image && (has_text == Some(true) || !effective_text.trim().is_empty()) {
+            morphology_tags.retain(|t| !tag_matches_concept(t, "无字图"));
+            if !morphology_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
+                morphology_tags.push("有字图".to_string());
             }
         }
-        mobilenet_tags
+        morphology_tags
     };
 
     // CLIP 互斥组与 photo_type 细化联动更新（语义优先于规则推导）
@@ -1450,7 +1466,7 @@ async fn perceive_file_handler(
     let mut detected_visual_tags: Vec<String> = Vec::new();
     for tag in clip_tags
         .iter()
-        .chain(mobilenet_tags.iter())
+        .chain(morphology_tags.iter())
         .chain(nsfw_tags.iter())
         .chain(quality_issues.iter())
         .chain(ram_tags.iter().map(|r| &r.name))
@@ -1478,7 +1494,7 @@ async fn perceive_file_handler(
             // CLIP：提取层标定分 (calibrate_clip_score)，无分回退 0.55 起步值
             register(t, "clip", 2, clip_tag_confs.get(t).copied());
         }
-        for t in &mobilenet_tags {
+        for t in &morphology_tags {
             // 物理规则推导：无模型分数，分层回退 0.90
             register(t, "physical", 4, None);
         }
@@ -1531,8 +1547,8 @@ async fn perceive_file_handler(
         &engine_lookup,
     );
 
-    // 文字存在性绝对保护：若已探活出文字或 OCR 内容，无条件排除无字图，确保有字图存在
-    if has_text == Some(true) || !effective_text.trim().is_empty() {
+    // 文字存在性绝对保护：若已探活出文字或 OCR 内容，无条件排除无字图，确保有字图存在（仅图片路径）
+    if is_image && (has_text == Some(true) || !effective_text.trim().is_empty()) {
         detected_visual_tags.retain(|t| !tag_matches_concept(t, "无字图"));
         if !detected_visual_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
             detected_visual_tags.push("有字图".to_string());
@@ -1547,10 +1563,10 @@ async fn perceive_file_handler(
         .collect();
     let detected_visual_tags = normalize_tag_set_to_codes(&detected_visual_tags);
 
-    // 修复(问题4)：clip/mobilenet 只用 code 集合做内部比对，保留原始名供输出
-    // 同步清洗 mobilenet_tags 与 clip_tags，确保互斥清洗结果一致贯通（防止被清洗的子标签混入下游主体池）
+    // 修复(问题4)：clip/morphology 只用 code 集合做内部比对，保留原始名供输出
+    // 同步清洗 morphology_tags 与 clip_tags，确保互斥清洗结果一致贯通（防止被清洗的子标签混入下游主体池）
     // 输出保留原始中文/英文名（debug 字段，与 ram_tags 保持一致）
-    let mobilenet_tags: Vec<String> = mobilenet_tags
+    let morphology_tags: Vec<String> = morphology_tags
         .into_iter()
         .filter(|name| {
             let code = normalize_tag_to_code(name);
@@ -1564,7 +1580,7 @@ async fn perceive_file_handler(
             detected_visual_tags.contains(&code)
         })
         .collect();
-    // RAM 对称治理 (P3 来源对称)：与 clip/mobilenet 一致，按 gated 后 code 集回写过滤，
+    // RAM 对称治理 (P3 来源对称)：与 clip/morphology 一致，按 gated 后 code 集回写过滤，
     // 杜绝原始 ram_tags 经「6.1 直注 / ram_tags_flat / 级联主体池」三条通道绕过互斥门禁
     let gated_ram_tags: Vec<omni_core::RamTagItem> = ram_tags
         .iter()
@@ -1743,7 +1759,7 @@ async fn perceive_file_handler(
             &file_path,
             &detected_visual_tags,
             &gated_ram_tags,
-            &mobilenet_tags,
+            &morphology_tags,
             &nsfw_tags,
             image_embedding.as_deref(),
             req.language.as_deref(),
@@ -2002,11 +2018,11 @@ async fn perceive_file_handler(
         photo_type,
         quality_issues,
         visual_tags: structured_visual_tags,
-        mobilenet_tags,
+        morphology_tags,
         clip_tags,
         nsfw_tags,
         ram_tags: ram_tags_flat,
-        mobilenet_high_confidence_tags,
+        morphology_high_confidence_tags,
         clip_high_confidence_tags,
         nsfw_high_confidence_tags,
         sensitive_types,
