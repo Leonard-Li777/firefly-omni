@@ -4339,6 +4339,7 @@ dependencies = [
  "magika",
  "ndarray 0.16.1",
  "omni-core",
+ "omni-text",
  "ort",
  "ort-sys",
  "serde",
