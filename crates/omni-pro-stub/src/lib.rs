@@ -198,7 +198,7 @@ pub mod perceive {
 
     pub fn infer_image_modal_type(
         _img: &image::DynamicImage,
-        _mobilenet_tags: &[String],
+        _morphology_tags: &[String],
         _clip_tags: &[String],
         _nsfw_tags: &[String],
         _has_text: bool,
@@ -331,14 +331,14 @@ pub mod vision {
             Vec::new()
         }
 
-        pub fn extract_mobilenet_tags(
+        pub fn extract_morphology_tags(
             _img: &image::DynamicImage,
             _has_text: bool,
         ) -> Vec<String> {
             Vec::new()
         }
 
-        pub fn extract_mobilenet_high_confidence_tags(
+        pub fn extract_morphology_high_confidence_tags(
             _img: &image::DynamicImage,
             _has_text: bool,
         ) -> Vec<String> {
@@ -357,7 +357,7 @@ pub mod vision {
             false
         }
 
-        pub fn derive_mobilenet_tags(
+        pub fn derive_morphology_tags(
             _aspect_ratio: f32,
             _has_text: bool,
             _is_bw: bool,
@@ -403,7 +403,7 @@ pub mod vision {
             _file_path: &str,
             _system_dimension_tags: &[String],
             _ram_tags: &[omni_core::TagChainItem],
-            _mobilenet_tags: &[String],
+            _morphology_tags: &[String],
             _nsfw_tags: &[String],
             _image_embedding: Option<&[f32]>,
             _lang: Option<&str>,

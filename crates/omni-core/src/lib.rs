@@ -266,13 +266,13 @@ pub struct OmniPerceptionResult {
 
     // 多模态直出字段与各大引擎标签 (统一走标签链输出)
     pub visual_tags: Vec<TagChainItem>,
-    pub mobilenet_tags: Vec<String>,
+    pub morphology_tags: Vec<String>,
     pub clip_tags: Vec<String>,
     pub nsfw_tags: Vec<String>,
     #[serde(default)]
     pub ram_tags: Vec<String>,
-    #[serde(default, skip_serializing, alias = "raw_mobilenet_tags", alias = "mobilenet_raw_tags")]
-    pub mobilenet_high_confidence_tags: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub morphology_high_confidence_tags: Vec<String>,
     #[serde(default, alias = "raw_clip_tags", alias = "clip_raw_tags")]
     pub clip_high_confidence_tags: Vec<String>,
     #[serde(default, skip_serializing, alias = "raw_nsfw_tags", alias = "nsfw_raw_tags")]

@@ -564,17 +564,13 @@ where
     }
 
     // 冲突仲裁：返回 true 表示 incoming 应覆盖 existing
+    // 由于 SQL 查询已按 is_canonical DESC, count DESC 排序，
+    // 最权威、词频最高的概念最先被读取入表，同优先级下保留最先入表的高频词义，
+    // 仅当 incoming 体系优先级更高 (omw > hownet > builtin) 时才允许覆盖。
     fn prefer_incoming(existing: &str, incoming: &str) -> bool {
         let p_existing = code_priority(existing);
         let p_incoming = code_priority(incoming);
-        if p_incoming > p_existing {
-            true
-        } else if p_incoming < p_existing {
-            false
-        } else {
-            // 同优先级（同为受控或非受控）：后写覆盖
-            true
-        }
+        p_incoming > p_existing
     }
 
     let norm_lang = normalize_language_code(lang).to_string();
@@ -617,11 +613,18 @@ where
                     global_guard.insert(norm_lemma.clone(), leaked_code);
                 }
             }
+        }
 
-            if is_canonical {
-                let leaked_lemma: &'static str = Box::leak(lemma.as_ref().to_string().into_boxed_str());
-                can_map.insert(code_ref.to_string(), leaked_lemma);
-            }
+        // 规范展示名仲裁 (以 code_ref 为主键，独立于 lemma 映射是否插入):
+        // 1. 若 is_canonical 为 true，优先更新覆盖；
+        // 2. 若当前分表中尚未记录该 code 的展示名，以首个出现的词形保底记录，
+        //    防止因同名 lemma 未更新导致特定 code 的母语展示名被漏登 (Q2 选项 A)。
+        if is_canonical || !can_map.contains_key(code_ref) {
+            let leaked_lemma: &'static str = match can_map.get(code_ref) {
+                Some(&existing) if is_canonical && existing == lemma.as_ref() => existing,
+                _ => Box::leak(lemma.as_ref().to_string().into_boxed_str()),
+            };
+            can_map.insert(code_ref.to_string(), leaked_lemma);
         }
     }
 }
@@ -666,10 +669,96 @@ pub fn resolve_controlled_tag_code(tag: &str) -> Option<&'static str> {
                 return Some(code);
             }
         }
+        for cand in english_lemma_candidates(&key) {
+            if let Some(&code) = dyn_map.get(&cand) {
+                if is_controlled_code(code) {
+                    return Some(code);
+                }
+            }
+        }
     }
-    // 2. 静态 builtin 字典（不经过 dynamic 再查，避免语义重复）
-    let en = alias_map().get(&key)?;
-    en_to_code().get(en.as_str()).map(|s| s.as_str())
+    // 2. 静态 builtin 字典
+    lookup_static_with_en_lemmas(&key)
+}
+
+/// 英文形态学词形还原候选词（单复数 s/es/ies 与分词 ed/ing 还原）
+pub fn english_lemma_candidates(key: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let len = key.len();
+
+    // 1. 复数还原
+    if key.ends_with("ies") && len > 4 {
+        candidates.push(format!("{}y", &key[..len - 3]));
+    }
+    if key.ends_with("es") && len > 3 {
+        // boxes -> box, watches -> watch
+        candidates.push(key[..len - 2].to_string());
+        // services -> service, tables -> table (es结尾但本体带e)
+        candidates.push(key[..len - 1].to_string());
+    }
+    if key.ends_with('s') && !key.ends_with("ss") && len > 3 {
+        candidates.push(key[..len - 1].to_string());
+    }
+
+    // 2. 动词分词还原 (ed, ing)
+    if key.ends_with("ied") && len > 4 {
+        candidates.push(format!("{}y", &key[..len - 3]));
+    }
+    if key.ends_with("ed") && len > 4 {
+        // connected -> connect
+        candidates.push(key[..len - 2].to_string());
+        // created -> create
+        candidates.push(key[..len - 1].to_string());
+    }
+    if key.ends_with("ing") && len > 5 {
+        // connecting -> connect
+        candidates.push(key[..len - 3].to_string());
+        // creating -> create, organizing -> organize
+        candidates.push(format!("{}e", &key[..len - 3]));
+    }
+
+    candidates
+}
+
+fn lookup_map_with_en_lemmas<'a>(
+    map: &'a HashMap<String, &'static str>,
+    key: &str,
+) -> Option<&'static str> {
+    if let Some(&code) = map.get(key) {
+        if is_controlled_code(code) {
+            return Some(code);
+        }
+    }
+    for cand in english_lemma_candidates(key) {
+        if let Some(&code) = map.get(&cand) {
+            if is_controlled_code(code) {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+fn lookup_static_with_en_lemmas(key: &str) -> Option<&'static str> {
+    if let Some(en) = alias_map().get(key) {
+        if let Some(code) = en_to_code().get(en.as_str()) {
+            return Some(code.as_str());
+        }
+    }
+    if let Some(code) = en_to_code().get(key) {
+        return Some(code.as_str());
+    }
+    for cand in english_lemma_candidates(key) {
+        if let Some(en) = alias_map().get(&cand) {
+            if let Some(code) = en_to_code().get(en.as_str()) {
+                return Some(code.as_str());
+            }
+        }
+        if let Some(code) = en_to_code().get(&cand) {
+            return Some(code.as_str());
+        }
+    }
+    None
 }
 
 /// 识别标签两阶段反查入口 (ADR-0048)
@@ -712,7 +801,11 @@ pub fn resolve_controlled_tag_two_stage(
     if detected_lang == curr_lang {
         if let Ok(by_lang) = dynamic_aliases_by_lang().read() {
             if let Some(map) = by_lang.get(curr_lang) {
-                if let Some(&code) = map.get(&key) {
+                if curr_lang == "en" {
+                    if let Some(code) = lookup_map_with_en_lemmas(map, &key) {
+                        return Some((code, None));
+                    }
+                } else if let Some(&code) = map.get(&key) {
                     if is_controlled_code(code) {
                         return Some((code, None));
                     }
@@ -727,8 +820,8 @@ pub fn resolve_controlled_tag_two_stage(
                 }
             }
         } else if curr_lang == "en" {
-            if let Some(code) = en_to_code().get(&key) {
-                return Some((code.as_str(), None));
+            if let Some(code) = lookup_static_with_en_lemmas(&key) {
+                return Some((code, None));
             }
         }
         // 相同语言未查得，直接判定为未登录词
@@ -739,7 +832,9 @@ pub fn resolve_controlled_tag_two_stage(
     let mut matched_code: Option<&'static str> = None;
     if let Ok(by_lang) = dynamic_aliases_by_lang().read() {
         if let Some(map) = by_lang.get(detected_lang) {
-            if let Some(&code) = map.get(&key) {
+            if detected_lang == "en" {
+                matched_code = lookup_map_with_en_lemmas(map, &key);
+            } else if let Some(&code) = map.get(&key) {
                 if is_controlled_code(code) {
                     matched_code = Some(code);
                 }
@@ -747,20 +842,14 @@ pub fn resolve_controlled_tag_two_stage(
         }
         if matched_code.is_none() && detected_lang != "en" {
             if let Some(map) = by_lang.get("en") {
-                if let Some(&code) = map.get(&key) {
-                    if is_controlled_code(code) {
-                        matched_code = Some(code);
-                    }
-                }
+                matched_code = lookup_map_with_en_lemmas(map, &key);
             }
         }
     }
 
     // 异语静态底座兜底
     if matched_code.is_none() {
-        if let Some(en) = alias_map().get(&key) {
-            matched_code = en_to_code().get(en.as_str()).map(|s| s.as_str());
-        }
+        matched_code = lookup_static_with_en_lemmas(&key);
     }
 
     if let Some(code) = matched_code {
@@ -1113,8 +1202,33 @@ mod tests {
         let outcome_character = resolve_controlled_tag_two_stage("character", Some("zh"));
         assert_eq!(outcome_character, Some(("builtin.human_subject", Some("人物主体".to_string()))));
 
-        let outcome_flat = resolve_controlled_tag_two_stage("flat", Some("zh"));
-        assert_eq!(outcome_flat, Some(("builtin.flat_minimalist", Some("扁平极简".to_string()))));
+        // ─── 场景 6：英文形态学词形还原（复数/分词）两阶段反查与就地本地化 ───
+        load_aliases_for_lang("zh", vec![
+            ("元素", "omw.05868954.n", true),
+            ("表格", "omw.08266235.n", true),
+            ("创建", "omw.01617192.v", true),
+        ]);
+        load_aliases_for_lang("en", vec![
+            ("element", "omw.05868954.n", true),
+            ("table", "omw.08266235.n", true),
+            ("create", "omw.01617192.v", true),
+        ]);
+
+        // 复数 Elements -> 原型 element -> omw.05868954.n -> 元素
+        let outcome_elements = resolve_controlled_tag_two_stage("Elements", Some("zh"));
+        assert_eq!(outcome_elements, Some(("omw.05868954.n", Some("元素".to_string()))));
+
+        // 复数 Tables -> 原型 table -> omw.08266235.n -> 表格
+        let outcome_tables = resolve_controlled_tag_two_stage("Tables", Some("zh"));
+        assert_eq!(outcome_tables, Some(("omw.08266235.n", Some("表格".to_string()))));
+
+        // 分词 Creating -> 原型 create -> omw.01617192.v -> 创建
+        let outcome_creating = resolve_controlled_tag_two_stage("Creating", Some("zh"));
+        assert_eq!(outcome_creating, Some(("omw.01617192.v", Some("创建".to_string()))));
+
+        // 过去分词 Connected -> 原型 connect -> builtin.connect -> 连接
+        let outcome_connected = resolve_controlled_tag_two_stage("Connected", Some("zh"));
+        assert_eq!(outcome_connected, Some(("builtin.connect", Some("连接".to_string()))));
 
         clear_dynamic_aliases();
     }
