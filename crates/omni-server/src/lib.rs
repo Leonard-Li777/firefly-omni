@@ -795,6 +795,7 @@ struct VisionComputed {
     bw_ms: u64,
     tag_ms: u64,
     ram_ms: u64,
+    subtasks: std::collections::BTreeMap<String, u64>,
 }
 
 /// 多核零拷贝并行视觉感知流水线: 图像单次加载与降采样，7 线程并发计算，消除串行阻塞与重复推理
@@ -898,7 +899,9 @@ fn run_vision_pipeline(
 
                 // 9. CLIP 图像嵌入向量提取 (用于级联假设 CLIP 仲裁)
                 let h_embed = s.spawn(|| {
-                    omni_pro::OmniVisionEngine::extract_clip_image_embedding(&inspect_img, lang)
+                    let t = std::time::Instant::now();
+                    let res = omni_pro::OmniVisionEngine::extract_clip_image_embedding(&inspect_img, lang);
+                    (res, t.elapsed().as_millis() as u64)
                 });
 
                 let (td, td_ms) = h_text.join().unwrap_or((false, 0));
@@ -909,7 +912,7 @@ fn run_vision_pipeline(
                 let (ar, ar_ms) = h_aes.join().unwrap_or(((7.5, Vec::new()), 0));
                 let (bw, bw_ms) = h_bw.join().unwrap_or((false, 0));
                 let (ram_res, ram_ms) = h_ram.join().unwrap_or((Vec::new(), 0));
-                let img_embed = h_embed.join().unwrap_or(None);
+                let (img_embed, embed_ms) = h_embed.join().unwrap_or((None, 0));
 
                 out.has_text = Some(td);
                 out.text_detect_ms = td_ms;
@@ -932,14 +935,31 @@ fn run_vision_pipeline(
                 out.ram_ms = ram_ms;
                 out.image_embedding = img_embed;
                 // CLIP 互斥分类：利用图像嵌入向量对内容形态/色彩/文字等互斥组分类
+                let mut mutual_ms = 0u64;
                 if let Some(ref emb) = out.image_embedding {
+                    let t_mutual = std::time::Instant::now();
                     out.clip_mutual_tags = omni_pro::OmniVisionEngine::classify_mutual_exclusive_groups(
                         emb.as_slice(),
                         lang,
                     );
+                    mutual_ms = t_mutual.elapsed().as_millis() as u64;
                 }
                 // 标签任务取并行最大值
-                out.tag_ms = ct_ms.max(np_ms).max(ram_ms);
+                let tag_max_ms = ct_ms.max(np_ms).max(ram_ms);
+                out.tag_ms = tag_max_ms;
+
+                // 统一汇总至子任务度量字典
+                out.subtasks.insert("text_detect_ms".to_string(), td_ms);
+                out.subtasks.insert("clip_ms".to_string(), ct_ms);
+                out.subtasks.insert("clip_embed_ms".to_string(), embed_ms);
+                out.subtasks.insert("clip_mutual_ms".to_string(), mutual_ms);
+                out.subtasks.insert("nsfw_ms".to_string(), np_ms);
+                out.subtasks.insert("watermark_ms".to_string(), wl_ms);
+                out.subtasks.insert("mosaic_ms".to_string(), ml_ms);
+                out.subtasks.insert("aesthetic_ms".to_string(), ar_ms);
+                out.subtasks.insert("bw_ms".to_string(), bw_ms);
+                out.subtasks.insert("ram_ms".to_string(), ram_ms);
+                out.subtasks.insert("tag_ms".to_string(), tag_max_ms);
 
                 // 零耗时内存推导
                 out.has_watermark = Some(wl > 0);
@@ -1051,7 +1071,7 @@ async fn perceive_file_handler(
     let mime_type = omni_pro::OmniVisionEngine::detect_mime_type(p)
         .unwrap_or_else(|_| "application/octet-stream".to_string());
     let magika_ms = t_magika.elapsed().as_millis() as u64;
-    benchmark.magika_ms = Some(magika_ms);
+    benchmark.record("magika_ms", magika_ms);
 
     // 2. 根据 MIME 类型与扩展名判定大类分支
     let is_image = mime_type.starts_with("image/") || matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff");
@@ -1192,19 +1212,11 @@ async fn perceive_file_handler(
         let (ads_res, (metadata_ms, vision_res, markdown_content, ocr_ms, text_ms, phash, metadata, ocr_text)) =
             tokio::join!(f_ads, f_img);
 
-        benchmark.metadata_ms = if metadata_ms > 0 { Some(metadata_ms) } else { None };
+        benchmark.record_opt("metadata_ms", if metadata_ms > 0 { Some(metadata_ms) } else { None });
         benchmark.vision_ms = Some(vision_res.duration_ms);
-        benchmark.text_detect_ms = Some(vision_res.text_detect_ms);
-        benchmark.clip_ms = Some(vision_res.clip_ms);
-        benchmark.nsfw_ms = Some(vision_res.nsfw_ms);
-        benchmark.watermark_ms = Some(vision_res.watermark_ms);
-        benchmark.mosaic_ms = Some(vision_res.mosaic_ms);
-        benchmark.aesthetic_ms = Some(vision_res.aesthetic_ms);
-        benchmark.bw_ms = Some(vision_res.bw_ms);
-        benchmark.ram_ms = Some(vision_res.ram_ms);
-        benchmark.tag_ms = Some(vision_res.tag_ms);
-        benchmark.ocr_ms = ocr_ms;
-        benchmark.text_ms = text_ms;
+        benchmark.extend_subtasks(vision_res.subtasks.clone());
+        benchmark.record_opt("ocr_ms", ocr_ms);
+        benchmark.record_opt("text_ms", text_ms);
         benchmark.extract_ms = Some(vision_res.duration_ms.max(metadata_ms).max(ocr_ms.unwrap_or(0)));
 
         (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text))
@@ -1289,9 +1301,9 @@ async fn perceive_file_handler(
         benchmark.extract_ms = Some(extract_ms);
         benchmark.audio_ms = audio_ms;
         if let Some(bm) = &ext_res.benchmark {
-            benchmark.metadata_ms = bm.metadata_ms;
-            benchmark.text_ms = bm.text_ms;
-            benchmark.ocr_ms = bm.ocr_ms;
+            benchmark.record_opt("metadata_ms", bm.metadata_ms);
+            benchmark.record_opt("text_ms", bm.text_ms);
+            benchmark.record_opt("ocr_ms", bm.ocr_ms);
         }
 
         (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, None))
@@ -1813,7 +1825,8 @@ async fn perceive_file_handler(
         })
         .await;
         let text_duration = t_text.elapsed().as_millis() as u64;
-        benchmark.text_ms = Some(benchmark.text_ms.unwrap_or(0) + text_duration);
+        let cur_text_ms = benchmark.get("text_ms").unwrap_or(0);
+        benchmark.record("text_ms", cur_text_ms + text_duration);
         match res {
             Ok(result) => Some(result),
             Err(e) => {

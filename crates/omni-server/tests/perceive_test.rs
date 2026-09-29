@@ -136,3 +136,55 @@ fn multimodal_context_carries_internal_audio_transcript() {
     let back: MultimodalContext = serde_json::from_value(value).unwrap();
     assert_eq!(back.audio_transcript.as_deref(), Some("季度预算评审"));
 }
+
+/// 契约 4（PRD 0053 Seam 1）：感知结果中的 `benchmark` 字段完整平铺输出所有细分子任务耗时，
+/// 且未来新增任意算子（如 custom_detector_ms）均直接展现在 benchmark 顶层同级属性中。
+#[test]
+fn perception_result_benchmark_flattens_dynamic_subtasks() {
+    let mut bm = omni_core::OmniPerceptionBenchmark {
+        total_ms: 150,
+        vision_ms: Some(110),
+        extract_ms: Some(115),
+        ..Default::default()
+    };
+
+    bm.record("clip_ms", 40);
+    bm.record("clip_embed_ms", 18);
+    bm.record("clip_mutual_ms", 6);
+    bm.record("nsfw_ms", 22);
+    bm.record("watermark_ms", 12);
+    bm.record("custom_detector_ms", 33);
+
+    let result = OmniPerceptionResult {
+        file_path: "/tmp/test.png".to_string(),
+        mime_type: "image/png".to_string(),
+        file_size: 2048,
+        benchmark: Some(bm),
+        ..Default::default()
+    };
+
+    let value: Value = serde_json::to_value(&result).expect("序列化感知结果失败");
+    let bm_val = &value["benchmark"];
+
+    // 阶段宏观耗时存在
+    assert_eq!(bm_val["total_ms"], json!(150));
+    assert_eq!(bm_val["vision_ms"], json!(110));
+
+    // 细分算子耗时在 benchmark 内部完全顶层平铺 (Flattened)
+    assert_eq!(bm_val["clip_ms"], json!(40));
+    assert_eq!(bm_val["clip_embed_ms"], json!(18));
+    assert_eq!(bm_val["clip_mutual_ms"], json!(6));
+    assert_eq!(bm_val["nsfw_ms"], json!(22));
+    assert_eq!(bm_val["watermark_ms"], json!(12));
+    assert_eq!(bm_val["custom_detector_ms"], json!(33));
+    assert!(bm_val.get("subtasks").is_none());
+
+    // 无损反序列化还原
+    let back: OmniPerceptionResult = serde_json::from_value(value).expect("反序列化感知结果失败");
+    let back_bm = back.benchmark.expect("必须包含 benchmark");
+    assert_eq!(back_bm.total_ms, 150);
+    assert_eq!(back_bm.get("clip_ms"), Some(40));
+    assert_eq!(back_bm.get("clip_embed_ms"), Some(18));
+    assert_eq!(back_bm.get("clip_mutual_ms"), Some(6));
+    assert_eq!(back_bm.get("custom_detector_ms"), Some(33));
+}

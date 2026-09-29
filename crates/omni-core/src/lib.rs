@@ -142,29 +142,76 @@ pub struct OmniPerceptionRequest {
 }
 
 /// 原生多模态感知细分耗时
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct OmniPerceptionBenchmark {
     pub total_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub extract_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ads_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vision_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub geo_ms: Option<u64>,
 
-    // 细分任务独立耗时
-    pub magika_ms: Option<u64>,
-    pub metadata_ms: Option<u64>,
-    pub tag_ms: Option<u64>,
-    pub text_ms: Option<u64>,
-    pub ocr_ms: Option<u64>,
-    pub text_detect_ms: Option<u64>,
-    pub clip_ms: Option<u64>,
-    pub nsfw_ms: Option<u64>,
-    pub watermark_ms: Option<u64>,
-    pub mosaic_ms: Option<u64>,
-    pub aesthetic_ms: Option<u64>,
-    pub bw_ms: Option<u64>,
-    pub ram_ms: Option<u64>,
+    // 细分任务动态指标字典 (通过 serde(flatten) 在 JSON 顶层平铺展开)
+    // 自动兼容 clip_ms, nsfw_ms, ram_ms, text_detect_ms 等现有与未来任意新增子任务
+    #[serde(flatten)]
+    pub subtasks: std::collections::BTreeMap<String, u64>,
+}
+
+impl OmniPerceptionBenchmark {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录某项细分子任务耗时（毫秒）
+    pub fn record(&mut self, name: impl Into<String>, ms: u64) {
+        self.subtasks.insert(name.into(), ms);
+    }
+
+    /// 记录可选耗时值（仅当 Some 时记录）
+    pub fn record_opt(&mut self, name: impl Into<String>, ms: Option<u64>) {
+        if let Some(val) = ms {
+            self.subtasks.insert(name.into(), val);
+        }
+    }
+
+    /// 获取某项细分子任务耗时
+    pub fn get(&self, name: &str) -> Option<u64> {
+        self.subtasks.get(name).copied()
+    }
+
+    /// 批量合并/扩展细分子任务耗时
+    pub fn extend_subtasks<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = (String, u64)>,
+    {
+        self.subtasks.extend(iter);
+    }
+}
+
+/// 通用子任务测量工具：执行闭包，返回 (结果, 任务标识名, 耗时ms)
+#[inline]
+pub fn measure_subtask<T, F: FnOnce() -> T>(name: &'static str, f: F) -> (T, &'static str, u64) {
+    let start = std::time::Instant::now();
+    let res = f();
+    let elapsed = start.elapsed().as_millis() as u64;
+    (res, name, elapsed)
+}
+
+/// 快捷宏：在 thread scope 中度量执行，返回 (name, res, elapsed_ms)
+#[macro_export]
+macro_rules! timed_spawn {
+    ($scope:expr, $name:expr, $task:expr) => {
+        $scope.spawn(|| {
+            let start = std::time::Instant::now();
+            let res = $task;
+            ($name, res, start.elapsed().as_millis() as u64)
+        })
+    };
 }
 
 /// 统一多模态标签链项 (融合语义数据库 file_tags 全字段属性)
