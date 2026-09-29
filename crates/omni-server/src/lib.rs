@@ -938,9 +938,9 @@ fn run_vision_pipeline(
                     );
                     mutual_ms = t_mutual.elapsed().as_millis() as u64;
                 }
-                // 标签分支挂钟 = 并行段长尾 (CLIP/NSFW/RAM 取 Max) + 串行尾巴 (嵌入→互斥分类)
-                // 嵌入提取与互斥分类在并行 join 之后顺序执行，必须累加进 tag_ms 才能反映真实挂钟瓶颈
-                let tag_wall_ms = ct_ms.max(np_ms).max(ram_ms) + embed_ms + mutual_ms;
+                // 标签分支挂钟 = 并行段长尾 (CLIP/NSFW/RAM/Embed 取 Max) + 串行尾巴 (互斥分类)
+                // 图像嵌入提取在 scope 内并行执行，互斥分类在 scope 外部消费嵌入向量顺序执行
+                let tag_wall_ms = ct_ms.max(np_ms).max(ram_ms).max(embed_ms) + mutual_ms;
                 out.tag_ms = tag_wall_ms;
 
                 // 统一汇总至子任务度量字典
