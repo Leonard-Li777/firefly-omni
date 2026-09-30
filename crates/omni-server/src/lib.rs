@@ -518,10 +518,12 @@ async fn cover_handler(
 
     // 交由 CoverRenderer 按扩展名路由：
     // 对于 Office 文档，内部会默认先解压提取压缩包中的首张图；无图时仅在 enable_office_cover = true 时才执行 LO 渲染
+    let t_cover = std::time::Instant::now();
     let outcome = tokio::task::spawn_blocking(move || {
         omni_pro::CoverRenderer::render_cover_with_options(&path, enable_office_cover)
     })
     .await;
+    let cover_ms = t_cover.elapsed().as_millis() as u64;
 
     match outcome {
         Ok(Ok(bytes)) => {
@@ -530,6 +532,10 @@ async fn cover_handler(
             // CoverRenderer 统一返回 WebP 格式
             resp.headers_mut()
                 .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/webp"));
+            if let Ok(val) = HeaderValue::from_str(&cover_ms.to_string()) {
+                resp.headers_mut()
+                    .insert(axum::http::HeaderName::from_static("x-cover-duration-ms"), val);
+            }
             resp
         }
         Ok(Err(err)) => {
@@ -1299,6 +1305,9 @@ async fn perceive_file_handler(
             benchmark.record_opt("metadata_ms", bm.metadata_ms);
             benchmark.record_opt("text_ms", bm.text_ms);
             benchmark.record_opt("ocr_ms", bm.ocr_ms);
+            if let Some(t_ms) = bm.text_ms {
+                benchmark.record("doc_parse_ms", t_ms);
+            }
         }
 
         (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, None))
@@ -1835,6 +1844,11 @@ async fn perceive_file_handler(
         let text_duration = t_text.elapsed().as_millis() as u64;
         let cur_text_ms = benchmark.get("text_ms").unwrap_or(0);
         benchmark.record("text_ms", cur_text_ms + text_duration);
+        if let Ok(ref result) = res {
+            benchmark.record("bekko_embed_ms", result.bekko_embed_ms);
+            benchmark.record("keybert_ms", result.keybert_ms);
+            benchmark.record("slot_summary_ms", result.slot_summary_ms);
+        }
         match res {
             Ok(result) => Some(result),
             Err(e) => {
@@ -1888,6 +1902,7 @@ async fn perceive_file_handler(
         language: req.language.clone(),
     };
 
+    let t_fusion = std::time::Instant::now();
     let fusion_outcome = if is_pro {
         omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate(&multimodal_ctx)
     } else {
@@ -1898,6 +1913,8 @@ async fn perceive_file_handler(
             candidate_hypotheses: Vec::new(),
         }
     };
+    let fusion_ms = t_fusion.elapsed().as_millis() as u64;
+    benchmark.record("fusion_ms", fusion_ms);
 
     let candidate_hypotheses = if !fusion_outcome.candidate_hypotheses.is_empty() {
         fusion_outcome.candidate_hypotheses

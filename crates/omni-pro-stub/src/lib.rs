@@ -864,6 +864,18 @@ pub mod text {
             }
         }
     }
+
+    pub struct FastTextNsfwClassifier;
+
+    impl FastTextNsfwClassifier {
+        pub fn classify(_text: &str, _lang_opt: Option<&str>) -> (Vec<String>, Vec<String>, Option<String>) {
+            (vec!["全年龄".to_string()], Vec::new(), Some("safe".to_string()))
+        }
+
+        pub fn reload_config() -> bool {
+            true
+        }
+    }
 }
 
 pub mod search {
@@ -1302,21 +1314,8 @@ pub use omw_query::{
     OmwSynsetResult, OmwTagResult, OmwTreeRequest, TaxonomyAliasesResponse, TaxonomyNode,
     TaxonomyTreeResponse, TreeNode, UnmappedStats,
 };
-
-pub mod text {
-    pub struct FastTextNsfwClassifier;
-
-    impl FastTextNsfwClassifier {
-        pub fn classify(_text: &str, _lang_opt: Option<&str>) -> (Vec<String>, Vec<String>, Option<String>) {
-            (vec!["全年龄".to_string()], Vec::new(), Some("safe".to_string()))
-        }
-
-        pub fn reload_config() -> bool {
-            true
-        }
-    }
-}
 pub use text::FastTextNsfwClassifier;
+
 
 
 
