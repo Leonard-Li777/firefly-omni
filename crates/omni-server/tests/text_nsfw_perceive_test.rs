@@ -229,7 +229,7 @@ async fn test_perceive_config_reload_resilience() {
     // 验证配置重载机制与损坏降级
     assert!(omni_pro::text::FastTextNsfwClassifier::reload_config());
     let cfg = omni_pro::text::FastTextNsfwClassifier::get_config();
-    assert!(cfg.version == "1.1.0" || cfg.version == "1.0.0" || cfg.version == "1.2.0");
+    assert_eq!(cfg.version, "1.1.0");
     assert!(cfg.get_threshold("pornography", Some("zh")) > 0.0);
 }
 

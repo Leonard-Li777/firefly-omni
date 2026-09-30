@@ -244,6 +244,18 @@ pub struct TagChainItem {
     /// "clip" | "ram" | "physical" | "mutual_group" | "ocr" | "nsfw" | "quality" | "rule" | "metadata"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
+    /// 词性标识 (n/v/a/s/r)，句法槽位投放的物理基石
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos: Option<String>,
+    /// 44大类语义范畴 (noun.artifact等)，具象实体与虚词判据
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexfile: Option<String>,
+    /// 概念树层级深度 (Min BFS Depth，具象度评分与虚词熔断)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+    /// 专名个体标识 (true=专名个体，受 R1 保护不被折叠)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_instance: Option<bool>,
 }
 
 impl TagChainItem {

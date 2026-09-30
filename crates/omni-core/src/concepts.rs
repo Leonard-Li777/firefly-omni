@@ -43,7 +43,7 @@ pub enum Concept {
     半肉,
     /// 概念: 半身 | 代码: builtin.half_body
     半身,
-    /// 概念: 伴侣交换 | 代码: builtin.t_c4cd7a4d
+    /// 概念: 伴侣交换 | 代码: builtin.partner_swap
     伴侣交换,
     /// 概念: 帮助文档 | 代码: builtin.help_documentation
     帮助文档,
@@ -53,11 +53,11 @@ pub enum Concept {
     保函协议,
     /// 概念: 报销凭证 | 代码: builtin.reimbursement_vouchers
     报销凭证,
-    /// 概念: 暴恐 | 代码: builtin.t_4af648b7
+    /// 概念: 暴恐 | 代码: builtin.violence_terrorism
     暴恐,
     /// 概念: 暴恐惨案 | 代码: builtin.violent_terrorist_attacks
     暴恐惨案,
-    /// 概念: 暴力胁迫 | 代码: builtin.t_824b52bc
+    /// 概念: 暴力胁迫 | 代码: builtin.violent_coercion
     暴力胁迫,
     /// 概念: 暴乱动乱 | 代码: builtin.riots_and_unrest
     暴乱动乱,
@@ -83,7 +83,7 @@ pub enum Concept {
     标清480P,
     /// 概念: 表格 | 代码: omw.06473563.n
     表格,
-    /// 概念: 表亲姻亲 | 代码: builtin.t_5b473127
+    /// 概念: 表亲姻亲 | 代码: builtin.cousins_in_laws
     表亲姻亲,
     /// 概念: 表情包 | 代码: builtin.emoticons
     表情包,
@@ -109,7 +109,7 @@ pub enum Concept {
     超清1080P,
     /// 概念: 车牌 | 代码: builtin.license_plate
     车牌,
-    /// 概念: 车震 | 代码: hownet.clf.车震
+    /// 概念: 车震 | 代码: builtin.car_shock
     车震,
     /// 概念: 成人漫 | 代码: builtin.adult_comics
     成人漫,
@@ -129,7 +129,7 @@ pub enum Concept {
     出版状态,
     /// 概念: 处理状态 | 代码: builtin.processing_status
     处理状态,
-    /// 概念: 处女情结 | 代码: builtin.t_1b09c89b
+    /// 概念: 处女情结 | 代码: builtin.virginity_complex
     处女情结,
     /// 概念: 穿越 | 代码: builtin.time_travel
     穿越,
@@ -139,7 +139,7 @@ pub enum Concept {
     创意项目,
     /// 概念: 春季花景 | 代码: builtin.spring_flower_scene
     春季花景,
-    /// 概念: 纯洁恋情 | 代码: builtin.t_06e0e511
+    /// 概念: 纯洁恋情 | 代码: builtin.pure_love
     纯洁恋情,
     /// 概念: 纯肉 | 代码: builtin.pure_meat
     纯肉,
@@ -157,13 +157,13 @@ pub enum Concept {
     磁盘映像扩展名,
     /// 概念: 磁盘映像细分 | 代码: builtin.disk_image_segmentation
     磁盘映像细分,
-    /// 概念: 粗暴性爱 | 代码: builtin.t_c9aeb234
+    /// 概念: 粗暴性爱 | 代码: builtin.rough_sex
     粗暴性爱,
     /// 概念: 粗野性交 | 代码: builtin.t_53c68b04
     粗野性交,
     /// 概念: 打码程度 | 代码: builtin.coding_level
     打码程度,
-    /// 概念: 大学生 | 代码: omw.09936892.n
+    /// 概念: 大学生 | 代码: builtin.college_student
     大学生,
     /// 概念: 代码截图 | 代码: builtin.code_screenshot
     代码截图,
@@ -175,7 +175,7 @@ pub enum Concept {
     单行本,
     /// 概念: 耽美 | 代码: builtin.danmei
     耽美,
-    /// 概念: 当代都市 | 代码: builtin.t_723a7b39
+    /// 概念: 当代都市 | 代码: builtin.contemporary_city
     当代都市,
     /// 概念: 德语 | 代码: builtin.german
     德语,
@@ -185,7 +185,7 @@ pub enum Concept {
     地图导航截图,
     /// 概念: 低质量 | 代码: builtin.low_quality
     低质量,
-    /// 概念: 滴蜡皮鞭 | 代码: builtin.t_be458e7b
+    /// 概念: 滴蜡皮鞭 | 代码: builtin.dripping_wax_whip
     滴蜡皮鞭,
     /// 概念: 第一人称 | 代码: builtin.first_person
     第一人称,
@@ -217,7 +217,7 @@ pub enum Concept {
     动作,
     /// 概念: 都市 | 代码: builtin.city
     都市,
-    /// 概念: 都市生活 | 代码: builtin.t_6e67e2a8
+    /// 概念: 都市生活 | 代码: builtin.urban_life
     都市生活,
     /// 概念: 抖动 | 代码: omw.01888511.v
     抖动,
@@ -233,19 +233,19 @@ pub enum Concept {
     断头斩首,
     /// 概念: 对账单 | 代码: builtin.statement_of_account
     对账单,
-    /// 概念: 多伴侣聚会 | 代码: builtin.t_28e8368d
+    /// 概念: 多伴侣聚会 | 代码: builtin.multi_partner_gathering
     多伴侣聚会,
     /// 概念: 多人合影 | 代码: builtin.group_photo
     多人合影,
-    /// 概念: 多人派对 | 代码: builtin.t_1dbbb3dd
+    /// 概念: 多人派对 | 代码: builtin.multi_person_party
     多人派对,
-    /// 概念: 多人群交 | 代码: builtin.t_5884ad20
+    /// 概念: 多人群交 | 代码: builtin.group_sex
     多人群交,
-    /// 概念: 多人群体细分 | 代码: builtin.t_6db1c092
+    /// 概念: 多人群体细分 | 代码: builtin.multi_person_group_segmentation
     多人群体细分,
-    /// 概念: 多元取向 | 代码: builtin.t_cc1c5091
+    /// 概念: 多元取向 | 代码: builtin.multiple_orientations
     多元取向,
-    /// 概念: 多元取向细分 | 代码: builtin.t_b18db166
+    /// 概念: 多元取向细分 | 代码: builtin.multiple_orientation_segmentation
     多元取向细分,
     /// 概念: 俄语 | 代码: builtin.russian
     俄语,
@@ -265,9 +265,9 @@ pub enum Concept {
     房产证,
     /// 概念: 房屋居住 | 代码: builtin.house_to_live_in
     房屋居住,
-    /// 概念: 非自愿侵犯 | 代码: builtin.t_83dbd0ce
+    /// 概念: 非自愿侵犯 | 代码: builtin.involuntary_assault
     非自愿侵犯,
-    /// 概念: 非自愿侵犯细分 | 代码: builtin.t_6089022e
+    /// 概念: 非自愿侵犯细分 | 代码: builtin.involuntary_assault_breakdown
     非自愿侵犯细分,
     /// 概念: 分裂国家 | 代码: builtin.secession
     分裂国家,
@@ -275,19 +275,19 @@ pub enum Concept {
     粉色,
     /// 概念: 风景照 | 代码: builtin.landscape_photos
     风景照,
-    /// 概念: 疯狂暴露 | 代码: builtin.t_5d51bceb
+    /// 概念: 疯狂暴露 | 代码: builtin.crazy_exposure
     疯狂暴露,
     /// 概念: 俯视 | 代码: builtin.looking_down
     俯视,
-    /// 概念: 父女 | 代码: builtin.t_28824b3d
+    /// 概念: 父女 | 代码: builtin.father_and_daughter
     父女,
-    /// 概念: 妇产科 | 代码: builtin.t_f896913a
+    /// 概念: 妇产科 | 代码: builtin.obstetrics_and_gynecology
     妇产科,
     /// 概念: 复古胶片 | 代码: builtin.vintage_film
     复古胶片,
     /// 概念: 感动 | 代码: builtin.move
     感动,
-    /// 概念: 肛交 | 代码: hownet.clf.肛交
+    /// 概念: 肛交 | 代码: builtin.anal_sex
     肛交,
     /// 概念: 高饱和鲜艳 | 代码: builtin.highly_saturated_and_vivid
     高饱和鲜艳,
@@ -295,7 +295,7 @@ pub enum Concept {
     高清720P,
     /// 概念: 高质量 | 代码: builtin.high_quality
     高质量,
-    /// 概念: 高中生 | 代码: builtin.t_d5e7a7fb
+    /// 概念: 高中生 | 代码: builtin.high_school_student
     高中生,
     /// 概念: 高ISO噪点 | 代码: builtin.high_iso_noise
     高ISO噪点,
@@ -315,19 +315,19 @@ pub enum Concept {
     工作证,
     /// 概念: 公版书 | 代码: builtin.public_book
     公版书,
-    /// 概念: 公公媳妇 | 代码: builtin.t_913f974d
+    /// 概念: 公公媳妇 | 代码: builtin.father_in_law_and_daughter_in_law
     公公媳妇,
-    /// 概念: 公共空间暴露 | 代码: builtin.t_f38b90de
+    /// 概念: 公共空间暴露 | 代码: builtin.public_space_exposure
     公共空间暴露,
     /// 概念: 公开 | 代码: omw.01704761.a
     公开,
     /// 概念: 构图不良 | 代码: builtin.poor_composition
     构图不良,
-    /// 概念: 姑侄 | 代码: builtin.t_d3d3cfab
+    /// 概念: 姑侄 | 代码: builtin.aunt_and_nephew
     姑侄,
     /// 概念: 古典 | 代码: builtin.classical_music
     古典,
-    /// 概念: 古典情色 | 代码: builtin.t_59884ae9
+    /// 概念: 古典情色 | 代码: builtin.classical_erotica
     古典情色,
     /// 概念: 古风 | 代码: builtin.traditional_style_music
     古风,
@@ -377,7 +377,7 @@ pub enum Concept {
     户口本,
     /// 概念: 户外活动 | 代码: builtin.outdoor_activities
     户外活动,
-    /// 概念: 户外露出 | 代码: builtin.t_3a13f897
+    /// 概念: 户外露出 | 代码: builtin.exposed_outdoors
     户外露出,
     /// 概念: 护照 | 代码: omw.06500937.n
     护照,
@@ -397,7 +397,7 @@ pub enum Concept {
     环境建筑,
     /// 概念: 缓存 | 代码: builtin.cache
     缓存,
-    /// 概念: 换妻 | 代码: hownet.clf.换妻
+    /// 概念: 换妻 | 代码: builtin.wife_swapping
     换妻,
     /// 概念: 黄色 | 代码: omw.00385756.s
     黄色,
@@ -411,9 +411,9 @@ pub enum Concept {
     绘画,
     /// 概念: 婚纱照 | 代码: builtin.wedding_photos
     婚纱照,
-    /// 概念: 婚外情欲 | 代码: builtin.t_bb77105c
+    /// 概念: 婚外情欲 | 代码: builtin.extramarital_lust
     婚外情欲,
-    /// 概念: 婚外情欲细分 | 代码: builtin.t_05f0e054
+    /// 概念: 婚外情欲细分 | 代码: builtin.extramarital_lust_breakdown
     婚外情欲细分,
     /// 概念: 机翻 | 代码: builtin.machine_translation
     机翻,
@@ -427,7 +427,7 @@ pub enum Concept {
     纪录,
     /// 概念: 技术书籍 | 代码: builtin.technical_books
     技术书籍,
-    /// 概念: 继父继母 | 代码: builtin.t_22999444
+    /// 概念: 继父继母 | 代码: builtin.stepfather_stepmother
     继父继母,
     /// 概念: 加密压缩包 | 代码: builtin.encrypted_compressed_package
     加密压缩包,
@@ -437,11 +437,11 @@ pub enum Concept {
     家居购物,
     /// 概念: 家庭 | 代码: omw.02940759.a
     家庭,
-    /// 概念: 家庭教师 | 代码: omw.09931418.n
+    /// 概念: 家庭教师 | 代码: builtin.tutor
     家庭教师,
-    /// 概念: 家庭乱伦 | 代码: builtin.t_e0f02d4c
+    /// 概念: 家庭乱伦 | 代码: builtin.family_incest
     家庭乱伦,
-    /// 概念: 家庭乱伦细分 | 代码: builtin.t_68e90791
+    /// 概念: 家庭乱伦细分 | 代码: builtin.family_incest_breakdown
     家庭乱伦细分,
     /// 概念: 家庭生活 | 代码: builtin.family_life
     家庭生活,
@@ -467,7 +467,7 @@ pub enum Concept {
     脚本,
     /// 概念: 教材 | 代码: builtin.textbook
     教材,
-    /// 概念: 教师学生 | 代码: builtin.t_e2e59834
+    /// 概念: 教师学生 | 代码: builtin.teacher_student
     教师学生,
     /// 概念: 教学视频 | 代码: builtin.instructional_video
     教学视频,
@@ -483,7 +483,7 @@ pub enum Concept {
     截图,
     /// 概念: 截图细分 | 代码: builtin.screenshot_breakdown
     截图细分,
-    /// 概念: 姐弟 | 代码: builtin.t_e2c09cb1
+    /// 概念: 姐弟 | 代码: builtin.siblings
     姐弟,
     /// 概念: 解谜 | 代码: builtin.puzzle_mystery
     解谜,
@@ -491,7 +491,7 @@ pub enum Concept {
     金属,
     /// 概念: 紧张 | 代码: omw.00025203.v
     紧张,
-    /// 概念: 近亲乱伦 | 代码: builtin.t_4871fadf
+    /// 概念: 近亲乱伦 | 代码: builtin.incest
     近亲乱伦,
     /// 概念: 经济学 | 代码: omw.06149484.n
     经济学,
@@ -525,7 +525,7 @@ pub enum Concept {
     科幻,
     /// 概念: 科普 | 代码: builtin.popular_science
     科普,
-    /// 概念: 空姐 | 代码: hownet.clf.空姐
+    /// 概念: 空姐 | 代码: builtin.airline_stewardess
     空姐,
     /// 概念: 恐怖主义 | 代码: builtin.terrorism
     恐怖主义,
@@ -533,13 +533,13 @@ pub enum Concept {
     口交,
     /// 概念: 酷刑折磨 | 代码: builtin.torture_and_cruel_treatment
     酷刑折磨,
-    /// 概念: 跨性别 | 代码: builtin.t_541c3d28
+    /// 概念: 跨性别 | 代码: builtin.transgender
     跨性别,
     /// 概念: 快捷方式 | 代码: builtin.shortcut
     快捷方式,
-    /// 概念: 窥视暴露 | 代码: builtin.t_250e9caa
+    /// 概念: 窥视暴露 | 代码: builtin.peeping_exposed
     窥视暴露,
-    /// 概念: 窥视暴露细分 | 代码: builtin.t_e73b4635
+    /// 概念: 窥视暴露细分 | 代码: builtin.peep_exposed_segmentation
     窥视暴露细分,
     /// 概念: 拉丁 | 代码: builtin.latin_music
     拉丁,
@@ -551,7 +551,7 @@ pub enum Concept {
     冷色调,
     /// 概念: 历史 | 代码: omw.02377418.a
     历史,
-    /// 概念: 历史情色 | 代码: builtin.t_f4a6b89e
+    /// 概念: 历史情色 | 代码: builtin.historical_erotica
     历史情色,
     /// 概念: 历史遗迹 | 代码: builtin.historical_sites
     历史遗迹,
@@ -585,7 +585,7 @@ pub enum Concept {
     绿色版,
     /// 概念: 伦理 | 代码: omw.02723563.a
     伦理,
-    /// 概念: 轮奸侵犯 | 代码: builtin.t_1b93c517
+    /// 概念: 轮奸侵犯 | 代码: builtin.gang_rape_assault
     轮奸侵犯,
     /// 概念: 论文 | 代码: omw.06269956.n
     论文,
@@ -595,11 +595,11 @@ pub enum Concept {
     漫画细分,
     /// 概念: 冒险 | 代码: omw.00065791.a
     冒险,
-    /// 概念: 美乳美腿 | 代码: builtin.t_f987c45d
+    /// 概念: 美乳美腿 | 代码: builtin.beautiful_breasts_and_legs
     美乳美腿,
     /// 概念: 美食 | 代码: builtin.gourmet_food
     美食,
-    /// 概念: 迷奸下药 | 代码: builtin.t_67f049e9
+    /// 概念: 迷奸下药 | 代码: builtin.raped_and_drugged
     迷奸下药,
     /// 概念: 密集排版 | 代码: builtin.dense_typography
     密集排版,
@@ -609,19 +609,19 @@ pub enum Concept {
     敏感内容,
     /// 概念: 模糊废片 | 代码: builtin.blurry_unusable_photos
     模糊废片,
-    /// 概念: 模特车模 | 代码: builtin.t_63e86361
+    /// 概念: 模特车模 | 代码: builtin.mannequin_car_model
     模特车模,
     /// 概念: 模型 | 代码: omw.02979662.n
     模型,
     /// 概念: 魔幻 | 代码: builtin.magic
     魔幻,
-    /// 概念: 母子 | 代码: builtin.t_cc457b62
+    /// 概念: 母子 | 代码: builtin.mother_and_son
     母子,
-    /// 概念: 男老师 | 代码: builtin.t_c72581f1
+    /// 概念: 男老师 | 代码: builtin.male_teacher
     男老师,
-    /// 概念: 男上司 | 代码: builtin.t_02fbd626
+    /// 概念: 男上司 | 代码: builtin.male_boss
     男上司,
-    /// 概念: 男同耽美 | 代码: builtin.t_2cda513f
+    /// 概念: 男同耽美 | 代码: builtin.gay_beauty
     男同耽美,
     /// 概念: 内部 | 代码: omw.00951831.s
     内部,
@@ -631,21 +631,21 @@ pub enum Concept {
     内容尺度,
     /// 概念: 逆光死白 | 代码: builtin.blown_out_highlights_in_backlighting
     逆光死白,
-    /// 概念: 女教师 | 代码: builtin.t_502899b6
+    /// 概念: 女教师 | 代码: builtin.female_teacher
     女教师,
-    /// 概念: 女警 | 代码: builtin.t_d28c2a04
+    /// 概念: 女警 | 代码: builtin.policewoman
     女警,
-    /// 概念: 女老板 | 代码: builtin.t_1ff47a9f
+    /// 概念: 女老板 | 代码: builtin.female_boss
     女老板,
-    /// 概念: 女邻居 | 代码: builtin.t_b5466230
+    /// 概念: 女邻居 | 代码: builtin.female_neighbor
     女邻居,
-    /// 概念: 女秘书 | 代码: builtin.t_5a772ba3
+    /// 概念: 女秘书 | 代码: builtin.female_secretary
     女秘书,
-    /// 概念: 女同百合 | 代码: builtin.t_5cc60883
+    /// 概念: 女同百合 | 代码: builtin.lesbian_lily
     女同百合,
-    /// 概念: 女同学 | 代码: builtin.t_11b905de
+    /// 概念: 女同学 | 代码: builtin.female_classmate
     女同学,
-    /// 概念: 女佣 | 代码: omw.10282672.n
+    /// 概念: 女佣 | 代码: builtin.maid
     女佣,
     /// 概念: 暖色调 | 代码: builtin.warm_colors
     暖色调,
@@ -657,7 +657,7 @@ pub enum Concept {
     朋克,
     /// 概念: 平视 | 代码: builtin.eye_level
     平视,
-    /// 概念: 婆媳 | 代码: builtin.t_10d0aacd
+    /// 概念: 婆媳 | 代码: builtin.mother_in_law_and_daughter_in_law
     婆媳,
     /// 概念: 破解版 | 代码: builtin.cracked_version
     破解版,
@@ -665,15 +665,15 @@ pub enum Concept {
     葡萄牙语,
     /// 概念: 曝光正常 | 代码: builtin.exposure_is_normal
     曝光正常,
-    /// 概念: 奇幻科幻 | 代码: builtin.t_12546ecb
+    /// 概念: 奇幻科幻 | 代码: builtin.fantasy_science_fiction
     奇幻科幻,
-    /// 概念: 奇遇物语 | 代码: builtin.t_d7beff9c
+    /// 概念: 奇遇物语 | 代码: builtin.adventure_story
     奇遇物语,
     /// 概念: 前端 | 代码: omw.08573472.n
     前端,
     /// 概念: 枪支弹药 | 代码: builtin.firearms_and_ammunition
     枪支弹药,
-    /// 概念: 强暴强奸 | 代码: builtin.t_e644d759
+    /// 概念: 强暴强奸 | 代码: builtin.rape_rape
     强暴强奸,
     /// 概念: 侵害未成年 | 代码: builtin.abuse_of_minors
     侵害未成年,
@@ -685,15 +685,15 @@ pub enum Concept {
     轻水印,
     /// 概念: 轻松 | 代码: omw.01064148.n
     轻松,
-    /// 概念: 情妇小三 | 代码: builtin.t_0ea8744b
+    /// 概念: 情妇小三 | 代码: builtin.mistress_mistress
     情妇小三,
-    /// 概念: 情色武侠 | 代码: builtin.t_19110a0a
+    /// 概念: 情色武侠 | 代码: builtin.erotic_martial_arts
     情色武侠,
     /// 概念: 情绪标签 | 代码: builtin.emotion_tags
     情绪标签,
-    /// 概念: 情欲生理 | 代码: builtin.t_2fae80b7
+    /// 概念: 情欲生理 | 代码: builtin.erotic_physiology
     情欲生理,
-    /// 概念: 情欲生理细分 | 代码: builtin.t_d5a4544a
+    /// 概念: 情欲生理细分 | 代码: builtin.physiological_breakdown_of_desire
     情欲生理细分,
     /// 概念: 秋季金黄 | 代码: builtin.autumn_golden
     秋季金黄,
@@ -709,9 +709,9 @@ pub enum Concept {
     全身,
     /// 概念: 群交 | 代码: builtin.t_c2fc297d
     群交,
-    /// 概念: 群体互动 | 代码: builtin.t_7f8ff3bf
+    /// 概念: 群体互动 | 代码: builtin.group_interaction
     群体互动,
-    /// 概念: 人妻美妇 | 代码: builtin.t_d7150193
+    /// 概念: 人妻美妇 | 代码: builtin.beautiful_married_woman
     人妻美妇,
     /// 概念: 人文 | 代码: omw.06153846.n
     人文,
@@ -723,7 +723,7 @@ pub enum Concept {
     人物主体,
     /// 概念: 人像写真 | 代码: builtin.portrait_photography
     人像写真,
-    /// 概念: 日本情色 | 代码: builtin.t_530d38ae
+    /// 概念: 日本情色 | 代码: builtin.japanese_erotica
     日本情色,
     /// 概念: 日光 | 代码: omw.11444038.n
     日光,
@@ -737,7 +737,7 @@ pub enum Concept {
     日志文件,
     /// 概念: 肉鸽 | 代码: builtin.roguelike
     肉鸽,
-    /// 概念: 辱骂 | 代码: omw.00419908.n
+    /// 概念: 辱骂 | 代码: builtin.abuse
     辱骂,
     /// 概念: 软件性质 | 代码: builtin.software_nature
     软件性质,
@@ -759,11 +759,11 @@ pub enum Concept {
     色情细分,
     /// 概念: 删减版 | 代码: builtin.abridged_version
     删减版,
-    /// 概念: 商业涉黄 | 代码: builtin.t_bf25df0e
+    /// 概念: 商业涉黄 | 代码: builtin.commercial_pornography
     商业涉黄,
     /// 概念: 商业志 | 代码: builtin.business_journal
     商业志,
-    /// 概念: 少妇熟女 | 代码: builtin.t_3fb12bde
+    /// 概念: 少妇熟女 | 代码: builtin.young_mature_woman
     少妇熟女,
     /// 概念: 少年漫 | 代码: builtin.shounen_comics
     少年漫,
@@ -827,7 +827,7 @@ pub enum Concept {
     手机,
     /// 概念: 手写笔记 | 代码: builtin.handwritten_notes
     手写笔记,
-    /// 概念: 叔侄 | 代码: builtin.t_465f93c2
+    /// 概念: 叔侄 | 代码: builtin.uncle_and_nephew
     叔侄,
     /// 概念: 竖屏 | 代码: builtin.vertical_screen
     竖屏,
@@ -853,7 +853,7 @@ pub enum Concept {
     税务文件,
     /// 概念: 说唱 | 代码: builtin.rap
     说唱,
-    /// 概念: 司机工友 | 代码: builtin.t_3a63c6e9
+    /// 概念: 司机工友 | 代码: builtin.driver_coworker
     司机工友,
     /// 概念: 私房写真 | 代码: builtin.private_photo_shoot
     私房写真,
@@ -865,7 +865,7 @@ pub enum Concept {
     泰语,
     /// 概念: 特典 | 代码: builtin.special_offer
     特典,
-    /// 概念: 特定恋物 | 代码: builtin.t_3ef2a3dc
+    /// 概念: 特定恋物 | 代码: builtin.specific_fetish
     特定恋物,
     /// 概念: 特殊XP | 代码: builtin.special_xp
     特殊XP,
@@ -885,15 +885,15 @@ pub enum Concept {
     同人,
     /// 概念: 同人本 | 代码: builtin.doujinshi
     同人本,
-    /// 概念: 同事之间 | 代码: builtin.t_25e65344
+    /// 概念: 同事之间 | 代码: builtin.between_colleagues
     同事之间,
-    /// 概念: 同性情色 | 代码: builtin.t_2be83dfd
+    /// 概念: 同性情色 | 代码: builtin.homoerotic
     同性情色,
     /// 概念: 童话 | 代码: builtin.fairy_tale
     童话,
     /// 概念: 偷拍窥视 | 代码: builtin.covert_photography_and_peeping
     偷拍窥视,
-    /// 概念: 偷情出轨 | 代码: builtin.t_c54b48ea
+    /// 概念: 偷情出轨 | 代码: builtin.cheating
     偷情出轨,
     /// 概念: 投标文件 | 代码: builtin.bid_documents
     投标文件,
@@ -921,13 +921,13 @@ pub enum Concept {
     脱焦,
     /// 概念: 网络赌博 | 代码: builtin.online_gambling
     网络赌博,
-    /// 概念: 网络交友 | 代码: builtin.t_3102c0c7
+    /// 概念: 网络交友 | 代码: builtin.internet_dating
     网络交友,
     /// 概念: 网络下载 | 代码: builtin.web_downloads
     网络下载,
     /// 概念: 网页长截图 | 代码: builtin.long_screenshot_of_a_webpage
     网页长截图,
-    /// 概念: 忘年之乐 | 代码: builtin.t_09a8e081
+    /// 概念: 忘年之乐 | 代码: builtin.the_joy_of_forgetting_the_year
     忘年之乐,
     /// 概念: 微距 | 代码: builtin.macro
     微距,
@@ -971,9 +971,9 @@ pub enum Concept {
     文件用途,
     /// 概念: 文件质量 | 代码: builtin.document_quality
     文件质量,
-    /// 概念: 文学题材 | 代码: builtin.t_7df460c6
+    /// 概念: 文学题材 | 代码: builtin.literary_themes
     文学题材,
-    /// 概念: 文学题材细分 | 代码: builtin.t_85b0acf4
+    /// 概念: 文学题材细分 | 代码: builtin.literary_subject_breakdown
     文学题材细分,
     /// 概念: 文字密度 | 代码: builtin.text_density
     文字密度,
@@ -985,23 +985,23 @@ pub enum Concept {
     无水印,
     /// 概念: 无字图 | 代码: builtin.image_with_no_text
     无字图,
-    /// 概念: 午夜怪谈 | 代码: builtin.t_ddb125c3
+    /// 概念: 午夜怪谈 | 代码: builtin.midnight_stories
     午夜怪谈,
     /// 概念: 武侠 | 代码: builtin.martial_arts
     武侠,
-    /// 概念: 舞女 | 代码: hownet.clf.舞女
+    /// 概念: 舞女 | 代码: builtin.dancing_girl
     舞女,
     /// 概念: 物理 | 代码: omw.00842324.s
     物理,
     /// 概念: 西班牙语 | 代码: builtin.spanish
     西班牙语,
-    /// 概念: 西洋情色 | 代码: builtin.t_02d814bf
+    /// 概念: 西洋情色 | 代码: builtin.western_erotica
     西洋情色,
     /// 概念: 嘻哈 | 代码: builtin.hip_hop
     嘻哈,
     /// 概念: 洗钱黑产 | 代码: builtin.money_laundering_and_illegal_activities
     洗钱黑产,
-    /// 概念: 洗澡窥视 | 代码: builtin.t_88d1d746
+    /// 概念: 洗澡窥视 | 代码: builtin.bath_peeping
     洗澡窥视,
     /// 概念: 喜剧 | 代码: omw.07015510.n
     喜剧,
@@ -1025,19 +1025,19 @@ pub enum Concept {
     仙侠,
     /// 概念: 乡村 | 代码: omw.02050452.a
     乡村,
-    /// 概念: 乡间记趣 | 代码: builtin.t_2b293beb
+    /// 概念: 乡间记趣 | 代码: builtin.countryside_notes
     乡间记趣,
     /// 概念: 小说 | 代码: omw.06367879.n
     小说,
-    /// 概念: 小姨子 | 代码: omw.10603766.n
+    /// 概念: 小姨子 | 代码: builtin.sister_in_law
     小姨子,
-    /// 概念: 校花 | 代码: builtin.t_c31150e1
+    /// 概念: 校花 | 代码: builtin.school_beauty
     校花,
     /// 概念: 校园 | 代码: builtin.campus
     校园,
-    /// 概念: 校园师生 | 代码: builtin.t_2f02929a
+    /// 概念: 校园师生 | 代码: builtin.campus_teachers_and_students
     校园师生,
-    /// 概念: 校园师生细分 | 代码: builtin.t_1cf7de13
+    /// 概念: 校园师生细分 | 代码: builtin.campus_teachers_and_students_breakdown
     校园师生细分,
     /// 概念: 邪教组织 | 代码: builtin.cult_organizations
     邪教组织,
@@ -1047,13 +1047,13 @@ pub enum Concept {
     行驶证,
     /// 概念: 兴奋 | 代码: omw.14037011.n
     兴奋,
-    /// 概念: 性爱调教 | 代码: builtin.t_07e19996
+    /// 概念: 性爱调教 | 代码: builtin.sex_training
     性爱调教,
-    /// 概念: 性爱调教细分 | 代码: builtin.t_15c8a44e
+    /// 概念: 性爱调教细分 | 代码: builtin.sex_training_breakdown
     性爱调教细分,
-    /// 概念: 性奴隶 | 代码: builtin.t_9ec41f0b
+    /// 概念: 性奴隶 | 代码: builtin.sex_slave
     性奴隶,
-    /// 概念: 兄妹 | 代码: builtin.t_c406deda
+    /// 概念: 兄妹 | 代码: builtin.brother_and_sister
     兄妹,
     /// 概念: 修改版 | 代码: builtin.modified_version
     修改版,
@@ -1063,7 +1063,7 @@ pub enum Concept {
     虚焦,
     /// 概念: 悬疑 | 代码: builtin.suspense
     悬疑,
-    /// 概念: 学弟学妹 | 代码: builtin.t_07eaba86
+    /// 概念: 学弟学妹 | 代码: builtin.underclassmen
     学弟学妹,
     /// 概念: 学科领域 | 代码: builtin.subject_area
     学科领域,
@@ -1073,7 +1073,7 @@ pub enum Concept {
     学位证,
     /// 概念: 学习资料 | 代码: builtin.learning_materials
     学习资料,
-    /// 概念: 学长学姐 | 代码: builtin.t_5780742f
+    /// 概念: 学长学姐 | 代码: builtin.senior_senior_sister
     学长学姐,
     /// 概念: 血肉模糊 | 代码: builtin.a_bloody_mess
     血肉模糊,
@@ -1093,7 +1093,7 @@ pub enum Concept {
     压抑,
     /// 概念: 言情 | 代码: builtin.romance
     言情,
-    /// 概念: 颜射吞精 | 代码: builtin.t_8ca49225
+    /// 概念: 颜射吞精 | 代码: builtin.facial_cum_swallowing
     颜射吞精,
     /// 概念: 演示文稿 | 代码: builtin.presentation
     演示文稿,
@@ -1103,7 +1103,7 @@ pub enum Concept {
     养成,
     /// 概念: 摇滚 | 代码: omw.07064715.n
     摇滚,
-    /// 概念: 爷孙隔代 | 代码: builtin.t_25da9ed7
+    /// 概念: 爷孙隔代 | 代码: builtin.grandfather_and_grandson_separated_generations
     爷孙隔代,
     /// 概念: 页漫 | 代码: builtin.page_manga
     页漫,
@@ -1111,7 +1111,7 @@ pub enum Concept {
     夜景,
     /// 概念: 夜景照 | 代码: builtin.nighttime_photos
     夜景照,
-    /// 概念: 医生护士 | 代码: builtin.t_6a6134d7
+    /// 概念: 医生护士 | 代码: builtin.doctor_nurse
     医生护士,
     /// 概念: 医学影像 | 代码: builtin.medical_imaging
     医学影像,
@@ -1143,7 +1143,7 @@ pub enum Concept {
     银行回单,
     /// 概念: 银行卡 | 代码: builtin.bank_card
     银行卡,
-    /// 概念: 隐私盗摄 | 代码: builtin.t_58bf376d
+    /// 概念: 隐私盗摄 | 代码: builtin.privacy_camera
     隐私盗摄,
     /// 概念: 印地语 | 代码: builtin.hindi
     印地语,
@@ -1177,7 +1177,7 @@ pub enum Concept {
     游戏类型,
     /// 概念: 游戏平台 | 代码: builtin.game_platform
     游戏平台,
-    /// 概念: 游戏同人 | 代码: builtin.t_623becc3
+    /// 概念: 游戏同人 | 代码: builtin.game_fan
     游戏同人,
     /// 概念: 游戏娱乐 | 代码: builtin.gaming_entertainment
     游戏娱乐,
@@ -1199,7 +1199,7 @@ pub enum Concept {
     欲望,
     /// 概念: 原创 | 代码: builtin.original
     原创,
-    /// 概念: 援交嫖妓 | 代码: builtin.t_e1ee6456
+    /// 概念: 援交嫖妓 | 代码: builtin.paid_dating_and_prostitution
     援交嫖妓,
     /// 概念: 源代码 | 代码: builtin.source_code
     源代码,
@@ -1207,7 +1207,7 @@ pub enum Concept {
     源代码扩展名,
     /// 概念: 源代码细分 | 代码: builtin.source_code_segmentation
     源代码细分,
-    /// 概念: 岳父岳母 | 代码: builtin.t_e5dbba54
+    /// 概念: 岳父岳母 | 代码: builtin.father_in_law_and_mother_in_law
     岳父岳母,
     /// 概念: 越南语 | 代码: builtin.vietnamese
     越南语,
@@ -1237,13 +1237,13 @@ pub enum Concept {
     肢解碎尸,
     /// 概念: 职场 | 代码: builtin.workplace
     职场,
-    /// 概念: 职场社交 | 代码: builtin.t_fc0773fc
+    /// 概念: 职场社交 | 代码: builtin.workplace_social
     职场社交,
-    /// 概念: 职场社交细分 | 代码: builtin.t_b1261439
+    /// 概念: 职场社交细分 | 代码: builtin.workplace_social_segmentation
     职场社交细分,
-    /// 概念: 职业制服 | 代码: builtin.t_4f23e352
+    /// 概念: 职业制服 | 代码: builtin.professional_uniform
     职业制服,
-    /// 概念: 职业制服细分 | 代码: builtin.t_d875ad80
+    /// 概念: 职业制服细分 | 代码: builtin.professional_uniform_segmentation
     职业制服细分,
     /// 概念: 植物花草 | 代码: builtin.plants_and_flowers
     植物花草,
@@ -1263,9 +1263,9 @@ pub enum Concept {
     中性黑白灰,
     /// 概念: 终端控制台截图 | 代码: builtin.screenshot_of_the_terminal_console
     终端控制台截图,
-    /// 概念: 重度猎奇 | 代码: builtin.severe_curiosity
+    /// 概念: 重度猎奇 | 代码: builtin.extreme_grotesque
     重度猎奇,
-    /// 概念: 重口变态 | 代码: builtin.t_49295e4a
+    /// 概念: 重口变态 | 代码: builtin.heavy_duty_pervert
     重口变态,
     /// 概念: 重口猎奇 | 代码: builtin.extreme_and_bizarre
     重口猎奇,
@@ -1309,13 +1309,13 @@ pub enum Concept {
     宗教极端,
     /// 概念: 棕色 | 代码: omw.00245112.s
     棕色,
-    /// 概念: 走光露底 | 代码: builtin.t_9da47788
+    /// 概念: 走光露底 | 代码: builtin.exposed
     走光露底,
     /// 概念: 走私贩私 | 代码: builtin.smugglers
     走私贩私,
     /// 概念: 罪恶感 | 代码: builtin.guilt
     罪恶感,
-    /// 概念: 左邻右舍 | 代码: omw.10352299.n
+    /// 概念: 左邻右舍 | 代码: builtin.neighbors
     左邻右舍,
     /// 概念: 作品来源 | 代码: builtin.source_of_work
     作品来源,
@@ -2073,14 +2073,14 @@ impl Concept {
             Concept::版面 => "builtin.layout",
             Concept::半肉 => "builtin.half_meat",
             Concept::半身 => "builtin.half_body",
-            Concept::伴侣交换 => "builtin.t_c4cd7a4d",
+            Concept::伴侣交换 => "builtin.partner_swap",
             Concept::帮助文档 => "builtin.help_documentation",
             Concept::薄码 => "builtin.light_mosaic",
             Concept::保函协议 => "builtin.letter_of_guarantee_agreement",
             Concept::报销凭证 => "builtin.reimbursement_vouchers",
-            Concept::暴恐 => "builtin.t_4af648b7",
+            Concept::暴恐 => "builtin.violence_terrorism",
             Concept::暴恐惨案 => "builtin.violent_terrorist_attacks",
-            Concept::暴力胁迫 => "builtin.t_824b52bc",
+            Concept::暴力胁迫 => "builtin.violent_coercion",
             Concept::暴乱动乱 => "builtin.riots_and_unrest",
             Concept::悲伤 => "omw.01364008.a",
             Concept::背德感 => "builtin.sense_of_immorality",
@@ -2093,7 +2093,7 @@ impl Concept {
             Concept::标记文档 => "builtin.marked_documents",
             Concept::标清480P => "builtin.sd_480p",
             Concept::表格 => "omw.06473563.n",
-            Concept::表亲姻亲 => "builtin.t_5b473127",
+            Concept::表亲姻亲 => "builtin.cousins_in_laws",
             Concept::表情包 => "builtin.emoticons",
             Concept::播放列表 => "builtin.playlist",
             Concept::播客 => "builtin.podcast",
@@ -2106,7 +2106,7 @@ impl Concept {
             Concept::超宽长条 => "builtin.extra_wide_strip",
             Concept::超清1080P => "builtin.ultra_hd_1080p",
             Concept::车牌 => "builtin.license_plate",
-            Concept::车震 => "hownet.clf.车震",
+            Concept::车震 => "builtin.car_shock",
             Concept::成人漫 => "builtin.adult_comics",
             Concept::城市建筑 => "builtin.urban_architecture",
             Concept::程序 => "builtin.executable_program",
@@ -2116,12 +2116,12 @@ impl Concept {
             Concept::宠物照 => "builtin.pet_photos",
             Concept::出版状态 => "builtin.publication_status",
             Concept::处理状态 => "builtin.processing_status",
-            Concept::处女情结 => "builtin.t_1b09c89b",
+            Concept::处女情结 => "builtin.virginity_complex",
             Concept::穿越 => "builtin.time_travel",
             Concept::传记 => "omw.06515827.n",
             Concept::创意项目 => "builtin.creative_projects",
             Concept::春季花景 => "builtin.spring_flower_scene",
-            Concept::纯洁恋情 => "builtin.t_06e0e511",
+            Concept::纯洁恋情 => "builtin.pure_love",
             Concept::纯肉 => "builtin.pure_meat",
             Concept::纯色背景 => "builtin.solid_color_background",
             Concept::纯文本 => "builtin.plain_text",
@@ -2130,21 +2130,21 @@ impl Concept {
             Concept::磁盘映像 => "builtin.disk_image",
             Concept::磁盘映像扩展名 => "builtin.disk_image_extensions",
             Concept::磁盘映像细分 => "builtin.disk_image_segmentation",
-            Concept::粗暴性爱 => "builtin.t_c9aeb234",
+            Concept::粗暴性爱 => "builtin.rough_sex",
             Concept::粗野性交 => "builtin.t_53c68b04",
             Concept::打码程度 => "builtin.coding_level",
-            Concept::大学生 => "omw.09936892.n",
+            Concept::大学生 => "builtin.college_student",
             Concept::代码截图 => "builtin.code_screenshot",
             Concept::待修订 => "builtin.to_be_revised",
             Concept::单人 => "builtin.single",
             Concept::单行本 => "builtin.separate_book",
             Concept::耽美 => "builtin.danmei",
-            Concept::当代都市 => "builtin.t_723a7b39",
+            Concept::当代都市 => "builtin.contemporary_city",
             Concept::德语 => "builtin.german",
             Concept::地理位置 => "builtin.geographical_location",
             Concept::地图导航截图 => "builtin.screenshot_of_map_navigation",
             Concept::低质量 => "builtin.low_quality",
-            Concept::滴蜡皮鞭 => "builtin.t_be458e7b",
+            Concept::滴蜡皮鞭 => "builtin.dripping_wax_whip",
             Concept::第一人称 => "builtin.first_person",
             Concept::颠覆政权 => "builtin.overthrow_the_government",
             Concept::电信诈骗 => "builtin.telecom_fraud",
@@ -2160,7 +2160,7 @@ impl Concept {
             Concept::动物宠物 => "builtin.animal_pets",
             Concept::动作 => "omw.00331950.n",
             Concept::都市 => "builtin.city",
-            Concept::都市生活 => "builtin.t_6e67e2a8",
+            Concept::都市生活 => "builtin.urban_life",
             Concept::抖动 => "omw.01888511.v",
             Concept::毒品交易 => "builtin.drug_trafficking",
             Concept::独立平台 => "builtin.independent_platform",
@@ -2168,13 +2168,13 @@ impl Concept {
             Concept::短视频 => "builtin.short_video",
             Concept::断头斩首 => "builtin.beheading",
             Concept::对账单 => "builtin.statement_of_account",
-            Concept::多伴侣聚会 => "builtin.t_28e8368d",
+            Concept::多伴侣聚会 => "builtin.multi_partner_gathering",
             Concept::多人合影 => "builtin.group_photo",
-            Concept::多人派对 => "builtin.t_1dbbb3dd",
-            Concept::多人群交 => "builtin.t_5884ad20",
-            Concept::多人群体细分 => "builtin.t_6db1c092",
-            Concept::多元取向 => "builtin.t_cc1c5091",
-            Concept::多元取向细分 => "builtin.t_b18db166",
+            Concept::多人派对 => "builtin.multi_person_party",
+            Concept::多人群交 => "builtin.group_sex",
+            Concept::多人群体细分 => "builtin.multi_person_group_segmentation",
+            Concept::多元取向 => "builtin.multiple_orientations",
+            Concept::多元取向细分 => "builtin.multiple_orientation_segmentation",
             Concept::俄语 => "builtin.russian",
             Concept::发票 => "omw.06516955.n",
             Concept::法语 => "builtin.french",
@@ -2184,22 +2184,22 @@ impl Concept {
             Concept::方向错误 => "builtin.wrong_direction",
             Concept::房产证 => "builtin.property_ownership_certificate",
             Concept::房屋居住 => "builtin.house_to_live_in",
-            Concept::非自愿侵犯 => "builtin.t_83dbd0ce",
-            Concept::非自愿侵犯细分 => "builtin.t_6089022e",
+            Concept::非自愿侵犯 => "builtin.involuntary_assault",
+            Concept::非自愿侵犯细分 => "builtin.involuntary_assault_breakdown",
             Concept::分裂国家 => "builtin.secession",
             Concept::粉色 => "builtin.pink",
             Concept::风景照 => "builtin.landscape_photos",
-            Concept::疯狂暴露 => "builtin.t_5d51bceb",
+            Concept::疯狂暴露 => "builtin.crazy_exposure",
             Concept::俯视 => "builtin.looking_down",
-            Concept::父女 => "builtin.t_28824b3d",
-            Concept::妇产科 => "builtin.t_f896913a",
+            Concept::父女 => "builtin.father_and_daughter",
+            Concept::妇产科 => "builtin.obstetrics_and_gynecology",
             Concept::复古胶片 => "builtin.vintage_film",
             Concept::感动 => "builtin.move",
-            Concept::肛交 => "hownet.clf.肛交",
+            Concept::肛交 => "builtin.anal_sex",
             Concept::高饱和鲜艳 => "builtin.highly_saturated_and_vivid",
             Concept::高清720P => "builtin.hd_720p",
             Concept::高质量 => "builtin.high_quality",
-            Concept::高中生 => "builtin.t_d5e7a7fb",
+            Concept::高中生 => "builtin.high_school_student",
             Concept::高ISO噪点 => "builtin.high_iso_noise",
             Concept::格斗 => "builtin.fighting_game",
             Concept::个人笔记 => "builtin.personal_notes",
@@ -2209,13 +2209,13 @@ impl Concept {
             Concept::工作文档 => "builtin.work_documents",
             Concept::工作证 => "builtin.employee_id_card",
             Concept::公版书 => "builtin.public_book",
-            Concept::公公媳妇 => "builtin.t_913f974d",
-            Concept::公共空间暴露 => "builtin.t_f38b90de",
+            Concept::公公媳妇 => "builtin.father_in_law_and_daughter_in_law",
+            Concept::公共空间暴露 => "builtin.public_space_exposure",
             Concept::公开 => "omw.01704761.a",
             Concept::构图不良 => "builtin.poor_composition",
-            Concept::姑侄 => "builtin.t_d3d3cfab",
+            Concept::姑侄 => "builtin.aunt_and_nephew",
             Concept::古典 => "builtin.classical_music",
-            Concept::古典情色 => "builtin.t_59884ae9",
+            Concept::古典情色 => "builtin.classical_erotica",
             Concept::古风 => "builtin.traditional_style_music",
             Concept::怪谈 => "builtin.weird_stories",
             Concept::官翻 => "builtin.official_translation",
@@ -2240,7 +2240,7 @@ impl Concept {
             Concept::后宫 => "builtin.harem",
             Concept::户口本 => "builtin.household_registration_book",
             Concept::户外活动 => "builtin.outdoor_activities",
-            Concept::户外露出 => "builtin.t_3a13f897",
+            Concept::户外露出 => "builtin.exposed_outdoors",
             Concept::护照 => "omw.06500937.n",
             Concept::化学 => "omw.06084469.n",
             Concept::画幅 => "builtin.frame",
@@ -2250,29 +2250,29 @@ impl Concept {
             Concept::欢乐 => "omw.07529377.n",
             Concept::环境建筑 => "builtin.environmental_architecture",
             Concept::缓存 => "builtin.cache",
-            Concept::换妻 => "hownet.clf.换妻",
+            Concept::换妻 => "builtin.wife_swapping",
             Concept::黄色 => "omw.00385756.s",
             Concept::灰色 => "omw.00289392.v",
             Concept::会议录像 => "builtin.meeting_video",
             Concept::会议录音 => "builtin.meeting_recording",
             Concept::绘画 => "builtin.painting",
             Concept::婚纱照 => "builtin.wedding_photos",
-            Concept::婚外情欲 => "builtin.t_bb77105c",
-            Concept::婚外情欲细分 => "builtin.t_05f0e054",
+            Concept::婚外情欲 => "builtin.extramarital_lust",
+            Concept::婚外情欲细分 => "builtin.extramarital_lust_breakdown",
             Concept::机翻 => "builtin.machine_translation",
             Concept::机密 => "omw.06673142.n",
             Concept::极端思潮 => "builtin.extremist_ideologies",
             Concept::计算机科学 => "omw.06128570.n",
             Concept::纪录 => "builtin.record",
             Concept::技术书籍 => "builtin.technical_books",
-            Concept::继父继母 => "builtin.t_22999444",
+            Concept::继父继母 => "builtin.stepfather_stepmother",
             Concept::加密压缩包 => "builtin.encrypted_compressed_package",
             Concept::家常饮食 => "builtin.home_cooked_meals",
             Concept::家居购物 => "builtin.home_shopping",
             Concept::家庭 => "omw.02940759.a",
-            Concept::家庭教师 => "omw.09931418.n",
-            Concept::家庭乱伦 => "builtin.t_e0f02d4c",
-            Concept::家庭乱伦细分 => "builtin.t_68e90791",
+            Concept::家庭教师 => "builtin.tutor",
+            Concept::家庭乱伦 => "builtin.family_incest",
+            Concept::家庭乱伦细分 => "builtin.family_incest_breakdown",
             Concept::家庭生活 => "builtin.family_life",
             Concept::家庭生活细分 => "builtin.family_life_segmentation",
             Concept::家庭医疗 => "builtin.family_medicine",
@@ -2285,7 +2285,7 @@ impl Concept {
             Concept::交响 => "builtin.symphonic_music",
             Concept::脚本 => "omw.06351613.n",
             Concept::教材 => "builtin.textbook",
-            Concept::教师学生 => "builtin.t_e2e59834",
+            Concept::教师学生 => "builtin.teacher_student",
             Concept::教学视频 => "builtin.instructional_video",
             Concept::教育 => "builtin.education",
             Concept::街机 => "builtin.arcade",
@@ -2293,11 +2293,11 @@ impl Concept {
             Concept::结婚证 => "builtin.marriage_certificate",
             Concept::截图 => "builtin.screenshot",
             Concept::截图细分 => "builtin.screenshot_breakdown",
-            Concept::姐弟 => "builtin.t_e2c09cb1",
+            Concept::姐弟 => "builtin.siblings",
             Concept::解谜 => "builtin.puzzle_mystery",
             Concept::金属 => "omw.01527420.a",
             Concept::紧张 => "omw.00025203.v",
-            Concept::近亲乱伦 => "builtin.t_4871fadf",
+            Concept::近亲乱伦 => "builtin.incest",
             Concept::经济学 => "omw.06149484.n",
             Concept::经营 => "omw.01095966.n",
             Concept::惊悚 => "builtin.thriller",
@@ -2314,20 +2314,20 @@ impl Concept {
             Concept::爵士 => "omw.03624767.n",
             Concept::科幻 => "builtin.science_fiction",
             Concept::科普 => "builtin.popular_science",
-            Concept::空姐 => "hownet.clf.空姐",
+            Concept::空姐 => "builtin.airline_stewardess",
             Concept::恐怖主义 => "builtin.terrorism",
             Concept::口交 => "omw.00854876.n",
             Concept::酷刑折磨 => "builtin.torture_and_cruel_treatment",
-            Concept::跨性别 => "builtin.t_541c3d28",
+            Concept::跨性别 => "builtin.transgender",
             Concept::快捷方式 => "builtin.shortcut",
-            Concept::窥视暴露 => "builtin.t_250e9caa",
-            Concept::窥视暴露细分 => "builtin.t_e73b4635",
+            Concept::窥视暴露 => "builtin.peeping_exposed",
+            Concept::窥视暴露细分 => "builtin.peep_exposed_segmentation",
             Concept::拉丁 => "builtin.latin_music",
             Concept::蓝调 => "builtin.blues_music",
             Concept::蓝色 => "omw.00378586-a",
             Concept::冷色调 => "builtin.cool_colors",
             Concept::历史 => "omw.02377418.a",
-            Concept::历史情色 => "builtin.t_f4a6b89e",
+            Concept::历史情色 => "builtin.historical_erotica",
             Concept::历史遗迹 => "builtin.historical_sites",
             Concept::连载中 => "builtin.serializing",
             Concept::恋爱 => "builtin.romance_dating_sim",
@@ -2344,61 +2344,61 @@ impl Concept {
             Concept::绿色 => "omw.03069937.a",
             Concept::绿色版 => "builtin.green_version",
             Concept::伦理 => "omw.02723563.a",
-            Concept::轮奸侵犯 => "builtin.t_1b93c517",
+            Concept::轮奸侵犯 => "builtin.gang_rape_assault",
             Concept::论文 => "omw.06269956.n",
             Concept::漫画 => "omw.06780069.n",
             Concept::漫画细分 => "builtin.comic_segmentation",
             Concept::冒险 => "omw.00065791.a",
-            Concept::美乳美腿 => "builtin.t_f987c45d",
+            Concept::美乳美腿 => "builtin.beautiful_breasts_and_legs",
             Concept::美食 => "builtin.gourmet_food",
-            Concept::迷奸下药 => "builtin.t_67f049e9",
+            Concept::迷奸下药 => "builtin.raped_and_drugged",
             Concept::密集排版 => "builtin.dense_typography",
             Concept::民谣 => "builtin.folk_acoustic",
             Concept::敏感内容 => "builtin.sensitive_content",
             Concept::模糊废片 => "builtin.blurry_unusable_photos",
-            Concept::模特车模 => "builtin.t_63e86361",
+            Concept::模特车模 => "builtin.mannequin_car_model",
             Concept::模型 => "omw.02979662.n",
             Concept::魔幻 => "builtin.magic",
-            Concept::母子 => "builtin.t_cc457b62",
-            Concept::男老师 => "builtin.t_c72581f1",
-            Concept::男上司 => "builtin.t_02fbd626",
-            Concept::男同耽美 => "builtin.t_2cda513f",
+            Concept::母子 => "builtin.mother_and_son",
+            Concept::男老师 => "builtin.male_teacher",
+            Concept::男上司 => "builtin.male_boss",
+            Concept::男同耽美 => "builtin.gay_beauty",
             Concept::内部 => "omw.00951831.s",
             Concept::内容标签 => "builtin.content_tags",
             Concept::内容尺度 => "builtin.content_scale",
             Concept::逆光死白 => "builtin.blown_out_highlights_in_backlighting",
-            Concept::女教师 => "builtin.t_502899b6",
-            Concept::女警 => "builtin.t_d28c2a04",
-            Concept::女老板 => "builtin.t_1ff47a9f",
-            Concept::女邻居 => "builtin.t_b5466230",
-            Concept::女秘书 => "builtin.t_5a772ba3",
-            Concept::女同百合 => "builtin.t_5cc60883",
-            Concept::女同学 => "builtin.t_11b905de",
-            Concept::女佣 => "omw.10282672.n",
+            Concept::女教师 => "builtin.female_teacher",
+            Concept::女警 => "builtin.policewoman",
+            Concept::女老板 => "builtin.female_boss",
+            Concept::女邻居 => "builtin.female_neighbor",
+            Concept::女秘书 => "builtin.female_secretary",
+            Concept::女同百合 => "builtin.lesbian_lily",
+            Concept::女同学 => "builtin.female_classmate",
+            Concept::女佣 => "builtin.maid",
             Concept::暖色调 => "builtin.warm_colors",
             Concept::偶像 => "omw.03560161.n",
             Concept::配置文件 => "builtin.configuration_file",
             Concept::朋克 => "builtin.punk",
             Concept::平视 => "builtin.eye_level",
-            Concept::婆媳 => "builtin.t_10d0aacd",
+            Concept::婆媳 => "builtin.mother_in_law_and_daughter_in_law",
             Concept::破解版 => "builtin.cracked_version",
             Concept::葡萄牙语 => "builtin.portuguese",
             Concept::曝光正常 => "builtin.exposure_is_normal",
-            Concept::奇幻科幻 => "builtin.t_12546ecb",
-            Concept::奇遇物语 => "builtin.t_d7beff9c",
+            Concept::奇幻科幻 => "builtin.fantasy_science_fiction",
+            Concept::奇遇物语 => "builtin.adventure_story",
             Concept::前端 => "omw.08573472.n",
             Concept::枪支弹药 => "builtin.firearms_and_ammunition",
-            Concept::强暴强奸 => "builtin.t_e644d759",
+            Concept::强暴强奸 => "builtin.rape_rape",
             Concept::侵害未成年 => "builtin.abuse_of_minors",
             Concept::青年漫 => "builtin.youth_comics",
             Concept::青色 => "builtin.blue",
             Concept::轻水印 => "builtin.light_watermark",
             Concept::轻松 => "omw.01064148.n",
-            Concept::情妇小三 => "builtin.t_0ea8744b",
-            Concept::情色武侠 => "builtin.t_19110a0a",
+            Concept::情妇小三 => "builtin.mistress_mistress",
+            Concept::情色武侠 => "builtin.erotic_martial_arts",
             Concept::情绪标签 => "builtin.emotion_tags",
-            Concept::情欲生理 => "builtin.t_2fae80b7",
-            Concept::情欲生理细分 => "builtin.t_d5a4544a",
+            Concept::情欲生理 => "builtin.erotic_physiology",
+            Concept::情欲生理细分 => "builtin.physiological_breakdown_of_desire",
             Concept::秋季金黄 => "builtin.autumn_golden",
             Concept::驱动 => "omw.01181559.v",
             Concept::全彩 => "builtin.full_color",
@@ -2406,21 +2406,21 @@ impl Concept {
             Concept::全年龄 => "builtin.all_ages",
             Concept::全身 => "builtin.whole_body",
             Concept::群交 => "builtin.t_c2fc297d",
-            Concept::群体互动 => "builtin.t_7f8ff3bf",
-            Concept::人妻美妇 => "builtin.t_d7150193",
+            Concept::群体互动 => "builtin.group_interaction",
+            Concept::人妻美妇 => "builtin.beautiful_married_woman",
             Concept::人文 => "omw.06153846.n",
             Concept::人文活动 => "builtin.humanistic_activities",
             Concept::人物照 => "builtin.portrait_photos",
             Concept::人物主体 => "builtin.character_subject",
             Concept::人像写真 => "builtin.portrait_photography",
-            Concept::日本情色 => "builtin.t_530d38ae",
+            Concept::日本情色 => "builtin.japanese_erotica",
             Concept::日光 => "omw.11444038.n",
             Concept::日落 => "builtin.sunset",
             Concept::日语 => "builtin.japanese",
             Concept::日志 => "omw.06402031.n",
             Concept::日志文件 => "builtin.log_files",
             Concept::肉鸽 => "builtin.roguelike",
-            Concept::辱骂 => "omw.00419908.n",
+            Concept::辱骂 => "builtin.abuse",
             Concept::软件性质 => "builtin.software_nature",
             Concept::软色情 => "builtin.soft_porn",
             Concept::赛博朋克 => "builtin.cyberpunk",
@@ -2431,9 +2431,9 @@ impl Concept {
             Concept::色情 => "builtin.pornography",
             Concept::色情细分 => "builtin.pornography_subgenres",
             Concept::删减版 => "builtin.abridged_version",
-            Concept::商业涉黄 => "builtin.t_bf25df0e",
+            Concept::商业涉黄 => "builtin.commercial_pornography",
             Concept::商业志 => "builtin.business_journal",
-            Concept::少妇熟女 => "builtin.t_3fb12bde",
+            Concept::少妇熟女 => "builtin.young_mature_woman",
             Concept::少年漫 => "builtin.shounen_comics",
             Concept::少女漫 => "builtin.girls_comics",
             Concept::设备导入 => "builtin.device_import",
@@ -2465,7 +2465,7 @@ impl Concept {
             Concept::手绘 => "builtin.hand_drawn",
             Concept::手机 => "builtin.cell_phone",
             Concept::手写笔记 => "builtin.handwritten_notes",
-            Concept::叔侄 => "builtin.t_465f93c2",
+            Concept::叔侄 => "builtin.uncle_and_nephew",
             Concept::竖屏 => "builtin.vertical_screen",
             Concept::数据备份 => "builtin.data_backup",
             Concept::数据镜像 => "builtin.data_mirroring",
@@ -2478,13 +2478,13 @@ impl Concept {
             Concept::水印程度 => "builtin.watermark_level",
             Concept::税务文件 => "builtin.tax_documents",
             Concept::说唱 => "builtin.rap",
-            Concept::司机工友 => "builtin.t_3a63c6e9",
+            Concept::司机工友 => "builtin.driver_coworker",
             Concept::私房写真 => "builtin.private_photo_shoot",
             Concept::四格漫 => "builtin.4_koma_manga",
             Concept::塔防 => "builtin.tower_defense",
             Concept::泰语 => "builtin.thai",
             Concept::特典 => "builtin.special_offer",
-            Concept::特定恋物 => "builtin.t_3ef2a3dc",
+            Concept::特定恋物 => "builtin.specific_fetish",
             Concept::特殊XP => "builtin.special_xp",
             Concept::特写 => "builtin.close_up",
             Concept::题材 => "builtin.theme",
@@ -2494,11 +2494,11 @@ impl Concept {
             Concept::通讯接收 => "builtin.communication_reception",
             Concept::同人 => "builtin.doujin",
             Concept::同人本 => "builtin.doujinshi",
-            Concept::同事之间 => "builtin.t_25e65344",
-            Concept::同性情色 => "builtin.t_2be83dfd",
+            Concept::同事之间 => "builtin.between_colleagues",
+            Concept::同性情色 => "builtin.homoerotic",
             Concept::童话 => "builtin.fairy_tale",
             Concept::偷拍窥视 => "builtin.covert_photography_and_peeping",
-            Concept::偷情出轨 => "builtin.t_c54b48ea",
+            Concept::偷情出轨 => "builtin.cheating",
             Concept::投标文件 => "builtin.bid_documents",
             Concept::透明背景 => "builtin.transparent_background",
             Concept::图标字体 => "builtin.icon_font",
@@ -2512,10 +2512,10 @@ impl Concept {
             Concept::推理 => "omw.01926089.s",
             Concept::脱焦 => "builtin.decoking",
             Concept::网络赌博 => "builtin.online_gambling",
-            Concept::网络交友 => "builtin.t_3102c0c7",
+            Concept::网络交友 => "builtin.internet_dating",
             Concept::网络下载 => "builtin.web_downloads",
             Concept::网页长截图 => "builtin.long_screenshot_of_a_webpage",
-            Concept::忘年之乐 => "builtin.t_09a8e081",
+            Concept::忘年之乐 => "builtin.the_joy_of_forgetting_the_year",
             Concept::微距 => "builtin.macro",
             Concept::微距摄影 => "builtin.macro_photography",
             Concept::微量文本 => "builtin.microtext",
@@ -2537,22 +2537,22 @@ impl Concept {
             Concept::文件类型 => "builtin.file_type",
             Concept::文件用途 => "builtin.file_purpose",
             Concept::文件质量 => "builtin.document_quality",
-            Concept::文学题材 => "builtin.t_7df460c6",
-            Concept::文学题材细分 => "builtin.t_85b0acf4",
+            Concept::文学题材 => "builtin.literary_themes",
+            Concept::文学题材细分 => "builtin.literary_subject_breakdown",
             Concept::文字密度 => "builtin.text_density",
             Concept::无码 => "builtin.uncensored",
             Concept::无人空镜 => "builtin.unmanned_aerial_mirror",
             Concept::无水印 => "builtin.no_watermark",
             Concept::无字图 => "builtin.image_with_no_text",
-            Concept::午夜怪谈 => "builtin.t_ddb125c3",
+            Concept::午夜怪谈 => "builtin.midnight_stories",
             Concept::武侠 => "builtin.martial_arts",
-            Concept::舞女 => "hownet.clf.舞女",
+            Concept::舞女 => "builtin.dancing_girl",
             Concept::物理 => "omw.00842324.s",
             Concept::西班牙语 => "builtin.spanish",
-            Concept::西洋情色 => "builtin.t_02d814bf",
+            Concept::西洋情色 => "builtin.western_erotica",
             Concept::嘻哈 => "builtin.hip_hop",
             Concept::洗钱黑产 => "builtin.money_laundering_and_illegal_activities",
-            Concept::洗澡窥视 => "builtin.t_88d1d746",
+            Concept::洗澡窥视 => "builtin.bath_peeping",
             Concept::喜剧 => "omw.07015510.n",
             Concept::系统报错截图 => "builtin.screenshot_of_the_system_error_message",
             Concept::系统镜像 => "builtin.system_image",
@@ -2564,31 +2564,31 @@ impl Concept {
             Concept::夏季绿荫 => "builtin.summer_shade",
             Concept::仙侠 => "builtin.xianxia",
             Concept::乡村 => "omw.02050452.a",
-            Concept::乡间记趣 => "builtin.t_2b293beb",
+            Concept::乡间记趣 => "builtin.countryside_notes",
             Concept::小说 => "omw.06367879.n",
-            Concept::小姨子 => "omw.10603766.n",
-            Concept::校花 => "builtin.t_c31150e1",
+            Concept::小姨子 => "builtin.sister_in_law",
+            Concept::校花 => "builtin.school_beauty",
             Concept::校园 => "builtin.campus",
-            Concept::校园师生 => "builtin.t_2f02929a",
-            Concept::校园师生细分 => "builtin.t_1cf7de13",
+            Concept::校园师生 => "builtin.campus_teachers_and_students",
+            Concept::校园师生细分 => "builtin.campus_teachers_and_students_breakdown",
             Concept::邪教组织 => "builtin.cult_organizations",
             Concept::写实拟真 => "builtin.realistic",
             Concept::行驶证 => "builtin.vehicle_registration_certificate",
             Concept::兴奋 => "omw.14037011.n",
-            Concept::性爱调教 => "builtin.t_07e19996",
-            Concept::性爱调教细分 => "builtin.t_15c8a44e",
-            Concept::性奴隶 => "builtin.t_9ec41f0b",
-            Concept::兄妹 => "builtin.t_c406deda",
+            Concept::性爱调教 => "builtin.sex_training",
+            Concept::性爱调教细分 => "builtin.sex_training_breakdown",
+            Concept::性奴隶 => "builtin.sex_slave",
+            Concept::兄妹 => "builtin.brother_and_sister",
             Concept::修改版 => "builtin.modified_version",
             Concept::羞耻 => "builtin.shame",
             Concept::虚焦 => "builtin.out_of_focus",
             Concept::悬疑 => "builtin.suspense",
-            Concept::学弟学妹 => "builtin.t_07eaba86",
+            Concept::学弟学妹 => "builtin.underclassmen",
             Concept::学科领域 => "builtin.subject_area",
             Concept::学术科研 => "builtin.academic_research",
             Concept::学位证 => "builtin.degree_certificate",
             Concept::学习资料 => "builtin.learning_materials",
-            Concept::学长学姐 => "builtin.t_5780742f",
+            Concept::学长学姐 => "builtin.senior_senior_sister",
             Concept::血肉模糊 => "builtin.a_bloody_mess",
             Concept::血腥 => "builtin.bloody",
             Concept::血腥虐杀 => "builtin.bloody_massacre",
@@ -2598,16 +2598,16 @@ impl Concept {
             Concept::压缩包细分 => "builtin.compressed_package_breakdown",
             Concept::压抑 => "omw.02423762.v",
             Concept::言情 => "builtin.romance",
-            Concept::颜射吞精 => "builtin.t_8ca49225",
+            Concept::颜射吞精 => "builtin.facial_cum_swallowing",
             Concept::演示文稿 => "builtin.presentation",
             Concept::仰视 => "builtin.look_up",
             Concept::养成 => "builtin.nurturing_raising_sim",
             Concept::摇滚 => "omw.07064715.n",
-            Concept::爷孙隔代 => "builtin.t_25da9ed7",
+            Concept::爷孙隔代 => "builtin.grandfather_and_grandson_separated_generations",
             Concept::页漫 => "builtin.page_manga",
             Concept::夜景 => "builtin.night_view",
             Concept::夜景照 => "builtin.nighttime_photos",
-            Concept::医生护士 => "builtin.t_6a6134d7",
+            Concept::医生护士 => "builtin.doctor_nurse",
             Concept::医学影像 => "builtin.medical_imaging",
             Concept::乙女 => "builtin.otome_game",
             Concept::已归档 => "builtin.archived",
@@ -2623,7 +2623,7 @@ impl Concept {
             Concept::音效 => "builtin.sound_effects",
             Concept::银行回单 => "builtin.bank_receipt",
             Concept::银行卡 => "builtin.bank_card",
-            Concept::隐私盗摄 => "builtin.t_58bf376d",
+            Concept::隐私盗摄 => "builtin.privacy_camera",
             Concept::印地语 => "builtin.hindi",
             Concept::应用数据 => "builtin.application_data",
             Concept::应用数据扩展名 => "builtin.application_data_extensions",
@@ -2640,7 +2640,7 @@ impl Concept {
             Concept::游戏截图 => "builtin.game_screenshots",
             Concept::游戏类型 => "builtin.game_type",
             Concept::游戏平台 => "builtin.game_platform",
-            Concept::游戏同人 => "builtin.t_623becc3",
+            Concept::游戏同人 => "builtin.game_fan",
             Concept::游戏娱乐 => "builtin.gaming_entertainment",
             Concept::有码 => "builtin.censored",
             Concept::有声书 => "builtin.audiobook",
@@ -2651,11 +2651,11 @@ impl Concept {
             Concept::语音备忘 => "builtin.voice_memo",
             Concept::欲望 => "omw.04945057.n",
             Concept::原创 => "builtin.original",
-            Concept::援交嫖妓 => "builtin.t_e1ee6456",
+            Concept::援交嫖妓 => "builtin.paid_dating_and_prostitution",
             Concept::源代码 => "builtin.source_code",
             Concept::源代码扩展名 => "builtin.source_code_extensions",
             Concept::源代码细分 => "builtin.source_code_segmentation",
-            Concept::岳父岳母 => "builtin.t_e5dbba54",
+            Concept::岳父岳母 => "builtin.father_in_law_and_mother_in_law",
             Concept::越南语 => "builtin.vietnamese",
             Concept::云同步 => "builtin.cloud_sync",
             Concept::运动抖动 => "builtin.motion_jitter",
@@ -2670,10 +2670,10 @@ impl Concept {
             Concept::支配 => "omw.02234087.v",
             Concept::肢解碎尸 => "builtin.dismemberment_and_dismantling_of_a_corpse",
             Concept::职场 => "builtin.workplace",
-            Concept::职场社交 => "builtin.t_fc0773fc",
-            Concept::职场社交细分 => "builtin.t_b1261439",
-            Concept::职业制服 => "builtin.t_4f23e352",
-            Concept::职业制服细分 => "builtin.t_d875ad80",
+            Concept::职场社交 => "builtin.workplace_social",
+            Concept::职场社交细分 => "builtin.workplace_social_segmentation",
+            Concept::职业制服 => "builtin.professional_uniform",
+            Concept::职业制服细分 => "builtin.professional_uniform_segmentation",
             Concept::植物花草 => "builtin.plants_and_flowers",
             Concept::治愈 => "omw.00081725.v",
             Concept::质感风格 => "builtin.texture_style",
@@ -2683,8 +2683,8 @@ impl Concept {
             Concept::中文字体 => "builtin.chinese_font",
             Concept::中性黑白灰 => "builtin.neutral_black_white_and_gray",
             Concept::终端控制台截图 => "builtin.screenshot_of_the_terminal_console",
-            Concept::重度猎奇 => "builtin.severe_curiosity",
-            Concept::重口变态 => "builtin.t_49295e4a",
+            Concept::重度猎奇 => "builtin.extreme_grotesque",
+            Concept::重口变态 => "builtin.heavy_duty_pervert",
             Concept::重口猎奇 => "builtin.extreme_and_bizarre",
             Concept::主妇 => "omw.10189776.n",
             Concept::主色调 => "builtin.main_color",
@@ -2706,10 +2706,10 @@ impl Concept {
             Concept::自慰高潮 => "builtin.orgasm_through_masturbation",
             Concept::宗教极端 => "builtin.religious_extremism",
             Concept::棕色 => "omw.00245112.s",
-            Concept::走光露底 => "builtin.t_9da47788",
+            Concept::走光露底 => "builtin.exposed",
             Concept::走私贩私 => "builtin.smugglers",
             Concept::罪恶感 => "builtin.guilt",
-            Concept::左邻右舍 => "omw.10352299.n",
+            Concept::左邻右舍 => "builtin.neighbors",
             Concept::作品来源 => "builtin.source_of_work",
             Concept::作者 => "builtin.author",
             Concept::aac => "builtin.aac",
@@ -5153,14 +5153,14 @@ impl Concept {
             "builtin.layout" => Some(Concept::版面),
             "builtin.half_meat" => Some(Concept::半肉),
             "builtin.half_body" => Some(Concept::半身),
-            "builtin.t_c4cd7a4d" => Some(Concept::伴侣交换),
+            "builtin.partner_swap" => Some(Concept::伴侣交换),
             "builtin.help_documentation" => Some(Concept::帮助文档),
             "builtin.light_mosaic" => Some(Concept::薄码),
             "builtin.letter_of_guarantee_agreement" => Some(Concept::保函协议),
             "builtin.reimbursement_vouchers" => Some(Concept::报销凭证),
-            "builtin.t_4af648b7" => Some(Concept::暴恐),
+            "builtin.violence_terrorism" => Some(Concept::暴恐),
             "builtin.violent_terrorist_attacks" => Some(Concept::暴恐惨案),
-            "builtin.t_824b52bc" => Some(Concept::暴力胁迫),
+            "builtin.violent_coercion" => Some(Concept::暴力胁迫),
             "builtin.riots_and_unrest" => Some(Concept::暴乱动乱),
             "omw.01364008.a" => Some(Concept::悲伤),
             "builtin.sense_of_immorality" => Some(Concept::背德感),
@@ -5173,7 +5173,7 @@ impl Concept {
             "builtin.marked_documents" => Some(Concept::标记文档),
             "builtin.sd_480p" => Some(Concept::标清480P),
             "omw.06473563.n" => Some(Concept::表格),
-            "builtin.t_5b473127" => Some(Concept::表亲姻亲),
+            "builtin.cousins_in_laws" => Some(Concept::表亲姻亲),
             "builtin.emoticons" => Some(Concept::表情包),
             "builtin.playlist" => Some(Concept::播放列表),
             "builtin.podcast" => Some(Concept::播客),
@@ -5186,7 +5186,7 @@ impl Concept {
             "builtin.extra_wide_strip" => Some(Concept::超宽长条),
             "builtin.ultra_hd_1080p" => Some(Concept::超清1080P),
             "builtin.license_plate" => Some(Concept::车牌),
-            "hownet.clf.车震" => Some(Concept::车震),
+            "builtin.car_shock" => Some(Concept::车震),
             "builtin.adult_comics" => Some(Concept::成人漫),
             "builtin.urban_architecture" => Some(Concept::城市建筑),
             "builtin.executable_program" => Some(Concept::程序),
@@ -5196,12 +5196,12 @@ impl Concept {
             "builtin.pet_photos" => Some(Concept::宠物照),
             "builtin.publication_status" => Some(Concept::出版状态),
             "builtin.processing_status" => Some(Concept::处理状态),
-            "builtin.t_1b09c89b" => Some(Concept::处女情结),
+            "builtin.virginity_complex" => Some(Concept::处女情结),
             "builtin.time_travel" => Some(Concept::穿越),
             "omw.06515827.n" => Some(Concept::传记),
             "builtin.creative_projects" => Some(Concept::创意项目),
             "builtin.spring_flower_scene" => Some(Concept::春季花景),
-            "builtin.t_06e0e511" => Some(Concept::纯洁恋情),
+            "builtin.pure_love" => Some(Concept::纯洁恋情),
             "builtin.pure_meat" => Some(Concept::纯肉),
             "builtin.solid_color_background" => Some(Concept::纯色背景),
             "builtin.plain_text" => Some(Concept::纯文本),
@@ -5210,21 +5210,21 @@ impl Concept {
             "builtin.disk_image" => Some(Concept::磁盘映像),
             "builtin.disk_image_extensions" => Some(Concept::磁盘映像扩展名),
             "builtin.disk_image_segmentation" => Some(Concept::磁盘映像细分),
-            "builtin.t_c9aeb234" => Some(Concept::粗暴性爱),
+            "builtin.rough_sex" => Some(Concept::粗暴性爱),
             "builtin.t_53c68b04" => Some(Concept::粗野性交),
             "builtin.coding_level" => Some(Concept::打码程度),
-            "omw.09936892.n" => Some(Concept::大学生),
+            "builtin.college_student" => Some(Concept::大学生),
             "builtin.code_screenshot" => Some(Concept::代码截图),
             "builtin.to_be_revised" => Some(Concept::待修订),
             "builtin.single" => Some(Concept::单人),
             "builtin.separate_book" => Some(Concept::单行本),
             "builtin.danmei" => Some(Concept::耽美),
-            "builtin.t_723a7b39" => Some(Concept::当代都市),
+            "builtin.contemporary_city" => Some(Concept::当代都市),
             "builtin.german" => Some(Concept::德语),
             "builtin.geographical_location" => Some(Concept::地理位置),
             "builtin.screenshot_of_map_navigation" => Some(Concept::地图导航截图),
             "builtin.low_quality" => Some(Concept::低质量),
-            "builtin.t_be458e7b" => Some(Concept::滴蜡皮鞭),
+            "builtin.dripping_wax_whip" => Some(Concept::滴蜡皮鞭),
             "builtin.first_person" => Some(Concept::第一人称),
             "builtin.overthrow_the_government" => Some(Concept::颠覆政权),
             "builtin.telecom_fraud" => Some(Concept::电信诈骗),
@@ -5240,7 +5240,7 @@ impl Concept {
             "builtin.animal_pets" => Some(Concept::动物宠物),
             "omw.00331950.n" => Some(Concept::动作),
             "builtin.city" => Some(Concept::都市),
-            "builtin.t_6e67e2a8" => Some(Concept::都市生活),
+            "builtin.urban_life" => Some(Concept::都市生活),
             "omw.01888511.v" => Some(Concept::抖动),
             "builtin.drug_trafficking" => Some(Concept::毒品交易),
             "builtin.independent_platform" => Some(Concept::独立平台),
@@ -5248,13 +5248,13 @@ impl Concept {
             "builtin.short_video" => Some(Concept::短视频),
             "builtin.beheading" => Some(Concept::断头斩首),
             "builtin.statement_of_account" => Some(Concept::对账单),
-            "builtin.t_28e8368d" => Some(Concept::多伴侣聚会),
+            "builtin.multi_partner_gathering" => Some(Concept::多伴侣聚会),
             "builtin.group_photo" => Some(Concept::多人合影),
-            "builtin.t_1dbbb3dd" => Some(Concept::多人派对),
-            "builtin.t_5884ad20" => Some(Concept::多人群交),
-            "builtin.t_6db1c092" => Some(Concept::多人群体细分),
-            "builtin.t_cc1c5091" => Some(Concept::多元取向),
-            "builtin.t_b18db166" => Some(Concept::多元取向细分),
+            "builtin.multi_person_party" => Some(Concept::多人派对),
+            "builtin.group_sex" => Some(Concept::多人群交),
+            "builtin.multi_person_group_segmentation" => Some(Concept::多人群体细分),
+            "builtin.multiple_orientations" => Some(Concept::多元取向),
+            "builtin.multiple_orientation_segmentation" => Some(Concept::多元取向细分),
             "builtin.russian" => Some(Concept::俄语),
             "omw.06516955.n" => Some(Concept::发票),
             "builtin.french" => Some(Concept::法语),
@@ -5264,22 +5264,22 @@ impl Concept {
             "builtin.wrong_direction" => Some(Concept::方向错误),
             "builtin.property_ownership_certificate" => Some(Concept::房产证),
             "builtin.house_to_live_in" => Some(Concept::房屋居住),
-            "builtin.t_83dbd0ce" => Some(Concept::非自愿侵犯),
-            "builtin.t_6089022e" => Some(Concept::非自愿侵犯细分),
+            "builtin.involuntary_assault" => Some(Concept::非自愿侵犯),
+            "builtin.involuntary_assault_breakdown" => Some(Concept::非自愿侵犯细分),
             "builtin.secession" => Some(Concept::分裂国家),
             "builtin.pink" => Some(Concept::粉色),
             "builtin.landscape_photos" => Some(Concept::风景照),
-            "builtin.t_5d51bceb" => Some(Concept::疯狂暴露),
+            "builtin.crazy_exposure" => Some(Concept::疯狂暴露),
             "builtin.looking_down" => Some(Concept::俯视),
-            "builtin.t_28824b3d" => Some(Concept::父女),
-            "builtin.t_f896913a" => Some(Concept::妇产科),
+            "builtin.father_and_daughter" => Some(Concept::父女),
+            "builtin.obstetrics_and_gynecology" => Some(Concept::妇产科),
             "builtin.vintage_film" => Some(Concept::复古胶片),
             "builtin.move" => Some(Concept::感动),
-            "hownet.clf.肛交" => Some(Concept::肛交),
+            "builtin.anal_sex" => Some(Concept::肛交),
             "builtin.highly_saturated_and_vivid" => Some(Concept::高饱和鲜艳),
             "builtin.hd_720p" => Some(Concept::高清720P),
             "builtin.high_quality" => Some(Concept::高质量),
-            "builtin.t_d5e7a7fb" => Some(Concept::高中生),
+            "builtin.high_school_student" => Some(Concept::高中生),
             "builtin.high_iso_noise" => Some(Concept::高ISO噪点),
             "builtin.fighting_game" => Some(Concept::格斗),
             "builtin.personal_notes" => Some(Concept::个人笔记),
@@ -5289,13 +5289,13 @@ impl Concept {
             "builtin.work_documents" => Some(Concept::工作文档),
             "builtin.employee_id_card" => Some(Concept::工作证),
             "builtin.public_book" => Some(Concept::公版书),
-            "builtin.t_913f974d" => Some(Concept::公公媳妇),
-            "builtin.t_f38b90de" => Some(Concept::公共空间暴露),
+            "builtin.father_in_law_and_daughter_in_law" => Some(Concept::公公媳妇),
+            "builtin.public_space_exposure" => Some(Concept::公共空间暴露),
             "omw.01704761.a" => Some(Concept::公开),
             "builtin.poor_composition" => Some(Concept::构图不良),
-            "builtin.t_d3d3cfab" => Some(Concept::姑侄),
+            "builtin.aunt_and_nephew" => Some(Concept::姑侄),
             "builtin.classical_music" => Some(Concept::古典),
-            "builtin.t_59884ae9" => Some(Concept::古典情色),
+            "builtin.classical_erotica" => Some(Concept::古典情色),
             "builtin.traditional_style_music" => Some(Concept::古风),
             "builtin.weird_stories" => Some(Concept::怪谈),
             "builtin.official_translation" => Some(Concept::官翻),
@@ -5320,7 +5320,7 @@ impl Concept {
             "builtin.harem" => Some(Concept::后宫),
             "builtin.household_registration_book" => Some(Concept::户口本),
             "builtin.outdoor_activities" => Some(Concept::户外活动),
-            "builtin.t_3a13f897" => Some(Concept::户外露出),
+            "builtin.exposed_outdoors" => Some(Concept::户外露出),
             "omw.06500937.n" => Some(Concept::护照),
             "omw.06084469.n" => Some(Concept::化学),
             "builtin.frame" => Some(Concept::画幅),
@@ -5330,29 +5330,29 @@ impl Concept {
             "omw.07529377.n" => Some(Concept::欢乐),
             "builtin.environmental_architecture" => Some(Concept::环境建筑),
             "builtin.cache" => Some(Concept::缓存),
-            "hownet.clf.换妻" => Some(Concept::换妻),
+            "builtin.wife_swapping" => Some(Concept::换妻),
             "omw.00385756.s" => Some(Concept::黄色),
             "omw.00289392.v" => Some(Concept::灰色),
             "builtin.meeting_video" => Some(Concept::会议录像),
             "builtin.meeting_recording" => Some(Concept::会议录音),
             "builtin.painting" => Some(Concept::绘画),
             "builtin.wedding_photos" => Some(Concept::婚纱照),
-            "builtin.t_bb77105c" => Some(Concept::婚外情欲),
-            "builtin.t_05f0e054" => Some(Concept::婚外情欲细分),
+            "builtin.extramarital_lust" => Some(Concept::婚外情欲),
+            "builtin.extramarital_lust_breakdown" => Some(Concept::婚外情欲细分),
             "builtin.machine_translation" => Some(Concept::机翻),
             "omw.06673142.n" => Some(Concept::机密),
             "builtin.extremist_ideologies" => Some(Concept::极端思潮),
             "omw.06128570.n" => Some(Concept::计算机科学),
             "builtin.record" => Some(Concept::纪录),
             "builtin.technical_books" => Some(Concept::技术书籍),
-            "builtin.t_22999444" => Some(Concept::继父继母),
+            "builtin.stepfather_stepmother" => Some(Concept::继父继母),
             "builtin.encrypted_compressed_package" => Some(Concept::加密压缩包),
             "builtin.home_cooked_meals" => Some(Concept::家常饮食),
             "builtin.home_shopping" => Some(Concept::家居购物),
             "omw.02940759.a" => Some(Concept::家庭),
-            "omw.09931418.n" => Some(Concept::家庭教师),
-            "builtin.t_e0f02d4c" => Some(Concept::家庭乱伦),
-            "builtin.t_68e90791" => Some(Concept::家庭乱伦细分),
+            "builtin.tutor" => Some(Concept::家庭教师),
+            "builtin.family_incest" => Some(Concept::家庭乱伦),
+            "builtin.family_incest_breakdown" => Some(Concept::家庭乱伦细分),
             "builtin.family_life" => Some(Concept::家庭生活),
             "builtin.family_life_segmentation" => Some(Concept::家庭生活细分),
             "builtin.family_medicine" => Some(Concept::家庭医疗),
@@ -5365,7 +5365,7 @@ impl Concept {
             "builtin.symphonic_music" => Some(Concept::交响),
             "omw.06351613.n" => Some(Concept::脚本),
             "builtin.textbook" => Some(Concept::教材),
-            "builtin.t_e2e59834" => Some(Concept::教师学生),
+            "builtin.teacher_student" => Some(Concept::教师学生),
             "builtin.instructional_video" => Some(Concept::教学视频),
             "builtin.education" => Some(Concept::教育),
             "builtin.arcade" => Some(Concept::街机),
@@ -5373,11 +5373,11 @@ impl Concept {
             "builtin.marriage_certificate" => Some(Concept::结婚证),
             "builtin.screenshot" => Some(Concept::截图),
             "builtin.screenshot_breakdown" => Some(Concept::截图细分),
-            "builtin.t_e2c09cb1" => Some(Concept::姐弟),
+            "builtin.siblings" => Some(Concept::姐弟),
             "builtin.puzzle_mystery" => Some(Concept::解谜),
             "omw.01527420.a" => Some(Concept::金属),
             "omw.00025203.v" => Some(Concept::紧张),
-            "builtin.t_4871fadf" => Some(Concept::近亲乱伦),
+            "builtin.incest" => Some(Concept::近亲乱伦),
             "omw.06149484.n" => Some(Concept::经济学),
             "omw.01095966.n" => Some(Concept::经营),
             "builtin.thriller" => Some(Concept::惊悚),
@@ -5394,20 +5394,20 @@ impl Concept {
             "omw.03624767.n" => Some(Concept::爵士),
             "builtin.science_fiction" => Some(Concept::科幻),
             "builtin.popular_science" => Some(Concept::科普),
-            "hownet.clf.空姐" => Some(Concept::空姐),
+            "builtin.airline_stewardess" => Some(Concept::空姐),
             "builtin.terrorism" => Some(Concept::恐怖主义),
             "omw.00854876.n" => Some(Concept::口交),
             "builtin.torture_and_cruel_treatment" => Some(Concept::酷刑折磨),
-            "builtin.t_541c3d28" => Some(Concept::跨性别),
+            "builtin.transgender" => Some(Concept::跨性别),
             "builtin.shortcut" => Some(Concept::快捷方式),
-            "builtin.t_250e9caa" => Some(Concept::窥视暴露),
-            "builtin.t_e73b4635" => Some(Concept::窥视暴露细分),
+            "builtin.peeping_exposed" => Some(Concept::窥视暴露),
+            "builtin.peep_exposed_segmentation" => Some(Concept::窥视暴露细分),
             "builtin.latin_music" => Some(Concept::拉丁),
             "builtin.blues_music" => Some(Concept::蓝调),
             "omw.00378586-a" => Some(Concept::蓝色),
             "builtin.cool_colors" => Some(Concept::冷色调),
             "omw.02377418.a" => Some(Concept::历史),
-            "builtin.t_f4a6b89e" => Some(Concept::历史情色),
+            "builtin.historical_erotica" => Some(Concept::历史情色),
             "builtin.historical_sites" => Some(Concept::历史遗迹),
             "builtin.serializing" => Some(Concept::连载中),
             "builtin.romance_dating_sim" => Some(Concept::恋爱),
@@ -5424,61 +5424,61 @@ impl Concept {
             "omw.03069937.a" => Some(Concept::绿色),
             "builtin.green_version" => Some(Concept::绿色版),
             "omw.02723563.a" => Some(Concept::伦理),
-            "builtin.t_1b93c517" => Some(Concept::轮奸侵犯),
+            "builtin.gang_rape_assault" => Some(Concept::轮奸侵犯),
             "omw.06269956.n" => Some(Concept::论文),
             "omw.06780069.n" => Some(Concept::漫画),
             "builtin.comic_segmentation" => Some(Concept::漫画细分),
             "omw.00065791.a" => Some(Concept::冒险),
-            "builtin.t_f987c45d" => Some(Concept::美乳美腿),
+            "builtin.beautiful_breasts_and_legs" => Some(Concept::美乳美腿),
             "builtin.gourmet_food" => Some(Concept::美食),
-            "builtin.t_67f049e9" => Some(Concept::迷奸下药),
+            "builtin.raped_and_drugged" => Some(Concept::迷奸下药),
             "builtin.dense_typography" => Some(Concept::密集排版),
             "builtin.folk_acoustic" => Some(Concept::民谣),
             "builtin.sensitive_content" => Some(Concept::敏感内容),
             "builtin.blurry_unusable_photos" => Some(Concept::模糊废片),
-            "builtin.t_63e86361" => Some(Concept::模特车模),
+            "builtin.mannequin_car_model" => Some(Concept::模特车模),
             "omw.02979662.n" => Some(Concept::模型),
             "builtin.magic" => Some(Concept::魔幻),
-            "builtin.t_cc457b62" => Some(Concept::母子),
-            "builtin.t_c72581f1" => Some(Concept::男老师),
-            "builtin.t_02fbd626" => Some(Concept::男上司),
-            "builtin.t_2cda513f" => Some(Concept::男同耽美),
+            "builtin.mother_and_son" => Some(Concept::母子),
+            "builtin.male_teacher" => Some(Concept::男老师),
+            "builtin.male_boss" => Some(Concept::男上司),
+            "builtin.gay_beauty" => Some(Concept::男同耽美),
             "omw.00951831.s" => Some(Concept::内部),
             "builtin.content_tags" => Some(Concept::内容标签),
             "builtin.content_scale" => Some(Concept::内容尺度),
             "builtin.blown_out_highlights_in_backlighting" => Some(Concept::逆光死白),
-            "builtin.t_502899b6" => Some(Concept::女教师),
-            "builtin.t_d28c2a04" => Some(Concept::女警),
-            "builtin.t_1ff47a9f" => Some(Concept::女老板),
-            "builtin.t_b5466230" => Some(Concept::女邻居),
-            "builtin.t_5a772ba3" => Some(Concept::女秘书),
-            "builtin.t_5cc60883" => Some(Concept::女同百合),
-            "builtin.t_11b905de" => Some(Concept::女同学),
-            "omw.10282672.n" => Some(Concept::女佣),
+            "builtin.female_teacher" => Some(Concept::女教师),
+            "builtin.policewoman" => Some(Concept::女警),
+            "builtin.female_boss" => Some(Concept::女老板),
+            "builtin.female_neighbor" => Some(Concept::女邻居),
+            "builtin.female_secretary" => Some(Concept::女秘书),
+            "builtin.lesbian_lily" => Some(Concept::女同百合),
+            "builtin.female_classmate" => Some(Concept::女同学),
+            "builtin.maid" => Some(Concept::女佣),
             "builtin.warm_colors" => Some(Concept::暖色调),
             "omw.03560161.n" => Some(Concept::偶像),
             "builtin.configuration_file" => Some(Concept::配置文件),
             "builtin.punk" => Some(Concept::朋克),
             "builtin.eye_level" => Some(Concept::平视),
-            "builtin.t_10d0aacd" => Some(Concept::婆媳),
+            "builtin.mother_in_law_and_daughter_in_law" => Some(Concept::婆媳),
             "builtin.cracked_version" => Some(Concept::破解版),
             "builtin.portuguese" => Some(Concept::葡萄牙语),
             "builtin.exposure_is_normal" => Some(Concept::曝光正常),
-            "builtin.t_12546ecb" => Some(Concept::奇幻科幻),
-            "builtin.t_d7beff9c" => Some(Concept::奇遇物语),
+            "builtin.fantasy_science_fiction" => Some(Concept::奇幻科幻),
+            "builtin.adventure_story" => Some(Concept::奇遇物语),
             "omw.08573472.n" => Some(Concept::前端),
             "builtin.firearms_and_ammunition" => Some(Concept::枪支弹药),
-            "builtin.t_e644d759" => Some(Concept::强暴强奸),
+            "builtin.rape_rape" => Some(Concept::强暴强奸),
             "builtin.abuse_of_minors" => Some(Concept::侵害未成年),
             "builtin.youth_comics" => Some(Concept::青年漫),
             "builtin.blue" => Some(Concept::青色),
             "builtin.light_watermark" => Some(Concept::轻水印),
             "omw.01064148.n" => Some(Concept::轻松),
-            "builtin.t_0ea8744b" => Some(Concept::情妇小三),
-            "builtin.t_19110a0a" => Some(Concept::情色武侠),
+            "builtin.mistress_mistress" => Some(Concept::情妇小三),
+            "builtin.erotic_martial_arts" => Some(Concept::情色武侠),
             "builtin.emotion_tags" => Some(Concept::情绪标签),
-            "builtin.t_2fae80b7" => Some(Concept::情欲生理),
-            "builtin.t_d5a4544a" => Some(Concept::情欲生理细分),
+            "builtin.erotic_physiology" => Some(Concept::情欲生理),
+            "builtin.physiological_breakdown_of_desire" => Some(Concept::情欲生理细分),
             "builtin.autumn_golden" => Some(Concept::秋季金黄),
             "omw.01181559.v" => Some(Concept::驱动),
             "builtin.full_color" => Some(Concept::全彩),
@@ -5486,21 +5486,21 @@ impl Concept {
             "builtin.all_ages" => Some(Concept::全年龄),
             "builtin.whole_body" => Some(Concept::全身),
             "builtin.t_c2fc297d" => Some(Concept::群交),
-            "builtin.t_7f8ff3bf" => Some(Concept::群体互动),
-            "builtin.t_d7150193" => Some(Concept::人妻美妇),
+            "builtin.group_interaction" => Some(Concept::群体互动),
+            "builtin.beautiful_married_woman" => Some(Concept::人妻美妇),
             "omw.06153846.n" => Some(Concept::人文),
             "builtin.humanistic_activities" => Some(Concept::人文活动),
             "builtin.portrait_photos" => Some(Concept::人物照),
             "builtin.character_subject" => Some(Concept::人物主体),
             "builtin.portrait_photography" => Some(Concept::人像写真),
-            "builtin.t_530d38ae" => Some(Concept::日本情色),
+            "builtin.japanese_erotica" => Some(Concept::日本情色),
             "omw.11444038.n" => Some(Concept::日光),
             "builtin.sunset" => Some(Concept::日落),
             "builtin.japanese" => Some(Concept::日语),
             "omw.06402031.n" => Some(Concept::日志),
             "builtin.log_files" => Some(Concept::日志文件),
             "builtin.roguelike" => Some(Concept::肉鸽),
-            "omw.00419908.n" => Some(Concept::辱骂),
+            "builtin.abuse" => Some(Concept::辱骂),
             "builtin.software_nature" => Some(Concept::软件性质),
             "builtin.soft_porn" => Some(Concept::软色情),
             "builtin.cyberpunk" => Some(Concept::赛博朋克),
@@ -5511,9 +5511,9 @@ impl Concept {
             "builtin.pornography" => Some(Concept::色情),
             "builtin.pornography_subgenres" => Some(Concept::色情细分),
             "builtin.abridged_version" => Some(Concept::删减版),
-            "builtin.t_bf25df0e" => Some(Concept::商业涉黄),
+            "builtin.commercial_pornography" => Some(Concept::商业涉黄),
             "builtin.business_journal" => Some(Concept::商业志),
-            "builtin.t_3fb12bde" => Some(Concept::少妇熟女),
+            "builtin.young_mature_woman" => Some(Concept::少妇熟女),
             "builtin.shounen_comics" => Some(Concept::少年漫),
             "builtin.girls_comics" => Some(Concept::少女漫),
             "builtin.device_import" => Some(Concept::设备导入),
@@ -5545,7 +5545,7 @@ impl Concept {
             "builtin.hand_drawn" => Some(Concept::手绘),
             "builtin.cell_phone" => Some(Concept::手机),
             "builtin.handwritten_notes" => Some(Concept::手写笔记),
-            "builtin.t_465f93c2" => Some(Concept::叔侄),
+            "builtin.uncle_and_nephew" => Some(Concept::叔侄),
             "builtin.vertical_screen" => Some(Concept::竖屏),
             "builtin.data_backup" => Some(Concept::数据备份),
             "builtin.data_mirroring" => Some(Concept::数据镜像),
@@ -5558,13 +5558,13 @@ impl Concept {
             "builtin.watermark_level" => Some(Concept::水印程度),
             "builtin.tax_documents" => Some(Concept::税务文件),
             "builtin.rap" => Some(Concept::说唱),
-            "builtin.t_3a63c6e9" => Some(Concept::司机工友),
+            "builtin.driver_coworker" => Some(Concept::司机工友),
             "builtin.private_photo_shoot" => Some(Concept::私房写真),
             "builtin.4_koma_manga" => Some(Concept::四格漫),
             "builtin.tower_defense" => Some(Concept::塔防),
             "builtin.thai" => Some(Concept::泰语),
             "builtin.special_offer" => Some(Concept::特典),
-            "builtin.t_3ef2a3dc" => Some(Concept::特定恋物),
+            "builtin.specific_fetish" => Some(Concept::特定恋物),
             "builtin.special_xp" => Some(Concept::特殊XP),
             "builtin.close_up" => Some(Concept::特写),
             "builtin.theme" => Some(Concept::题材),
@@ -5574,11 +5574,11 @@ impl Concept {
             "builtin.communication_reception" => Some(Concept::通讯接收),
             "builtin.doujin" => Some(Concept::同人),
             "builtin.doujinshi" => Some(Concept::同人本),
-            "builtin.t_25e65344" => Some(Concept::同事之间),
-            "builtin.t_2be83dfd" => Some(Concept::同性情色),
+            "builtin.between_colleagues" => Some(Concept::同事之间),
+            "builtin.homoerotic" => Some(Concept::同性情色),
             "builtin.fairy_tale" => Some(Concept::童话),
             "builtin.covert_photography_and_peeping" => Some(Concept::偷拍窥视),
-            "builtin.t_c54b48ea" => Some(Concept::偷情出轨),
+            "builtin.cheating" => Some(Concept::偷情出轨),
             "builtin.bid_documents" => Some(Concept::投标文件),
             "builtin.transparent_background" => Some(Concept::透明背景),
             "builtin.icon_font" => Some(Concept::图标字体),
@@ -5592,10 +5592,10 @@ impl Concept {
             "omw.01926089.s" => Some(Concept::推理),
             "builtin.decoking" => Some(Concept::脱焦),
             "builtin.online_gambling" => Some(Concept::网络赌博),
-            "builtin.t_3102c0c7" => Some(Concept::网络交友),
+            "builtin.internet_dating" => Some(Concept::网络交友),
             "builtin.web_downloads" => Some(Concept::网络下载),
             "builtin.long_screenshot_of_a_webpage" => Some(Concept::网页长截图),
-            "builtin.t_09a8e081" => Some(Concept::忘年之乐),
+            "builtin.the_joy_of_forgetting_the_year" => Some(Concept::忘年之乐),
             "builtin.macro" => Some(Concept::微距),
             "builtin.macro_photography" => Some(Concept::微距摄影),
             "builtin.microtext" => Some(Concept::微量文本),
@@ -5617,22 +5617,22 @@ impl Concept {
             "builtin.file_type" => Some(Concept::文件类型),
             "builtin.file_purpose" => Some(Concept::文件用途),
             "builtin.document_quality" => Some(Concept::文件质量),
-            "builtin.t_7df460c6" => Some(Concept::文学题材),
-            "builtin.t_85b0acf4" => Some(Concept::文学题材细分),
+            "builtin.literary_themes" => Some(Concept::文学题材),
+            "builtin.literary_subject_breakdown" => Some(Concept::文学题材细分),
             "builtin.text_density" => Some(Concept::文字密度),
             "builtin.uncensored" => Some(Concept::无码),
             "builtin.unmanned_aerial_mirror" => Some(Concept::无人空镜),
             "builtin.no_watermark" => Some(Concept::无水印),
             "builtin.image_with_no_text" => Some(Concept::无字图),
-            "builtin.t_ddb125c3" => Some(Concept::午夜怪谈),
+            "builtin.midnight_stories" => Some(Concept::午夜怪谈),
             "builtin.martial_arts" => Some(Concept::武侠),
-            "hownet.clf.舞女" => Some(Concept::舞女),
+            "builtin.dancing_girl" => Some(Concept::舞女),
             "omw.00842324.s" => Some(Concept::物理),
             "builtin.spanish" => Some(Concept::西班牙语),
-            "builtin.t_02d814bf" => Some(Concept::西洋情色),
+            "builtin.western_erotica" => Some(Concept::西洋情色),
             "builtin.hip_hop" => Some(Concept::嘻哈),
             "builtin.money_laundering_and_illegal_activities" => Some(Concept::洗钱黑产),
-            "builtin.t_88d1d746" => Some(Concept::洗澡窥视),
+            "builtin.bath_peeping" => Some(Concept::洗澡窥视),
             "omw.07015510.n" => Some(Concept::喜剧),
             "builtin.screenshot_of_the_system_error_message" => Some(Concept::系统报错截图),
             "builtin.system_image" => Some(Concept::系统镜像),
@@ -5644,31 +5644,31 @@ impl Concept {
             "builtin.summer_shade" => Some(Concept::夏季绿荫),
             "builtin.xianxia" => Some(Concept::仙侠),
             "omw.02050452.a" => Some(Concept::乡村),
-            "builtin.t_2b293beb" => Some(Concept::乡间记趣),
+            "builtin.countryside_notes" => Some(Concept::乡间记趣),
             "omw.06367879.n" => Some(Concept::小说),
-            "omw.10603766.n" => Some(Concept::小姨子),
-            "builtin.t_c31150e1" => Some(Concept::校花),
+            "builtin.sister_in_law" => Some(Concept::小姨子),
+            "builtin.school_beauty" => Some(Concept::校花),
             "builtin.campus" => Some(Concept::校园),
-            "builtin.t_2f02929a" => Some(Concept::校园师生),
-            "builtin.t_1cf7de13" => Some(Concept::校园师生细分),
+            "builtin.campus_teachers_and_students" => Some(Concept::校园师生),
+            "builtin.campus_teachers_and_students_breakdown" => Some(Concept::校园师生细分),
             "builtin.cult_organizations" => Some(Concept::邪教组织),
             "builtin.realistic" => Some(Concept::写实拟真),
             "builtin.vehicle_registration_certificate" => Some(Concept::行驶证),
             "omw.14037011.n" => Some(Concept::兴奋),
-            "builtin.t_07e19996" => Some(Concept::性爱调教),
-            "builtin.t_15c8a44e" => Some(Concept::性爱调教细分),
-            "builtin.t_9ec41f0b" => Some(Concept::性奴隶),
-            "builtin.t_c406deda" => Some(Concept::兄妹),
+            "builtin.sex_training" => Some(Concept::性爱调教),
+            "builtin.sex_training_breakdown" => Some(Concept::性爱调教细分),
+            "builtin.sex_slave" => Some(Concept::性奴隶),
+            "builtin.brother_and_sister" => Some(Concept::兄妹),
             "builtin.modified_version" => Some(Concept::修改版),
             "builtin.shame" => Some(Concept::羞耻),
             "builtin.out_of_focus" => Some(Concept::虚焦),
             "builtin.suspense" => Some(Concept::悬疑),
-            "builtin.t_07eaba86" => Some(Concept::学弟学妹),
+            "builtin.underclassmen" => Some(Concept::学弟学妹),
             "builtin.subject_area" => Some(Concept::学科领域),
             "builtin.academic_research" => Some(Concept::学术科研),
             "builtin.degree_certificate" => Some(Concept::学位证),
             "builtin.learning_materials" => Some(Concept::学习资料),
-            "builtin.t_5780742f" => Some(Concept::学长学姐),
+            "builtin.senior_senior_sister" => Some(Concept::学长学姐),
             "builtin.a_bloody_mess" => Some(Concept::血肉模糊),
             "builtin.bloody" => Some(Concept::血腥),
             "builtin.bloody_massacre" => Some(Concept::血腥虐杀),
@@ -5678,16 +5678,16 @@ impl Concept {
             "builtin.compressed_package_breakdown" => Some(Concept::压缩包细分),
             "omw.02423762.v" => Some(Concept::压抑),
             "builtin.romance" => Some(Concept::言情),
-            "builtin.t_8ca49225" => Some(Concept::颜射吞精),
+            "builtin.facial_cum_swallowing" => Some(Concept::颜射吞精),
             "builtin.presentation" => Some(Concept::演示文稿),
             "builtin.look_up" => Some(Concept::仰视),
             "builtin.nurturing_raising_sim" => Some(Concept::养成),
             "omw.07064715.n" => Some(Concept::摇滚),
-            "builtin.t_25da9ed7" => Some(Concept::爷孙隔代),
+            "builtin.grandfather_and_grandson_separated_generations" => Some(Concept::爷孙隔代),
             "builtin.page_manga" => Some(Concept::页漫),
             "builtin.night_view" => Some(Concept::夜景),
             "builtin.nighttime_photos" => Some(Concept::夜景照),
-            "builtin.t_6a6134d7" => Some(Concept::医生护士),
+            "builtin.doctor_nurse" => Some(Concept::医生护士),
             "builtin.medical_imaging" => Some(Concept::医学影像),
             "builtin.otome_game" => Some(Concept::乙女),
             "builtin.archived" => Some(Concept::已归档),
@@ -5702,7 +5702,7 @@ impl Concept {
             "builtin.sound_effects" => Some(Concept::音效),
             "builtin.bank_receipt" => Some(Concept::银行回单),
             "builtin.bank_card" => Some(Concept::银行卡),
-            "builtin.t_58bf376d" => Some(Concept::隐私盗摄),
+            "builtin.privacy_camera" => Some(Concept::隐私盗摄),
             "builtin.hindi" => Some(Concept::印地语),
             "builtin.application_data" => Some(Concept::应用数据),
             "builtin.application_data_extensions" => Some(Concept::应用数据扩展名),
@@ -5719,7 +5719,7 @@ impl Concept {
             "builtin.game_screenshots" => Some(Concept::游戏截图),
             "builtin.game_type" => Some(Concept::游戏类型),
             "builtin.game_platform" => Some(Concept::游戏平台),
-            "builtin.t_623becc3" => Some(Concept::游戏同人),
+            "builtin.game_fan" => Some(Concept::游戏同人),
             "builtin.gaming_entertainment" => Some(Concept::游戏娱乐),
             "builtin.censored" => Some(Concept::有码),
             "builtin.audiobook" => Some(Concept::有声书),
@@ -5730,11 +5730,11 @@ impl Concept {
             "builtin.voice_memo" => Some(Concept::语音备忘),
             "omw.04945057.n" => Some(Concept::欲望),
             "builtin.original" => Some(Concept::原创),
-            "builtin.t_e1ee6456" => Some(Concept::援交嫖妓),
+            "builtin.paid_dating_and_prostitution" => Some(Concept::援交嫖妓),
             "builtin.source_code" => Some(Concept::源代码),
             "builtin.source_code_extensions" => Some(Concept::源代码扩展名),
             "builtin.source_code_segmentation" => Some(Concept::源代码细分),
-            "builtin.t_e5dbba54" => Some(Concept::岳父岳母),
+            "builtin.father_in_law_and_mother_in_law" => Some(Concept::岳父岳母),
             "builtin.vietnamese" => Some(Concept::越南语),
             "builtin.cloud_sync" => Some(Concept::云同步),
             "builtin.motion_jitter" => Some(Concept::运动抖动),
@@ -5749,10 +5749,10 @@ impl Concept {
             "omw.02234087.v" => Some(Concept::支配),
             "builtin.dismemberment_and_dismantling_of_a_corpse" => Some(Concept::肢解碎尸),
             "builtin.workplace" => Some(Concept::职场),
-            "builtin.t_fc0773fc" => Some(Concept::职场社交),
-            "builtin.t_b1261439" => Some(Concept::职场社交细分),
-            "builtin.t_4f23e352" => Some(Concept::职业制服),
-            "builtin.t_d875ad80" => Some(Concept::职业制服细分),
+            "builtin.workplace_social" => Some(Concept::职场社交),
+            "builtin.workplace_social_segmentation" => Some(Concept::职场社交细分),
+            "builtin.professional_uniform" => Some(Concept::职业制服),
+            "builtin.professional_uniform_segmentation" => Some(Concept::职业制服细分),
             "builtin.plants_and_flowers" => Some(Concept::植物花草),
             "omw.00081725.v" => Some(Concept::治愈),
             "builtin.texture_style" => Some(Concept::质感风格),
@@ -5762,8 +5762,8 @@ impl Concept {
             "builtin.chinese_font" => Some(Concept::中文字体),
             "builtin.neutral_black_white_and_gray" => Some(Concept::中性黑白灰),
             "builtin.screenshot_of_the_terminal_console" => Some(Concept::终端控制台截图),
-            "builtin.severe_curiosity" => Some(Concept::重度猎奇),
-            "builtin.t_49295e4a" => Some(Concept::重口变态),
+            "builtin.extreme_grotesque" => Some(Concept::重度猎奇),
+            "builtin.heavy_duty_pervert" => Some(Concept::重口变态),
             "builtin.extreme_and_bizarre" => Some(Concept::重口猎奇),
             "omw.10189776.n" => Some(Concept::主妇),
             "builtin.main_color" => Some(Concept::主色调),
@@ -5785,10 +5785,10 @@ impl Concept {
             "builtin.orgasm_through_masturbation" => Some(Concept::自慰高潮),
             "builtin.religious_extremism" => Some(Concept::宗教极端),
             "omw.00245112.s" => Some(Concept::棕色),
-            "builtin.t_9da47788" => Some(Concept::走光露底),
+            "builtin.exposed" => Some(Concept::走光露底),
             "builtin.smugglers" => Some(Concept::走私贩私),
             "builtin.guilt" => Some(Concept::罪恶感),
-            "omw.10352299.n" => Some(Concept::左邻右舍),
+            "builtin.neighbors" => Some(Concept::左邻右舍),
             "builtin.source_of_work" => Some(Concept::作品来源),
             "builtin.author" => Some(Concept::作者),
             "builtin.aac" => Some(Concept::aac),

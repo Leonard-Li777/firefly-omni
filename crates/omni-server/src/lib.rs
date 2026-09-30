@@ -1599,6 +1599,16 @@ async fn perceive_file_handler(
         })
         .cloned()
         .collect();
+    let sem_graph = if is_pro { state.omw.semantic_graph() } else { None };
+    let enrich_tag = |tag: &mut omni_core::TagChainItem| {
+        if let Some(ref g) = sem_graph {
+            g.enrich_tag_chain_item(tag);
+        }
+    };
+    let mut gated_ram_tags = gated_ram_tags;
+    for r in &mut gated_ram_tags {
+        enrich_tag(r);
+    }
 
     // 4. 离线逆地理编码 (若元数据中含 GPS 坐标且开启了地理反查，Pro 专享)
     let mut geo_address = None;
@@ -1756,6 +1766,7 @@ async fn perceive_file_handler(
             if let Some(engine) = engine_name {
                 item.engine = Some(engine.to_string());
             }
+            enrich_tag(&mut item);
             structured_visual_tags.push(item);
         }
     }
@@ -1763,7 +1774,7 @@ async fn perceive_file_handler(
     // 7. 级联提示词合成 + CLIP 向量仲裁终局裁决 (Pro 专享，仅图片路径生效)
     // 注意：此处在 ram_tags 降级为 flat 前调用，以获取完整 TagChainItem 结构
     // (P3 来源对称：级联主体池同样只消费门禁后存活的 gated_ram_tags)
-    let (cascade_candidates, winning_hypothesis, activated_dimension_tags, smart_name, content_description, pruned_ambiguous_words) = if is_pro && is_image {
+    let (cascade_candidates, winning_hypothesis, activated_dimension_tags, _smart_name, _content_description, pruned_ambiguous_words) = if is_pro && is_image {
         omni_pro::OmniVisionEngine::synthesize_cascade_hypotheses_and_arbitrate(
             &file_path,
             &detected_visual_tags,
@@ -1904,9 +1915,10 @@ async fn perceive_file_handler(
         })
         .or(winning_hypothesis);
 
-    // 终局智能重命名与描述：优先取第三阶段双锚点交叉验证胜出者，平滑回退
-    let smart_name = fusion_outcome.smart_name.or(smart_name).or(text_smart_name);
-    let content_description = fusion_outcome.content_description.or(content_description).or_else(|| text_one_desc.clone());
+    // 终局智能重命名与描述：优先取第三阶段双锚点交叉验证胜出者 (Fusion 轨单轨出厂，PRD §7.1.4)
+    // 视觉内联旁路已退役，图片路径绝不回退至 text 5W 范畴错配
+    let smart_name = fusion_outcome.smart_name.or(if is_image { None } else { text_smart_name });
+    let content_description = fusion_outcome.content_description.or_else(|| if is_image { None } else { text_one_desc.clone() });
     
     // 置信度门限控制：低于 EXIT_CONFIDENCE_THRESHOLD 的候选标签严禁透出到接口返回结果中 (日志中已输出完整候选打分)
     structured_visual_tags.retain(|t| t.confidence >= EXIT_CONFIDENCE_THRESHOLD);

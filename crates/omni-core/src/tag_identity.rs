@@ -520,13 +520,13 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("性奴隶", "Sex slave"),
     ("调教拘束", "Training and Restraint"),
     ("粗暴性爱", "Rough sex"),
-    ("重口变态", "Heavy-duty pervert"),
+    ("重口变态", "Hardcore Perversion"),
     ("滴蜡皮鞭", "Dripping wax whip"),
     ("特定恋物", "Specific fetish"),
     ("疯狂暴露", "Crazy exposure"),
     ("公共空间暴露", "Public space exposure"),
     ("户外露出", "Exposed outdoors"),
-    ("车震", "Car shock"),
+    ("车震", "Car Sex"),
     ("偷拍窥视", "Covert Photography and Peeping"),
     ("covert photography and peeping", "Covert Photography and Peeping"),
     ("隐私盗摄", "Privacy camera"),
@@ -552,7 +552,7 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("肛交", "Anal sex"),
     ("anal sex", "Anal sex"),
     ("颜射吞精", "Facial cum swallowing"),
-    ("强暴强奸", "Rape rape"),
+    ("强暴强奸", "Rape and Sexual Assault"),
     ("迷奸下药", "Raped and drugged"),
     ("违背意愿", "Against one's will"),
     ("轮奸侵犯", "Gang rape assault"),
@@ -583,8 +583,14 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("特殊XP", "Special XP"),
     ("special xp", "Special XP"),
     ("special_xp", "Special XP"),
-    ("重度猎奇", "Severe curiosity"),
-    ("severe curiosity", "Severe curiosity"),
+    ("重度猎奇", "Extreme Grotesque"),
+    ("extreme grotesque", "Extreme Grotesque"),
+    ("severe curiosity", "Extreme Grotesque"),
+    ("car sex", "Car Sex"),
+    ("car shock", "Car Sex"),
+    ("rape and sexual assault", "Rape and Sexual Assault"),
+    ("rape rape", "Rape and Sexual Assault"),
+    ("hardcore perversion", "Hardcore Perversion"),
 ];
 
 use std::sync::RwLock;
@@ -1311,7 +1317,7 @@ mod tests {
         assert_eq!(resolve_controlled_tag_code("半肉"), Some("builtin.half_meat"));
         assert_eq!(resolve_controlled_tag_code("纯肉"), Some("builtin.pure_meat"));
         assert_eq!(resolve_controlled_tag_code("特殊XP"), Some("builtin.special_xp"));
-        assert_eq!(resolve_controlled_tag_code("重度猎奇"), Some("builtin.severe_curiosity"));
+        assert_eq!(resolve_controlled_tag_code("重度猎奇"), Some("builtin.extreme_grotesque"));
 
         // ─── 场景 5：高频英文视觉/文档候选词在中文环境下的受控两阶段反查与就地本地化 ───
         let outcome_portrait = resolve_controlled_tag_two_stage("portrait", Some("zh"));
