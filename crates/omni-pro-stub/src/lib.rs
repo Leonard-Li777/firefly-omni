@@ -773,8 +773,11 @@ pub mod text {
         pub embedding_dense: Vec<f32>,
         pub chunks: Vec<DocumentChunk>,
         pub duration_ms: u64,
+        #[serde(default)]
         pub bekko_embed_ms: u64,
+        #[serde(default)]
         pub keybert_ms: u64,
+        #[serde(default)]
         pub slot_summary_ms: u64,
     }
 
@@ -1104,8 +1107,18 @@ pub mod vector_engine {
     }
 }
 
+pub mod semantic_graph {
+    #[derive(Clone, Default)]
+    pub struct SemanticGraph;
+
+    impl SemanticGraph {
+        pub fn enrich_tag_chain_item(&self, _tag: &mut omni_core::TagChainItem) {}
+    }
+}
+
 pub mod omw_db {
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     #[derive(Clone)]
     pub struct OmwDb;
@@ -1119,6 +1132,13 @@ pub mod omw_db {
         }
         pub fn load_pack_bytes(&self, _pack_bytes: &[u8]) -> anyhow::Result<()> {
             anyhow::bail!("Open-core mode: omw requires omni-pro");
+        }
+        pub fn connect<P: AsRef<Path>>(&self, _path: P) -> anyhow::Result<()> {
+            anyhow::bail!("Open-core mode: omw requires omni-pro");
+        }
+        pub fn disconnect(&self) {}
+        pub fn semantic_graph(&self) -> Option<Arc<super::semantic_graph::SemanticGraph>> {
+            None
         }
         pub fn is_available(&self) -> bool {
             false
