@@ -52,10 +52,10 @@ fn create_test_sqlite_bytes() -> Vec<u8> {
         ) WITHOUT ROWID;
 
         CREATE TABLE omw_relations (
-            source_id TEXT NOT NULL,
-            target_id TEXT NOT NULL,
+            source_code TEXT NOT NULL,
+            target_code TEXT NOT NULL,
             rel_type TEXT NOT NULL,
-            PRIMARY KEY (source_id, target_id, rel_type)
+            PRIMARY KEY (source_code, target_code, rel_type)
         );
 
         INSERT INTO file_tags (code, name, parent_codes, source, sort_order) VALUES
@@ -78,7 +78,7 @@ fn create_test_sqlite_bytes() -> Vec<u8> {
             ('builtin.invoice', 'Invoice', 1, 1, 80),
             ('builtin.receipt', 'Receipt', 1, 1, 70);
 
-        INSERT INTO omw_relations (source_id, target_id, rel_type) VALUES
+        INSERT INTO omw_relations (source_code, target_code, rel_type) VALUES
             ('omw.00000001.n', 'omw.00000002.n', 'hypernym'),
             ('omw.00000002.n', 'omw.00000003.n', 'hypernym');"
     )
@@ -129,10 +129,10 @@ fn test_semantic_pack_pack_and_zero_disk_mount() {
     let mut stmt = conn
         .prepare(
             "WITH RECURSIVE hypernyms(id, level) AS (
-                SELECT target_id, 1 FROM omw_relations WHERE source_id = 'omw.00000001.n' AND rel_type = 'hypernym'
+                SELECT target_code, 1 FROM omw_relations WHERE source_code = 'omw.00000001.n' AND rel_type = 'hypernym'
                 UNION ALL
-                SELECT r.target_id, h.level + 1 FROM omw_relations r
-                JOIN hypernyms h ON r.source_id = h.id
+                SELECT r.target_code, h.level + 1 FROM omw_relations r
+                JOIN hypernyms h ON r.source_code = h.id
                 WHERE r.rel_type = 'hypernym' AND h.level < 64
             )
             SELECT id FROM hypernyms",

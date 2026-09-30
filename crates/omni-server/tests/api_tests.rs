@@ -59,8 +59,8 @@ fn create_omw_api_fixture(dir: &std::path::Path) -> (std::path::PathBuf, rusqlit
             meta TEXT NOT NULL DEFAULT '{}');
          CREATE TABLE omw_lexical_entries (id TEXT PRIMARY KEY, synset_id TEXT NOT NULL, \
             language TEXT NOT NULL, lemma TEXT NOT NULL, pos TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}');
-         CREATE TABLE omw_relations (source_id TEXT NOT NULL, target_id TEXT NOT NULL, \
-            rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_id, target_id, rel_type));
+         CREATE TABLE omw_relations (source_code TEXT NOT NULL, target_code TEXT NOT NULL, \
+            rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_code, target_code, rel_type));
          CREATE TABLE omw_sense_relations (source_entry_id TEXT NOT NULL, target_entry_id TEXT NOT NULL, \
             rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_entry_id, target_entry_id, rel_type));
          CREATE TABLE antonym_pairs (word_a TEXT NOT NULL, word_b TEXT NOT NULL, \
@@ -79,7 +79,7 @@ fn create_omw_api_fixture(dir: &std::path::Path) -> (std::path::PathBuf, rusqlit
             ('e2', 'o-dog.n', 'en', 'domestic dog', 'n'),
             ('e3', 'o-animal.n', 'en', 'animal', 'n'),
             ('e4', 'o-plant.n', 'en', 'plant', 'n');
-         INSERT INTO omw_relations (source_id, target_id, rel_type) VALUES
+         INSERT INTO omw_relations (source_code, target_code, rel_type) VALUES
             ('o-dog.n', 'o-animal.n', 'hypernym'),
             ('o-animal.n', 'o-organism.n', 'hypernym'),
             ('o-dog.n', 'o-animal.n', 'hyponym');
@@ -91,7 +91,10 @@ fn create_omw_api_fixture(dir: &std::path::Path) -> (std::path::PathBuf, rusqlit
             ('builtin.dog', '狗', '[\"omw.o-dog.n\", \"builtin.pet\"]', 'tag', 1),
             ('builtin.pet', '宠物', '[\"omw.o-dog.n\"]', 'tag', 2),
             ('builtin.cat', '猫', '[\"omw.o-dog.n\"]', 'tag', 3),
-            ('builtin.unrelated', '无关', '[]', 'tag', 4);",
+            ('builtin.unrelated', '无关', '[]', 'tag', 4),
+            ('o-dog.n', '狗', '[]', 'omw', 5),
+            ('o-animal.n', '动物', '[]', 'omw', 6),
+            ('o-organism.n', '生物', '[]', 'omw', 7);",
     )
     .unwrap();
     (path, conn)
@@ -1466,6 +1469,58 @@ async fn test_omw_hierarchy_walks_hypernym_chain() {
     let lemmas: Vec<&str> = nodes[0]["lemmas"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
     assert_eq!(lemmas, vec!["animal"]);
 }
+
+#[tokio::test]
+async fn test_omw_hierarchy_multi_parent_and_instance_hypernym() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, conn) = create_omw_api_fixture(dir.path());
+    conn.execute_batch(
+        "INSERT INTO omw_synsets (id, pos, lexfile) VALUES
+            ('o-young.n', 'n', 'noun.animal'),
+            ('o-puppy.n', 'n', 'noun.animal'),
+            ('o-hachiko.n', 'n', 'noun.animal');
+         INSERT INTO omw_lexical_entries (id, synset_id, language, lemma, pos) VALUES
+            ('e5', 'o-young.n', 'en', 'young', 'n'),
+            ('e6', 'o-puppy.n', 'en', 'puppy', 'n'),
+            ('e7', 'o-hachiko.n', 'en', 'Hachiko', 'n');
+         INSERT INTO omw_relations (source_code, target_code, rel_type) VALUES
+            ('o-young.n', 'o-organism.n', 'hypernym'),
+            ('o-puppy.n', 'o-dog.n', 'hypernym'),
+            ('o-puppy.n', 'o-young.n', 'hypernym'),
+            ('o-hachiko.n', 'o-dog.n', 'instance_hypernym');
+         INSERT INTO file_tags (code, name, parent_codes, source, sort_order) VALUES
+            ('o-young.n', '幼年生物', '[]', 'omw', 8),
+            ('o-puppy.n', '幼犬', '[]', 'omw', 9),
+            ('o-hachiko.n', '忠犬八公', '[]', 'omw', 10);",
+    )
+    .unwrap();
+    let app = setup_test_app();
+    reconnect(&app, serde_json::json!(path.to_string_lossy().to_string())).await;
+
+    // 1. 验证 instance_hypernym：八公 -> 狗 -> 动物 -> 生物
+    let json = post_json(&app, "/api/v1/omw/hierarchy", serde_json::json!({"synsetId": "o-hachiko.n"})).await;
+    let nodes = json.as_array().unwrap();
+    let ids: Vec<&str> = nodes.iter().map(|n| n["synsetId"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["o-dog.n", "o-animal.n", "o-organism.n"]);
+    assert_eq!(nodes[0]["relType"], "instance_hypernym");
+    assert_eq!(nodes[1]["relType"], "hypernym");
+
+    // 2. 验证多继承 DAG：幼犬 -> [狗, 幼年生物] -> [动物, 生物] -> 根汇聚且去重
+    let json_puppy = post_json(&app, "/api/v1/omw/hierarchy", serde_json::json!({"synsetId": "o-puppy.n"})).await;
+    let nodes_puppy = json_puppy.as_array().unwrap();
+    let ids_puppy: Vec<&str> = nodes_puppy.iter().map(|n| n["synsetId"].as_str().unwrap()).collect();
+    // 必须包含所有父分支：o-dog.n, o-young.n, o-animal.n, o-organism.n
+    assert!(ids_puppy.contains(&"o-dog.n"), "需包含直接父级 o-dog.n");
+    assert!(ids_puppy.contains(&"o-young.n"), "需包含直接父级 o-young.n");
+    assert!(ids_puppy.contains(&"o-animal.n"), "需包含间接父级 o-animal.n");
+    assert!(ids_puppy.contains(&"o-organism.n"), "需包含根概念 o-organism.n");
+    // 保证无重复节点
+    let mut deduped = ids_puppy.clone();
+    deduped.sort();
+    deduped.dedup();
+    assert_eq!(deduped.len(), ids_puppy.len(), "hierarchy 结果不应包含重复概念");
+}
+
 
 #[tokio::test]
 async fn test_omw_antonyms_pairs_fallback_when_no_sense() {
