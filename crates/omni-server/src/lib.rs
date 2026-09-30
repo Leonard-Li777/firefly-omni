@@ -2160,6 +2160,9 @@ fn empty_text_analysis_result() -> omni_pro::text::TextAnalysisResult {
         embedding_dense: Vec::new(),
         chunks: Vec::new(),
         duration_ms: 0,
+        bekko_embed_ms: 0,
+        keybert_ms: 0,
+        slot_summary_ms: 0,
     }
 }
 

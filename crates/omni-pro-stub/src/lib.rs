@@ -773,6 +773,9 @@ pub mod text {
         pub embedding_dense: Vec<f32>,
         pub chunks: Vec<DocumentChunk>,
         pub duration_ms: u64,
+        pub bekko_embed_ms: u64,
+        pub keybert_ms: u64,
+        pub slot_summary_ms: u64,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -815,6 +818,9 @@ pub mod text {
                 embedding_dense: vec![0.0f32; EMBEDDING_DIM],
                 chunks: Vec::new(),
                 duration_ms: 0,
+                bekko_embed_ms: 0,
+                keybert_ms: 0,
+                slot_summary_ms: 0,
             }
         }
     }
