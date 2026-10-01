@@ -18,7 +18,7 @@ macro_rules! tag_code {
         // 受控反查：动态别名（omw.* 优先）→ 静态 builtin
         $crate::tag_identity::resolve_controlled_tag_code($name)
             .or_else(|| $crate::tag_identity::builtin_tag_code($name))
-            .unwrap_or("builtin.unknown")
+            .unwrap_or($crate::tag_identity::UNKNOWN_TAG_CODE)
     }};
 }
 
@@ -329,6 +329,10 @@ pub struct OmniPerceptionResult {
     pub morphology_tags: Vec<String>,
     pub clip_tags: Vec<String>,
     pub nsfw_tags: Vec<String>,
+    /// 文本/文档路径的敏感内容标签（FastText 分类器 + 关键词匹配，与视觉 NSFW 标签分流透出）
+    /// 图片/视频路径此字段为空，文本/文档路径 `nsfw_tags` 为空此字段有值
+    #[serde(default)]
+    pub nsfw_text_tags: Vec<String>,
     #[serde(default)]
     pub ram_tags: Vec<String>,
     #[serde(default, skip_serializing)]
