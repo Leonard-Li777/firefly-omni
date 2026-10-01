@@ -192,11 +192,43 @@ pub fn query_taxonomy_tree(
     // 2. 预载入别名与规范名映射表 (优化展示名注入)
     let alias_map = query_canonical_and_aliases(conn, locale).unwrap_or_default();
 
-    // 3. 查询 file_tags：读取 pack source/sort_order（创世字段治理，不兼容 category）
-    // TreeNode.source 仍为 code 前缀分区（builtin/omw/_ext/user），供 UI 分区消费
-    let mut stmt = conn.prepare(
-        "SELECT code, name, parent_codes, source, sort_order FROM file_tags ORDER BY code"
-    )?;
+    // 3. 动态探测 file_tags 表列，兼容只读语义包 (含 sort_order / _debug_name_zh, 无 name) 与本地主库 (含 name, 无 sort_order)
+    let mut has_name_col = false;
+    let mut has_sort_order_col = false;
+    let mut has_debug_name_col = false;
+    if let Ok(mut info_stmt) = conn.prepare("PRAGMA table_info(file_tags)") {
+        if let Ok(rows) = info_stmt.query_map([], |r| r.get::<_, String>(1)) {
+            for col_name in rows.flatten() {
+                if col_name == "name" {
+                    has_name_col = true;
+                } else if col_name == "sort_order" {
+                    has_sort_order_col = true;
+                } else if col_name == "_debug_name_zh" {
+                    has_debug_name_col = true;
+                }
+            }
+        }
+    }
+
+    let name_expr = if has_name_col {
+        "name"
+    } else if has_debug_name_col {
+        "_debug_name_zh"
+    } else {
+        "'' AS name"
+    };
+
+    let sort_order_expr = if has_sort_order_col {
+        "sort_order"
+    } else {
+        "0 AS sort_order"
+    };
+
+    let select_sql = format!(
+        "SELECT code, {}, parent_codes, source, {} FROM file_tags ORDER BY code",
+        name_expr, sort_order_expr
+    );
+    let mut stmt = conn.prepare(&select_sql)?;
 
     struct RawTag {
         code: String,
@@ -209,7 +241,7 @@ pub fn query_taxonomy_tree(
     let mut raw_tags: Vec<RawTag> = Vec::new();
     let rows = stmt.query_map([], |row| {
         let code: String = row.get(0)?;
-        let name: String = row.get(1)?;
+        let name: Option<String> = row.get(1)?;
         let parent_codes_raw: String = row.get(2).unwrap_or_else(|_| "[]".to_string());
         let source: Option<String> = row.get(3)?;
         let sort_order: Option<i64> = row.get(4)?;
@@ -217,7 +249,8 @@ pub fn query_taxonomy_tree(
     })?;
 
     for row in rows {
-        let (code, default_name, parent_codes_raw, pack_source, sort_order) = row?;
+        let (code, default_name_opt, parent_codes_raw, pack_source, sort_order) = row?;
+        let default_name = default_name_opt.unwrap_or_default();
         let parent_codes: Vec<String> = serde_json::from_str(&parent_codes_raw).unwrap_or_default();
         // TreeNode.source = code 前缀分区（与 pack source 语义正交：前者 code 身份，后者 taxonomy 来源）
         let source = if code.starts_with("builtin.") {
@@ -240,8 +273,6 @@ pub fn query_taxonomy_tree(
             sort_order,
         });
     }
-
-    let total_nodes = raw_tags.len();
 
     // 4. 为每个标签确定注入的本地化展示名
     let mut node_map: BTreeMap<String, TaxonomyNode> = BTreeMap::new();
@@ -308,8 +339,16 @@ pub fn query_taxonomy_tree(
                 }
             }
         }
-        // 子节点按 code 稳定排序
-        children.sort_by(|a, b| a.code.cmp(&b.code));
+        // 子节点按 sort_order 升序优先 (sort_order > 0)，相同或未标注时按 code 稳定排序
+        children.sort_by(|a, b| {
+            let order_a = if a.sort_order > 0 { a.sort_order } else { i64::MAX };
+            let order_b = if b.sort_order > 0 { b.sort_order } else { i64::MAX };
+            if order_a != order_b {
+                order_a.cmp(&order_b)
+            } else {
+                a.code.cmp(&b.code)
+            }
+        });
 
         visited.remove(code);
 
@@ -329,16 +368,42 @@ pub fn query_taxonomy_tree(
 
     if let Some(target_root) = root_filter {
         if let Some(root_node) = build_subtree(target_root, &node_map, &parent_to_children, &mut visited) {
-            roots.push(root_node);
+            // 对于根级，如果其下没有子标签，则根级数据不应输出，也不应展示
+            if !root_node.children.is_empty() {
+                roots.push(root_node);
+            }
         }
     } else {
         root_candidates.sort();
         for root_code in root_candidates {
             if let Some(root_node) = build_subtree(&root_code, &node_map, &parent_to_children, &mut visited) {
-                roots.push(root_node);
+                // 对于根级，如果其下没有子标签，则根级数据不应输出，也不应展示
+                if !root_node.children.is_empty() {
+                    roots.push(root_node);
+                }
             }
         }
+        // 顶层主干根节点：按 sort_order 升序优先 (sort_order > 0)，次之按 code 字典序排序
+        roots.sort_by(|a, b| {
+            let order_a = if a.sort_order > 0 { a.sort_order } else { i64::MAX };
+            let order_b = if b.sort_order > 0 { b.sort_order } else { i64::MAX };
+            if order_a != order_b {
+                order_a.cmp(&order_b)
+            } else {
+                a.code.cmp(&b.code)
+            }
+        });
     }
+
+    fn count_nodes(nodes: &[TaxonomyNode]) -> usize {
+        let mut count = nodes.len();
+        for node in nodes {
+            count += count_nodes(&node.children);
+        }
+        count
+    }
+
+    let total_nodes = count_nodes(&roots);
 
     Ok(TaxonomyTreeResponse {
         locale: locale.to_string(),

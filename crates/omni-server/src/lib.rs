@@ -39,6 +39,13 @@ use omni_pro::{
 
 pub mod routes;
 
+/// CLIP 互斥组标准名称定义
+const GROUP_COLOR_MODE: &str = "色彩模式";
+const GROUP_TEXT_PRESENCE: &str = "文字存在性";
+const GROUP_SCREENSHOT_SUB: &str = "截图场景细分";
+const GROUP_PHOTO_SUB: &str = "摄影题材细分";
+const GROUP_CONTENT_FORM: &str = "内容形态";
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Mutex<OmniConfig>>,
@@ -622,17 +629,12 @@ pub async fn start_server(
     let mut pack_mounted = false;
     let pack_to_load = pack_path.or_else(SemanticPackLoader::discover_pack_path);
     if let Some(target_pack_path) = pack_to_load {
-        match SemanticPackLoader::load_pack_raw_from_file(&target_pack_path) {
-            Ok(bytes) => {
-                match omw.load_pack_bytes(&bytes) {
-                    Ok(()) => {
-                        info!("semantic.pack zero-disk mounted to OmwDb from {}", target_pack_path.display());
-                        pack_mounted = true;
-                    }
-                    Err(err) => tracing::warn!("Failed to mount semantic.pack: {err}"),
-                }
+        match omw.connect_pack(&target_pack_path) {
+            Ok(()) => {
+                info!("semantic.pack zero-disk mounted to OmwDb from {}", target_pack_path.display());
+                pack_mounted = true;
             }
-            Err(err) => tracing::warn!("Failed to load semantic.pack at {}: {err}", target_pack_path.display()),
+            Err(err) => tracing::warn!("Failed to mount semantic.pack: {err}"),
         }
     }
 
@@ -989,8 +991,43 @@ fn run_vision_pipeline(
                     });
                 }
 
-                // CLIP 高置信度标签直接截取 Top 5，消除第 2 次模型重复推理
-                out.clip_high_confidence_tags = out.clip_tags.iter().take(5).cloned().collect();
+                // CLIP 高置信度标签截取 Top 5，同互斥单选组内仅保留最高排序项 (杜绝 Windows/macOS/Linux 截图同存)
+                let mut high_conf: Vec<String> = Vec::with_capacity(5);
+                let mut seen_groups: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+                for t in &out.clip_tags {
+                    if high_conf.len() >= 5 {
+                        break;
+                    }
+                    let code = normalize_tag_to_code(t);
+                    let group = match Concept::from_code(code.as_str()) {
+                        Some(Concept::Windows截图)
+                        | Some(Concept::macOS截图)
+                        | Some(Concept::iOS截图)
+                        | Some(Concept::Android截图)
+                        | Some(Concept::Linux截图) => Some("system_ecology"),
+
+                        Some(Concept::实拍)
+                        | Some(Concept::手绘)
+                        | Some(Concept::CG渲染)
+                        | Some(Concept::AI生成) => Some("generation_carrier"),
+
+                        Some(Concept::横屏)
+                        | Some(Concept::竖屏)
+                        | Some(Concept::超宽长条)
+                        | Some(Concept::正方形) => Some("aspect_ratio"),
+
+                        _ => None,
+                    };
+
+                    if let Some(g) = group {
+                        if seen_groups.insert(g) {
+                            high_conf.push(t.clone());
+                        }
+                    } else {
+                        high_conf.push(t.clone());
+                    }
+                }
+                out.clip_high_confidence_tags = high_conf;
 
                 // 漫画细分标签形态门禁：仅当内容明确具有动漫/漫画/插画特征时，才根据版式推导条漫/页漫
                 let is_anime_art = out.clip_tags.iter().any(|t| {
@@ -1332,16 +1369,24 @@ async fn perceive_file_handler(
         omni_core::resolve_effective_text(&markdown_content, ocr_text.as_deref(), asr.as_deref());
 
     // 内存零耗时推导: NSFW 敏感内容与高置信度标签 (结合 OCR/ASR 提取文本和 CLIP 标签，两层漏斗过滤)
-    let (nsfw_tags, sensitive_types, content_rating) = if is_pro {
-        omni_pro::OmniVisionEngine::derive_nsfw_tags_and_rating_full(
+    // 按媒体类型分流：图片/视频走视觉 NSFW 管线（nsfw_tags），文本/文档走文本 NSFW 管线（nsfw_text_tags）
+    let (nsfw_tags, nsfw_text_tags, sensitive_types, content_rating) = if is_pro {
+        let (tags, sens, rating) = omni_pro::OmniVisionEngine::derive_nsfw_tags_and_rating_full(
             vision_res.nsfw_probs,
             &effective_text,
             &vision_res.clip_tags,
             req.language.as_deref(),
             Some(&file_path),
-        )
+        );
+        if is_image || is_video {
+            // 视觉路径：NSFW 结论写 nsfw_tags，nsfw_text_tags 为空
+            (tags, vec![], sens, rating)
+        } else {
+            // 文本/文档路径：NSFW 结论写 nsfw_text_tags，nsfw_tags 为空（避免与视觉引擎字段混淆）
+            (vec![], tags, sens, rating)
+        }
     } else {
-        (vec!["全年龄".to_string()], Vec::new(), Some("safe".to_string()))
+        (vec!["全年龄".to_string()], vec![], Vec::new(), Some("safe".to_string()))
     };
 
     let nsfw_high_confidence_tags = if is_pro {
@@ -1352,6 +1397,7 @@ async fn perceive_file_handler(
     } else {
         Vec::new()
     };
+
 
     let watermark_level = vision_res.watermark_level;
     let watermark_status = vision_res.watermark_status;
@@ -1423,38 +1469,40 @@ async fn perceive_file_handler(
         }
         // CLIP 互斥分类保证组内只有一个胜出者，移除被覆盖的规则推导冲突项
         // 1. 色彩模式：CLIP 结果与黑白检测结果互斥对齐（概念 code 匹配，兼容中英）
-        if clip_mutual_tags.iter().any(|(t, _, g)| *g == "色彩模式" && tag_matches_concept(t, "全彩"))
+        if clip_mutual_tags
+            .iter()
+            .any(|(t, _, g)| *g == GROUP_COLOR_MODE && tag_matches_concept(t, Concept::全彩.zh_name()))
         {
-            merged.retain(|t| !tag_matches_concept(t, "黑白"));
+            merged.retain(|t| !tag_matches_concept(t, Concept::黑白.zh_name()));
         } else if clip_mutual_tags
             .iter()
-            .any(|(t, _, g)| *g == "色彩模式" && tag_matches_concept(t, "黑白"))
+            .any(|(t, _, g)| *g == GROUP_COLOR_MODE && tag_matches_concept(t, Concept::黑白.zh_name()))
         {
-            merged.retain(|t| !tag_matches_concept(t, "全彩"));
+            merged.retain(|t| !tag_matches_concept(t, Concept::全彩.zh_name()));
         }
         // 2. 文字存在性：客观检测与 OCR 事实优先于语义猜测（仅图片路径，避免文本正文误标有字图）
         if is_image && (has_text == Some(true) || !effective_text.trim().is_empty()) {
-            merged.retain(|t| !tag_matches_concept(t, "无字图"));
-            if !merged.iter().any(|t| tag_matches_concept(t, "有字图")) {
-                merged.push("有字图".to_string());
+            merged.retain(|t| !tag_matches_concept(t, Concept::无字图.zh_name()));
+            if !merged.iter().any(|t| tag_matches_concept(t, Concept::有字图.zh_name())) {
+                merged.push(Concept::有字图.zh_name().to_string());
             }
         } else if clip_mutual_tags
             .iter()
-            .any(|(t, _, g)| *g == "文字存在性" && tag_matches_concept(t, "有字图"))
+            .any(|(t, _, g)| *g == GROUP_TEXT_PRESENCE && tag_matches_concept(t, Concept::有字图.zh_name()))
         {
-            merged.retain(|t| !tag_matches_concept(t, "无字图"));
+            merged.retain(|t| !tag_matches_concept(t, Concept::无字图.zh_name()));
         } else if clip_mutual_tags
             .iter()
-            .any(|(t, _, g)| *g == "文字存在性" && tag_matches_concept(t, "无字图"))
+            .any(|(t, _, g)| *g == GROUP_TEXT_PRESENCE && tag_matches_concept(t, Concept::无字图.zh_name()))
         {
-            merged.retain(|t| !tag_matches_concept(t, "有字图"));
+            merged.retain(|t| !tag_matches_concept(t, Concept::有字图.zh_name()));
         }
         merged
     } else {
         if is_image && (has_text == Some(true) || !effective_text.trim().is_empty()) {
-            morphology_tags.retain(|t| !tag_matches_concept(t, "无字图"));
-            if !morphology_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
-                morphology_tags.push("有字图".to_string());
+            morphology_tags.retain(|t| !tag_matches_concept(t, Concept::无字图.zh_name()));
+            if !morphology_tags.iter().any(|t| tag_matches_concept(t, Concept::有字图.zh_name())) {
+                morphology_tags.push(Concept::有字图.zh_name().to_string());
             }
         }
         morphology_tags
@@ -1463,16 +1511,22 @@ async fn perceive_file_handler(
     // CLIP 互斥组与 photo_type 细化联动更新（语义优先于规则推导）
     if !clip_mutual_tags.is_empty() {
         // 优先取截图细分（比泛截图更精确）
-        if let Some((sub_tag, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == "截图场景细分") {
-            if photo_type.is_none() || photo_type.as_deref() == Some("截图") {
+        if let Some((sub_tag, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == GROUP_SCREENSHOT_SUB) {
+            if photo_type.is_none()
+                || photo_type.as_deref() == Some(Concept::截图.zh_name())
+                || photo_type.as_deref() == Some(Concept::截图.code())
+            {
                 photo_type = Some(sub_tag.clone());
             }
-        } else if let Some((photo_sub, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == "摄影题材细分") {
+        } else if let Some((photo_sub, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == GROUP_PHOTO_SUB) {
             // 若为摄影照片，细化为风景照/人物照/静物照等
-            if photo_type.is_none() || photo_type.as_deref() == Some("摄影照片") {
+            if photo_type.is_none()
+                || photo_type.as_deref() == Some(Concept::摄影照片.zh_name())
+                || photo_type.as_deref() == Some(Concept::摄影照片.code())
+            {
                 photo_type = Some(photo_sub.clone());
             }
-        } else if let Some((form_tag, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == "内容形态") {
+        } else if let Some((form_tag, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == GROUP_CONTENT_FORM) {
             // 内容形态胜出者作为 photo_type 的兜底
             if photo_type.is_none() {
                 photo_type = Some(form_tag.clone());
@@ -1797,8 +1851,8 @@ async fn perceive_file_handler(
         (Vec::new(), None, Vec::new(), None, None, Vec::new())
     };
 
-    // 6.3 ram_tags 降级为平铺字符串数组 (仅包含门禁后存活的 RAM++ 纯实体标签名)
-    let ram_tags_flat: Vec<String> = gated_ram_tags.into_iter().map(|r| r.name).collect();
+    // 6.3 ram_tags 平铺字符串数组：忠实透出 RAM++ 模型端原始识别结果 (供外部洞察与调试)
+    let ram_tags_flat: Vec<String> = ram_tags.iter().map(|r| r.name.clone()).collect();
 
     let lrc = metadata
         .get("lrc")
@@ -2060,6 +2114,7 @@ async fn perceive_file_handler(
         morphology_tags,
         clip_tags,
         nsfw_tags,
+        nsfw_text_tags,
         ram_tags: ram_tags_flat,
         morphology_high_confidence_tags,
         clip_high_confidence_tags,

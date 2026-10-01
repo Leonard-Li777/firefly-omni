@@ -72,6 +72,9 @@ pub fn is_controlled_code(code: &str) -> bool {
     code.starts_with("builtin.") || code.starts_with("omw.") || code.starts_with("hownet.")
 }
 
+/// 未知标签兜底代码
+pub const UNKNOWN_TAG_CODE: &str = "builtin.unknown";
+
 /// 受控别名表：(别名, 英文规范名)
 /// 同一概念的多语言别名必须指向同一 en 规范名。
 const BUILTIN_ALIASES: &[(&str, &str)] = &[
@@ -79,7 +82,12 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("文本", "Text"),
     ("纯文字", "Plain Text"),
     ("文档", "Document"),
+    ("文件", "Document"),
     ("图片", "Image"),
+    ("图像", "Image"),
+    ("画面", "Image"),
+    ("照片", "Photo"),
+    ("素材", "Material"),
     ("视频", "Video"),
     ("音频", "Audio"),
     ("压缩包", "Compressed Archive"),
@@ -200,7 +208,11 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     // 英文模型直出别名（归一到同一概念）
     ("text", "Text"),
     ("document", "Document"),
+    ("file", "Document"),
     ("image", "Image"),
+    ("picture", "Image"),
+    ("pic", "Image"),
+    ("img", "Image"),
     ("screenshot", "Screenshot"),
     ("screen capture", "Screenshot"),
     ("design draft", "Design Draft"),
@@ -260,8 +272,10 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("正方形图", "Square Image"),
     ("横图", "Horizontal Image"),
     ("竖图", "Vertical Image"),
-    ("横屏", "Landscape"),
-    ("竖屏", "Portrait"),
+    ("横屏", "Horizontal Screen"),
+    ("Landscape", "Horizontal Screen"),
+    ("竖屏", "Vertical Screen"),
+    ("Portrait", "Vertical Screen"),
     ("主题内容", "Topic"),
     ("topic", "Topic"),
     ("long image", "Long Image"),
@@ -313,15 +327,20 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("图文混合", "Text And Graphic"),
     ("手写笔记", "Handwritten Notes"),
     ("Windows截图", "Windows Screenshot"),
-    ("macOS截图", "macOS Screenshot"),
-    ("iOS截图", "iOS Screenshot"),
+    ("macOS截图", "macOS Screenshots"),
+    ("macOS Screenshot", "macOS Screenshots"),
+    ("iOS截图", "iOS Screenshots"),
+    ("iOS Screenshot", "iOS Screenshots"),
     ("Android截图", "Android Screenshot"),
     ("Linux截图", "Linux Screenshot"),
     ("正方形", "Square"),
     ("超宽长条", "Ultra Wide"),
-    ("微量文本", "Minimal Text"),
-    ("图文标题", "Graphic Title"),
-    ("密集排版", "Dense Layout"),
+    ("微量文本", "Microtext"),
+    ("Minimal Text", "Microtext"),
+    ("图文标题", "Picture And Text Title"),
+    ("Graphic Title", "Picture And Text Title"),
+    ("密集排版", "Dense Typography"),
+    ("Dense Layout", "Dense Typography"),
     ("扁平极简", "Flat Minimalist"),
     ("写实拟真", "Photorealistic"),
     ("复古胶片", "Vintage Film"),
