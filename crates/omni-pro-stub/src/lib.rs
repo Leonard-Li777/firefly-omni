@@ -298,6 +298,15 @@ pub mod vision {
         }
 
         pub fn resolve_tag_to_chain_item(tag: &str, confidence: f32) -> omni_core::TagChainItem {
+            // G1 词形闸（拒绝先于铸造）：开源兜底同样不得为不合格词产出 code。
+            if omni_core::tag_admissibility::is_g1_rejected(tag.trim()) {
+                return omni_core::TagChainItem {
+                    code: String::new(),
+                    name: String::new(),
+                    confidence,
+                    ..Default::default()
+                };
+            }
             omni_core::TagChainItem {
                 code: format!("builtin.{}", tag),
                 name: tag.to_string(),

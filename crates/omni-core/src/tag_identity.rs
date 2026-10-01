@@ -48,8 +48,16 @@ pub fn en_builtin_code(en_name: &str) -> String {
 }
 
 /// 开放集扩展标签 code：_ext.{slug}.{hash8(原串)}
+///
+/// **G1 词形闸（拒绝先于铸造，spec §6.9.3 / ADR-0052）**：不合格词**不派生任何 code**，
+/// 返回空串哨兵 [`crate::tag_admissibility::REJECTED_CODE`]。这是全仓 `_ext.*` 铸造的
+/// 唯一 omni-core 出口，把闸门装在这里可保证「四类坏名不产生新的 `_ext.*` 概念」。
+/// 调用方必须把空 code 视为「未通过准入」并丢弃（见 `normalize_tag_set_to_codes`）。
 pub fn derive_ext_tag_code(tag: &str) -> String {
     let tag_clean = tag.trim();
+    if crate::tag_admissibility::is_g1_rejected(tag_clean) {
+        return crate::tag_admissibility::REJECTED_CODE.to_string();
+    }
     let hash8 = content_hash8(tag_clean);
     let slug = sanitize_en_slug(tag_clean);
     if slug.is_empty() {
@@ -1151,6 +1159,9 @@ pub fn tag_matches_concept(tag: &str, canonical_zh_or_en: &str) -> bool {
 }
 
 /// 标签串归一：命中别名 → builtin code；未命中 → _ext 派生
+///
+/// **注意**：被 G1 词形闸拒绝的词会返回空串哨兵（`_ext` 铸造被拦），调用方需按
+/// [`crate::tag_admissibility::is_rejected_code`] 判定并丢弃。
 pub fn normalize_tag_to_code(tag: &str) -> String {
     if let Some(code) = builtin_tag_code(tag) {
         return code.to_string();
@@ -1164,8 +1175,16 @@ pub fn normalize_tag_to_code(tag: &str) -> String {
 }
 
 /// 将标签列表归一为 code 集合（P0 幂等契约：zh/en 别名输入应产出相同集合）
+///
+/// **G1 拒绝传播**：被词形闸拒绝的词会归一为空串哨兵，此处统一滤除，
+/// 使拒绝沿 `detected_visual_tags` → morphology/clip/ram 回写过滤 → 标签链汇聚全链路自动传播
+/// （这些下游一律用 `contains(&code)` 判定，空串不在集合内即被剔除）。
 pub fn normalize_tag_set_to_codes(tags: &[String]) -> Vec<String> {
-    let mut codes: Vec<String> = tags.iter().map(|t| normalize_tag_to_code(t)).collect();
+    let mut codes: Vec<String> = tags
+        .iter()
+        .map(|t| normalize_tag_to_code(t))
+        .filter(|c| !crate::tag_admissibility::is_rejected_code(c))
+        .collect();
     codes.sort();
     codes.dedup();
     codes
@@ -1260,6 +1279,40 @@ mod tests {
         let b = derive_ext_tag_code("go");
         assert_ne!(a, b);
         assert!(a.starts_with("_ext."));
+    }
+
+    /// G1 词形闸（spec §6.9.3 / 验收 V10）：四类坏名**不得**产出 `_ext.*` 概念。
+    #[test]
+    fn g1_rejects_mojibake_before_minting_ext_code() {
+        for bad in [
+            "\u{FFFD}\u{FFFD}\u{FFFD}乱码", // U+FFFD 替换字符
+            "袁浩, 李晓红编著\u{0}",        // NUL 控制字符
+            "Exclude\u{f023}T,",            // 私用区 PUA
+            "\u{85}abc",                    // C1 控制字符
+            "ӉӉӉ汉",                        // 单串多脚本混杂（R-G1-11）
+        ] {
+            let code = derive_ext_tag_code(bad);
+            assert!(
+                crate::tag_admissibility::is_rejected_code(&code),
+                "坏名不得铸造 _ext code: {bad:?} → {code}"
+            );
+            assert!(normalize_tag_to_code(bad).is_empty(), "{bad:?}");
+        }
+    }
+
+    /// 正例零误杀：合法词仍正常铸造，且拒绝不污染 code 集合。
+    #[test]
+    fn g1_allows_positive_and_filters_rejected_from_set() {
+        assert!(derive_ext_tag_code("手机照片").starts_with("_ext."));
+        assert!(derive_ext_tag_code("Документы").starts_with("_ext."));
+        let mixed = vec![
+            "手机照片".to_string(),
+            "\u{FFFD}\u{FFFD}乱码".to_string(),
+            "Документы".to_string(),
+        ];
+        let codes = normalize_tag_set_to_codes(&mixed);
+        assert_eq!(codes.len(), 2, "空串哨兵必须被滤除: {codes:?}");
+        assert!(codes.iter().all(|c| !c.is_empty()));
     }
 
     // 注意：dynamic_aliases_* 全局字典为进程级共享状态（static RwLock），

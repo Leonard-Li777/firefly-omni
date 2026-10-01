@@ -999,6 +999,10 @@ fn run_vision_pipeline(
                         break;
                     }
                     let code = normalize_tag_to_code(t);
+                    // G1 词形闸哨兵：空 code 表示该词未通过准入，不得进入高置信度截取
+                    if omni_core::tag_admissibility::is_rejected_code(&code) {
+                        continue;
+                    }
                     let group = match Concept::from_code(code.as_str()) {
                         Some(Concept::Windows截图)
                         | Some(Concept::macOS截图)
@@ -1812,6 +1816,13 @@ async fn perceive_file_handler(
                         confidence,
                         req.language.as_deref(),
                     );
+                // G1 词形闸哨兵：空 code 表示该词未通过准入——**必须丢弃**，
+                // 否则坏概念会写进概念表、别名表与 materialized_paths 标签树（spec §6.9.1）。
+                // 正常路径下 normalize_tag_set_to_codes 已滤除坏词，此处是防御性二道保险；
+                // 注意必须判在 code 覆盖**之前**，否则 raw_code 会把哨兵盖掉。
+                if omni_core::tag_admissibility::is_rejected_code(&resolved.code) {
+                    continue;
+                }
                 // 确保 code 与归一结果一致（仅当 raw_code 是合法受控码时才覆盖；若 raw_code 发生 _ext 漂移而 resolved 命中受控码则严格保留受控码）
                 if omni_core::tag_identity::is_controlled_code(raw_code) || !omni_core::tag_identity::is_controlled_code(&resolved.code) {
                     resolved.code = raw_code.clone();
