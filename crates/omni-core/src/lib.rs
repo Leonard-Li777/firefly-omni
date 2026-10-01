@@ -9,6 +9,9 @@ pub mod concepts;
 /// (WP5) 图片标签链路阈值集中定义（CLIP/RAM/互斥组 margin/出口 conf），单点可调
 pub mod tag_thresholds;
 
+/// 标签准入闸门 · G1 词形层（取码前，零本体依赖；单一数据源 `taxonomy/tag-admissibility.json`）
+pub mod tag_admissibility;
+
 /// 编译/运行期受控标签宏：开发时书写中文或英文直观名称，自动解析为系统标准 tag_code
 ///
 /// 示例：`tag_code!("截图")` → `"builtin.screenshot"`
