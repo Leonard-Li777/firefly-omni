@@ -235,6 +235,7 @@ pub fn query_taxonomy_tree(
         default_name: String,
         parent_codes: Vec<String>,
         source: String,
+        _pack_source: String,
         sort_order: i64,
     }
 
@@ -248,10 +249,14 @@ pub fn query_taxonomy_tree(
         Ok((code, name, parent_codes_raw, source, sort_order))
     })?;
 
+    let mut pack_source_map: HashMap<String, String> = HashMap::new();
     for row in rows {
         let (code, default_name_opt, parent_codes_raw, pack_source, sort_order) = row?;
         let default_name = default_name_opt.unwrap_or_default();
         let parent_codes: Vec<String> = serde_json::from_str(&parent_codes_raw).unwrap_or_default();
+        let pack_source_str = pack_source.unwrap_or_default();
+        pack_source_map.insert(code.clone(), pack_source_str.clone());
+
         // TreeNode.source = code 前缀分区（与 pack source 语义正交：前者 code 身份，后者 taxonomy 来源）
         let source = if code.starts_with("builtin.") {
             "builtin"
@@ -264,12 +269,12 @@ pub fn query_taxonomy_tree(
         };
         // builtin 中文命中 omw 时 pack 已回写 sort_order；未写则 0
         let sort_order = sort_order.unwrap_or(0);
-        let _ = pack_source; // pack source 已在 unmapped_stats / 义原查询面消费；树分区不混用
         raw_tags.push(RawTag {
             code,
             default_name,
             parent_codes,
             source: source.to_string(),
+            _pack_source: pack_source_str,
             sort_order,
         });
     }
@@ -311,10 +316,20 @@ pub fn query_taxonomy_tree(
             if node_map.contains_key(p) && p != code {
                 parent_to_children.entry(p.clone()).or_default().push(code.clone());
             } else {
-                root_candidates.push(code.clone());
+                // 父节点不存在时，仅当其为受控维度时方可作为顶层根候选（排除 omw/hownet 孤立顶层词）
+                let is_dimension = pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false)
+                    || (code.starts_with("builtin.") && !code.starts_with("omw.") && !code.starts_with("hownet."));
+                if is_dimension {
+                    root_candidates.push(code.clone());
+                }
             }
         } else {
-            root_candidates.push(code.clone());
+            // parent_code 为空时：仅受控维度可作为顶层根候选！绝不可将 omw/hownet 作为分类树根输出！
+            let is_dimension = pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false)
+                || (code.starts_with("builtin.") && !code.starts_with("omw.") && !code.starts_with("hownet."));
+            if is_dimension {
+                root_candidates.push(code.clone());
+            }
         }
     }
 
@@ -375,24 +390,41 @@ pub fn query_taxonomy_tree(
         }
     } else {
         root_candidates.sort();
+        let mut candidate_nodes: Vec<TaxonomyNode> = Vec::new();
         for root_code in root_candidates {
             if let Some(root_node) = build_subtree(&root_code, &node_map, &parent_to_children, &mut visited) {
                 // 对于根级，如果其下没有子标签，则根级数据不应输出，也不应展示
                 if !root_node.children.is_empty() {
-                    roots.push(root_node);
+                    candidate_nodes.push(root_node);
                 }
             }
         }
-        // 顶层主干根节点：按 sort_order 升序优先 (sort_order > 0)，次之按 code 字典序排序
-        roots.sort_by(|a, b| {
+
+        // 顶层主干根节点排序：按 sort_order 升序优先 (sort_order > 0)，次之 builtin.* 优先，再按 code 字典序稳定排序
+        candidate_nodes.sort_by(|a, b| {
             let order_a = if a.sort_order > 0 { a.sort_order } else { i64::MAX };
             let order_b = if b.sort_order > 0 { b.sort_order } else { i64::MAX };
             if order_a != order_b {
                 order_a.cmp(&order_b)
             } else {
-                a.code.cmp(&b.code)
+                let is_builtin_a = a.code.starts_with("builtin.");
+                let is_builtin_b = b.code.starts_with("builtin.");
+                if is_builtin_a != is_builtin_b {
+                    is_builtin_b.cmp(&is_builtin_a)
+                } else {
+                    a.code.cmp(&b.code)
+                }
             }
         });
+
+        // 根级展示名去重：相同名称只保留第一个规范主干维度，彻底杜绝出现重复根级（如多个“背景”）
+        let mut seen_root_names = HashSet::new();
+        for node in candidate_nodes {
+            if !seen_root_names.contains(&node.name) {
+                seen_root_names.insert(node.name.clone());
+                roots.push(node);
+            }
+        }
     }
 
     fn count_nodes(nodes: &[TaxonomyNode]) -> usize {

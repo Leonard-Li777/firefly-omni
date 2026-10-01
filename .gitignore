@@ -1,6 +1,7 @@
 /target
 # 隔离构建目录：target-runs/<task>/ 供并行测试，target-review 等备用
 /target-*
+/target_*
 node_modules/
 dist/
 .DS_Store
