@@ -1855,10 +1855,10 @@ async fn perceive_file_handler(
     let is_all_ages_content = is_pro && sensitive_types.is_empty() && (
         content_rating.as_deref() == Some("safe")
             || content_rating.as_deref() == Some("all_ages")
-            || content_rating.as_deref() == Some("全年龄")
-            || nsfw_tags.iter().any(|t| t == "全年龄")
-            || (!nsfw_tags.iter().any(|t| t == "R-18" || t == "R-18G" || t == "色情" || t == "血腥")
-                && !nsfw_text_tags.iter().any(|t| t == "R-18" || t == "R-18G" || t == "色情" || t == "血腥"))
+            || content_rating.as_deref().map_or(false, |r| tag_matches_concept(r, Concept::全年龄.code()))
+            || nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::全年龄.code()))
+            || (!nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || t == "R-18" || t == "R-18G")
+                && !nsfw_text_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || t == "R-18" || t == "R-18G"))
     );
     let ram_tags_flat: Vec<String> = if is_all_ages_content {
         ram_tags
