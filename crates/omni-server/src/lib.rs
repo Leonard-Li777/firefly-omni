@@ -1451,7 +1451,7 @@ async fn perceive_file_handler(
         }
     }
     let morphology_high_confidence_tags = vision_res.morphology_high_confidence_tags;
-    let clip_high_confidence_tags = vision_res.clip_high_confidence_tags;
+    let mut clip_high_confidence_tags = vision_res.clip_high_confidence_tags;
 
     let ram_tags = vision_res.ram_tags;
     let image_embedding = vision_res.image_embedding;
@@ -1645,7 +1645,7 @@ async fn perceive_file_handler(
             detected_visual_tags.contains(&code)
         })
         .collect();
-    let clip_tags: Vec<String> = clip_tags
+    let mut clip_tags: Vec<String> = clip_tags
         .into_iter()
         .filter(|name| {
             let code = normalize_tag_to_code(name);
@@ -1930,7 +1930,7 @@ async fn perceive_file_handler(
         None
     };
 
-    let (text_title, text_keywords, text_entities, text_summary, text_one_desc, text_slots, text_emb, text_smart_name) = match text_analysis {
+    let (text_title, mut text_keywords, text_entities, text_summary, text_one_desc, text_slots, text_emb, text_smart_name) = match text_analysis {
         Some(res) => (
             res.title,
             res.keywords,
@@ -2053,9 +2053,39 @@ async fn perceive_file_handler(
         .map(backfill_chain_item)
         .collect();
 
+    // 10. 原生事实标签抽取 (Task 2)：元数据直读 + 下沉物理事实 → fact_tags 直出
+    let language_label: Option<String> = req.language.as_deref().and_then(|l| {
+        let lower = l.to_ascii_lowercase();
+        if lower.starts_with("zh") || lower.starts_with("cmn") {
+            Some("中文".to_string())
+        } else if lower.starts_with("en") {
+            Some("英文".to_string())
+        } else {
+            None
+        }
+    });
+    let mut fact_tags: Vec<omni_core::TagChainItem> = {
+        let ctx = omni_extract::FactTagContext {
+            metadata: &metadata,
+            file_source: file_source.clone(),
+            workflow_state: workflow_state.clone(),
+            security_level: security_level.clone(),
+            quality_score,
+            language_label: language_label.clone(),
+        };
+        omni_extract::OmniFactTagExtractor::extract(&ctx)
+    };
+
+    // 核心安全合规契约：无论什么类型的文件（图片/视频/音频/文本/文档），
+    // 若通过 nsfw_tags 或 nsfw_text_tags 专职判定为非 NSFW 的内容 (is_all_ages_content)，全面过滤所有通道的敏感标签！
+    // 若为真正违规/NSFW 的内容，则不过滤，忠实透出全部检测结果供审计与标记。
     if is_all_ages_content {
+        clip_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(t));
+        clip_high_confidence_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(t));
         structured_visual_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(&t.name));
         fused_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(&t.name));
+        fact_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(&t.name));
+        text_keywords.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(t));
     }
 
     benchmark.total_ms = t_start.elapsed().as_millis() as u64;
@@ -2073,31 +2103,6 @@ async fn perceive_file_handler(
         geo_address
     );
 
-    // 10. 原生事实标签抽取 (Task 2)：元数据直读 + 下沉物理事实 → fact_tags 直出
-    // 置信度扁平统一 0.90（物理直读与规则推导同级），engine 统一为 "metadata"，
-    // Desktop 端作为第一权威事实无损落库至 file_tags。
-    // 语言细分：由请求语言标识归一到母语展示名 (zh* → 中文 / en* → 英文)
-    let language_label: Option<String> = req.language.as_deref().and_then(|l| {
-        let lower = l.to_ascii_lowercase();
-        if lower.starts_with("zh") || lower.starts_with("cmn") {
-            Some("中文".to_string())
-        } else if lower.starts_with("en") {
-            Some("英文".to_string())
-        } else {
-            None
-        }
-    });
-    let fact_tags: Vec<omni_core::TagChainItem> = {
-        let ctx = omni_extract::FactTagContext {
-            metadata: &metadata,
-            file_source: file_source.clone(),
-            workflow_state: workflow_state.clone(),
-            security_level: security_level.clone(),
-            quality_score,
-            language_label: language_label.clone(),
-        };
-        omni_extract::OmniFactTagExtractor::extract(&ctx)
-    };
     tracing::info!(
         "[事实标签抽取:fact_tags] 文件: {}, 产出标签数: {}, 标签: {:?}",
         file_name,
