@@ -918,7 +918,8 @@ fn extract_plain_text(path: &Path, max_bytes: usize) -> Result<String> {
                 return Ok(truncate_string(&utf16_decoded, max_bytes));
             }
         }
-        return Ok("[Binary File] NUL byte detected, text content skipped to prevent garbled output.".to_string());
+        // 二进制文件检测到 NUL 字节，文本内容跳过并保持为空，严禁填入调试占位符导致文本分析提取垃圾标签与伪智能命名
+        return Ok(String::new());
     }
 
     // 3. 严格验证是否为标准 UTF-8（中文及现代文本事实标准，不允许任何解码错误）
@@ -1752,7 +1753,7 @@ mod tests {
         let res = OmniExtractor::extract(&temp_path, &config).await.unwrap();
         let _ = std::fs::remove_file(&temp_path);
 
-        assert!(res.markdown_content.contains("[Binary File] NUL byte detected"));
+        assert!(res.markdown_content.is_empty());
     }
 
     #[tokio::test]

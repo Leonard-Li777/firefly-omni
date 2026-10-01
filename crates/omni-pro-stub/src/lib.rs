@@ -666,6 +666,10 @@ pub mod text {
         pub location: Option<String>,
         pub doc_type: Option<String>,
         pub classifier: Option<String>,
+        pub form: Option<String>,
+        pub style: Option<String>,
+        pub shot_type: Option<String>,
+        pub modifiers: Vec<String>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

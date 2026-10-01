@@ -291,7 +291,12 @@ pub fn query_taxonomy_tree(
             raw.code.clone()
         };
 
-        let primary_parent = raw.parent_codes.first().cloned();
+        let primary_parent = raw
+            .parent_codes
+            .iter()
+            .find(|p| pack_source_map.contains_key(*p) && *p != &raw.code)
+            .cloned()
+            .or_else(|| raw.parent_codes.first().cloned());
         node_map.insert(
             raw.code.clone(),
             TaxonomyNode {
@@ -316,17 +321,15 @@ pub fn query_taxonomy_tree(
             if node_map.contains_key(p) && p != code {
                 parent_to_children.entry(p.clone()).or_default().push(code.clone());
             } else {
-                // 父节点不存在时，仅当其为受控维度时方可作为顶层根候选（排除 omw/hownet 孤立顶层词）
-                let is_dimension = pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false)
-                    || (code.starts_with("builtin.") && !code.starts_with("omw.") && !code.starts_with("hownet."));
+                // 父节点不存在时，仅当其为受控维度时方可作为顶层根候选（排除 omw/hownet/tag 孤立词）
+                let is_dimension = pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false);
                 if is_dimension {
                     root_candidates.push(code.clone());
                 }
             }
         } else {
-            // parent_code 为空时：仅受控维度可作为顶层根候选！绝不可将 omw/hownet 作为分类树根输出！
-            let is_dimension = pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false)
-                || (code.starts_with("builtin.") && !code.starts_with("omw.") && !code.starts_with("hownet."));
+            // parent_code 为空时：仅受控维度可作为顶层根候选！绝不可将 omw/hownet/tag 作为分类树根输出！
+            let is_dimension = pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false);
             if is_dimension {
                 root_candidates.push(code.clone());
             }

@@ -1851,8 +1851,24 @@ async fn perceive_file_handler(
         (Vec::new(), None, Vec::new(), None, None, Vec::new())
     };
 
-    // 6.3 ram_tags 平铺字符串数组：忠实透出 RAM++ 模型端原始识别结果 (供外部洞察与调试)
-    let ram_tags_flat: Vec<String> = ram_tags.iter().map(|r| r.name.clone()).collect();
+    // 6.3 ram_tags 平铺字符串数组：忠实透出 RAM++ 模型端原始识别结果 (全年龄/安全内容下过滤违禁敏感词)
+    let is_all_ages_content = is_pro && sensitive_types.is_empty() && (
+        content_rating.as_deref() == Some("safe")
+            || content_rating.as_deref() == Some("all_ages")
+            || content_rating.as_deref() == Some("全年龄")
+            || nsfw_tags.iter().any(|t| t == "全年龄")
+            || (!nsfw_tags.iter().any(|t| t == "R-18" || t == "R-18G" || t == "色情" || t == "血腥")
+                && !nsfw_text_tags.iter().any(|t| t == "R-18" || t == "R-18G" || t == "色情" || t == "血腥"))
+    );
+    let ram_tags_flat: Vec<String> = if is_all_ages_content {
+        ram_tags
+            .iter()
+            .filter(|r| !omni_pro::is_nsfw_or_restricted_tag(&r.name))
+            .map(|r| r.name.clone())
+            .collect()
+    } else {
+        ram_tags.iter().map(|r| r.name.clone()).collect()
+    };
 
     let lrc = metadata
         .get("lrc")
@@ -2027,15 +2043,20 @@ async fn perceive_file_handler(
         tag
     };
 
-    let structured_visual_tags: Vec<omni_core::TagChainItem> = structured_visual_tags
+    let mut structured_visual_tags: Vec<omni_core::TagChainItem> = structured_visual_tags
         .into_iter()
         .map(backfill_chain_item)
         .collect();
 
-    let fused_tags: Vec<omni_core::TagChainItem> = fused_tags
+    let mut fused_tags: Vec<omni_core::TagChainItem> = fused_tags
         .into_iter()
         .map(backfill_chain_item)
         .collect();
+
+    if is_all_ages_content {
+        structured_visual_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(&t.name));
+        fused_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(&t.name));
+    }
 
     benchmark.total_ms = t_start.elapsed().as_millis() as u64;
 
