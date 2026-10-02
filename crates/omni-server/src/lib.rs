@@ -1669,7 +1669,15 @@ async fn perceive_file_handler(
     let gated_ram_tags: Vec<omni_core::RamTagItem> = ram_tags
         .iter()
         .filter(|r| {
-            let code = normalize_tag_to_code(&r.name);
+            // spec §6.9.6 待裁定项 2（2026-10-02 裁决 B）：优先用生产端已填的 code——
+            // proj.code 由 zh 规范名离线受控反查得出（omni-vision `get_ram_projections`），
+            // 而 `r.name` 是各语言展示名（ja/ar 词表各 1 条 `A / B` 形，含非中性标点 `/`），
+            // 按名字重复归一会被 G1 误拒成空哨兵 → 整条误杀。code 为空（异常兜底）才回退名字归一。
+            let code = if r.code.is_empty() {
+                normalize_tag_to_code(&r.name)
+            } else {
+                r.code.clone()
+            };
             detected_visual_tags.contains(&code)
         })
         .cloned()
