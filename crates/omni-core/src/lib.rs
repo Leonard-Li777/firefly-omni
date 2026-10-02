@@ -232,6 +232,12 @@ pub struct TagChainItem {
     pub via_parent_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialized_paths: Option<String>,
+    /// 完整物化代码路径 (如 "/builtin.file_type/builtin.image/builtin.subject_type/omw.01846331.n")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_path: Option<String>,
+    /// 完整物化展示名路径 (如 "/文件类型/图片/主体类型/鸭子")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_path: Option<String>,
     /// 完整父级标签名链 (如 "/主体类型/动物宠物/鸭子")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_name_chain: Option<String>,
@@ -718,5 +724,22 @@ mod tests {
 pub fn get_canonical_concept_name(code: &str) -> Option<&'static str> {
     concepts::Concept::from_code(code).map(|item| item.zh_name())
 }
+
+/// 6 大受控根维度强类型枚举集合 (file-dimension-source.ts level=1)
+pub const ROOT_DIMENSION_CONCEPTS: &[concepts::Concept] = &[
+    concepts::Concept::文件类型,
+    concepts::Concept::文件用途,
+    concepts::Concept::文件来源,
+    concepts::Concept::作者,
+    concepts::Concept::文件质量,
+    concepts::Concept::内容标签,
+];
+
+/// 判定指定 code 是否为 6 大受控根维度 (内置 builtin.author 别名收敛)
+#[inline]
+pub fn is_root_dimension(code: &str) -> bool {
+    code == "builtin.author" || ROOT_DIMENSION_CONCEPTS.iter().any(|item| item.code() == code)
+}
+
 
 

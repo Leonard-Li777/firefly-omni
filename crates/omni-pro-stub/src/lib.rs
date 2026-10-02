@@ -1130,6 +1130,11 @@ pub mod semantic_graph {
 
     impl SemanticGraph {
         pub fn enrich_tag_chain_item(&self, _tag: &mut omni_core::TagChainItem) {}
+        pub fn enrich_tag_chain_item_with_context(
+            &self,
+            _tag: &mut omni_core::TagChainItem,
+            _file_group: Option<&str>,
+        ) {}
     }
 }
 
