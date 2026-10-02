@@ -1120,6 +1120,20 @@ pub fn tag_display(code: &str, lang: &str) -> String {
         }
     }
 
+    // 动态规范词典兜底：静态 BUILTIN_ALIASES 只登记 builtin.* 的规范名，
+    // omw.*/hownet.* 的母语规范展示名由 semantic.pack 热载入轨写入 dynamic_canonical_by_lang，
+    // 若不查这张表，这两层受控概念的展示名会被降级成裸 code（违背 omw ≻ hownet ≻ builtin 分层）。
+    // 命中值等于 code 时视为无效（脏别名表可能把 code 冻结成词形），继续走 slug 兜底。
+    if let Ok(canon_guard) = dynamic_canonical_by_lang().read() {
+        if let Some(cmap) = canon_guard.get(normalize_language_code(lang)) {
+            if let Some(&name) = cmap.get(clean_code) {
+                if !name.is_empty() && name != clean_code {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+
     // 针对 _ext.slug.hash 或 builtin.slug 提取人类可读部分
     if let Some(stripped) = clean_code.strip_prefix("builtin.") {
         return stripped.replace('_', " ");
@@ -1302,7 +1316,7 @@ mod tests {
             "\u{FFFD}\u{FFFD}\u{FFFD}乱码", // U+FFFD 替换字符
             "袁浩, 李晓红编著\u{0}",        // NUL 控制字符
             "Exclude\u{f023}T,",            // 私用区 PUA
-            "\u{85}abc",                    // C1 控制字符
+            "\u{80}abc",                    // C1 控制字符（U+0080 PAD，非 White_Space）
             "ӉӉӉ汉",                        // 单串多脚本混杂（R-G1-11）
         ] {
             let code = normalize_tag_to_code(bad);
@@ -1501,6 +1515,31 @@ mod tests {
         // 过去分词 Connected -> 原型 connect -> builtin.connect -> 连接
         let outcome_connected = resolve_controlled_tag_two_stage("Connected", Some("zh"));
         assert_eq!(outcome_connected, Some(("builtin.connect", Some("连接".to_string()))));
+
+        clear_dynamic_aliases();
+    }
+
+    /// 回归守卫：tag_display 必须能解析 omw.*/hownet.* 的母语规范名。
+    /// 静态 BUILTIN_ALIASES 只登记 builtin.*，历史上 tag_display 从不查 semantic.pack
+    /// 热载入轨写入的 dynamic_canonical_by_lang，导致这两层受控概念的展示名被降级成裸 code。
+    #[test]
+    fn tag_display_resolves_dynamic_canonical_for_omw_and_hownet() {
+        load_aliases_for_lang(
+            "zh-CN",
+            vec![("测试心智", "omw.05617606.n", true), ("测试义原", "hownet.9999999", true)],
+        );
+        // locale 与归一短码都必须命中同一规范名
+        assert_eq!(tag_display("omw.05617606.n", "zh-CN"), "测试心智");
+        assert_eq!(tag_display("omw.05617606.n", "zh"), "测试心智");
+        assert_eq!(tag_display("hownet.9999999", "zh-CN"), "测试义原");
+
+        // 脏别名（词形被冻结成 code）不得被当作规范展示名采纳：
+        // tag_display 仍回吐 code，弃用责任在调用方词形闸（fusion.rs 三处 canon != code 过滤）
+        load_aliases_for_lang("zh-CN", vec![("omw.00202784.v", "omw.00202784.v", true)]);
+        assert_eq!(tag_display("omw.00202784.v", "zh-CN"), "omw.00202784.v");
+
+        // 完全未登录的 code 保持旧行为（原样返回）
+        assert_eq!(tag_display("omw.99999999.n", "zh-CN"), "omw.99999999.n");
 
         clear_dynamic_aliases();
     }
