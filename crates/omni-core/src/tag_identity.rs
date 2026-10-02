@@ -1327,6 +1327,27 @@ mod tests {
         }
     }
 
+    /// 幂等短路：已是合法 code 形态的输入必须**原样返回**，不得再走派生。
+    ///
+    /// 必要性：G1 会拒绝含 `.` 的串（`.` 非白名单文种亦非中性字符），无短路会把
+    /// `_ext.foo.12345678` 这类合法 code 先判「不合格」而返回空哨兵——把合法标签误杀。
+    /// （S1 #705 第 1 轮审查：该短路此前零测试覆盖。）
+    #[test]
+    fn idempotent_short_circuit_returns_code_form_as_is() {
+        for code in [
+            "_ext.foo.12345678",
+            "builtin.invoice",
+            "omw.01846331.n",
+            "hownet.002",
+        ] {
+            assert_eq!(
+                normalize_tag_to_code(code),
+                code,
+                "code 形态输入应原样返回: {code}"
+            );
+        }
+    }
+
     /// 闸门不得误伤策展资产：RAM++ 投影表的 `zh` 键含 `/`（多义项 gloss），
     /// 经 `derive_ext_tag_code` 仍须产出合法 `_ext.*`（纯生成器不做准入校验）。
     #[test]

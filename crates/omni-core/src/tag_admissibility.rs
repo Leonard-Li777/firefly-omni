@@ -563,6 +563,41 @@ mod tests {
     }
 
     #[test]
+    fn allows_non_exclusive_script_mixes() {
+        // Latin↔Cyrillic / Latin↔Arabic **刻意不在互斥对内**：品牌与外来词合法混写
+        // （`МВидео`），误杀代价高于收益。此为「互斥对之外多脚本混写应放行」的否定用例
+        // （S1 #705 第 1 轮审查：测试缺口）。
+        assert!(g1_verdict("Ӊabc").is_admitted(), "Cyr+Latin 混写应放行");
+        assert!(g1_verdict("МВидео").is_admitted(), "品牌混写应放行");
+        assert!(g1_verdict("Helloمرحبا").is_admitted(), "Latin+Arabic 混写应放行");
+        // 对照：互斥对（Han↔Cyrillic）无分隔仍拒
+        assert!(g1_verdict("ӉӉӉ汉").is_reject());
+        // 对照：互斥对**有**分隔则放行
+        assert!(g1_verdict("ӉӉӉ 汉").is_admitted());
+    }
+
+    #[test]
+    fn from_json_partial_corruption_falls_back_per_field() {
+        // 部分字段损坏 → 该字段回退内置默认；合法字段照常采纳（逐字段降级，不整体失败）
+        let dflt = TagAdmissibility::default_config();
+        let cfg = serde_json::json!({
+            "g1": {
+                "allowed_scripts": "not-an-array",
+                "neutral_chars": ["-", "_"],
+                "exclusive_script_pairs": [["Han", "Cyrillic"]]
+            }
+        });
+        let parsed = TagAdmissibility::from_json(&cfg, &dflt);
+        // 损坏字段 → 回退默认（7 个白名单文种）
+        assert_eq!(parsed.allowed_scripts(), dflt.allowed_scripts());
+        // 合法字段 → 采纳（不含 `·`，与默认不同）
+        assert_eq!(parsed.neutral_chars, vec!['-', '_']);
+        // 合法字段 → 采纳
+        use Script::*;
+        assert_eq!(parsed.exclusive_pairs(), &[(Han, Cyrillic)]);
+    }
+
+    #[test]
     fn rejects_non_whitelisted_script() {
         // 希腊字母不在白名单语族内
         let v = g1_verdict("Ελληνικά");
