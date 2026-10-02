@@ -419,7 +419,7 @@ pub fn rejection_counts() -> [(&'static str, u64); 4] {
 
 /// 清零计数（仅供测试与诊断，不影响生产语义）
 pub fn reset_rejection_counts() {
-    for c in [&REJECT_R_G1_01, &REJECT_R_G1_10, &REJECT_R_G1_11] {
+    for c in [&REJECT_R_G1_01, &REJECT_R_G1_03, &REJECT_R_G1_10, &REJECT_R_G1_11] {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -490,7 +490,7 @@ pub fn g1_verdict(tag: &str) -> Verdict {
     if present.is_empty() {
         return Verdict::Reject {
             rule: R_G1_03,
-            reason: "零文种字符（纯数字/纯标点/纯符号）",
+            reason: "零文种字符（纯空白/ASCII数字/中性标点）",
         };
     }
 

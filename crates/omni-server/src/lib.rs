@@ -1669,23 +1669,25 @@ async fn perceive_file_handler(
     let gated_ram_tags: Vec<omni_core::RamTagItem> = ram_tags
         .iter()
         .filter(|r| {
-            // spec §6.9.6 待裁定项 2（2026-10-02 裁决 B）：优先用生产端已填的 code——
-            // proj.code 由 zh 规范名离线受控反查得出（omni-vision `get_ram_projections`），
-            // 而 `r.name` 是各语言展示名（ja/ar 词表各 1 条 `A / B` 形，含非中性标点 `/`），
-            // 按名字重复归一会被 G1 误拒成空哨兵 → 整条误杀。code 为空（异常兜底）才回退名字归一。
-            let code = if r.code.is_empty() {
-                normalize_tag_to_code(&r.name)
-            } else {
-                r.code.clone()
-            };
-            detected_visual_tags.contains(&code)
+            // spec §6.9.6 待裁定项 2（2026-10-02 裁决 B + 第 2 轮盲审 P1-2 收敛为 OR 语义）：
+            // ① 名字归一保底（旧行为）：detected_visual_tags 集合由各引擎展示名（含 r.name）汇聚，
+            //    未受控 _ext 条目在非 zh 会话下集合内是「展示名 hash」，只有名字归一能命中自身贡献——
+            //    去掉此路会把旧逻辑的偶然命中变成丢失。
+            // ② r.code 救援（新增）：proj.code 由 zh 规范名离线受控反查得出（权威）。ja/ar 词表各 1 条
+            //    展示名含非中性标点 `/`（エレクトロニック / EDM 等），名字归一被 G1 拒成空哨兵 →
+            //    自身贡献缺失 + 过滤误杀；r.code 路径使其中在其它引擎贡献了同 code 时得以存活。
+            // OR 语义 = 旧行为严格超集，零回归；集合侧与过滤侧派生彻底同源化属超纲项，另行开票。
+            let by_name = normalize_tag_to_code(&r.name);
+            detected_visual_tags.contains(&by_name)
+                || (!r.code.is_empty() && detected_visual_tags.contains(&r.code))
         })
         .cloned()
         .collect();
     let sem_graph = if is_pro { state.omw.semantic_graph() } else { None };
+    let current_file_group = if is_image { Some("image") } else { None };
     let enrich_tag = |tag: &mut omni_core::TagChainItem| {
         if let Some(ref g) = sem_graph {
-            g.enrich_tag_chain_item(tag);
+            g.enrich_tag_chain_item_with_context(tag, current_file_group);
         }
     };
     let mut gated_ram_tags = gated_ram_tags;
