@@ -232,6 +232,12 @@ pub struct TagChainItem {
     pub via_parent_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialized_paths: Option<String>,
+    /// 完整父级标签名链 (如 "/主体类型/动物宠物/鸭子")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_name_chain: Option<String>,
+    /// 完整父级标签Code链 (如 "/builtin.subject_type/builtin.animal/omw.01846331.n")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_code_chain: Option<String>,
     // 创世字段治理：pack 来源列已收敛为 source（dimension/tag/hownet/omw），废除 category
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
