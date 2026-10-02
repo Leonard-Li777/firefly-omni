@@ -299,7 +299,11 @@ pub mod vision {
 
         pub fn resolve_tag_to_chain_item(tag: &str, confidence: f32) -> omni_core::TagChainItem {
             // G1 词形闸（拒绝先于铸造）：开源兜底同样不得为不合格词产出 code。
-            if omni_core::tag_admissibility::is_g1_rejected(tag.trim()) {
+            // 闸与铸造**必须同源取自修剪后串**（S1 #705 第 1 轮 P2-5）：若闸判 trim 串、
+            // 铸造用原串，`"\u{85}abc"` 会产出 `builtin.\u{85}abc`——C1 控制字符直入 code/name。
+            // 与 `omni_core::tag_identity::normalize_tag_to_code` 的「trim 一次、两处同用」保持一致。
+            let tag_clean = tag.trim();
+            if omni_core::tag_admissibility::is_g1_rejected(tag_clean) {
                 return omni_core::TagChainItem {
                     code: String::new(),
                     name: String::new(),
@@ -308,8 +312,8 @@ pub mod vision {
                 };
             }
             omni_core::TagChainItem {
-                code: format!("builtin.{}", tag),
-                name: tag.to_string(),
+                code: format!("builtin.{}", tag_clean),
+                name: tag_clean.to_string(),
                 confidence,
                 ..Default::default()
             }
