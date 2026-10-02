@@ -12,7 +12,9 @@
 //! - **零本体依赖**：不查语义包、不取码，故可放在铸造入口最省算力的位置。
 //! - **本模块不做语言分支**：同一套字符类规则对 zh/en 同等生效（P3 来源对称）。
 //!
-//! 覆盖规则：R-G1-01（非白名单文种）、R-G1-10（不可入列码位，一票否决）、R-G1-11（单串多脚本混杂）。
+//! 覆盖规则：R-G1-01（非白名单文种）、R-G1-03（零文种字符子类：纯数字/纯标点/纯符号，
+//! 2026-10-02 用户裁决收敛进本模块单点拦截）、R-G1-10（不可入列码位，一票否决）、
+//! R-G1-11（单串多脚本混杂）。
 //!
 //! **严格性声明（与 TS 参考实现对齐，勿擅改）**：R-G1-01 是**全串锚定**判定——串内任一字符既非
 //! 白名单文种、又非数字/空白/中性字符（`-` `_` `·`）即拒。因此 `C++`、`C#`、`川菜（辣）`
@@ -20,8 +22,9 @@
 //! 的全串锚定字符类行为一致（其字符类同样不含 `+` `#` `（`），是有意为之而非疏漏。
 //! 若将来要放宽，必须**两侧同时**改（Rust 资源 + TS 正则），否则 L1/L2 判定漂移。
 //!
-//! 本模块**只**覆盖 R-G1-01 / R-G1-10 / R-G1-11 三条；R-G1-02…R-G1-09（超长、纯数字、hex 形态、
-//! 停用词、句型框架、CJK 单字、括号截断、保留字）**不在本模块范围**，由各自既有实现承担。
+//! 本模块**只**覆盖 R-G1-01 / R-G1-03（零文种字符子类）/ R-G1-10 / R-G1-11；R-G1-02 与
+//! R-G1-04…R-G1-09（超长、hex 形态、停用词、句型框架、CJK 单字、括号截断、保留字）及
+//! R-G1-03 的其余范畴承担者（hex/流水号等形态判定由各自既有实现负责）**不在本模块范围**。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +32,8 @@ use std::sync::OnceLock;
 
 /// R-G1-01 非白名单文种
 pub const R_G1_01: &str = "R-G1-01";
+/// R-G1-03 纯数字 / 纯标点 / 纯符号（零文种字符子类，2026-10-02 用户裁决收敛进本模块单点拦截）
+pub const R_G1_03: &str = "R-G1-03";
 /// R-G1-10 含不可入列码位（一票否决）
 pub const R_G1_10: &str = "R-G1-10";
 /// R-G1-11 单串多脚本混杂
@@ -381,12 +386,14 @@ pub fn config() -> &'static TagAdmissibility {
 // ============ 聚合计数（spec §7 D8：拒绝原因落日志 + 聚合计数，不建审计表） ============
 
 static REJECT_R_G1_01: AtomicU64 = AtomicU64::new(0);
+static REJECT_R_G1_03: AtomicU64 = AtomicU64::new(0);
 static REJECT_R_G1_10: AtomicU64 = AtomicU64::new(0);
 static REJECT_R_G1_11: AtomicU64 = AtomicU64::new(0);
 
 fn counter_for(rule: &str) -> Option<&'static AtomicU64> {
     match rule {
         R_G1_01 => Some(&REJECT_R_G1_01),
+        R_G1_03 => Some(&REJECT_R_G1_03),
         R_G1_10 => Some(&REJECT_R_G1_10),
         R_G1_11 => Some(&REJECT_R_G1_11),
         _ => None,
@@ -401,9 +408,10 @@ pub fn rejection_count(rule: &str) -> u64 {
 }
 
 /// 全部规则的累计拒绝次数（规则 ID → 次数）
-pub fn rejection_counts() -> [(&'static str, u64); 3] {
+pub fn rejection_counts() -> [(&'static str, u64); 4] {
     [
         (R_G1_01, rejection_count(R_G1_01)),
+        (R_G1_03, rejection_count(R_G1_03)),
         (R_G1_10, rejection_count(R_G1_10)),
         (R_G1_11, rejection_count(R_G1_11)),
     ]
@@ -425,7 +433,7 @@ pub fn reset_rejection_counts() {
 /// 因铸造入口的 code 与 name 同源取自修剪后的串，这不会铸造出垃圾概念。
 /// 夹在中间的同名控制字符仍由 R-G1-10 拦下（真实乱码即此形态）。
 ///
-/// 判定顺序：**R-G1-10 一票否决** → R-G1-01 文种白名单 → R-G1-11 多脚本混杂。
+/// 判定顺序：**R-G1-10 一票否决** → R-G1-01 文种白名单 → R-G1-03 零文种字符 → R-G1-11 多脚本混杂。
 ///
 /// > 规范 §2 的通用顺序是「按规则 ID 升序，首个命中即裁决」，但 §3.1 F25 / §5.1 明确把
 /// > R-G1-10 标为**一票否决**。若严格按 ID 升序，R-G1-01 会先命中（U+FFFD / NUL / PUA
@@ -470,6 +478,20 @@ pub fn g1_verdict(tag: &str) -> Verdict {
                 }
             }
         }
+    }
+
+    // ②' R-G1-03（零文种字符子类，2026-10-02 用户裁决收敛进 G1 单点拦截）：
+    // R-G1-01 循环对数字与中性字符一律 continue，纯此类串（`---` / `___` / `123` / `· ·`）
+    // 走完后 `present` 为空，此前会静默放行并在铸造点产出 `_ext.{hash8}` 垃圾 code。
+    // spec §5.1 表格本就标注 R-G1-03 装在铸造路径，本分支使其在 Rust 侧落地。
+    // 收敛语义：此处是**权威契约兜底**——上游预筛（fusion `is_noise_entity` 等候选早筛，
+    // 其范畴更宽：短 ASCII 碎片 / 序列号 / CJK 单字，与 G1 不重叠）漏拦也铸不出垃圾；
+    // 零额外扫描成本（复用 ② 的 present 结果）。受控反查在闸前，合法受控别名不受影响。
+    if present.is_empty() {
+        return Verdict::Reject {
+            rule: R_G1_03,
+            reason: "零文种字符（纯数字/纯标点/纯符号）",
+        };
     }
 
     // ③ R-G1-11：单串多脚本混杂（有分隔则不判）
@@ -650,6 +672,32 @@ mod tests {
             assert!(v.is_reject(), "含非中性符号应被拒: {bad} → {v:?}");
             assert_eq!(v.rule(), Some(R_G1_01), "{bad}");
         }
+    }
+
+    #[test]
+    fn rejects_zero_script_char_strings() {
+        // R-G1-03 零文种字符子类（2026-10-02 用户裁决收敛进 G1 单点拦截，spec §6.9.6 项 3）：
+        // 纯数字 / 纯中性标点 / 纯空白串无任何白名单文种字符，此前走完 R-G1-01 循环后
+        // `present` 为空被静默放行，会在铸造点产出 `_ext.{hash8}` 垃圾 code。
+        for bad in ["---", "___", "·-·", "123", "9 9", "-_-", "···"] {
+            let v = g1_verdict(bad);
+            assert!(v.is_reject(), "零文种字符串应被拒: {bad:?} → {v:?}");
+            assert_eq!(v.rule(), Some(R_G1_03), "{bad:?}");
+        }
+        // 混入白名单文种字符的含数字/中性字符形态不受影响
+        for ok in ["2024年度报告", "abc-def", "v2", "MP3 Player"] {
+            let v = g1_verdict(ok);
+            assert!(v.is_admitted(), "含文种字符的混合形态不应被拒: {ok} → {v:?}");
+        }
+        // 铸造入口收敛：上游预筛（fusion is_noise_entity 等）漏拦时，此处兜底也铸不出垃圾
+        assert!(crate::tag_identity::normalize_tag_to_code("---").is_empty());
+        assert!(crate::tag_identity::normalize_tag_to_code("123").is_empty());
+        // 受控别名优先级不受影响（反查在闸前；「高质量」为静态 BUILTIN_ALIASES 映射，
+        // 与 tag_identity 测试 :1469 的既有断言同源）
+        assert_eq!(
+            crate::tag_identity::normalize_tag_to_code("高质量"),
+            "builtin.high_quality"
+        );
     }
 
     #[test]
