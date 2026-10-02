@@ -123,25 +123,39 @@ impl Script {
         }
     }
 
-    /// 码位 → 文种。仅覆盖白名单语族的**主干区段**（够用即止，不追求 Unicode 全量）。
+    /// 码位 → 文种。
+    ///
+    /// **与 TS 参考实现的已知差异（有意登记，勿静默扩散）**：TS 侧用 Unicode Script 属性类
+    /// (`\p{Script=Han}` 等)，覆盖全部已指派码位；本函数按**显式区段枚举**，未列出的码位一律判
+    /// 「非白名单文种」。已按审查（S1 #705 第 1 轮 P2-1）补齐主干扩展区段（CJK Ext B–I、
+    /// 拉丁 Ext C/D/E、谚文 Jamo 扩展、西里尔扩展）；若 TS 侧将来再扩白名单，两侧必须同步。
     pub fn of(c: char) -> Option<Script> {
         let u = c as u32;
         match u {
-            // Han：基本区 / 扩展 A / 兼容表意
-            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => Some(Script::Han),
+            // Han：基本区 / 扩展 A / 兼容表意 / **扩展 B–I / 兼容补充**
+            // （Ext B 起含 U+20000+，真实汉字如 `𠮷`(U+20BB7) 在此——缺了会把合法人名用字判成乱码）
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2B739 | 0x2B740..=0x2B81F | 0x2B820..=0x2CEAF | 0x2CEB0..=0x2EBEF
+            | 0x2EBF0..=0x2EE5F | 0x2F800..=0x2FA1F | 0x30000..=0x3134A | 0x31350..=0x323AF => {
+                Some(Script::Han)
+            }
             // 日文假名
             0x3040..=0x309F => Some(Script::Hiragana),
             0x30A0..=0x30FF | 0x31F0..=0x31FF => Some(Script::Katakana),
-            // 谚文
-            0x1100..=0x11FF | 0x3130..=0x318F | 0xAC00..=0xD7AF => Some(Script::Hangul),
-            // 西里尔
-            0x0400..=0x04FF | 0x0500..=0x052F | 0x2DE0..=0x2DFF => Some(Script::Cyrillic),
+            // 谚文（含 Jamo 扩展 A/B）
+            0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97C | 0xAC00..=0xD7AF
+            | 0xD7B0..=0xD7FF => Some(Script::Hangul),
+            // 西里尔（含 Cyrillic Extended-A）
+            0x0400..=0x04FF | 0x0500..=0x052F | 0x2DE0..=0x2DFF | 0xA640..=0xA69F => {
+                Some(Script::Cyrillic)
+            }
             // 阿拉伯
             0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF
             | 0xFE70..=0xFEFF => Some(Script::Arabic),
-            // 拉丁：ASCII 字母 + 拉丁补充 / 扩展 A / 扩展 B 起始段
+            // 拉丁：ASCII 字母 + 拉丁补充 / 扩展 A / 扩展 B / **扩展 C / D / E**
             _ if c.is_ascii_alphabetic() => Some(Script::Latin),
-            0x00C0..=0x024F | 0x1E00..=0x1EFF => Some(Script::Latin),
+            0x00C0..=0x024F | 0x1E00..=0x1EFF | 0x2C60..=0x2C7F | 0xA720..=0xA7FF
+            | 0xAB30..=0xAB6F => Some(Script::Latin),
             _ => None,
         }
     }
@@ -294,8 +308,18 @@ impl TagAdmissibility {
     }
 }
 
-/// 规则资源所在目录候选（与 `omni-vision::OmniVisionEngine::resolve_taxonomy_dir` 同源的路径解析；
-/// 重复的是**路径查找**而非**规则数据**——规则数据仍只有 `tag-admissibility.json` 一份）。
+/// 规则资源所在目录候选。
+///
+/// **镜像自 `omni-vision::OmniVisionEngine::resolve_taxonomy_dir`，但已登记 3 处差异**
+/// （S1 #705 第 1 轮审查 P2-3；完整收敛——下沉为 omni-core 单一函数、omni-vision 改为调用——
+/// 属超纲建议，另行开票）：
+/// ① 后者另有 `%APPDATA%/firefly-ai-folder/taxonomy` 与 `%USERPROFILE%/.firefly/taxonomy` 两个
+///    宿主侧候选，本函数**有意不收**（引擎不应读宿主用户数据，见
+///    `docs/features/ai/engine-resource-lookup-scope.md`，尽管该文档只管辖引擎二进制）；
+/// ② 命中判据不同：本函数要求目录含 `tag-admissibility.json`，后者要求含 `entity_ontology.json`——
+///    若某目录只有其一，两者可能选中**不同目录**（规则与词表漂移的现实风险）；
+/// ③ CWD 向上 walk 已补齐 `build/extraResources/taxonomy`（原镜像源漏了该项）。
+/// 重复的是**路径查找**而非**规则数据**——规则数据仍只有 `tag-admissibility.json` 一份。
 fn taxonomy_dir_candidates() -> Vec<PathBuf> {
     let mut candidates = vec![
         PathBuf::from("apps/desktop/build/extraResources/taxonomy"),
@@ -323,6 +347,7 @@ fn taxonomy_dir_candidates() -> Vec<PathBuf> {
     if let Ok(mut current) = std::env::current_dir() {
         for _ in 0..8 {
             candidates.push(current.join("taxonomy"));
+            candidates.push(current.join("build/extraResources/taxonomy"));
             candidates.push(current.join("apps/desktop/build/extraResources/taxonomy"));
             match current.parent() {
                 Some(p) => current = p.to_path_buf(),
@@ -395,6 +420,11 @@ pub fn reset_rejection_counts() {
 
 /// 纯判定：不做日志、不计数。用于单测与需要无副作用的场景。
 ///
+/// **修剪语义**：判定前先 `trim()`。由于 `str::trim()` 按 Unicode `White_Space` 剥离，
+/// U+0085(NEL)、U+000B(VT)、U+000C(FF) 等**空白类控制字符**出现在首尾时会被剥掉而非判拒；
+/// 因铸造入口的 code 与 name 同源取自修剪后的串，这不会铸造出垃圾概念。
+/// 夹在中间的同名控制字符仍由 R-G1-10 拦下（真实乱码即此形态）。
+///
 /// 判定顺序：**R-G1-10 一票否决** → R-G1-01 文种白名单 → R-G1-11 多脚本混杂。
 ///
 /// > 规范 §2 的通用顺序是「按规则 ID 升序，首个命中即裁决」，但 §3.1 F25 / §5.1 明确把
@@ -444,9 +474,13 @@ pub fn g1_verdict(tag: &str) -> Verdict {
 
     // ③ R-G1-11：单串多脚本混杂（有分隔则不判）
     if present.len() >= 2 {
+        // 分隔符判定与 R-G1-01 的中性字符集**同源**（cfg.neutral_chars + 空白），
+        // 避免两条规则对「什么算分隔」分叉（S1 #705 第 1 轮 P2-4）。
+        // 注意规范 N24/F26 的文本只写「空格/连字符」，本实现刻意取超集（含 `_` `·`）——
+        // 与 TS 参考实现的字符类 `\d\-_·\s` 对齐；该差异已在资源 notes 中登记。
         let has_separator = trimmed
             .chars()
-            .any(|c| c.is_whitespace() || c == '-' || c == '_' || c == '·');
+            .any(|c| c.is_whitespace() || cfg.neutral_chars.contains(&c));
         if !has_separator {
             for (a, b) in &cfg.exclusive_pairs {
                 if present.contains(a) && present.contains(b) {
@@ -515,6 +549,17 @@ mod tests {
         let v = g1_verdict("abc\u{85}def");
         assert!(v.is_reject(), "C1 控制字符必须被拒");
         assert_eq!(v.rule(), Some(R_G1_10));
+    }
+
+    #[test]
+    fn trims_whitespace_class_control_chars_before_scan() {
+        // U+0085 (NEL) 虽落在 C1 区段，但它同时是 Unicode `White_Space`，
+        // 会被 `str::trim()` 先剥掉 → 前导/尾随 NEL **不会**触发 R-G1-10。
+        // 这是可接受的：`g1_verdict` 与铸造入口同源修剪，code 与 name 都取自修剪后的串，
+        // 不会因此铸造出垃圾概念（`"\u{85}abc"` → 视作 `"abc"`）。
+        assert!(g1_verdict("\u{85}abc").is_admitted());
+        // 但夹在中间的 NEL 不会被 trim，仍由 R-G1-10 拦下（这才是真实乱码的形态）。
+        assert_eq!(g1_verdict("abc\u{85}def").rule(), Some(R_G1_10));
     }
 
     #[test]

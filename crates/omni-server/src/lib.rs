@@ -59,6 +59,8 @@ pub struct AppState {
     pub omw: OmwDb,
     /// 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 WeMM-Embedding 2B 2048 维，闭源优先 🔒)
     pub vector: Arc<VectorEngine>,
+    /// 桌面端 SQLite 业务主库路径（只读访问 file_tag_relations 等主库表）
+    pub master_db_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
 #[derive(Deserialize)]
@@ -293,6 +295,11 @@ async fn reconnect_omw_handler(
     Json(req): Json<ReconnectRequest>,
 ) -> Json<serde_json::Value> {
     let db_path = req.db_path.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(p) = db_path {
+        if let Ok(mut lock) = state.master_db_path.lock() {
+            *lock = Some(std::path::PathBuf::from(p));
+        }
+    }
     let result = match db_path {
         Some(path) => state.omw.connect(path),
         None => {
@@ -664,6 +671,7 @@ pub async fn start_server(
         search,
         omw,
         vector,
+        master_db_path: Arc::new(Mutex::new(db_path)),
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本

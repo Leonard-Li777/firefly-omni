@@ -23,6 +23,18 @@ pub struct TaxonomyTreeQuery {
     pub locale: Option<String>,
     /// 可选指定根节点 code (例如 builtin.domain)；缺省返回全部顶层根节点
     pub root: Option<String>,
+    /// 可选指定桌面端 SQLite 业务主库路径（只读访问 file_tag_relations 等主库表）
+    #[serde(alias = "db_path")]
+    pub db_path: Option<String>,
+    /// 是否在响应中包含各节点的完整文件指纹列表（默认 false，节省带宽与序列化耗时）
+    #[serde(alias = "include_files")]
+    pub include_files: Option<bool>,
+    /// 可选指定所属工作区ID过滤（作用域感知建树）
+    #[serde(alias = "workspace_id")]
+    pub workspace_id: Option<i64>,
+    /// 可选指定目录物理路径前缀过滤（作用域感知建树）
+    #[serde(alias = "directory_prefix")]
+    pub directory_prefix: Option<String>,
 }
 
 /// 分类树多叉树节点
@@ -36,6 +48,10 @@ pub struct TaxonomyNode {
     pub parent_codes: Vec<String>,
     pub source: String,
     pub sort_order: i64,
+    #[serde(default)]
+    pub file_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
     pub children: Vec<TaxonomyNode>,
 }
 
@@ -113,9 +129,24 @@ pub async fn taxonomy_tree_handler(
 ) -> Json<TaxonomyTreeResponse> {
     let locale = query.locale.unwrap_or_else(|| "zh-CN".to_string());
     let root_filter = query.root;
+    let explicit_db_path = query.db_path.map(std::path::PathBuf::from);
+    let master_db_path = explicit_db_path.or_else(|| {
+        state.master_db_path.lock().ok().and_then(|opt| opt.clone())
+    });
+    let include_files = query.include_files.unwrap_or(false);
+    let workspace_id = query.workspace_id;
+    let directory_prefix = query.directory_prefix;
 
     let res = state.omw.with_conn(|conn| {
-        query_taxonomy_tree(conn, &locale, root_filter.as_deref())
+        query_taxonomy_tree(
+            conn,
+            &locale,
+            root_filter.as_deref(),
+            master_db_path.as_deref(),
+            include_files,
+            workspace_id,
+            directory_prefix.as_deref(),
+        )
     });
 
     match res {
@@ -171,6 +202,10 @@ pub fn query_taxonomy_tree(
     conn: &Connection,
     locale: &str,
     root_filter: Option<&str>,
+    master_db_path: Option<&std::path::Path>,
+    include_files: bool,
+    workspace_id: Option<i64>,
+    directory_prefix: Option<&str>,
 ) -> anyhow::Result<TaxonomyTreeResponse> {
     // 1. 检查 file_tags 表是否存在
     let has_file_tags: bool = conn
@@ -306,43 +341,271 @@ pub fn query_taxonomy_tree(
                 parent_codes: raw.parent_codes,
                 source: raw.source,
                 sort_order: raw.sort_order,
+                file_count: 0,
+                files: Vec::new(),
                 children: Vec::new(),
             },
         );
     }
 
-    // 5. 组装多叉树森林
-    // 找出所有节点及其父子关系
+    // 5. 组装多叉树森林与文件关联 (支持直读桌面主库 file_tag_relations)
+    let mut direct_files: HashMap<String, HashSet<String>> = HashMap::new();
     let mut parent_to_children: HashMap<String, Vec<String>> = HashMap::new();
     let mut root_candidates: Vec<String> = Vec::new();
 
+    // 5.1 确保通用受控内容标签根节点存在
+    if !node_map.contains_key("builtin.content_tags") {
+        node_map.insert(
+            "builtin.content_tags".to_string(),
+            TaxonomyNode {
+                code: "builtin.content_tags".to_string(),
+                name: if locale.to_ascii_lowercase().starts_with("en") {
+                    "Content Tags".to_string()
+                } else {
+                    "内容标签".to_string()
+                },
+                parent_code: None,
+                parent_codes: Vec::new(),
+                source: "builtin".to_string(),
+                sort_order: 9999,
+                file_count: 0,
+                files: Vec::new(),
+                children: Vec::new(),
+            },
+        );
+        pack_source_map.insert("builtin.content_tags".to_string(), "dimension".to_string());
+    }
+
+    // 5.2 若提供业务主库路径，只读加载 file_tag_relations 中的文件归属与父级链
+    if let Some(path) = master_db_path {
+        if path.exists() {
+            if let Ok(master_conn) = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+                let has_ftr: bool = master_conn
+                    .query_row(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file_tag_relations'",
+                        [],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+
+                if has_ftr {
+                    let mut has_name_chain = false;
+                    let mut has_code_chain = false;
+                    if let Ok(mut col_stmt) = master_conn.prepare("PRAGMA table_info(file_tag_relations)") {
+                        if let Ok(rows) = col_stmt.query_map([], |r| r.get::<_, String>(1)) {
+                            for col in rows.flatten() {
+                                if col == "parent_name_chain" {
+                                    has_name_chain = true;
+                                } else if col == "parent_code_chain" {
+                                    has_code_chain = true;
+                                }
+                            }
+                        }
+                    }
+
+                    let has_wf: bool = master_conn
+                        .query_row(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workspace_files'",
+                            [],
+                            |_| Ok(true),
+                        )
+                        .unwrap_or(false);
+
+                    let mut where_clauses = vec!["wf.status = 1".to_string()];
+                    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+
+                    if let Some(ws_id) = workspace_id {
+                        where_clauses.push("wf.workspace_id = ?".to_string());
+                        params.push(rusqlite::types::Value::Integer(ws_id));
+                    }
+
+                    if let Some(prefix) = directory_prefix {
+                        let clean_prefix = prefix.trim();
+                        if !clean_prefix.is_empty() {
+                            let sep = if clean_prefix.contains('\\') { '\\' } else { '/' };
+                            let prefix_pattern = if clean_prefix.ends_with('/') || clean_prefix.ends_with('\\') {
+                                format!("{}%", clean_prefix)
+                            } else {
+                                format!("{}{}%", clean_prefix, sep)
+                            };
+                            where_clauses.push("(wf.path LIKE ? OR wf.path = ?)".to_string());
+                            params.push(rusqlite::types::Value::Text(prefix_pattern));
+                            params.push(rusqlite::types::Value::Text(clean_prefix.to_string()));
+                        }
+                    }
+
+                    let select_sql = if has_wf && !params.is_empty() {
+                        format!(
+                            "SELECT DISTINCT ftr.file_fingerprint, ftr.tag_code, ftr.via_parent_code, {}, {} \
+                             FROM file_tag_relations ftr \
+                             JOIN workspace_files wf ON wf.file_fingerprint = ftr.file_fingerprint \
+                             WHERE {}",
+                            if has_name_chain { "ftr.parent_name_chain" } else { "''" },
+                            if has_code_chain { "ftr.parent_code_chain" } else { "''" },
+                            where_clauses.join(" AND ")
+                        )
+                    } else {
+                        format!(
+                            "SELECT file_fingerprint, tag_code, via_parent_code, {}, {} FROM file_tag_relations",
+                            if has_name_chain { "parent_name_chain" } else { "''" },
+                            if has_code_chain { "parent_code_chain" } else { "''" }
+                        )
+                    };
+
+                    if let Ok(mut stmt) = master_conn.prepare(&select_sql) {
+                        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+                        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                            let fp: String = row.get(0)?;
+                            let tag_code: String = row.get(1)?;
+                            let via: String = row.get(2).unwrap_or_default();
+                            let name_chain: String = row.get(3).unwrap_or_default();
+                            let code_chain: String = row.get(4).unwrap_or_default();
+                            Ok((fp, tag_code, via, name_chain, code_chain))
+                        });
+
+                        if let Ok(rows) = rows {
+                            for r in rows.flatten() {
+                                let (fp, tag_code, via, name_chain, code_chain) = r;
+                                direct_files.entry(tag_code.clone()).or_default().insert(fp.clone());
+
+                                // 处理父级链 (例如 "/建筑空间/文化场馆/博物馆" 或 "/builtin.subject_type/builtin.animal/omw.01846331.n")
+                                let has_name_chain = !name_chain.trim().is_empty();
+                                let has_code_chain = !code_chain.trim().is_empty();
+                                if has_name_chain || has_code_chain {
+                                    let name_segs: Vec<String> = if has_name_chain {
+                                        name_chain
+                                            .split('/')
+                                            .map(|s| s.trim().to_string())
+                                            .filter(|s| !s.is_empty() && s != "内容标签" && s != "builtin.content_tags")
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let code_segs: Vec<String> = if has_code_chain {
+                                        code_chain
+                                            .split('/')
+                                            .map(|s| s.trim().to_string())
+                                            .filter(|s| !s.is_empty() && s != "内容标签" && s != "builtin.content_tags")
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
+
+                                    let num_segs = code_segs.len().max(name_segs.len());
+                                    if num_segs > 0 {
+                                        let first_seg_code = if !code_segs.is_empty() && !code_segs[0].is_empty() {
+                                            code_segs[0].clone()
+                                        } else if num_segs == 1 {
+                                            tag_code.clone()
+                                        } else {
+                                            format!("builtin.cat.{}", name_segs[0])
+                                        };
+
+                                        // 若链条根部本身为已声明的主干维度或顶层根节点，则链条自身具有独立根，严禁重复挂入 builtin.content_tags
+                                        let is_root_dim = pack_source_map.get(&first_seg_code).map_or(false, |s| s == "dimension")
+                                            || node_map.get(&first_seg_code).map_or(false, |n| n.parent_code.is_none() && n.code != "builtin.content_tags");
+
+                                        let (mut prev_code, start_idx) = if is_root_dim {
+                                            (first_seg_code, 1)
+                                        } else {
+                                            ("builtin.content_tags".to_string(), 0)
+                                        };
+
+                                        for i in start_idx..num_segs {
+                                            let seg_code = if i < code_segs.len() && !code_segs[i].is_empty() {
+                                                code_segs[i].clone()
+                                            } else if i == num_segs - 1 {
+                                                tag_code.clone()
+                                            } else if i < name_segs.len() {
+                                                format!("builtin.cat.{}", name_segs[i])
+                                            } else {
+                                                tag_code.clone()
+                                            };
+
+                                            let seg_name = if i < name_segs.len() && !name_segs[i].is_empty() {
+                                                name_segs[i].clone()
+                                            } else if let Some(n) = node_map.get(&seg_code) {
+                                                n.name.clone()
+                                            } else if let Some((canonical, _)) = alias_map.get(&seg_code) {
+                                                canonical.clone()
+                                            } else {
+                                                let lang = locale.split('-').next().unwrap_or("zh");
+                                                omni_core::tag_identity::tag_display(&seg_code, lang)
+                                            };
+
+                                            if !node_map.contains_key(&seg_code) {
+                                                node_map.insert(
+                                                    seg_code.clone(),
+                                                    TaxonomyNode {
+                                                        code: seg_code.clone(),
+                                                        name: seg_name.clone(),
+                                                        parent_code: Some(prev_code.clone()),
+                                                        parent_codes: vec![prev_code.clone()],
+                                                        source: "chain".to_string(),
+                                                        sort_order: 9999,
+                                                        file_count: 0,
+                                                        files: Vec::new(),
+                                                        children: Vec::new(),
+                                                    },
+                                                );
+                                            }
+
+                                            if prev_code != seg_code {
+                                                let children = parent_to_children.entry(prev_code.clone()).or_default();
+                                                if !children.contains(&seg_code) {
+                                                    children.push(seg_code.clone());
+                                                }
+                                            }
+                                            prev_code = seg_code;
+                                        }
+                                    }
+                                } else if !via.trim().is_empty() && via != tag_code {
+                                    let children = parent_to_children.entry(via.clone()).or_default();
+                                    if !children.contains(&tag_code) {
+                                        children.push(tag_code.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 5.3 补齐受控语义库中所有已有节点的父子邻接映射
     for (code, node) in &node_map {
         if let Some(ref p) = node.parent_code {
             if node_map.contains_key(p) && p != code {
-                parent_to_children.entry(p.clone()).or_default().push(code.clone());
+                let children = parent_to_children.entry(p.clone()).or_default();
+                if !children.contains(code) {
+                    children.push(code.clone());
+                }
             } else {
-                // 父节点不存在时，仅当其为受控维度时方可作为顶层根候选（排除 omw/hownet/tag 孤立词）
-                let is_dimension = pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false);
-                if is_dimension {
+                let is_dimension = pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false)
+                    || code == "builtin.content_tags";
+                if is_dimension && !root_candidates.contains(code) {
                     root_candidates.push(code.clone());
                 }
             }
         } else {
-            // parent_code 为空时：仅受控维度可作为顶层根候选！绝不可将 omw/hownet/tag 作为分类树根输出！
-            let is_dimension = pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false);
-            if is_dimension {
+            let is_dimension = pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false)
+                || code == "builtin.content_tags";
+            if is_dimension && !root_candidates.contains(code) {
                 root_candidates.push(code.clone());
             }
         }
     }
 
-    // 递归组装树节点
+    // 递归组装树节点并自底向上后序遍历计算唯一文件合计 (数学公理：真实父级与逻辑父级一视同仁)
     fn build_subtree(
         code: &str,
         node_map: &BTreeMap<String, TaxonomyNode>,
         parent_to_children: &HashMap<String, Vec<String>>,
         visited: &mut HashSet<String>,
-    ) -> Option<TaxonomyNode> {
+        direct_files: &HashMap<String, HashSet<String>>,
+        include_files: bool,
+    ) -> Option<(TaxonomyNode, HashSet<String>)> {
         if visited.contains(code) {
             return None; // 防环保护
         }
@@ -350,9 +613,19 @@ pub fn query_taxonomy_tree(
 
         let base_node = node_map.get(code)?;
         let mut children = Vec::new();
+        let mut aggregate_files = HashSet::new();
+
+        if let Some(dfs) = direct_files.get(code) {
+            aggregate_files.extend(dfs.iter().cloned());
+        }
+        if let Some(dfs) = direct_files.get(&base_node.name) {
+            aggregate_files.extend(dfs.iter().cloned());
+        }
+
         if let Some(child_codes) = parent_to_children.get(code) {
             for child_code in child_codes {
-                if let Some(child_node) = build_subtree(child_code, node_map, parent_to_children, visited) {
+                if let Some((child_node, child_files)) = build_subtree(child_code, node_map, parent_to_children, visited, direct_files, include_files) {
+                    aggregate_files.extend(child_files);
                     children.push(child_node);
                 }
             }
@@ -370,24 +643,37 @@ pub fn query_taxonomy_tree(
 
         visited.remove(code);
 
-        Some(TaxonomyNode {
+        let file_count = aggregate_files.len();
+        let files = if include_files {
+            let mut sorted_files: Vec<String> = aggregate_files.iter().cloned().collect();
+            sorted_files.sort();
+            sorted_files
+        } else {
+            Vec::new()
+        };
+
+        let node = TaxonomyNode {
             code: base_node.code.clone(),
             name: base_node.name.clone(),
             parent_code: base_node.parent_code.clone(),
             parent_codes: base_node.parent_codes.clone(),
             source: base_node.source.clone(),
             sort_order: base_node.sort_order,
+            file_count,
+            files,
             children,
-        })
+        };
+
+        Some((node, aggregate_files))
     }
 
     let mut roots: Vec<TaxonomyNode> = Vec::new();
     let mut visited = HashSet::new();
 
     if let Some(target_root) = root_filter {
-        if let Some(root_node) = build_subtree(target_root, &node_map, &parent_to_children, &mut visited) {
-            // 对于根级，如果其下没有子标签，则根级数据不应输出，也不应展示
-            if !root_node.children.is_empty() {
+        if let Some((root_node, _)) = build_subtree(target_root, &node_map, &parent_to_children, &mut visited, &direct_files, include_files) {
+            // 对于根级，如果其下没有子标签且自身无文件，则根级数据不应输出
+            if !root_node.children.is_empty() || root_node.file_count > 0 {
                 roots.push(root_node);
             }
         }
@@ -395,9 +681,9 @@ pub fn query_taxonomy_tree(
         root_candidates.sort();
         let mut candidate_nodes: Vec<TaxonomyNode> = Vec::new();
         for root_code in root_candidates {
-            if let Some(root_node) = build_subtree(&root_code, &node_map, &parent_to_children, &mut visited) {
-                // 对于根级，如果其下没有子标签，则根级数据不应输出，也不应展示
-                if !root_node.children.is_empty() {
+            if let Some((root_node, _)) = build_subtree(&root_code, &node_map, &parent_to_children, &mut visited, &direct_files, include_files) {
+                // 对于根级，如果其下没有子标签且自身无文件，则根级数据不应输出
+                if !root_node.children.is_empty() || root_node.file_count > 0 {
                     candidate_nodes.push(root_node);
                 }
             }
