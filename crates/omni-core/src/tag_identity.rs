@@ -49,15 +49,17 @@ pub fn en_builtin_code(en_name: &str) -> String {
 
 /// 开放集扩展标签 code：_ext.{slug}.{hash8(原串)}
 ///
-/// **G1 词形闸（拒绝先于铸造，spec §6.9.3 / ADR-0052）**：不合格词**不派生任何 code**，
-/// 返回空串哨兵 [`crate::tag_admissibility::REJECTED_CODE`]。这是全仓 `_ext.*` 铸造的
-/// 唯一 omni-core 出口，把闸门装在这里可保证「四类坏名不产生新的 `_ext.*` 概念」。
-/// 调用方必须把空 code 视为「未通过准入」并丢弃（见 `normalize_tag_set_to_codes`）。
+/// **本函数是纯生成器，不做任何准入校验**（G1 词形闸装在**调用方**，见
+/// [`normalize_tag_to_code`] 的范式 —— spec §6.9.3 原文即写「`derive_ext_tag_code` **调用方**」）。
+///
+/// 为什么不把闸装在这里：本函数同时服务**可信的策展资产**——如 RAM++ 离线投影表
+/// `ram_pan_projection.json` 的 `zh` 字段（4585 条中 103 条是多义项 gloss，形如 `胡同/球道`，
+/// 含 `/`）。这些 `zh` 是**词典查找键**而非候选标签词，用 G1 去筛会误删 103 条合法投影。
+/// G1 的适用对象是**来自文件名 / OCR / CLIP / RAM 模型输出的候选词**，不是策展资产。
+///
+/// 新增调用方时，若输入来自不可信来源，**必须先过 G1 闸**再调用本函数。
 pub fn derive_ext_tag_code(tag: &str) -> String {
     let tag_clean = tag.trim();
-    if crate::tag_admissibility::is_g1_rejected(tag_clean) {
-        return crate::tag_admissibility::REJECTED_CODE.to_string();
-    }
     let hash8 = content_hash8(tag_clean);
     let slug = sanitize_en_slug(tag_clean);
     if slug.is_empty() {
@@ -1160,8 +1162,13 @@ pub fn tag_matches_concept(tag: &str, canonical_zh_or_en: &str) -> bool {
 
 /// 标签串归一：命中别名 → builtin code；未命中 → _ext 派生
 ///
-/// **注意**：被 G1 词形闸拒绝的词会返回空串哨兵（`_ext` 铸造被拦），调用方需按
+/// **G1 词形闸（拒绝先于铸造，spec §6.9.3 / ADR-0052）装在本函数**——它是「候选词 → code」
+/// 的主入口（`omni-server` 的 `detected_visual_tags` 归一即走此路）。不合格词返回空串哨兵
+/// [`crate::tag_admissibility::REJECTED_CODE`]，调用方需按
 /// [`crate::tag_admissibility::is_rejected_code`] 判定并丢弃。
+///
+/// 注意闸门位置：受控别名命中（`builtin.*` / `omw.*`）与「已是合法 code 形态」两个分支
+/// **不**过闸——受控词表本身即白名单，code 形态输入则是幂等短路。
 pub fn normalize_tag_to_code(tag: &str) -> String {
     if let Some(code) = builtin_tag_code(tag) {
         return code.to_string();
@@ -1170,6 +1177,10 @@ pub fn normalize_tag_to_code(tag: &str) -> String {
     let t = tag.trim();
     if t.starts_with("builtin.") || t.starts_with("_ext.") || t.starts_with("omw.") || t.starts_with("hownet.") {
         return t.to_string();
+    }
+    // G1 词形闸：不合格词不派生 `_ext`，返回空串哨兵
+    if crate::tag_admissibility::is_g1_rejected(t) {
+        return crate::tag_admissibility::REJECTED_CODE.to_string();
     }
     derive_ext_tag_code(t)
 }
@@ -1282,6 +1293,9 @@ mod tests {
     }
 
     /// G1 词形闸（spec §6.9.3 / 验收 V10）：四类坏名**不得**产出 `_ext.*` 概念。
+    ///
+    /// 闸门位置 = `normalize_tag_to_code`（「候选词 → code」主入口），而非 `derive_ext_tag_code`
+    /// （纯生成器，见其文档注释：策展资产如 RAM 投影表的 `zh` 键含 `/`，不可用 G1 去筛）。
     #[test]
     fn g1_rejects_mojibake_before_minting_ext_code() {
         for bad in [
@@ -1291,20 +1305,32 @@ mod tests {
             "\u{85}abc",                    // C1 控制字符
             "ӉӉӉ汉",                        // 单串多脚本混杂（R-G1-11）
         ] {
-            let code = derive_ext_tag_code(bad);
+            let code = normalize_tag_to_code(bad);
             assert!(
                 crate::tag_admissibility::is_rejected_code(&code),
-                "坏名不得铸造 _ext code: {bad:?} → {code}"
+                "坏名不得铸造 code: {bad:?} → {code}"
             );
-            assert!(normalize_tag_to_code(bad).is_empty(), "{bad:?}");
+        }
+    }
+
+    /// 闸门不得误伤策展资产：RAM++ 投影表的 `zh` 键含 `/`（多义项 gloss），
+    /// 经 `derive_ext_tag_code` 仍须产出合法 `_ext.*`（纯生成器不做准入校验）。
+    #[test]
+    fn derive_ext_tag_code_stays_pure_for_curated_gloss_keys() {
+        for gloss in ["胡同/球道", "检查/支票", "一本/一册"] {
+            let code = derive_ext_tag_code(gloss);
+            assert!(
+                code.starts_with("_ext.") && !code.is_empty(),
+                "策展 gloss 键必须仍能派生 code: {gloss} → {code}"
+            );
         }
     }
 
     /// 正例零误杀：合法词仍正常铸造，且拒绝不污染 code 集合。
     #[test]
     fn g1_allows_positive_and_filters_rejected_from_set() {
-        assert!(derive_ext_tag_code("手机照片").starts_with("_ext."));
-        assert!(derive_ext_tag_code("Документы").starts_with("_ext."));
+        assert!(normalize_tag_to_code("手机照片").starts_with("builtin.") || normalize_tag_to_code("手机照片").starts_with("_ext."));
+        assert!(normalize_tag_to_code("Документы").starts_with("_ext."));
         let mixed = vec![
             "手机照片".to_string(),
             "\u{FFFD}\u{FFFD}乱码".to_string(),

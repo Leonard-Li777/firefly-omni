@@ -62,3 +62,16 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# 开发与 watch 模式：加速第三方依赖执行速度（让 debug 版 exe 跑得飞快且保持快速增量编译）
+[profile.dev.package."*"]
+opt-level = 2
+
+# 快速 release 测试 profile：保留优化，使用 thin LTO 与 16 并行 codegen 大幅缩短生成 exe 耗时
+[profile.quick-release]
+inherits = "release"
+opt-level = 2
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = true
