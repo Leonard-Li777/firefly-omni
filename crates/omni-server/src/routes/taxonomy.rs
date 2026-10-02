@@ -389,12 +389,21 @@ pub fn query_taxonomy_tree(
                     .unwrap_or(false);
 
                 if has_ftr {
+                    let mut has_code_path = false;
+                    let mut has_name_path = false;
+                    let mut _has_depth = false;
                     let mut has_name_chain = false;
                     let mut has_code_chain = false;
                     if let Ok(mut col_stmt) = master_conn.prepare("PRAGMA table_info(file_tag_relations)") {
                         if let Ok(rows) = col_stmt.query_map([], |r| r.get::<_, String>(1)) {
                             for col in rows.flatten() {
-                                if col == "parent_name_chain" {
+                                if col == "code_path" {
+                                    has_code_path = true;
+                                } else if col == "name_path" {
+                                    has_name_path = true;
+                                } else if col == "depth" {
+                                    _has_depth = true;
+                                } else if col == "parent_name_chain" {
                                     has_name_chain = true;
                                 } else if col == "parent_code_chain" {
                                     has_code_chain = true;
@@ -434,21 +443,50 @@ pub fn query_taxonomy_tree(
                         }
                     }
 
+                    let col_name_expr = if has_name_path {
+                        "ftr.name_path"
+                    } else if has_name_chain {
+                        "ftr.parent_name_chain"
+                    } else {
+                        "''"
+                    };
+                    let col_code_expr = if has_code_path {
+                        "ftr.code_path"
+                    } else if has_code_chain {
+                        "ftr.parent_code_chain"
+                    } else {
+                        "''"
+                    };
+
                     let select_sql = if has_wf && !params.is_empty() {
                         format!(
                             "SELECT DISTINCT ftr.file_fingerprint, ftr.tag_code, ftr.via_parent_code, {}, {} \
                              FROM file_tag_relations ftr \
                              JOIN workspace_files wf ON wf.file_fingerprint = ftr.file_fingerprint \
                              WHERE {}",
-                            if has_name_chain { "ftr.parent_name_chain" } else { "''" },
-                            if has_code_chain { "ftr.parent_code_chain" } else { "''" },
+                            col_name_expr,
+                            col_code_expr,
                             where_clauses.join(" AND ")
                         )
                     } else {
+                        let col_name_raw = if has_name_path {
+                            "name_path"
+                        } else if has_name_chain {
+                            "parent_name_chain"
+                        } else {
+                            "''"
+                        };
+                        let col_code_raw = if has_code_path {
+                            "code_path"
+                        } else if has_code_chain {
+                            "code_path"
+                        } else {
+                            "''"
+                        };
                         format!(
                             "SELECT file_fingerprint, tag_code, via_parent_code, {}, {} FROM file_tag_relations",
-                            if has_name_chain { "parent_name_chain" } else { "''" },
-                            if has_code_chain { "parent_code_chain" } else { "''" }
+                            col_name_raw,
+                            col_code_raw
                         )
                     };
 
@@ -468,7 +506,7 @@ pub fn query_taxonomy_tree(
                                 let (fp, tag_code, via, name_chain, code_chain) = r;
                                 direct_files.entry(tag_code.clone()).or_default().insert(fp.clone());
 
-                                // 处理父级链 (例如 "/建筑空间/文化场馆/博物馆" 或 "/builtin.subject_type/builtin.animal/omw.01846331.n")
+                                // 处理物化路径 (例如 "/文件类型/图片/主体类型/鸭子" 或 "/builtin.file_type/builtin.image/builtin.subject_type/omw.01846331.n")
                                 let has_name_chain = !name_chain.trim().is_empty();
                                 let has_code_chain = !code_chain.trim().is_empty();
                                 if has_name_chain || has_code_chain {
@@ -501,13 +539,13 @@ pub fn query_taxonomy_tree(
                                             format!("builtin.cat.{}", name_segs[0])
                                         };
 
-                                        // 若链条根部本身为已声明的主干维度或顶层根节点，则链条自身具有独立根，严禁重复挂入 builtin.content_tags
-                                        let is_root_dim = pack_source_map.get(&first_seg_code).map_or(false, |s| s == "dimension")
-                                            || node_map.get(&first_seg_code).map_or(false, |n| n.parent_code.is_none() && n.code != "builtin.content_tags");
+                                        // 原则 2：只有 6 大受控根维度允许作为独立顶层树根
+                                        let is_root_dim = omni_core::is_root_dimension(&first_seg_code);
 
                                         let (mut prev_code, start_idx) = if is_root_dim {
                                             (first_seg_code, 1)
                                         } else {
+                                            // 原则 1：非 6 大根维度链路，统一安全收敛挂入 builtin.content_tags
                                             ("builtin.content_tags".to_string(), 0)
                                         };
 
@@ -582,17 +620,33 @@ pub fn query_taxonomy_tree(
                     children.push(code.clone());
                 }
             } else {
-                let is_dimension = pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false)
-                    || code == "builtin.content_tags";
-                if is_dimension && !root_candidates.contains(code) {
+                // 原则 2 双保险：拓扑无父级维度 + 强类型 ROOT_DIMENSION_CONCEPTS 校验
+                let is_root = omni_core::is_root_dimension(code)
+                    || (pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false)
+                        && node.parent_codes.is_empty());
+                if is_root && !root_candidates.contains(code) {
                     root_candidates.push(code.clone());
+                } else if !is_root && code != "builtin.content_tags" {
+                    // 原则 1：未挂在已知父级且非 6 大根维度的节点，统一收拢归入 builtin.content_tags
+                    let children = parent_to_children.entry("builtin.content_tags".to_string()).or_default();
+                    if !children.contains(code) {
+                        children.push(code.clone());
+                    }
                 }
             }
         } else {
-            let is_dimension = pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false)
-                || code == "builtin.content_tags";
-            if is_dimension && !root_candidates.contains(code) {
+            // 原则 2 双保险：拓扑无父级维度 + 强类型 ROOT_DIMENSION_CONCEPTS 校验
+            let is_root = omni_core::is_root_dimension(code)
+                || (pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false)
+                    && node.parent_codes.is_empty());
+            if is_root && !root_candidates.contains(code) {
                 root_candidates.push(code.clone());
+            } else if !is_root && code != "builtin.content_tags" {
+                // 原则 1：未挂在已知父级且非 6 大根维度的节点，统一收拢归入 builtin.content_tags
+                let children = parent_to_children.entry("builtin.content_tags".to_string()).or_default();
+                if !children.contains(code) {
+                    children.push(code.clone());
+                }
             }
         }
     }
@@ -678,6 +732,7 @@ pub fn query_taxonomy_tree(
             }
         }
     } else {
+        root_candidates.retain(|c| omni_core::is_root_dimension(c));
         root_candidates.sort();
         let mut candidate_nodes: Vec<TaxonomyNode> = Vec::new();
         for root_code in root_candidates {
