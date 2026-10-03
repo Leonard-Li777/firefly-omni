@@ -61,6 +61,8 @@ pub struct AppState {
     pub vector: Arc<VectorEngine>,
     /// 桌面端 SQLite 业务主库路径（只读访问 file_tag_relations 等主库表）
     pub master_db_path: Arc<Mutex<Option<PathBuf>>>,
+    /// 动态维度执行策略（由本地主库 system_config.DIMENSION_POLICIES 动态驱动，缺省回退内置）
+    pub dimension_policies: Arc<std::sync::RwLock<std::collections::HashMap<String, omni_core::DimensionExecutionPolicy>>>,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +151,8 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/v1/taxonomy/aliases", get(routes::taxonomy::taxonomy_aliases_handler))
             .route("/api/taxonomy/fast-recognize", post(routes::taxonomy::fast_recognize_handler))
             .route("/api/v1/taxonomy/fast-recognize", post(routes::taxonomy::fast_recognize_handler))
+            .route("/api/taxonomy/reload-policies", post(routes::taxonomy::reload_policies_handler))
+            .route("/api/v1/taxonomy/reload-policies", post(routes::taxonomy::reload_policies_handler))
             .route("/api/v1/vector/upsert", post(routes::vector::vector_upsert_handler))
             .route("/api/v1/vector/search", post(routes::vector::vector_search_handler))
             .route(
@@ -298,6 +302,10 @@ async fn reconnect_omw_handler(
     if let Some(p) = db_path {
         if let Ok(mut lock) = state.master_db_path.lock() {
             *lock = Some(std::path::PathBuf::from(p));
+        }
+        let new_policies = routes::taxonomy::load_dimension_policies_from_db(Some(std::path::Path::new(p)));
+        if let Ok(mut lock) = state.dimension_policies.write() {
+            *lock = new_policies;
         }
     }
     let result = match db_path {
@@ -664,6 +672,7 @@ pub async fn start_server(
         VectorEngine::in_memory()
     }));
 
+    let initial_policies = routes::taxonomy::load_dimension_policies_from_db(db_path.as_deref());
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),
         geo,
@@ -672,6 +681,7 @@ pub async fn start_server(
         omw,
         vector,
         master_db_path: Arc::new(Mutex::new(db_path)),
+        dimension_policies: Arc::new(std::sync::RwLock::new(initial_policies)),
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本
@@ -835,8 +845,9 @@ fn run_vision_pipeline(
 
     if is_image {
         if let Ok(img) = image::open(file_path) {
+            let (raw_w, raw_h) = (img.width(), img.height());
             // 大图自适应预降采样 (限制长边 <= 1280px)，采用高速 thumbnail 将千万级像素运算量削减 95%
-            let inspect_img = if img.width() > 1280 || img.height() > 1280 {
+            let inspect_img = if raw_w > 1280 || raw_h > 1280 {
                 img.thumbnail(1280, 1280)
             } else {
                 img
@@ -988,8 +999,51 @@ fn run_vision_pipeline(
                 }.to_string());
 
                 let aspect = inspect_img.width() as f32 / inspect_img.height().max(1) as f32;
-                let (mut morphology_tags, morphology_high_confidence_tags) =
+                let (mut morphology_tags, mut morphology_high_confidence_tags) =
                     omni_pro::OmniVisionEngine::derive_morphology_tags(aspect, td, bw);
+
+                // 物理事实轻量算子注入 (DEC-05)
+                // 1. 画幅算子 (ID 143)
+                let aspect_concept = omni_pro::OmniVisionEngine::detect_aspect_ratio_type(raw_w, raw_h);
+                let aspect_name = aspect_concept.zh_name().to_string();
+                if !morphology_tags.contains(&aspect_name) {
+                    morphology_tags.push(aspect_name.clone());
+                    morphology_high_confidence_tags.push(aspect_name);
+                }
+
+                // 2. 背景算子 (ID 139)
+                let bg_concept = omni_pro::OmniVisionEngine::detect_background_type(&inspect_img);
+                let bg_name = bg_concept.zh_name().to_string();
+                if !morphology_tags.contains(&bg_name) {
+                    morphology_tags.push(bg_name.clone());
+                    morphology_high_confidence_tags.push(bg_name);
+                }
+
+                // 3. 主色调与色系算子 (ID 149)
+                let (main_color_opt, color_series_opt) = omni_pro::OmniVisionEngine::detect_main_color_and_series(&inspect_img);
+                if let Some(mc) = main_color_opt {
+                    let mc_name = mc.zh_name().to_string();
+                    if !morphology_tags.contains(&mc_name) {
+                        morphology_tags.push(mc_name.clone());
+                        morphology_high_confidence_tags.push(mc_name);
+                    }
+                }
+                if let Some(series_concept) = color_series_opt {
+                    let cs_name = series_concept.zh_name().to_string();
+                    if !morphology_tags.contains(&cs_name) {
+                        morphology_tags.push(cs_name.clone());
+                        morphology_high_confidence_tags.push(cs_name);
+                    }
+                }
+
+                // 4. 画质等级算子 (ID 122)
+                if let Some(rq) = omni_pro::OmniVisionEngine::detect_resolution_quality(raw_w, raw_h) {
+                    let rq_name = rq.zh_name().to_string();
+                    if !morphology_tags.contains(&rq_name) {
+                        morphology_tags.push(rq_name.clone());
+                        morphology_high_confidence_tags.push(rq_name);
+                    }
+                }
 
                 // 无字图排版门禁：若未探活出文本内容，严禁打上依赖排版文字的海报宣发或截图标签
                 // Spec D9：闭环规则按概念 code 匹配，兼容中英别名
@@ -1094,6 +1148,8 @@ fn run_vision_pipeline(
     out.duration_ms = t_vision.elapsed().as_millis() as u64;
     out
 }
+
+use omni_core::arbitrate_tags_by_dimension_policies;
 
 /// 处理全量原生多模态感知请求: POST /api/perceive
 /// 单次 I/O 汇聚元数据提取、NTFS ADS 来源直查、频域水印/打码检测、离线逆地理编码与物理事实
@@ -1462,7 +1518,7 @@ async fn perceive_file_handler(
             }
         }
     }
-    let morphology_high_confidence_tags = vision_res.morphology_high_confidence_tags;
+    let mut morphology_high_confidence_tags = vision_res.morphology_high_confidence_tags;
     let mut clip_high_confidence_tags = vision_res.clip_high_confidence_tags;
 
     let ram_tags = vision_res.ram_tags;
@@ -1472,7 +1528,7 @@ async fn perceive_file_handler(
     // CLIP 互斥分类结果增强 morphology_tags：
     // 若 CLIP 互斥分类成功，直接替换规则推导结果（语义更准确）；
     // 若 CLIP 不可用（无模型），则保留规则推导的 morphology_tags 作为兜底。
-    let morphology_tags = if !clip_mutual_tags.is_empty() {
+    let mut morphology_tags = if !clip_mutual_tags.is_empty() {
         let mut merged = morphology_tags.clone();
         for (tag, _conf, _group) in &clip_mutual_tags {
             if !merged.contains(tag) {
@@ -1519,6 +1575,18 @@ async fn perceive_file_handler(
         }
         morphology_tags
     };
+
+    // 5. 文字密度物理算子注入 (ID 146, 依 OCR 文本字数区间确定，非模型余弦推断)
+    if is_image {
+        let ocr_char_count = ocr_text.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+        if let Some(density_concept) = omni_pro::OmniVisionEngine::detect_text_density(ocr_char_count, false) {
+            let density_name = density_concept.zh_name().to_string();
+            if !morphology_tags.contains(&density_name) {
+                morphology_tags.push(density_name.clone());
+                morphology_high_confidence_tags.push(density_name);
+            }
+        }
+    }
 
     // CLIP 互斥组与 photo_type 细化联动更新（语义优先于规则推导）
     if !clip_mutual_tags.is_empty() {
@@ -1984,6 +2052,7 @@ async fn perceive_file_handler(
 
     // 9. 第三阶段: 双锚点交叉向量验证与多模态终局融合 (Task 626)
     // 汇聚第二阶段收集到的所有多模态异构信息为 MultimodalContext
+    let current_policies = state.dimension_policies.read().unwrap_or_else(|e| e.into_inner()).clone();
     let multimodal_ctx = omni_core::MultimodalContext {
         file_path: file_path.clone(),
         file_name: file_name.clone(),
@@ -1999,6 +2068,7 @@ async fn perceive_file_handler(
         is_document: !is_image && !is_video,
         is_audio_or_video: is_video || has_asr || lrc.is_some(),
         language: req.language.clone(),
+        dimension_policies: Some(current_policies.clone()),
     };
 
     let t_fusion = std::time::Instant::now();
@@ -2072,15 +2142,19 @@ async fn perceive_file_handler(
         tag
     };
 
-    let mut structured_visual_tags: Vec<omni_core::TagChainItem> = structured_visual_tags
+    let structured_visual_tags: Vec<omni_core::TagChainItem> = structured_visual_tags
         .into_iter()
         .map(backfill_chain_item)
         .collect();
 
-    let mut fused_tags: Vec<omni_core::TagChainItem> = fused_tags
+    let fused_tags: Vec<omni_core::TagChainItem> = fused_tags
         .into_iter()
         .map(backfill_chain_item)
         .collect();
+
+    // 9.1 基于维度策略执行单选互斥 argmax 与多选维度放行最终一致性仲裁
+    let mut structured_visual_tags = arbitrate_tags_by_dimension_policies(structured_visual_tags, &current_policies);
+    let mut fused_tags = arbitrate_tags_by_dimension_policies(fused_tags, &current_policies);
 
     // 10. 原生事实标签抽取 (Task 2)：元数据直读 + 下沉物理事实 → fact_tags 直出
     let language_label: Option<String> = req.language.as_deref().and_then(|l| {
@@ -3111,5 +3185,3 @@ async fn cleanup_fix_handler(
         errors: outcome.3,
     })
 }
-
-

@@ -1143,3 +1143,91 @@ pub async fn fast_recognize_handler(
     }
 }
 
+/// 从 SQLite 桌面主库只读加载 DIMENSION_POLICIES 策略配置（DEC-03 / DEC-04）
+pub fn load_dimension_policies_from_db(
+    master_db_path: Option<&std::path::Path>,
+) -> HashMap<String, omni_core::DimensionExecutionPolicy> {
+    let mut policies = omni_core::get_default_dimension_policies();
+    let Some(path) = master_db_path else {
+        return policies;
+    };
+    if !path.exists() {
+        return policies;
+    }
+
+    let Ok(conn) = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return policies;
+    };
+
+    let has_table: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'system_config'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if !has_table {
+        return policies;
+    }
+
+    let val_str: Result<String, _> = conn.query_row(
+        "SELECT value FROM system_config WHERE key = 'DIMENSION_POLICIES' LIMIT 1",
+        [],
+        |row| row.get(0),
+    );
+
+    if let Ok(raw) = val_str {
+        if let Ok(db_policies) = serde_json::from_str::<HashMap<String, omni_core::DimensionExecutionPolicy>>(&raw) {
+            let count = db_policies.len();
+            for (code, policy) in db_policies {
+                policies.insert(code, policy);
+            }
+            tracing::info!(
+                "[load_dimension_policies_from_db] 成功从主库 system_config 读取并覆盖 {} 条维度策略",
+                count
+            );
+        } else {
+            tracing::warn!("[load_dimension_policies_from_db] system_config.DIMENSION_POLICIES JSON 解析失败，回退物化默认策略");
+        }
+    }
+
+    policies
+}
+
+/// 策略重载响应体
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReloadPoliciesResponse {
+    pub success: bool,
+    pub count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// POST /api/taxonomy/reload-policies 与 POST /api/v1/taxonomy/reload-policies
+/// 动态重载维度执行策略端点 (DEC-04)
+pub async fn reload_policies_handler(
+    State(state): State<AppState>,
+) -> Json<ReloadPoliciesResponse> {
+    let master_path = state.master_db_path.lock().ok().and_then(|p| p.clone());
+    let new_policies = load_dimension_policies_from_db(master_path.as_deref());
+    let count = new_policies.len();
+    if let Ok(mut lock) = state.dimension_policies.write() {
+        *lock = new_policies;
+        tracing::info!("[reload_policies_handler] 策略重载成功，当前激活策略数: {}", count);
+        Json(ReloadPoliciesResponse {
+            success: true,
+            count,
+            error: None,
+        })
+    } else {
+        Json(ReloadPoliciesResponse {
+            success: false,
+            count: 0,
+            error: Some("RwLock poisoned".to_string()),
+        })
+    }
+}
+
+

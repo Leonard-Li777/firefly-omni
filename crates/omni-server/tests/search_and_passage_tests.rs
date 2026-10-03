@@ -28,6 +28,8 @@ fn setup_test_app() -> axum::Router {
         search: Arc::new(omni_pro::search::OmniSearchService::default()),
         omw: OmwDb::unavailable(),
         vector: Arc::new(VectorEngine::in_memory()),
+        master_db_path: Arc::new(Mutex::new(None)),
+        dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
     };
     create_app_router(state)
 }

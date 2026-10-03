@@ -370,6 +370,26 @@ pub mod vision {
             false
         }
 
+        pub fn detect_resolution_quality(_width: u32, _height: u32) -> Option<omni_core::concepts::Concept> {
+            None
+        }
+
+        pub fn detect_background_type(_img: &image::DynamicImage) -> omni_core::concepts::Concept {
+            omni_core::concepts::Concept::实景背景
+        }
+
+        pub fn detect_aspect_ratio_type(_width: u32, _height: u32) -> omni_core::concepts::Concept {
+            omni_core::concepts::Concept::正方形
+        }
+
+        pub fn detect_text_density(_ocr_char_count: usize, _has_large_title: bool) -> Option<omni_core::concepts::Concept> {
+            None
+        }
+
+        pub fn detect_main_color_and_series(_img: &image::DynamicImage) -> (Option<omni_core::concepts::Concept>, Option<omni_core::concepts::Concept>) {
+            (Some(omni_core::concepts::Concept::中性黑白灰), Some(omni_core::concepts::Concept::黑色))
+        }
+
         pub fn derive_morphology_tags(
             _aspect_ratio: f32,
             _has_text: bool,

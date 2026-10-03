@@ -20,6 +20,8 @@ fn setup_test_app_with_geo(geo: Arc<omni_pro::geo::GeoService>) -> Router {
         search: Arc::new(omni_pro::search::OmniSearchService::default()),
         omw: omni_server::OmwDb::unavailable(),
         vector: Arc::new(omni_server::VectorEngine::in_memory()),
+        master_db_path: Arc::new(Mutex::new(None)),
+        dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
     };
     create_app_router(state)
 }
@@ -35,6 +37,8 @@ fn setup_test_app_with_omw_db(path: &std::path::Path) -> Router {
         search: Arc::new(omni_pro::search::OmniSearchService::default()),
         omw,
         vector: Arc::new(omni_server::VectorEngine::in_memory()),
+        master_db_path: Arc::new(Mutex::new(None)),
+        dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
     };
     create_app_router(state)
 }
