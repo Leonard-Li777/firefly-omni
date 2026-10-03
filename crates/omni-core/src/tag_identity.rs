@@ -129,7 +129,7 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("全彩", "Full Color"),
     ("黑白", "Black And White"),
     ("摄影照片", "Photo"),
-    ("人像写真", "Portrait"),
+    ("人像写真", "Portrait Photography"),
     ("人物照", "Person Photo"),
     ("私房写真", "Boudoir Photo"),
     ("婚纱照", "Wedding Photo"),
@@ -245,7 +245,6 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("anime", "Anime"),
     ("illustration", "Illustration"),
     ("comic", "Comic"),
-    ("portrait", "Portrait"),
     ("person photo", "Person Photo"),
     ("still life photo", "Still Life Photo"),
     ("natural landscape", "Natural Landscape"),
@@ -258,7 +257,6 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("photo", "Photo"),
     ("pornography", "Pornography"),
     ("ui screenshot", "UI Screenshot"),
-    ("landscape", "Natural Landscape"),
     ("code screenshot", "Code Screenshot"),
     ("chat screenshot", "Chat Screenshot"),
     ("confidential", "Confidential"),
@@ -496,7 +494,7 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("艺术", "Painting"),
     ("art", "Painting"),
     ("cartoon", "Comic"),
-    ("肖像", "Portrait"),
+    ("肖像", "Portrait Photography"),
     ("人物", "Human Subject"),
     ("扁平", "Flat Minimalist"),
     ("flat", "Flat Minimalist"),
@@ -1307,12 +1305,13 @@ mod tests {
     /// 属**静默语义**（改行序即改行为）。`builtin_aliases_have_unique_keys` 只覆盖**字面别名**
     /// 重复，覆盖不到这种「别名 vs en 规范名」的**跨键空间**碰撞。
     ///
-    /// 现存 2 处已知歧义（**待本体裁决**，见
-    /// `docs/issues/issue-alias-map-joint-keyspace-conflicts.md`）：
-    /// `landscape`（自然景观 vs 横屏）与 `portrait`（人像写真 vs 竖屏）。
-    /// 本用例把它们**冻结**：新增歧义立即失败；改动这 2 处即失败（迫使显式裁决）。
+    /// 历史上曾有 2 处歧义（`landscape` / `portrait`，见
+    /// `docs/issues/issue-alias-map-joint-keyspace-conflicts.md`），已按「**裸词判给画幅**」
+    /// 裁决消除：题材概念的 en 规范名 `"Portrait"` → `"Portrait Photography"`
+    /// （顺带对齐 AOT 概念表 `builtin.portrait_photography`），并删去与画幅组争抢的裸词别名。
+    /// 本用例断言歧义键集合**为空** —— 一旦回退或新增即失败。
     #[test]
-    fn alias_map_joint_keyspace_conflicts_are_frozen() {
+    fn alias_map_joint_keyspace_has_no_conflicts() {
         // 复刻 alias_map() 的归一与插入，收集每个键对应的**全部**候选值。
         let mut vals: HashMap<String, Vec<&'static str>> = HashMap::new();
         for (alias, en) in BUILTIN_ALIASES {
@@ -1330,21 +1329,20 @@ mod tests {
             .collect();
         conflicts.sort();
 
-        assert_eq!(
-            conflicts,
-            vec!["landscape".to_string(), "portrait".to_string()],
-            "alias_map() 联合键空间出现**新的**歧义键（末次胜出 = 隐含行序依赖）。\
-             若确为有意新增，请连同 docs/issues/issue-alias-map-joint-keyspace-conflicts.md 一并裁决。"
+        assert!(
+            conflicts.is_empty(),
+            "alias_map() 联合键空间出现歧义键（末次胜出 = 隐含行序依赖）: {conflicts:?}。\
+             裸词归属裁决见 docs/issues/issue-alias-map-joint-keyspace-conflicts.md。"
         );
 
-        // 冻结当前「末次胜出」的实际落点：行序一旦变动即失败，迫使显式决策。
+        // 冻结裁决落点：裸词判给画幅（与桌面端 controlled-tag-resolver.ts:142-145 一致）。
         assert_eq!(
             alias_map().get("landscape").map(String::as_str),
             Some("Horizontal Screen")
         );
         assert_eq!(
             alias_map().get("portrait").map(String::as_str),
-            Some("Portrait")
+            Some("Vertical Screen")
         );
     }
 
@@ -1386,7 +1384,7 @@ mod tests {
     fn p0_vision_gating_concept_matching() {
         // 英文模型输出与中文规则 canonical 对齐（vision 门控语义）
         assert!(tag_matches_concept("Screenshot", "截图"));
-        assert!(tag_matches_concept("Portrait", "人像写真"));
+        assert!(tag_matches_concept("Portrait Photography", "人像写真"));
         assert!(tag_matches_concept("Person Photo", "人物照"));
         assert!(tag_matches_concept("Natural Landscape", "自然景观"));
         assert!(tag_matches_concept("Image Without Text", "无字图"));
@@ -1401,7 +1399,7 @@ mod tests {
         ];
         let en = vec![
             "Screenshot".to_string(),
-            "Portrait".to_string(),
+            "Portrait Photography".to_string(),
             "Image Without Text".to_string(),
         ];
         assert_eq!(normalize_tag_set_to_codes(&zh), normalize_tag_set_to_codes(&en));
@@ -1604,8 +1602,20 @@ mod tests {
         assert_eq!(resolve_controlled_tag_code("隐私盗摄"), Some("builtin.spy_camera_peeping"));
 
         // ─── 场景 5：高频英文视觉/文档候选词在中文环境下的受控两阶段反查与就地本地化 ───
+        // 裸词归属裁决（见 docs/issues/issue-alias-map-joint-keyspace-conflicts.md）：
+        // 裸词 `portrait` / `landscape` 判给**画幅**，与桌面端 controlled-tag-resolver.ts:142-145 一致。
         let outcome_portrait = resolve_controlled_tag_two_stage("portrait", Some("zh"));
-        assert_eq!(outcome_portrait, Some(("builtin.portrait", Some("人像写真".to_string()))));
+        assert_eq!(outcome_portrait, Some(("builtin.vertical_screen", Some("竖屏".to_string()))));
+
+        let outcome_landscape = resolve_controlled_tag_two_stage("landscape", Some("zh"));
+        assert_eq!(outcome_landscape, Some(("builtin.horizontal_screen", Some("横屏".to_string()))));
+
+        // 题材概念 `人像写真` 改由专属 en 名 `Portrait Photography` 承载（顺带对齐 AOT 表）。
+        let outcome_portrait_photo = resolve_controlled_tag_two_stage("Portrait Photography", Some("zh"));
+        assert_eq!(
+            outcome_portrait_photo,
+            Some(("builtin.portrait_photography", Some("人像写真".to_string())))
+        );
 
         let outcome_draft = resolve_controlled_tag_two_stage("draft", Some("zh"));
         assert_eq!(outcome_draft, Some(("builtin.draft", Some("草稿".to_string()))));
