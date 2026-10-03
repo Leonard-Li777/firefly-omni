@@ -1163,6 +1163,81 @@ pub fn tag_matches_concept(tag: &str, canonical_zh_or_en: &str) -> bool {
     }
 }
 
+/// 门控 / 评级 / 质量 / 水印 / 曝光 / 文字量类受控 code 集合（**唯一数据源**）。
+///
+/// ## 为什么是「门控」
+///
+/// 这些概念描述的是文件的**安全 / 评级 / 质量 / 技术状态 / 文字量**，而非**艺术风格**或
+/// **具象主体**。它们被感知后只应作为门控信号（过滤、互斥、决策）：
+/// **严禁**写入 style 槽（避免「整体呈安全风格」这类病句），**严禁**作为描述主体
+/// （见 `PRD §7.2` 与 `docs/issues/issue-fusion-rating-gate-language-dependent.md`）。
+///
+/// ## 为什么基于 code 而非词面（`AGENTS.md` 受控本体规范）
+///
+/// `AGENTS.md` 规定内部处理 **100% 仅基于受控 code / 强类型 `Concept` 枚举**，
+/// ❌ 严禁硬编码自然语言字符串匹配。该规则此前以硬编码中文词表实现，
+/// 导致**同一受控概念在 zh / en 词面下判定相反**，违反 D12 跨语言感知幂等契约
+/// （`CONTEXT.md:900-903`）：zh 词面「有字图」被丢弃，en 词面 `Image With Text` 却存活。
+///
+/// ## 词条来源与「受控近似词替换」约定
+///
+/// 每个 code 均取自受控本体（`apps/desktop/src/electron/config/file-dimension-source.ts`
+/// 的门控维度：**文件质量 / 画质等级 / 内容尺度 / 打码程度 / 水印程度 / 照片质量 /
+/// 敏感内容 / 文字密度 / 安全等级**），经 [`BUILTIN_ALIASES`] 归一为 code。
+/// 历史词表中**不在别名表**的近义/口语词，一律以其**受控近似概念**的 code 替换
+/// （见每条行尾「← 原词」注），从而彻底消除自然语言词面匹配。
+pub const GATE_CODES: &[&str] = &[
+    // ── 敏感内容 / 安全（维度「敏感内容」id 130 /「安全等级」id 17）──────────────
+    "builtin.safe",             // 安全（← 合规）
+    "builtin.all_ages",         // 全年龄
+    "builtin.violation",        // 违规
+    "builtin.sensitive_content", // 敏感内容（← 敏感）
+    // ── 内容尺度 / 评级（维度「内容尺度」id 123）──────────────────────────────
+    "builtin.content_scale",    // 内容尺度（← 成人向）
+    "builtin.r_15",             // R-15
+    "builtin.r_18",             // R-18
+    "builtin.explicit",         // 露骨
+    // ── 打码程度（维度「打码程度」id 124）────────────────────────────────────
+    "builtin.uncensored",       // 无码（← 无修）
+    "builtin.censored",         // 有码
+    // ── 文件质量（维度「文件质量」id 27）─────────────────────────────────────
+    "builtin.high_quality",     // 高质量（← 画质高）
+    "builtin.medium_quality",   // 中等质量（← 画质中）
+    "builtin.low_quality",      // 低质量（← 画质低）
+    // ── 水印程度（维度「水印程度」id 125）────────────────────────────────────
+    "builtin.no_watermark",     // 无水印（← 去水印）
+    "builtin.watermarked",      // 有水印（← 带水印）
+    // ── 照片质量 / 曝光（维度「照片质量」id 127）──────────────────────────────
+    "builtin.normal_exposure",  // 曝光正常
+    "builtin.good_exposure",    // 曝光良好
+    "builtin.underexposed",     // 暗光欠曝（← 曝光不足）
+    "builtin.backlight_blowout", // 逆光死白（← 曝光过度）
+    // ── 文字密度（维度「文字密度」id 146）────────────────────────────────────
+    "builtin.plain_text",         // 纯文字
+    "builtin.microtext",          // 微量文本
+    "builtin.image_with_text",    // 有字图（D12 泄漏修复：en 侧 `Image With Text` 曾漏判）
+    "builtin.image_without_text", // 无字图
+];
+
+/// 判断标签是否为门控 / 评级 / 质量类受控概念（**唯一判定入口**）。
+///
+/// 判定 **100% 基于受控 code**，绝不匹配自然语言词面：
+/// 1. 若已给定受控 `code`，直接按 [`GATE_CODES`] **精确**判定（幂等短路）；
+/// 2. 否则以词面做**受控别名反查**（[`builtin_tag_code`]，zh / en 词面一视同仁），再判定。
+///
+/// `omni-text` 侧 `fusion.rs::is_rating_quality_or_gate` 与
+/// `sentence_generator::archetypes::is_non_style_modifier` 均委托本函数，
+/// 使该规则**收敛为单一数据源**（此前是两份独立维护、必然漂移的中文词表副本）。
+pub fn is_gate_tag(name: &str, code: &str) -> bool {
+    if is_controlled_code(code) {
+        return GATE_CODES.contains(&code);
+    }
+    match builtin_tag_code(name) {
+        Some(c) => GATE_CODES.contains(&c),
+        None => false,
+    }
+}
+
 /// 标签串归一：命中别名 → builtin code；未命中 → _ext 派生
 ///
 /// **G1 词形闸（拒绝先于铸造，spec §6.9.3 / ADR-0052）装在本函数**——它是「候选词 → code」
@@ -1351,6 +1426,63 @@ mod tests {
         assert!(tag_matches_concept("Screenshot", "截图"));
         assert!(tag_matches_concept("有字图", "Image With Text"));
         assert!(!tag_matches_concept("Screenshot", "设计稿"));
+    }
+
+    /// D12 跨语言感知幂等：同一门控概念在 zh / en 词面下判定**必须一致**
+    /// （回归 `docs/issues/issue-fusion-rating-gate-language-dependent.md`）。
+    #[test]
+    fn gate_tag_is_language_agnostic_across_zh_and_en() {
+        // (zh 词面, en 词面) 均须判为门控。
+        const PAIRS: &[(&str, &str)] = &[
+            ("有字图", "Image With Text"),
+            ("无字图", "Image Without Text"),
+            ("纯文字", "Plain Text"),
+            ("微量文本", "Microtext"),
+            ("安全", "Safe"),
+            ("全年龄", "All Ages"),
+            ("违规", "Violation"),
+            ("露骨", "Explicit"),
+            ("无码", "Uncensored"),
+            ("有码", "Censored"),
+            ("高质量", "High Quality"),
+            ("中等质量", "Medium Quality"),
+            ("低质量", "Low Quality"),
+            ("无水印", "No Watermark"),
+            ("有水印", "Watermarked"),
+            ("曝光正常", "Normal Exposure"),
+            ("曝光良好", "Good Exposure"),
+            ("R-18", "R-18"),
+            ("R-15", "R-15"),
+        ];
+        for (zh, en) in PAIRS {
+            assert!(is_gate_tag(zh, ""), "zh 门控词漏判: {zh}");
+            assert!(is_gate_tag(en, ""), "en 门控词漏判: {en}");
+            // 已给受控 code 时同样成立（幂等短路）。
+            let code = builtin_tag_code(zh).expect("zh 词面应可归一为受控 code");
+            assert!(is_gate_tag("", code), "受控 code 漏判: {code}");
+        }
+
+        // 受控近似词替换：不在别名表的口语/近义词 → 受控概念 code，判定与规范词一致。
+        // （来源 file-dimension-source.ts 门控维度；见 GATE_CODES 文档。）
+        for (loose, canonical) in [
+            ("画质高", "高质量"),
+            ("画质中", "中等质量"),
+            ("画质低", "低质量"),
+            ("带水印", "有水印"),
+            ("去水印", "无水印"),
+            ("曝光不足", "暗光欠曝"),
+            ("曝光过度", "逆光死白"),
+            ("无修", "无码"),
+        ] {
+            // 口语词本身不在别名表（无法归一）→ 由门控集合内的规范 code 覆盖。
+            assert!(builtin_tag_code(loose).is_none(), "{loose} 不应在别名表内");
+            assert!(is_gate_tag(canonical, ""), "规范词 {canonical} 应判为门控");
+        }
+
+        // 非门控概念不得误判（风格 / 主体 / 泛形态）。
+        for nongate in ["截图", "设计稿", "人像写真", "自然景观", "写实拟真", "二次元"] {
+            assert!(!is_gate_tag(nongate, ""), "非门控词误判: {nongate}");
+        }
     }
 
     #[test]
