@@ -1182,18 +1182,19 @@ pub fn tag_matches_concept(tag: &str, canonical_zh_or_en: &str) -> bool {
 /// ## 词条来源与「受控近似词替换」约定
 ///
 /// 每个 code 均取自受控本体（`apps/desktop/src/electron/config/file-dimension-source.ts`
-/// 的门控维度：**文件质量 / 画质等级 / 内容尺度 / 打码程度 / 水印程度 / 照片质量 /
-/// 敏感内容 / 文字密度 / 安全等级**），经 [`BUILTIN_ALIASES`] 归一为 code。
+/// 的门控维度：**文件质量 / 内容尺度 / 打码程度 / 水印程度 / 照片质量 /
+/// 敏感内容 / 文字密度**），经 [`BUILTIN_ALIASES`] 归一为 code。
 /// 历史词表中**不在别名表**的近义/口语词，一律以其**受控近似概念**的 code 替换
-/// （见每条行尾「← 原词」注），从而彻底消除自然语言词面匹配。
+/// （见每条行尾「← 原词」注，及 [`LOOSE_GATE_ALIASES`]），从而彻底消除自然语言词面匹配。
 pub const GATE_CODES: &[&str] = &[
-    // ── 敏感内容 / 安全（维度「敏感内容」id 130 /「安全等级」id 17）──────────────
+    // ── 敏感内容 / 安全（维度「敏感内容」id 130）──────────────────────────────
     "builtin.safe",             // 安全（← 合规）
     "builtin.all_ages",         // 全年龄
     "builtin.violation",        // 违规
-    "builtin.sensitive_content", // 敏感内容（← 敏感）
+    // 维度级 code（非叶子别名）：仅经「已是受控 code」分支可达，词面分支永不命中。
+    "builtin.sensitive_content", // 敏感内容维度
     // ── 内容尺度 / 评级（维度「内容尺度」id 123）──────────────────────────────
-    "builtin.content_scale",    // 内容尺度（← 成人向）
+    "builtin.content_scale",    // 内容尺度维度（同上，维度级 code）
     "builtin.r_15",             // R-15
     "builtin.r_18",             // R-18
     "builtin.explicit",         // 露骨
@@ -1219,11 +1220,35 @@ pub const GATE_CODES: &[&str] = &[
     "builtin.image_without_text", // 无字图
 ];
 
+/// 门控维度的**口语 / 近义词 → 受控规范词**桥接表（**目标词必须已在 [`BUILTIN_ALIASES`] 内**）。
+///
+/// 依据「受控近似词替换」约定：历史词表中**不在别名表**的口语词，
+/// 一律替换为其在别名表中的**受控近似词**（优先取 `file-dimension-source.ts` 门控维度的词），
+/// 从而既保留语义覆盖、又彻底消除自然语言词面匹配。
+///
+/// 左列**仅**用于 [`is_gate_tag`] 的**词面**分支兜底（受控 code 分支不受影响）。
+/// 左列词不得出现在 `BUILTIN_ALIASES`（否则即为冗余，由 `loose_gate_aliases_are_not_in_alias_table` 冻结）。
+pub const LOOSE_GATE_ALIASES: &[(&str, &str)] = &[
+    ("合规", "安全"),      // 敏感内容维度 contextHint「合规安全检测」→ 别名表「安全 / Safe」
+    ("敏感", "违规"),      // 敏感内容维度叶子「违规 / Violation」
+    ("成人向", "露骨"),    // 内容尺度维度「露骨 / Explicit」
+    ("画质高", "高质量"),
+    ("画质中", "中等质量"),
+    ("画质低", "低质量"),
+    ("带水印", "有水印"),
+    ("去水印", "无水印"),
+    ("曝光不足", "暗光欠曝"),
+    ("曝光过度", "逆光死白"),
+    ("无修", "无码"),
+];
+
 /// 判断标签是否为门控 / 评级 / 质量类受控概念（**唯一判定入口**）。
 ///
 /// 判定 **100% 基于受控 code**，绝不匹配自然语言词面：
 /// 1. 若已给定受控 `code`，直接按 [`GATE_CODES`] **精确**判定（幂等短路）；
-/// 2. 否则以词面做**受控别名反查**（[`builtin_tag_code`]，zh / en 词面一视同仁），再判定。
+/// 2. 否则以词面做**受控别名反查**（[`builtin_tag_code`]，zh / en 词面一视同仁），再判定；
+/// 3. 若词面不在别名表，则查 [`LOOSE_GATE_ALIASES`] 口语桥接表取其**受控近似词**再反查
+///    （如「合规」→「安全」、「敏感」→「违规」、「成人向」→「露骨」）。
 ///
 /// `omni-text` 侧 `fusion.rs::is_rating_quality_or_gate` 与
 /// `sentence_generator::archetypes::is_non_style_modifier` 均委托本函数，
@@ -1232,10 +1257,16 @@ pub fn is_gate_tag(name: &str, code: &str) -> bool {
     if is_controlled_code(code) {
         return GATE_CODES.contains(&code);
     }
-    match builtin_tag_code(name) {
-        Some(c) => GATE_CODES.contains(&c),
-        None => false,
+    if let Some(c) = builtin_tag_code(name) {
+        return GATE_CODES.contains(&c);
     }
+    // 词面不在别名表：经口语桥接表取受控近似词再反查。
+    LOOSE_GATE_ALIASES
+        .iter()
+        .find(|(loose, _)| *loose == name)
+        .and_then(|(_, canon)| builtin_tag_code(canon))
+        .map(|c| GATE_CODES.contains(&c))
+        .unwrap_or(false)
 }
 
 /// 标签串归一：命中别名 → builtin code；未命中 → _ext 派生
@@ -1463,25 +1494,51 @@ mod tests {
         }
 
         // 受控近似词替换：不在别名表的口语/近义词 → 受控概念 code，判定与规范词一致。
-        // （来源 file-dimension-source.ts 门控维度；见 GATE_CODES 文档。）
-        for (loose, canonical) in [
-            ("画质高", "高质量"),
-            ("画质中", "中等质量"),
-            ("画质低", "低质量"),
-            ("带水印", "有水印"),
-            ("去水印", "无水印"),
-            ("曝光不足", "暗光欠曝"),
-            ("曝光过度", "逆光死白"),
-            ("无修", "无码"),
-        ] {
+        // （来源 file-dimension-source.ts 门控维度；见 GATE_CODES / LOOSE_GATE_ALIASES 文档。）
+        for (loose, canonical) in LOOSE_GATE_ALIASES {
             // 口语词本身不在别名表（无法归一）→ 由门控集合内的规范 code 覆盖。
-            assert!(builtin_tag_code(loose).is_none(), "{loose} 不应在别名表内");
-            assert!(is_gate_tag(canonical, ""), "规范词 {canonical} 应判为门控");
+            assert!(
+                builtin_tag_code(loose).is_none(),
+                "{loose} 不应在别名表内（否则桥接表冗余）"
+            );
+            assert!(is_gate_tag(loose, ""), "口语桥接词漏判: {loose}");
+            assert!(
+                is_gate_tag(canonical, ""),
+                "桥接目标 {canonical} 应判为门控"
+            );
+        }
+
+        // 历史词表（原 `fusion.rs::RATING_NAMES` 33 词）**逐词**回归，防覆盖回退。
+        // 口语词经 LOOSE_GATE_ALIASES 桥接后必须仍判为门控。
+        for w in [
+            "安全", "全年龄", "合规", "违规", "敏感", "R-18", "R18", "R-15", "R15", "露骨",
+            "成人向", "无码", "有码", "无修", "高质量", "中等质量", "低质量", "画质高", "画质中",
+            "画质低", "无水印", "有水印", "带水印", "去水印", "曝光正常", "曝光不足", "曝光过度",
+            "曝光良好", "纯文字", "微量文本", "无字图", "有字图",
+        ] {
+            assert!(is_gate_tag(w, ""), "历史词表覆盖回退: {w}");
         }
 
         // 非门控概念不得误判（风格 / 主体 / 泛形态）。
         for nongate in ["截图", "设计稿", "人像写真", "自然景观", "写实拟真", "二次元"] {
             assert!(!is_gate_tag(nongate, ""), "非门控词误判: {nongate}");
+        }
+    }
+
+    /// 桥接表契约：目标词必须已在别名表内且落在 [`GATE_CODES`]；源词必须不在别名表（防冗余）。
+    #[test]
+    fn loose_gate_aliases_are_not_in_alias_table() {
+        for (loose, canonical) in LOOSE_GATE_ALIASES {
+            assert!(
+                builtin_tag_code(loose).is_none(),
+                "桥接源词 {loose} 已在别名表内，属冗余条目"
+            );
+            let code = builtin_tag_code(canonical)
+                .unwrap_or_else(|| panic!("桥接目标 {canonical} 不在别名表内"));
+            assert!(
+                GATE_CODES.contains(&code),
+                "桥接目标 {canonical} → {code} 不在 GATE_CODES 内"
+            );
         }
     }
 
