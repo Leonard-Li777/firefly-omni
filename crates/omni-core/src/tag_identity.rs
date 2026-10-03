@@ -1291,6 +1291,63 @@ mod tests {
         }
     }
 
+    /// **联合键空间歧义门禁**（`alias_map()` 的 `normalize_lemma` 归一后）。
+    ///
+    /// `alias_map()` 把 **别名** 与 **en 规范名** 插入**同一张表**：
+    ///
+    /// ```text
+    /// for (alias, en) in BUILTIN_ALIASES {
+    ///     m.insert(normalize_lemma(alias), en);
+    ///     m.insert(normalize_lemma(en),    en);   // 同一张表
+    /// }
+    /// ```
+    ///
+    /// 当 `normalize_lemma(某别名) == normalize_lemma(另一概念的 en 规范名)` 时，两个概念
+    /// 会争抢同一个键 —— 而 `HashMap::insert` 是**末次胜出**，「谁赢」取决于**表内行序**，
+    /// 属**静默语义**（改行序即改行为）。`builtin_aliases_have_unique_keys` 只覆盖**字面别名**
+    /// 重复，覆盖不到这种「别名 vs en 规范名」的**跨键空间**碰撞。
+    ///
+    /// 现存 2 处已知歧义（**待本体裁决**，见
+    /// `docs/issues/issue-alias-map-joint-keyspace-conflicts.md`）：
+    /// `landscape`（自然景观 vs 横屏）与 `portrait`（人像写真 vs 竖屏）。
+    /// 本用例把它们**冻结**：新增歧义立即失败；改动这 2 处即失败（迫使显式裁决）。
+    #[test]
+    fn alias_map_joint_keyspace_conflicts_are_frozen() {
+        // 复刻 alias_map() 的归一与插入，收集每个键对应的**全部**候选值。
+        let mut vals: HashMap<String, Vec<&'static str>> = HashMap::new();
+        for (alias, en) in BUILTIN_ALIASES {
+            for k in [normalize_lemma(alias), normalize_lemma(en)] {
+                let bucket = vals.entry(k).or_default();
+                if !bucket.contains(en) {
+                    bucket.push(en);
+                }
+            }
+        }
+        let mut conflicts: Vec<String> = vals
+            .iter()
+            .filter(|(_, v)| v.len() > 1)
+            .map(|(k, _)| k.clone())
+            .collect();
+        conflicts.sort();
+
+        assert_eq!(
+            conflicts,
+            vec!["landscape".to_string(), "portrait".to_string()],
+            "alias_map() 联合键空间出现**新的**歧义键（末次胜出 = 隐含行序依赖）。\
+             若确为有意新增，请连同 docs/issues/issue-alias-map-joint-keyspace-conflicts.md 一并裁决。"
+        );
+
+        // 冻结当前「末次胜出」的实际落点：行序一旦变动即失败，迫使显式决策。
+        assert_eq!(
+            alias_map().get("landscape").map(String::as_str),
+            Some("Horizontal Screen")
+        );
+        assert_eq!(
+            alias_map().get("portrait").map(String::as_str),
+            Some("Portrait")
+        );
+    }
+
     #[test]
     fn tag_matches_concept_works_across_languages() {
         assert!(tag_matches_concept("Screenshot", "截图"));
