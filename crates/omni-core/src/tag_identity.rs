@@ -256,15 +256,10 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("cg render", "CG Render"),
     ("painting", "Painting"),
     ("photo", "Photo"),
-    ("black and white", "Black And White"),
-    ("full color", "Full Color"),
     ("pornography", "Pornography"),
-    ("image with text", "Image With Text"),
-    ("image without text", "Image Without Text"),
     ("ui screenshot", "UI Screenshot"),
     ("landscape", "Natural Landscape"),
     ("code screenshot", "Code Screenshot"),
-    ("ui screenshot", "UI Screenshot"),
     ("chat screenshot", "Chat Screenshot"),
     ("confidential", "Confidential"),
     ("exposure is normal", "Normal Exposure"),
@@ -390,9 +385,6 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("高质量", "High Quality"),
     ("中等质量", "Medium Quality"),
     ("低质量", "Low Quality"),
-    ("R-15", "R-15"),
-    ("R-18", "R-18"),
-    ("R-18G", "R-18G"),
     ("暴恐", "Violence Terror"),
     ("生殖器暴露", "Genital Exposure"),
     ("性虐调教", "Sadomasochism"),
@@ -493,21 +485,23 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("摄影照片细分", "Photography Categories"),
     ("photography_categories", "Photography Categories"),
     // 视觉与多模态高频候选词跨语言对齐（避免误被派生为 _ext.* 并确保规范母语本地化）
+    //
+    // 本段只补**本段专属**的跨语言别名。凡与上文既有条目**同名**者一律不在此重复声明
+    // （`设计` / `design` / `designated` / `角色` / `character` 均已在上文登记）——
+    // `alias_map()` 用 `HashMap::insert`（**末次胜出**），在此重复会**静默覆盖**上文的规范名，
+    // 属死数据 + 隐含行序依赖。裁决口径（方向 B，见
+    // docs/issues/issue-builtin-aliases-duplicate-keys.md）：**裸词 → 裸概念**
+    // （`design`→`Design`、`character`→`Character`）；复合概念 `Design Draft` /
+    // `Human Subject` 由各自**专属**别名承载（`设计稿` / `design draft`、`人物主体` / `人物`）。
     ("艺术", "Painting"),
     ("art", "Painting"),
-    ("漫画", "Comic"),
     ("cartoon", "Comic"),
-    ("设计", "Design Draft"),
-    ("design", "Design Draft"),
     ("肖像", "Portrait"),
-    ("portrait", "Portrait"),
-    ("角色", "Human Subject"),
     ("人物", "Human Subject"),
-    ("character", "Human Subject"),
     ("扁平", "Flat Minimalist"),
     ("flat", "Flat Minimalist"),
-    ("designated", "Design Draft"),
     // 敏感内容 / 成人色情 12 大垂直门类与细分子标签跨语言对齐 (PRD 0052)
+    // （同上：`调教拘束` / `露骨性行为` / `自慰高潮` 已在上文登记，此处不再重复声明，避免末次胜出覆盖）
     ("家庭乱伦", "Family incest"),
     ("family incest", "Family incest"),
     ("婚外情欲", "Extramarital lust"),
@@ -555,7 +549,6 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("多人派对", "Multi-person party"),
     ("sm", "SM"),
     ("性奴隶", "Sex slave"),
-    ("调教拘束", "Training and Restraint"),
     ("粗暴性爱", "Rough sex"),
     ("重口变态", "Hardcore Perversion"),
     ("滴蜡皮鞭", "Wax Play & Whip"),
@@ -582,9 +575,7 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("日本情色", "Japanese erotica"),
     ("japanese erotica", "Japanese erotica"),
     ("西洋情色", "Western erotica"),
-    ("露骨性行为", "Explicit Sexual Acts"),
     ("explicit sexual acts", "Explicit Sexual Acts"),
-    ("自慰高潮", "Orgasm Through Masturbation"),
     ("口交", "Oral sex"),
     ("oral sex", "Oral sex"),
     ("肛交", "Anal sex"),
@@ -1242,6 +1233,64 @@ mod tests {
         assert_eq!(zh, en_builtin_code("Screenshot"));
     }
 
+    /// **别名表键唯一门禁**。
+    ///
+    /// `BUILTIN_ALIASES` 是 `alias_map()` 的事实源，后者用 `HashMap::insert`（**末次胜出**）。
+    /// 同名别名一旦指向**不同的** en 规范名，靠后条目会**静默覆盖**靠前条目 —— 死数据 +
+    /// 隐含行序依赖（改表内行序即静默改语义）。详见
+    /// `docs/issues/issue-builtin-aliases-duplicate-keys.md`（已按方向 B 裁决）。
+    #[test]
+    fn builtin_aliases_have_unique_keys() {
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        let mut dups: Vec<String> = Vec::new();
+        for (alias, en) in BUILTIN_ALIASES {
+            if let Some(prev) = seen.insert(alias, en) {
+                dups.push(format!("{alias}: {prev} / {en}"));
+            }
+        }
+        assert!(
+            dups.is_empty(),
+            "BUILTIN_ALIASES 存在重复别名（末次胜出会静默覆盖）: {dups:?}"
+        );
+    }
+
+    /// **方向 B 回归**：8 个曾重复的别名一律「**裸词 → 裸概念**」，
+    /// 复合概念改由各自**专属**别名承载（未被本裁决波及）。
+    #[test]
+    fn bare_tokens_resolve_to_bare_concepts() {
+        for (alias, expected_code) in [
+            ("设计", "builtin.design"),
+            ("design", "builtin.design"),
+            ("designated", "builtin.design"),
+            ("角色", "builtin.character"),
+            ("character", "builtin.character"),
+            ("露骨性行为", "builtin.explicit_sexual_act"),
+            ("自慰高潮", "builtin.masturbation"),
+            ("调教拘束", "builtin.bondage"),
+        ] {
+            assert_eq!(
+                resolve_controlled_tag_two_stage(alias, Some("zh")).map(|(c, _)| c),
+                Some(expected_code),
+                "别名 {alias:?} 的解析结果与方向 B 裁决不符"
+            );
+        }
+
+        // 复合概念仍可达：专属别名未被方向 B 波及。
+        for (alias, expected_code) in [
+            ("设计稿", "builtin.design_draft"),
+            ("design draft", "builtin.design_draft"),
+            ("人物主体", "builtin.human_subject"),
+            ("人物", "builtin.human_subject"),
+            ("explicit sexual acts", "builtin.explicit_sexual_acts"),
+        ] {
+            assert_eq!(
+                resolve_controlled_tag_two_stage(alias, Some("zh")).map(|(c, _)| c),
+                Some(expected_code),
+                "复合概念 {alias:?} 应仍可达"
+            );
+        }
+    }
+
     #[test]
     fn tag_matches_concept_works_across_languages() {
         assert!(tag_matches_concept("Screenshot", "截图"));
@@ -1504,14 +1553,18 @@ mod tests {
         let outcome_draft = resolve_controlled_tag_two_stage("draft", Some("zh"));
         assert_eq!(outcome_draft, Some(("builtin.draft", Some("草稿".to_string()))));
 
+        // 方向 B（见 docs/issues/issue-builtin-aliases-duplicate-keys.md）：裸词 `design` 归**裸概念**
+        // `Design`（`builtin.design` / 设计）；复合概念 `Design Draft` 由专属别名 `设计稿` / `design draft` 承载。
         let outcome_design = resolve_controlled_tag_two_stage("design", Some("zh"));
-        assert_eq!(outcome_design, Some(("builtin.design_draft", Some("设计稿".to_string()))));
+        assert_eq!(outcome_design, Some(("builtin.design", Some("设计".to_string()))));
 
         let outcome_cartoon = resolve_controlled_tag_two_stage("cartoon", Some("zh"));
         assert_eq!(outcome_cartoon, Some(("builtin.comic", Some("漫画".to_string()))));
 
+        // 同上：裸词 `character` 归 `Character`（`builtin.character` / 角色）；
+        // 复合概念 `Human Subject` 由专属别名 `人物主体` / `人物` 承载。
         let outcome_character = resolve_controlled_tag_two_stage("character", Some("zh"));
-        assert_eq!(outcome_character, Some(("builtin.human_subject", Some("人物主体".to_string()))));
+        assert_eq!(outcome_character, Some(("builtin.character", Some("角色".to_string()))));
 
         // ─── 场景 6：英文形态学词形还原（复数/分词）两阶段反查与就地本地化 ───
         load_aliases_for_lang("zh", vec![
