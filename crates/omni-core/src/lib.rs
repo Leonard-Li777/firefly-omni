@@ -12,6 +12,10 @@ pub mod tag_thresholds;
 /// 标签准入闸门 · G1 词形层（取码前，零本体依赖；单一数据源 `taxonomy/tag-admissibility.json`）
 pub mod tag_admissibility;
 
+/// (DEC-03) 维度执行策略与多选/互斥裁决保底定义
+pub mod dimension_policies_generated;
+pub use dimension_policies_generated::*;
+
 /// 编译/运行期受控标签宏：开发时书写中文或英文直观名称，自动解析为系统标准 tag_code
 ///
 /// 示例：`tag_code!("截图")` → `"builtin.screenshot"`
@@ -454,6 +458,9 @@ pub struct MultimodalContext {
     pub is_document: bool,
     pub is_audio_or_video: bool,
     pub language: Option<String>,
+    /// 动态维度执行策略字典 (dim_code -> policy)
+    #[serde(default)]
+    pub dimension_policies: Option<std::collections::HashMap<String, DimensionExecutionPolicy>>,
 }
 
 /// 解析「可参与事实推导的文本正文」（Issue 0046 §1）。
