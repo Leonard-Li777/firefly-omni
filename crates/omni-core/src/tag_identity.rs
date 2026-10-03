@@ -1177,7 +1177,7 @@ pub fn tag_matches_concept(tag: &str, canonical_zh_or_en: &str) -> bool {
 /// `AGENTS.md` 规定内部处理 **100% 仅基于受控 code / 强类型 `Concept` 枚举**，
 /// ❌ 严禁硬编码自然语言字符串匹配。该规则此前以硬编码中文词表实现，
 /// 导致**同一受控概念在 zh / en 词面下判定相反**，违反 D12 跨语言感知幂等契约
-/// （`CONTEXT.md:900-903`）：zh 词面「有字图」被丢弃，en 词面 `Image With Text` 却存活。
+/// （`CONTEXT.md:920-922`）：zh 词面「有字图」被丢弃，en 词面 `Image With Text` 却存活。
 ///
 /// ## 词条来源与「受控近似词替换」约定
 ///
@@ -1231,7 +1231,7 @@ pub const GATE_CODES: &[&str] = &[
 pub const LOOSE_GATE_ALIASES: &[(&str, &str)] = &[
     ("合规", "安全"),      // 敏感内容维度 contextHint「合规安全检测」→ 别名表「安全 / Safe」
     ("敏感", "违规"),      // 敏感内容维度叶子「违规 / Violation」
-    ("成人向", "露骨"),    // 内容尺度维度「露骨 / Explicit」
+    ("成人向", "露骨"),    // 别名表「露骨 / Explicit」（内容尺度维度的尺度词之一，非其叶子）
     ("画质高", "高质量"),
     ("画质中", "中等质量"),
     ("画质低", "低质量"),
@@ -1261,9 +1261,12 @@ pub fn is_gate_tag(name: &str, code: &str) -> bool {
         return GATE_CODES.contains(&c);
     }
     // 词面不在别名表：经口语桥接表取受控近似词再反查。
+    // 归一化口径须与 `builtin_tag_code`（内部 `normalize_lemma`）一致，否则
+    // 「 合规」这类含空白/兼容变体的输入会在分支 2 / 分支 3 得到相反判定。
+    let norm = normalize_lemma(name);
     LOOSE_GATE_ALIASES
         .iter()
-        .find(|(loose, _)| *loose == name)
+        .find(|(loose, _)| norm == *loose)
         .and_then(|(_, canon)| builtin_tag_code(canon))
         .map(|c| GATE_CODES.contains(&c))
         .unwrap_or(false)
@@ -1508,7 +1511,7 @@ mod tests {
             );
         }
 
-        // 历史词表（原 `fusion.rs::RATING_NAMES` 33 词）**逐词**回归，防覆盖回退。
+        // 历史词表（原 `fusion.rs::RATING_NAMES` **32 词**）**逐词**回归，防覆盖回退。
         // 口语词经 LOOSE_GATE_ALIASES 桥接后必须仍判为门控。
         for w in [
             "安全", "全年龄", "合规", "违规", "敏感", "R-18", "R18", "R-15", "R15", "露骨",
@@ -1518,6 +1521,11 @@ mod tests {
         ] {
             assert!(is_gate_tag(w, ""), "历史词表覆盖回退: {w}");
         }
+
+        // 归一化口径一致性：桥接分支须与别名反查分支同口径（`normalize_lemma`）。
+        // 否则「 合规」在分支 2 因别名表无「合规」落空、分支 3 又因未 trim 不匹配 → 漏判。
+        assert!(is_gate_tag("  合规  ", ""), "桥接词含空白应经归一化命中");
+        assert!(is_gate_tag("\t敏感\n", ""), "桥接词含控制空白应经归一化命中");
 
         // 非门控概念不得误判（风格 / 主体 / 泛形态）。
         for nongate in ["截图", "设计稿", "人像写真", "自然景观", "写实拟真", "二次元"] {
