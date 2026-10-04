@@ -69,7 +69,7 @@ fn create_omw_api_fixture(dir: &std::path::Path) -> (std::path::PathBuf, rusqlit
             rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_entry_id, target_entry_id, rel_type));
          CREATE TABLE antonym_pairs (word_a TEXT NOT NULL, word_b TEXT NOT NULL, \
             meta TEXT NOT NULL DEFAULT '{}', UNIQUE (word_a, word_b));
-         CREATE TABLE file_tags (code TEXT PRIMARY KEY, name TEXT NOT NULL, parent_codes TEXT NOT NULL DEFAULT '[]', source TEXT, sort_order INTEGER DEFAULT 0);",
+         CREATE TABLE file_tags (code TEXT PRIMARY KEY, name TEXT NOT NULL, parent_codes TEXT NOT NULL DEFAULT '[]', source TEXT, sort_order INTEGER DEFAULT 0, pos TEXT);",
     )
     .unwrap();
     conn.execute_batch(
@@ -91,14 +91,14 @@ fn create_omw_api_fixture(dir: &std::path::Path) -> (std::path::PathBuf, rusqlit
             ('e3', 'e4', 'antonym');
          INSERT INTO antonym_pairs (word_a, word_b) VALUES
             ('dog', 'cat');
-         INSERT INTO file_tags (code, name, parent_codes, source, sort_order) VALUES
-            ('builtin.dog', '狗', '[\"omw.o-dog.n\", \"builtin.pet\"]', 'tag', 1),
-            ('builtin.pet', '宠物', '[\"omw.o-dog.n\"]', 'tag', 2),
-            ('builtin.cat', '猫', '[\"omw.o-dog.n\"]', 'tag', 3),
-            ('builtin.unrelated', '无关', '[]', 'tag', 4),
-            ('o-dog.n', '狗', '[]', 'omw', 5),
-            ('o-animal.n', '动物', '[]', 'omw', 6),
-            ('o-organism.n', '生物', '[]', 'omw', 7);",
+         INSERT INTO file_tags (code, name, parent_codes, source, sort_order, pos) VALUES
+            ('builtin.dog', '狗', '[\"omw.o-dog.n\", \"builtin.pet\"]', 'tag', 1, NULL),
+            ('builtin.pet', '宠物', '[\"omw.o-dog.n\"]', 'tag', 2, NULL),
+            ('builtin.cat', '猫', '[\"omw.o-dog.n\"]', 'tag', 3, NULL),
+            ('builtin.unrelated', '无关', '[]', 'tag', 4, NULL),
+            ('o-dog.n', '狗', '[]', 'omw', 5, 'n'),
+            ('o-animal.n', '动物', '[]', 'omw', 6, 'n'),
+            ('o-organism.n', '生物', '[]', 'omw', 7, 'n');",
     )
     .unwrap();
     (path, conn)
@@ -1492,10 +1492,10 @@ async fn test_omw_hierarchy_multi_parent_and_instance_hypernym() {
             ('o-puppy.n', 'o-dog.n', 'hypernym'),
             ('o-puppy.n', 'o-young.n', 'hypernym'),
             ('o-hachiko.n', 'o-dog.n', 'instance_hypernym');
-         INSERT INTO file_tags (code, name, parent_codes, source, sort_order) VALUES
-            ('o-young.n', '幼年生物', '[]', 'omw', 8),
-            ('o-puppy.n', '幼犬', '[]', 'omw', 9),
-            ('o-hachiko.n', '忠犬八公', '[]', 'omw', 10);",
+         INSERT INTO file_tags (code, name, parent_codes, source, sort_order, pos) VALUES
+            ('o-young.n', '幼年生物', '[]', 'omw', 8, 'n'),
+            ('o-puppy.n', '幼犬', '[]', 'omw', 9, 'n'),
+            ('o-hachiko.n', '忠犬八公', '[]', 'omw', 10, 'n');",
     )
     .unwrap();
     let app = setup_test_app();
