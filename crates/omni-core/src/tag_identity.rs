@@ -1334,9 +1334,9 @@ pub fn is_gate_tag(name: &str, code: &str) -> bool {
 /// 注意闸门位置：受控别名命中（`builtin.*` / `omw.*`）与「已是合法 code 形态」两个分支
 /// **不**过闸——受控词表本身即白名单，code 形态输入则是幂等短路。
 ///
-/// `dim.*` **有意不进**短路列表（2026-10-02 裁决：dim.* 完全迁移到 builtin.*，见
-/// `tag-admissibility-filter-spec.md` §6.9.6 待裁定项 1）——迁移完成后流转路径上不应再出现
-/// `dim.*` 输入；迁移完成前的残余 `dim.*` 会落到 G1 闸并派生 `_ext` 形态，属预期行为。
+/// `dim.*` **有意不进**短路列表（GH #717 裁决落地：dim.* 已全量迁移至 builtin.*，见
+/// `tag-admissibility-filter-spec.md` §6.9.6 裁定 1）——流转路径上严禁出现 dim.* 输入；
+/// 若有未预期的残余 dim.* 输入，直接落到 G1 词形闸并派生 _ext 形态作为安全兜底。
 pub fn normalize_tag_to_code(tag: &str) -> String {
     if let Some(code) = builtin_tag_code(tag) {
         return code.to_string();
