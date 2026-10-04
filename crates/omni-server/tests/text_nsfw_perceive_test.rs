@@ -66,8 +66,9 @@ async fn test_perceive_normal_document_outputs_all_ages_without_safe_tag() {
 
     // 契约断言：未检出违规仅输出评级语义的「全年龄」，严禁输出伪标签「安全」
     assert_eq!(res.content_rating.as_deref(), Some("safe"));
-    assert_eq!(res.nsfw_tags, vec!["全年龄".to_string()]);
-    assert!(!res.nsfw_tags.contains(&"安全".to_string()));
+    assert_eq!(res.nsfw_text_tags, vec!["全年龄".to_string()]);
+    assert!(!res.nsfw_text_tags.contains(&"安全".to_string()));
+    assert!(res.nsfw_tags.is_empty());
     assert!(res.sensitive_types.is_empty());
 }
 
@@ -86,10 +87,11 @@ async fn test_perceive_explicit_porn_document_detection() {
 
     assert_eq!(res.content_rating.as_deref(), Some("r18"));
     assert!(res.sensitive_types.contains(&"色情".to_string()));
-    assert!(res.nsfw_tags.contains(&"色情".to_string()));
-    assert!(res.nsfw_tags.contains(&"R-18".to_string()));
-    assert!(!res.nsfw_tags.contains(&"全年龄".to_string()));
-    assert!(!res.nsfw_tags.contains(&"安全".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"色情".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"R-18".to_string()));
+    assert!(!res.nsfw_text_tags.contains(&"全年龄".to_string()));
+    assert!(!res.nsfw_text_tags.contains(&"安全".to_string()));
+    assert!(res.nsfw_tags.is_empty());
 }
 
 #[tokio::test]
@@ -107,8 +109,9 @@ async fn test_perceive_violence_terror_document_detection() {
 
     assert_eq!(res.content_rating.as_deref(), Some("r18g"));
     assert!(res.sensitive_types.contains(&"血腥".to_string()));
-    assert!(res.nsfw_tags.contains(&"血腥暴力".to_string()));
-    assert!(res.nsfw_tags.contains(&"R-18G".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"血腥暴力".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"R-18G".to_string()));
+    assert!(res.nsfw_tags.is_empty());
 }
 
 #[tokio::test]
@@ -126,7 +129,8 @@ async fn test_perceive_political_sensitive_document_detection() {
 
     assert_eq!(res.content_rating.as_deref(), Some("r18"));
     assert!(res.sensitive_types.contains(&"涉政".to_string()));
-    assert!(res.nsfw_tags.contains(&"涉政违规".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"涉政违规".to_string()));
+    assert!(res.nsfw_tags.is_empty());
 }
 
 #[tokio::test]
@@ -144,7 +148,8 @@ async fn test_perceive_abuse_document_detection() {
 
     assert_eq!(res.content_rating.as_deref(), Some("r15"));
     assert!(res.sensitive_types.contains(&"辱骂".to_string()));
-    assert!(res.nsfw_tags.contains(&"仇恨辱骂".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"仇恨辱骂".to_string()));
+    assert!(res.nsfw_tags.is_empty());
 }
 
 #[tokio::test]
@@ -162,8 +167,9 @@ async fn test_perceive_medical_reference_anti_false_positive() {
 
     // 对照组防误杀保障：医学解剖文本绝不误判为色情 R-18
     assert_eq!(res.content_rating.as_deref(), Some("safe"));
-    assert_eq!(res.nsfw_tags, vec!["全年龄".to_string()]);
+    assert_eq!(res.nsfw_text_tags, vec!["全年龄".to_string()]);
     assert!(!res.sensitive_types.contains(&"色情".to_string()));
+    assert!(res.nsfw_tags.is_empty());
 }
 
 #[tokio::test]
@@ -181,8 +187,9 @@ async fn test_perceive_history_war_records_anti_false_positive() {
 
     // 对照组防误杀保障：历史战争纪实绝不误判为暴恐 R-18G
     assert_eq!(res.content_rating.as_deref(), Some("safe"));
-    assert_eq!(res.nsfw_tags, vec!["全年龄".to_string()]);
+    assert_eq!(res.nsfw_text_tags, vec!["全年龄".to_string()]);
     assert!(!res.sensitive_types.contains(&"血腥".to_string()));
+    assert!(res.nsfw_tags.is_empty());
 }
 
 #[tokio::test]
@@ -200,8 +207,9 @@ async fn test_perceive_legal_statutes_anti_false_positive() {
 
     // 对照组防误杀保障：宪法法律学术研究绝不误判为涉政违规
     assert_eq!(res.content_rating.as_deref(), Some("safe"));
-    assert_eq!(res.nsfw_tags, vec!["全年龄".to_string()]);
+    assert_eq!(res.nsfw_text_tags, vec!["全年龄".to_string()]);
     assert!(!res.sensitive_types.contains(&"涉政".to_string()));
+    assert!(res.nsfw_tags.is_empty());
 }
 
 #[tokio::test]
@@ -222,8 +230,9 @@ async fn test_perceive_whitelist_directory_exemption() {
 
     // 白名单目录路径直接豁免
     assert_eq!(res.content_rating.as_deref(), Some("safe"));
-    assert_eq!(res.nsfw_tags, vec!["全年龄".to_string()]);
+    assert_eq!(res.nsfw_text_tags, vec!["全年龄".to_string()]);
     assert!(res.sensitive_types.is_empty());
+    assert!(res.nsfw_tags.is_empty());
 }
 
 #[tokio::test]
@@ -249,8 +258,9 @@ async fn test_perceive_soft_porn_scale_pg13() {
     let res = perceive_file(&app, &file_path, Some("zh")).await;
 
     assert_ne!(res.content_rating.as_deref(), Some("safe"));
-    assert!(res.nsfw_tags.contains(&"软色情".to_string()));
-    assert!(res.nsfw_tags.contains(&"PG-13".to_string()) || res.nsfw_tags.contains(&"R-15".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"软色情".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"PG-13".to_string()) || res.nsfw_text_tags.contains(&"R-15".to_string()));
+    assert!(res.nsfw_tags.is_empty());
 }
 
 #[tokio::test]
@@ -267,8 +277,9 @@ async fn test_perceive_explicit_meat_and_pure_scale() {
     let res = perceive_file(&app, &file_path, Some("zh")).await;
 
     assert_eq!(res.content_rating.as_deref(), Some("r18"));
-    assert!(res.nsfw_tags.contains(&"R-18".to_string()));
-    assert!(res.nsfw_tags.contains(&"纯肉".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"R-18".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"纯肉".to_string()));
+    assert!(res.nsfw_tags.is_empty());
 }
 
 #[tokio::test]
@@ -285,7 +296,8 @@ async fn test_perceive_special_xp_scale() {
     let res = perceive_file(&app, &file_path, Some("zh")).await;
 
     assert_ne!(res.content_rating.as_deref(), Some("safe"));
-    assert!(res.nsfw_tags.contains(&"特殊XP".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"特殊XP".to_string()));
+    assert!(res.nsfw_tags.is_empty());
 }
 
 #[tokio::test]
@@ -302,7 +314,8 @@ async fn test_perceive_severe_curiosity_scale() {
     let res = perceive_file(&app, &file_path, Some("zh")).await;
 
     assert_eq!(res.content_rating.as_deref(), Some("r18g"));
-    assert!(res.nsfw_tags.contains(&"R-18G".to_string()));
-    assert!(res.nsfw_tags.contains(&"重度猎奇".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"R-18G".to_string()));
+    assert!(res.nsfw_text_tags.contains(&"重度猎奇".to_string()));
+    assert!(res.nsfw_tags.is_empty());
 }
 
