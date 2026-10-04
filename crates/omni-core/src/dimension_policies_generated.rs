@@ -1878,8 +1878,8 @@ pub fn is_dimension_code_multi_select(dim_code: &str) -> bool {
     if let Some(policy) = map.get(clean) {
         return policy.is_multi_select();
     }
-    // 兼容根据 Concept 查询
-    if let Some(concept) = crate::concepts::Concept::from_code(clean) {
+    // 兼容根据 Concept 查询（经跨注册表桥接，见 GH #719）
+    if let Some(concept) = crate::tag_identity::concept_from_code(clean) {
         if let Some(policy) = map.get(concept.code()) {
             return policy.is_multi_select();
         }

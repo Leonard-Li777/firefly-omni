@@ -727,9 +727,12 @@ mod tests {
 }
 
 /// 依据受控 code 反查中文权威展示名 (Canonical Lemma)
+///
+/// 经 [`tag_identity::concept_from_code`] 桥接：`Concept` 注册表与别名表对同一概念
+/// 存在 code 分歧（GH #719），直查 `from_code` 会静默落空、展示名退化成裸 slug。
 #[inline(always)]
 pub fn get_canonical_concept_name(code: &str) -> Option<&'static str> {
-    concepts::Concept::from_code(code).map(|item| item.zh_name())
+    tag_identity::concept_from_code(code).map(|item| item.zh_name())
 }
 
 /// 6 大受控根维度强类型枚举集合 (file-dimension-source.ts level=1)
