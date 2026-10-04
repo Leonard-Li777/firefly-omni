@@ -262,6 +262,21 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("confidential", "Confidential"),
     ("exposure is normal", "Exposure is normal"),
     ("normal exposure", "Exposure is normal"),
+    // ③ en 展示名劣化已纠偏（scripts/i18n-helper.js TRANSLATION_FIX_MAP），新译名形式在此补别名。
+    // 右侧规范名必须保持 code 冻结的旧形式：en_builtin_code(en) = builtin.{slug(en)} 不得漂移，
+    // 否则与 ① concepts.rs / semantic.pack / GATE_CODES 中的既有 code 断链。
+    // 若未来 step0 以新 en 重生成 ③，必须先加 slug 保持映射（见 issue-cross-registry-code-divergence.md）。
+    ("watermarked", "There is watermark"),
+    ("there is watermark", "There is watermark"),
+    ("underexposed in low light", "Underexposure in Low Light"),
+    ("underexposure in low light", "Underexposure in Low Light"),
+    ("blown highlights in backlight", "Blown-out highlights in backlighting"),
+    (
+        "blown-out highlights in backlighting",
+        "Blown-out highlights in backlighting"
+    ),
+    ("certificates and licenses", "Licenses and Permits"),
+    ("licenses and permits", "Licenses and Permits"),
     ("good exposure", "Good Exposure"),
     ("slight underexposure", "Slight Underexposure"),
     ("slight overexposure", "Slight Overexposure"),
@@ -1567,6 +1582,39 @@ mod tests {
         // 非门控概念不得误判（风格 / 主体 / 泛形态）。
         for nongate in ["截图", "设计稿", "人像写真", "自然景观", "写实拟真", "二次元"] {
             assert!(!is_gate_tag(nongate, ""), "非门控词误判: {nongate}");
+        }
+    }
+
+    /// ③ en 展示名劣化纠偏（scripts/i18n-helper.js TRANSLATION_FIX_MAP）回归：
+    /// 新译名形式与旧劣化形式都必须经别名表解析到**同一冻结 code**。
+    /// code 由 en_builtin_code(规范名) 派生 —— 规范名不动，只补别名行。
+    #[test]
+    fn improved_en_display_forms_resolve_to_frozen_codes() {
+        for (new_form, legacy_form, frozen_code) in [
+            ("Watermarked", "There is watermark", "builtin.there_is_watermark"),
+            ("Normal Exposure", "Exposure is normal", "builtin.exposure_is_normal"),
+            (
+                "Underexposed in Low Light",
+                "Underexposure in Low Light",
+                "builtin.underexposure_in_low_light"
+            ),
+            (
+                "Blown Highlights in Backlight",
+                "Blown-out highlights in backlighting",
+                "builtin.blown_out_highlights_in_backlighting"
+            ),
+            ("Certificates and Licenses", "Licenses and Permits", "builtin.licenses_and_permits"),
+        ] {
+            assert_eq!(
+                builtin_tag_code(new_form),
+                Some(frozen_code),
+                "新 en 展示名 {new_form} 未解析到冻结 code"
+            );
+            assert_eq!(
+                builtin_tag_code(legacy_form),
+                Some(frozen_code),
+                "旧劣化形式 {legacy_form} 应保持可解析（存量数据兼容）"
+            );
         }
     }
 
