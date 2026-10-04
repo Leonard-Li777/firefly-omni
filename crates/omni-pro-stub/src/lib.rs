@@ -593,8 +593,8 @@ pub mod text {
         /// 存根复位（no-op：缓存从未灌入）
         pub fn reset_classifier_map() {}
 
-        /// 存根恒 `Ok(0)`：CE 无 semantic.pack → 无量词数据源（等价空表，
-        /// 调用方 `refresh_classifier_map` 按灌入 0 条走 info 级，不产生 warn 噪音）
+        /// 存根恒 `Ok(0)`：与真版 API 面对齐的等价空表契约（CE 下调用方经
+        /// `is_available()` 早退先行，此为防御性兜底，避免 warn 噪音）
         pub fn hydrate_from_conn(_conn: &rusqlite::Connection) -> anyhow::Result<usize> {
             Ok(0)
         }
@@ -1194,6 +1194,11 @@ pub mod omw_db {
             anyhow::bail!("Open-core mode: omw requires omni-pro");
         }
         pub fn connect<P: AsRef<Path>>(&self, _path: P) -> anyhow::Result<()> {
+            anyhow::bail!("Open-core mode: omw requires omni-pro");
+        }
+        /// 只读语义包挂载存根（GH #710 R3 补齐）：CE 无 semantic.pack，
+        /// 与真仓 `OmwDb::connect_pack` API 面对齐，保证 omni-server 双版本可编译
+        pub fn connect_pack<P: AsRef<Path>>(&self, _path: P) -> anyhow::Result<()> {
             anyhow::bail!("Open-core mode: omw requires omni-pro");
         }
         pub fn disconnect(&self) {}
