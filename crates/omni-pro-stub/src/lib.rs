@@ -593,9 +593,10 @@ pub mod text {
         /// 存根复位（no-op：缓存从未灌入）
         pub fn reset_classifier_map() {}
 
-        /// 存根恒 `Err`：CE 无 `tag_aliases_zh_CN.classifier` 列（调用方按无量词数据降级）
+        /// 存根恒 `Ok(0)`：CE 无 semantic.pack → 无量词数据源（等价空表，
+        /// 调用方 `refresh_classifier_map` 按灌入 0 条走 info 级，不产生 warn 噪音）
         pub fn hydrate_from_conn(_conn: &rusqlite::Connection) -> anyhow::Result<usize> {
-            anyhow::bail!("open-core stub: classifier column unavailable (no semantic.pack)")
+            Ok(0)
         }
     }
 

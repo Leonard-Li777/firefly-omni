@@ -618,19 +618,27 @@ fn save_config_to_disk(cfg: &OmniConfig) {
 
 /// 量词接线（GH #710 S9）：以当前词库刷新 omni-text 真实搭配量词进程缓存
 ///
-/// 先复位再灌库：语义包含 `tag_aliases_zh_CN.classifier` 列（semantic.pack 的 zh_CN 分表）时
-/// 缓存即最新词库数据；桌面主库/老库无该列 → 缓存保持空（造句量词 miss，符合设计，不回退「张」）。
-/// 缺表/缺列属预期降级（info 级），其余异常按 warn 记录——均不阻断服务。
+/// 成功路径由 `hydrate_from_conn` 内部「局部建表 → `replace_map` 原子 swap」完成，
+/// 灌库窗口内旧词库量词仍可读（无空窗）；失败/无源路径显式复位为空
+/// （造句量词 miss，符合设计，不回退「张」，亦杜绝换库后的陈旧量词）。
+/// 缺表/缺列与断开态属预期降级（info 级），其余异常按 warn 记录——均不阻断服务。
 fn refresh_classifier_map(omw: &OmwDb) {
-    omni_pro::text::classifier_lookup::reset_classifier_map();
+    if !omw.is_available() {
+        // 断开态/未配置：无数据源 → 复位为空（主动断开是预期操作，记 info）
+        omni_pro::text::classifier_lookup::reset_classifier_map();
+        info!("classifier map cleared: omw unavailable (no classifier source)");
+        return;
+    }
     match omw.with_conn(|conn| omni_pro::text::classifier_lookup::hydrate_from_conn(conn)) {
         Ok(n) => info!("classifier map hydrated: {n} lemma entries"),
         Err(err) => {
+            // 灌库失败即清空：防止换库/老库场景残留上一个词库的陈旧量词
+            omni_pro::text::classifier_lookup::reset_classifier_map();
             let msg = format!("{err:#}");
             if msg.contains("no such column") || msg.contains("no such table") {
-                info!("classifier map left empty: source has no classifier column ({msg})");
+                info!("classifier map cleared: source has no classifier column ({msg})");
             } else {
-                tracing::warn!("classifier map hydrate failed: {msg}");
+                tracing::warn!("classifier map hydrate failed, cleared: {msg}");
             }
         }
     }
