@@ -316,6 +316,15 @@ async fn reconnect_omw_handler(
         }
     };
 
+    // 量词接线（GH #710 S9）：热重连/断开成功后刷新进程缓存——
+    // 换库取新库量词；断开或源无 classifier 列则复位为空（后续造句量词 miss），杜绝陈旧量词
+    if result.is_ok() {
+        let omw_bg = state.omw.clone();
+        tokio::task::spawn_blocking(move || refresh_classifier_map(&omw_bg))
+            .await
+            .unwrap_or_else(|err| tracing::warn!("classifier map refresh join failed: {err}"));
+    }
+
     match result {
         Ok(()) => Json(serde_json::json!({
             "status": "ok",
@@ -607,6 +616,26 @@ fn save_config_to_disk(cfg: &OmniConfig) {
     }
 }
 
+/// 量词接线（GH #710 S9）：以当前词库刷新 omni-text 真实搭配量词进程缓存
+///
+/// 先复位再灌库：语义包含 `tag_aliases_zh_CN.classifier` 列（semantic.pack 的 zh_CN 分表）时
+/// 缓存即最新词库数据；桌面主库/老库无该列 → 缓存保持空（造句量词 miss，符合设计，不回退「张」）。
+/// 缺表/缺列属预期降级（info 级），其余异常按 warn 记录——均不阻断服务。
+fn refresh_classifier_map(omw: &OmwDb) {
+    omni_pro::text::classifier_lookup::reset_classifier_map();
+    match omw.with_conn(|conn| omni_pro::text::classifier_lookup::hydrate_from_conn(conn)) {
+        Ok(n) => info!("classifier map hydrated: {n} lemma entries"),
+        Err(err) => {
+            let msg = format!("{err:#}");
+            if msg.contains("no such column") || msg.contains("no such table") {
+                info!("classifier map left empty: source has no classifier column ({msg})");
+            } else {
+                tracing::warn!("classifier map hydrate failed: {msg}");
+            }
+        }
+    }
+}
+
 pub async fn start_server(
     addr: SocketAddr,
     db_path: Option<PathBuf>,
@@ -671,12 +700,13 @@ pub async fn start_server(
         info!("semantic.pack mounted into memory; db-path is reserved for desktop master database ({})", path.display());
     }
 
-    // 量词接线（GH #710 S9）：词库就绪后一次性灌入 omni-text 真实搭配量词进程缓存
-    // （列 `tag_aliases_zh_CN.classifier`；灌库失败仅降级为量词 miss，不影响服务启动）
+    // 量词接线（GH #710 S9）：词库就绪后刷新量词进程缓存
+    // （spawn_blocking：41k 行全表 SQL 不阻塞 async runtime worker；await 保证首个请求前完成）
     if omw_connected {
-        if let Err(err) = omw.with_conn(|conn| omni_pro::text::classifier_lookup::hydrate_from_conn(conn)) {
-            tracing::warn!("classifier map hydrate skipped: {err}");
-        }
+        let omw_bg = omw.clone();
+        tokio::task::spawn_blocking(move || refresh_classifier_map(&omw_bg))
+            .await
+            .unwrap_or_else(|err| tracing::warn!("classifier map refresh join failed: {err}"));
     }
 
     // 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 WeMM-Embedding 2B 2048 维)
