@@ -1644,6 +1644,46 @@ mod tests {
         assert!(concept_from_code("").is_none());
     }
 
+    /// RAM++ 投影受控命中率量化（GH #718 前置核验 1）：
+    /// `ram_pan_projection.json` 的 `code` 字段不落盘（全空），由 omni-vision
+    /// `get_ram_projections()` OnceLock 运行期派生：`controlled_tag_code(zh)` 命中 →
+    /// 受控码，否则 `_ext.{zh hash}` 回落。
+    ///
+    /// 实测口径（2026-10-04，4,585 条 zh 词表）：
+    /// - 静态 ② 字典命中：**44 条（1.0%）**——RAM 是通用视觉概念词表，② 只策展维度根；
+    /// - 动态轨（semantic.pack `tag_aliases_zh_CN`，116,901 行）合并命中：**3,029（66.1%）**
+    ///   （omw.* 1,755 + hownet.* 1,252 + builtin 22）；
+    /// - `_ext` 回落面：1,556（33.9%），复合词为主（三维CG渲染/动作电影/有氧运动…）。
+    /// 本测试只锁**静态命中收缩**（② 覆盖不得回退），不声明总覆盖率；
+    /// 词表缺失（干净环境）时跳过。
+    #[test]
+    fn ram_tag_list_static_controlled_hit_rate() {
+        let txt_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../apps/desktop/build/presetResources/ram/ram_tag_list_zh.txt");
+        let text = match std::fs::read_to_string(&txt_path) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("[skip] 未找到 {txt_path:?}（RAM 预置词表缺失），跳过命中率量化");
+                return;
+            }
+        };
+        let tags: Vec<&str> = text.lines().map(str::trim).filter(|s| !s.is_empty()).collect();
+        assert!(
+            (4000..=5000).contains(&tags.len()),
+            "RAM zh 词表条数异常: {}（应为 4,585 量级）",
+            tags.len()
+        );
+        let hits = tags.iter().filter(|t| builtin_tag_code(t).is_some()).count();
+        // 收缩报警：静态命中不得低于基线 44 的九成。总覆盖主体在动态轨（66.1%），
+        // 此处数字小是结构性的（RAM 通用词 vs ② 维度根策展表），不是缺陷。
+        assert!(
+            hits >= 40,
+            "RAM zh 词表静态受控命中 {hits}/{} 低于收缩下界 40，② 覆盖疑似回退",
+            tags.len()
+        );
+        eprintln!("[metrics] RAM zh 词表静态受控命中: {hits}/{}（动态轨合并基线 3,029/4,585 = 66.1%）", tags.len());
+    }
+
     /// ★ 跨注册表一致性门禁（GH #719）：`BUILTIN_ALIASES`（②）与
     /// `builtin-tag-identity.json`（③，pro `step0` 由 `fileDimension_en-US.json` 派生）
     /// 对同一 zh 别名必须给出**同一 code**。
