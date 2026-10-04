@@ -1138,6 +1138,43 @@ pub fn tag_display(code: &str, lang: &str) -> String {
     clean_code.to_string()
 }
 
+/// 受控 code → [`crate::concepts::Concept`]（**跨注册表桥接，唯一收口**）。
+///
+/// ## 为什么需要桥接
+///
+/// 本仓存在**两份**受控注册表，对同一中文概念可能给出**不同 code**：
+///
+/// | 注册表 | 位置 | 事实源 |
+/// | :--- | :--- | :--- |
+/// | `Concept` 枚举 | `crates/omni-core/src/concepts.rs`（AOT 生成） | `fileDimension_zh-CN.json` + semantic.pack |
+/// | 别名注册表 | 本文件 `BUILTIN_ALIASES`（手写） | 人工维护 |
+///
+/// 实测共有概念中 **161/316（51%）分歧**（GH [#719]）。后果：
+/// `Concept::from_code(code)` 对其中约一半**静默落空**，于是任何
+/// `from_code(code).or_else(|| from_zh(词面))` 写法都会**退化成词面语言依赖**
+/// （zh 词面命中 `from_zh`、en 词面落空），直接违反 D12 跨语言感知幂等契约。
+///
+/// ## 桥接策略
+///
+/// 1. 先 `Concept::from_code(code)` 直查（零开销主路径）；
+/// 2. 落空时经**别名表**把 code 反查为该概念的 **zh 规范名**（[`tag_display`]），
+///    再走 `Concept::from_zh` —— 该路径**只依赖 code**，与用户传入的词面语言无关。
+///
+/// 这样无论两注册表最终如何统一（方向 A/B/C），调用点都不会退化成语言依赖。
+///
+/// [#719]: https://github.com/Leonard-Li777/firefly-ai-folder/issues/719
+pub fn concept_from_code(code: &str) -> Option<crate::concepts::Concept> {
+    let clean = code.trim();
+    crate::concepts::Concept::from_code(clean).or_else(|| {
+        let canon_zh = tag_display(clean, "zh");
+        if canon_zh != clean {
+            crate::concepts::Concept::from_zh(&canon_zh)
+        } else {
+            None
+        }
+    })
+}
+
 /// 别名/规范名 → builtin code（精确字典，非向量）
 pub fn builtin_tag_code(tag: &str) -> Option<&'static str> {
     let key = normalize_lemma(tag);
@@ -1531,6 +1568,35 @@ mod tests {
         for nongate in ["截图", "设计稿", "人像写真", "自然景观", "写实拟真", "二次元"] {
             assert!(!is_gate_tag(nongate, ""), "非门控词误判: {nongate}");
         }
+    }
+
+    /// 跨注册表桥接（GH #719）：`Concept` 注册表与 `BUILTIN_ALIASES` 对同一概念给出不同 code，
+    /// `Concept::from_code` 会静默落空 —— `concept_from_code` 必须仍能解析到同一概念。
+    #[test]
+    fn concept_from_code_bridges_cross_registry_divergence() {
+        // 已知分歧：别名表 code != Concept 注册表 code。
+        // 有字图: 别名表 builtin.image_with_text vs Concept builtin.text_in_image
+        let concept = concept_from_code("builtin.image_with_text")
+            .expect("有字图 应经桥接解析到 Concept");
+        assert_eq!(concept.zh_name(), "有字图");
+
+        // 截图: 别名表 builtin.screenshot vs Concept hownet.000000135085.v
+        let shot = concept_from_code("builtin.screenshot").expect("截图 应经桥接解析到 Concept");
+        assert_eq!(shot.zh_name(), "截图");
+
+        // 直查路径不受影响：Concept 注册表自己的 code 仍走零开销主路径（不经桥接）。
+        assert_eq!(
+            concept_from_code("builtin.text_in_image").map(|it| it.zh_name()),
+            Some("有字图")
+        );
+
+        // 桥接**只依赖 code**：同一 code 无论调用方传入何种语言词面，结果一致。
+        // （这是 D12 幂等的前提；若桥接退化成 from_zh(词面) 则 en 侧会落空。）
+        assert_eq!(concept_from_code("builtin.image_with_text"), concept_from_code("builtin.image_with_text"));
+
+        // 未受控 / 未知 code 必须返回 None，不得误命中。
+        assert!(concept_from_code("_ext.unknown.abc123").is_none());
+        assert!(concept_from_code("").is_none());
     }
 
     /// 桥接表契约：目标词必须已在别名表内且落在 [`GATE_CODES`]；源词必须不在别名表（防冗余）。

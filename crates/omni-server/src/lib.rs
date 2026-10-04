@@ -1065,7 +1065,9 @@ fn run_vision_pipeline(
                     if omni_core::tag_admissibility::is_rejected_code(&code) {
                         continue;
                     }
-                    let group = match Concept::from_code(code.as_str()) {
+                    // 经跨注册表桥接：`Concept` 注册表与别名表 code 分歧（GH #719）
+                    // 会使直查静默落空，导致同概念在 zh/en 下分组不一致。
+                    let group = match omni_core::tag_identity::concept_from_code(code.as_str()) {
                         Some(Concept::Windows截图)
                         | Some(Concept::macOS截图)
                         | Some(Concept::iOS截图)
