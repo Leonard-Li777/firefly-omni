@@ -1623,7 +1623,11 @@ async fn perceive_file_handler(
         .chain(morphology_tags.iter())
         .chain(nsfw_tags.iter())
         .chain(quality_issues.iter())
-        .chain(ram_tags.iter().map(|r| &r.name))
+        // (#718 汇聚侧同源化) ram 贡献改推 r.code（proj.code = 受控反查 zh 规范名，权威）：
+        // 此前推 r.name（展示名）→ normalize 后未受控条目 code = 展示名 hash，与过滤侧
+        // r.code（zh 规范名 hash）派生输入不同必然分叉；同源化后两侧消费同一 code，
+        // 非 zh 会话未受控条目不再依赖 OR 兜底存活。r.code 为空的条目回落展示名（旧行为）。
+        .chain(ram_tags.iter().map(|r| if r.code.is_empty() { &r.name } else { &r.code }))
     {
         if !detected_visual_tags.contains(tag) {
             detected_visual_tags.push(tag.clone());
@@ -1661,6 +1665,12 @@ async fn perceive_file_handler(
         for r in &ram_tags {
             // RAM++：真实模型置信度直接贯通
             register(&r.name, "ram", 3, Some(r.confidence));
+            // (#718) 汇聚侧同源化后 detected_visual_tags 内 ram 条目为 r.code 形态，
+            // engine_lookup（域压制②按集合条目精确取来源）必须同时覆盖 code 键，
+            // 否则「截图域压制 ram 来源」静默失效。
+            if !r.code.is_empty() && r.code != r.name {
+                register(&r.code, "ram", 3, Some(r.confidence));
+            }
         }
         for (tag, conf, _group) in &clip_mutual_tags {
             // 互斥组胜出项：组内点积经同一标定函数换算
@@ -1711,10 +1721,17 @@ async fn perceive_file_handler(
 
     // Spec D12：统一归一为稳定 code 后再做集合同步，保证 zh/en 输入幂等
     // 修复(问题2)：normalize 前先保留「原始名 → code」映射，供 6.2 步骤反查真实展示名
-    let detected_visual_tag_name_to_code: std::collections::HashMap<String, String> = detected_visual_tags
+    let mut detected_visual_tag_name_to_code: std::collections::HashMap<String, String> = detected_visual_tags
         .iter()
         .map(|name| (name.clone(), normalize_tag_to_code(name)))
         .collect();
+    // (#718) 同源化后 ram 条目在集合内是 code 形态，6.2 反查展示名需补「展示名 → code」
+    // 条目；同 code 多键时反查侧优先非 code 形态键（见下方 original_name 查找）。
+    for r in &ram_tags {
+        if !r.code.is_empty() && r.code != r.name {
+            detected_visual_tag_name_to_code.insert(r.name.clone(), r.code.clone());
+        }
+    }
     let detected_visual_tags = normalize_tag_set_to_codes(&detected_visual_tags);
 
     // 修复(问题4)：clip/morphology 只用 code 集合做内部比对，保留原始名供输出
@@ -1739,17 +1756,16 @@ async fn perceive_file_handler(
     let gated_ram_tags: Vec<omni_core::RamTagItem> = ram_tags
         .iter()
         .filter(|r| {
-            // spec §6.9.6 待裁定项 2（2026-10-02 裁决 B + 第 2 轮盲审 P1-2 收敛为 OR 语义）：
-            // ① 名字归一保底（旧行为）：detected_visual_tags 集合由各引擎展示名（含 r.name）汇聚，
-            //    未受控 _ext 条目在非 zh 会话下集合内是「展示名 hash」，只有名字归一能命中自身贡献——
-            //    去掉此路会把旧逻辑的偶然命中变成丢失。
-            // ② r.code 救援（新增）：proj.code 由 zh 规范名离线受控反查得出（权威）。ja/ar 词表各 1 条
-            //    展示名含非中性标点 `/`（エレクトロニック / EDM 等），名字归一被 G1 拒成空哨兵 →
-            //    自身贡献缺失 + 过滤误杀；r.code 路径使其中在其它引擎贡献了同 code 时得以存活。
-            // OR 语义 = 旧行为严格超集，零回归；集合侧与过滤侧派生彻底同源化属超纲项，另行开票。
-            let by_name = normalize_tag_to_code(&r.name);
-            detected_visual_tags.contains(&by_name)
-                || (!r.code.is_empty() && detected_visual_tags.contains(&r.code))
+            // spec §6.9.6 待裁定项 2 —— #718 同源化后 OR 兜底退役为单判据：
+            // 汇聚侧 ram 贡献已改推 r.code（权威 proj.code），过滤判据与派生源合一：
+            // r.code 非空 → contains(r.code)（自身贡献在集合 = 未被门控剔除）；
+            // r.code 为空（投影缺格）→ 回落名字归一（旧行为保底）。
+            // 旧 OR 的名字归一分支曾依赖「展示名 hash」偶然命中，已随同源化失去存在意义。
+            if r.code.is_empty() {
+                detected_visual_tags.contains(&normalize_tag_to_code(&r.name))
+            } else {
+                detected_visual_tags.contains(&r.code)
+            }
         })
         .cloned()
         .collect();
@@ -1876,11 +1892,18 @@ async fn perceive_file_handler(
     for raw_code in &detected_visual_tags {
         // 按 code 去重（normalize 后 code 已稳定，避免同一概念 zh/en 名称不同但指向同 code 时重复添加）
         if !structured_visual_tags.iter().any(|t| &t.code == raw_code) {
-            // 从 normalize 前的映射反查原始名（找不到则用 code 作为 fallback）
+            // 从 normalize 前的映射反查原始名（找不到则用 code 作为 fallback）。
+            // (#718) 同 code 多键（展示名 + code 自映射）时优先展示名键，
+            // 防止 ram 条目的 TagChainItem.name 被写成 code 串。
+            let is_code_form = |k: &str| {
+                k.starts_with("builtin.") || k.starts_with("omw.") || k.starts_with("hownet.")
+                    || k.starts_with("_ext.") || k.starts_with("dim.")
+            };
             let original_name = detected_visual_tag_name_to_code
                 .iter()
-                .find(|(_name, code): &(&String, &String)| code.as_str() == raw_code.as_str())
+                .filter(|(_name, code): &(&String, &String)| code.as_str() == raw_code.as_str())
                 .map(|(name, _code): (&String, &String)| name.clone())
+                .find(|name: &String| !is_code_form(name))
                 .unwrap_or_else(|| raw_code.clone());
             // (WP2b) 分层置信度：优先真实分数（CLIP 标定分 / 互斥组标定分 / RAM 真实分），
             // 缺失时按引擎分层回退：OCR事实 0.99 > 物理/互斥/NSFW/画质/RAM 0.90 > CLIP 起步 0.55
