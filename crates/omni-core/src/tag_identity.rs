@@ -1208,8 +1208,27 @@ pub fn builtin_tag_code(tag: &str) -> Option<&'static str> {
 }
 
 /// 是否与规范概念同 code（规则层用）
+///
+/// (#718 R1) code 形态解析通道：受控 code（`builtin.*|omw.*|hownet.*`）输入不再落空。
+/// #718 汇聚侧同源化后，门禁集合内 ram 条目为受控 code 形态，而别名表键全部为词面
+/// （实测 semantic.raw.db `tag_aliases_*` 10 语言分表共 ~72.7 万行、code 形态 lemma = 0），
+/// 词面查询分支对 code 输入恒落空 → 互斥/域矩阵/文字存在性门禁对 ram 条目静默失明
+/// （实测 RAM 词表 ∩ 门控词表 = 25 条：漫画/截图/特写/全景/9 色/证件票据类等）。
+/// 受控 code 直接作为比较键：r.code 与 canonical 的 code 同出 dynamic_aliases 同一词面
+/// 查询（omw.* > hownet.* > builtin.* 仲裁一致，同词面必同 code），无 #719 跨注册表分歧。
+/// 开放集 `_ext.*` / `dim.*` 无受控语义，保持 fallback 串等价旧行为。
 pub fn tag_matches_concept(tag: &str, canonical_zh_or_en: &str) -> bool {
-    match (builtin_tag_code(tag), builtin_tag_code(canonical_zh_or_en)) {
+    let tag_code = if is_controlled_code(tag) {
+        Some(tag.trim())
+    } else {
+        builtin_tag_code(tag)
+    };
+    let canon_code = if is_controlled_code(canonical_zh_or_en) {
+        Some(canonical_zh_or_en.trim())
+    } else {
+        builtin_tag_code(canonical_zh_or_en)
+    };
+    match (tag_code, canon_code) {
         (Some(a), Some(b)) => a == b,
         _ => tag.trim() == canonical_zh_or_en.trim(),
     }
@@ -2074,6 +2093,30 @@ mod tests {
         // 过去分词 Connected -> 原型 connect -> builtin.connect -> 连接
         let outcome_connected = resolve_controlled_tag_two_stage("Connected", Some("zh"));
         assert_eq!(outcome_connected, Some(("builtin.connect", Some("连接".to_string()))));
+
+        // ─── 场景 7（#718 R1）：tag_matches_concept 对 code 形态输入的解析通道 ───
+        // 复现实测回归面：#718 汇聚侧同源化后 ram 条目以受控 code 进入门禁集合，
+        // 而别名表键全为词面（tag_aliases_* 实测 0 条 code 形态 lemma），原实现恒走
+        // 串等价 fallback → 互斥/域矩阵/文字存在性门禁对 ram 条目静默失明。
+        clear_dynamic_aliases();
+        load_aliases_for_lang("zh", vec![
+            ("漫画", "omw.06780069.n", true),
+            ("特写", "omw.03049695.n", true),
+        ]);
+        // code 形态 tag vs 词面 canonical：同词面同 code（dynamic_aliases 单一仲裁）必须命中
+        assert!(tag_matches_concept("omw.06780069.n", "漫画"));
+        assert!(tag_matches_concept("omw.03049695.n", "特写"));
+        // 两侧均为 code 形态（同 code）
+        assert!(tag_matches_concept("omw.06780069.n", "omw.06780069.n"));
+        // 不同概念的 code / code vs 异词面不得误判
+        assert!(!tag_matches_concept("omw.06780069.n", "特写"));
+        assert!(!tag_matches_concept("omw.06780069.n", "omw.03049695.n"));
+        // 词面 vs 词面（原行为保持：两侧归一后 code 相等）
+        assert!(tag_matches_concept("漫画", "漫画"));
+        // 开放集 _ext.* 无受控语义：保持 fallback 串等价旧行为，不误命中受控概念
+        assert!(!tag_matches_concept("_ext.a1b2c3d4", "漫画"));
+        // canonical 词面未受控（动态/静态双轨均未命中）→ 受控 code 与词面字面不等 → false
+        assert!(!tag_matches_concept("omw.06780069.n", "完全无关词Q"));
 
         clear_dynamic_aliases();
     }

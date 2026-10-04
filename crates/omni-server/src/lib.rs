@@ -1895,6 +1895,11 @@ async fn perceive_file_handler(
             // 从 normalize 前的映射反查原始名（找不到则用 code 作为 fallback）。
             // (#718) 同 code 多键（展示名 + code 自映射）时优先展示名键，
             // 防止 ram 条目的 TagChainItem.name 被写成 code 串。
+            // (#718 R1/M1) 确定性仲裁：HashMap 迭代序不定，同 code 存在多个非 code 词面键
+            // （如 zh 规范名与 en 别名并存）时选择结果随运行波动 → 规则化：
+            // ① 非 ASCII（CJK）字符多者优先（zh 规范展示名优先于 translit 别名）；
+            // ② 字符数更少者优先（短规范名优先于长复合词）；
+            // ③ 字典序兜底，保证完全可复现。
             let is_code_form = |k: &str| {
                 k.starts_with("builtin.") || k.starts_with("omw.") || k.starts_with("hownet.")
                     || k.starts_with("_ext.") || k.starts_with("dim.")
@@ -1903,7 +1908,14 @@ async fn perceive_file_handler(
                 .iter()
                 .filter(|(_name, code): &(&String, &String)| code.as_str() == raw_code.as_str())
                 .map(|(name, _code): (&String, &String)| name.clone())
-                .find(|name: &String| !is_code_form(name))
+                .filter(|name: &String| !is_code_form(name))
+                .min_by_key(|name: &String| {
+                    (
+                        std::cmp::Reverse(name.chars().filter(|c| !c.is_ascii()).count()),
+                        name.chars().count(),
+                        name.clone(),
+                    )
+                })
                 .unwrap_or_else(|| raw_code.clone());
             // (WP2b) 分层置信度：优先真实分数（CLIP 标定分 / 互斥组标定分 / RAM 真实分），
             // 缺失时按引擎分层回退：OCR事实 0.99 > 物理/互斥/NSFW/画质/RAM 0.90 > CLIP 起步 0.55
