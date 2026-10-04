@@ -263,9 +263,31 @@ pub struct TagChainItem {
     /// "clip" | "ram" | "physical" | "mutual_group" | "ocr" | "nsfw" | "quality" | "rule" | "metadata"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
-    /// 词性标识 (n/v/a/s/r)，句法槽位投放的物理基石
+    /// 词性标识（封闭单字母枚举，ADR-0052 §5，GH #712 S7）：
+    ///
+    /// | 字母 | HowNet 原生        | 含义         | 准入策略                     |
+    /// |------|--------------------|--------------|------------------------------|
+    /// | `n`  | noun               | 名词         | G2 放行，可标注              |
+    /// | `v`  | verb               | 动词         | 白名单豁免后可标注           |
+    /// | `a`  | adj                | 形容词       | G2 放行，可标注              |
+    /// | `r`  | adv                | 副词         | 白名单豁免后可标注           |
+    /// | `m`  | num                | 数词         | 保留词库，禁标注（造句需要） |
+    /// | `q`  | classifier         | 量词         | 保留词库，禁标注（造句需要） |
+    /// | `p`  | prep               | 介词         | 保留词库，禁标注（造句需要） |
+    /// | `o`  | echo               | 拟声词       | 保留词库，禁标注（造句需要） |
+    /// | `y`  | pron               | 代词         | 保留词库，禁标注（造句需要） |
+    /// | `c`  | conj+coor          | 连词         | 保留词库，禁标注（造句需要） |
+    /// | `u`  | aux+stru           | 助词/结构助词| 保留词库，禁标注（造句需要） |
+    /// | `h`  | wh                 | 疑问词       | 保留词库，禁标注（造句需要） |
+    /// | `w`  | pun                | 标点         | 清洗阶段删除                 |
+    /// | `x`  | letter+prefix/expr | 字母前缀/表达式 | 清洗阶段删除/重归类        |
+    /// | `b`  | char               | 单字         | 清洗阶段删除                 |
+    ///
+    /// 热集未覆盖（约 15%）时字段为 `None`（冷集降级，有计数告警，非静默）。
+    /// **禁止从 code 尾段推导 pos**（ADR-0052 §5 硬约束 3）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pos: Option<String>,
+
     /// 44大类语义范畴 (noun.artifact等)，具象实体与虚词判据
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lexfile: Option<String>,

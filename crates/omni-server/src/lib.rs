@@ -2154,6 +2154,15 @@ async fn perceive_file_handler(
         structured_visual_tags.clone()
     };
 
+    // 缺口2（GH #712 S7）：融合标签组补挂词性回填。
+    // 融合引擎（OmniMultimodalFusionEngine::fuse_and_arbitrate）产出的 fused_tags
+    // 中的 TagChainItem 不一定经过了 enrich_tag，导致 pos 字段为空。
+    // 物理事实标签组（fact_tags）按豁免规则可不挂（ADR-0052 §6 决策⑥）。
+    let mut fused_tags = fused_tags;
+    for item in &mut fused_tags {
+        enrich_tag(item);
+    }
+
     // 票 05：受控标签与扩展标签经由父 (via_parent_code) 与树状父 (parent_codes) 主链回填
     // 终结「工单 01 已知限制」，确保受控标签行落库时 via_parent_code != ''
     let backfill_chain_item = |mut tag: omni_core::TagChainItem| -> omni_core::TagChainItem {
