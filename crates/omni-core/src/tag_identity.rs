@@ -96,7 +96,7 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("图片", "Image"),
     ("图像", "Image"),
     ("画面", "Image"),
-    ("照片", "Photo"),
+    ("照片", "Photography"),
     ("素材", "Material"),
     ("视频", "Video"),
     ("音频", "Audio"),
@@ -113,36 +113,36 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     // 闭环视觉规则高频项
     ("截图", "Screenshot"),
     ("设计稿", "Design Draft"),
-    ("图纸", "Blueprint"),
-    ("表情包", "Meme"),
-    ("证照", "ID Document"),
-    ("合同票据", "Contract or Invoice"),
-    ("海报宣发", "Poster Promo"),
+    ("图纸", "Drawing"),
+    ("表情包", "Emoticons"),
+    ("证照", "Licenses and Permits"),
+    ("合同票据", "Contract Instruments"),
+    ("海报宣发", "Poster Promotion"),
     ("医学影像", "Medical Imaging"),
-    ("网页长截图", "Long Webpage Screenshot"),
-    ("UI界面截图", "UI Screenshot"),
-    ("聊天截图", "Chat Screenshot"),
+    ("网页长截图", "Long Screenshot of a Webpage"),
+    ("UI界面截图", "Screenshots of the UI"),
+    ("聊天截图", "Chat Screenshots"),
     ("代码截图", "Code Screenshot"),
-    ("游戏截图", "Game Screenshot"),
-    ("有字图", "Image With Text"),
-    ("无字图", "Image Without Text"),
+    ("游戏截图", "Game Screenshots"),
+    ("有字图", "Text-in-Image"),
+    ("无字图", "Image with No Text"),
     ("全彩", "Full Color"),
     ("黑白", "Black And White"),
-    ("摄影照片", "Photo"),
+    ("摄影照片", "Photography"),
     ("人像写真", "Portrait Photography"),
-    ("人物照", "Person Photo"),
-    ("私房写真", "Boudoir Photo"),
-    ("婚纱照", "Wedding Photo"),
-    ("静物照", "Still Life Photo"),
+    ("人物照", "Portrait Photos"),
+    ("私房写真", "Private Photo Shoot"),
+    ("婚纱照", "Wedding Photos"),
+    ("静物照", "Still Life Photography"),
     ("自然景观", "Natural Landscape"),
-    ("城市建筑", "City Architecture"),
-    ("旅行照", "Travel Photo"),
-    ("风景照", "Scenery Photo"),
-    ("宠物照", "Pet Photo"),
+    ("城市建筑", "Urban Architecture"),
+    ("旅行照", "Travel Photos"),
+    ("风景照", "Landscape Photos"),
+    ("宠物照", "Pet Photos"),
     ("二次元", "Anime Style"),
     ("动漫", "Anime"),
     ("插画", "Illustration"),
-    ("漫画", "Comic"),
+    ("漫画", "Comics"),
     ("手绘", "Hand Drawn"),
     ("涂鸦", "Doodle"),
     ("角色", "Character"),
@@ -152,68 +152,68 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     // 视觉门控补充
     ("名人", "Celebrity"),
     ("社会名流", "Celebrity"),
-    ("历史遗迹", "Historic Site"),
-    ("户外活动", "Outdoor Activity"),
-    ("夜景照", "Night Photo"),
-    ("怀旧", "Nostalgic"),
-    ("建筑摄影", "Architecture Photo"),
-    ("微距摄影", "Macro Photo"),
-    ("街拍抓拍", "Street Photo"),
-    ("航空航拍", "Aerial Photo"),
-    ("青年漫", "Youth Comic"),
-    ("少年漫", "Boys Comic"),
-    ("少女漫", "Girls Comic"),
-    ("成人漫", "Adult Comic"),
+    ("历史遗迹", "Historical Sites"),
+    ("户外活动", "Outdoor Activities"),
+    ("夜景照", "Nighttime Photos"),
+    ("怀旧", "Nostalgia"),
+    ("建筑摄影", "Architectural Photography"),
+    ("微距摄影", "Macro Photography"),
+    ("街拍抓拍", "Street Photography: Candid Shots"),
+    ("航空航拍", "Aerial Photography"),
+    ("青年漫", "Youth Comics"),
+    ("少年漫", "Shounen Comics"),
+    ("少女漫", "Girls' comics"),
+    ("成人漫", "Adult Comics"),
     ("实拍", "Real Shot"),
-    ("CG渲染", "CG Render"),
+    ("CG渲染", "CG rendering"),
     ("AI生成", "AI Generated"),
     ("绘画", "Painting"),
-    ("应用图标", "App Icon"),
-    ("高饱和鲜艳", "High Saturation"),
-    ("暖色调", "Warm Tone"),
-    ("冷色调", "Cool Tone"),
-    ("中性黑白灰", "Neutral Gray"),
+    ("应用图标", "Application Icon"),
+    ("高饱和鲜艳", "Highly saturated and vivid"),
+    ("暖色调", "Warm colors"),
+    ("冷色调", "Cool colors"),
+    ("中性黑白灰", "Neutral black, white and gray"),
     ("透明背景", "Transparent Background"),
-    ("实景背景", "Real Scene Background"),
-    ("人物主体", "Human Subject"),
-    ("动物宠物", "Animal Pet"),
-    ("植物花草", "Plant Flower"),
-    ("静物商品", "Still Life Product"),
-    ("环境建筑", "Environment Building"),
-    ("无人空镜", "Empty Scene"),
-    ("单人", "Single Person"),
-    ("双人", "Two Persons"),
+    ("实景背景", "Live background"),
+    ("人物主体", "Character subject"),
+    ("动物宠物", "Animal pets"),
+    ("植物花草", "Plants and flowers"),
+    ("静物商品", "Still life merchandise"),
+    ("环境建筑", "Environmental architecture"),
+    ("无人空镜", "Unmanned aerial mirror"),
+    ("单人", "Single"),
+    ("双人", "Double"),
     ("多人合影", "Group Photo"),
     ("色情", "Pornography"),
-    ("血腥", "Gore"),
-    ("涉政", "Political Sensitive"),
+    ("血腥", "Bloody"),
+    ("涉政", "Political Issues"),
     ("违规", "Violation"),
     ("高ISO噪点", "High ISO Noise"),
-    ("逆光死白", "Backlight Blowout"),
-    ("暗光欠曝", "Underexposed"),
+    ("逆光死白", "Blown-out highlights in backlighting"),
+    ("暗光欠曝", "Underexposure in Low Light"),
     ("同人本", "Doujinshi"),
-    ("剧情", "Story"),
+    ("剧情", "Plot"),
     ("二次元色情", "Anime Pornography"),
     ("软色情", "Soft Porn"),
     ("性感", "Sexy"),
-    ("擦边诱惑", "Borderline Tease"),
+    ("擦边诱惑", "Temptation on the Edge"),
     ("血腥暴力", "Bloody Violence"),
     ("断头斩首", "Beheading"),
-    ("肢解碎尸", "Dismemberment"),
+    ("肢解碎尸", "Dismemberment and Dismantling of a Corpse"),
     ("血腥虐杀", "Bloody Massacre"),
     ("露骨", "Explicit"),
-    ("露骨性行为", "Explicit Sexual Act"),
+    ("露骨性行为", "Explicit Sexual Acts"),
     ("安全", "Safe"),
     ("全年龄", "All Ages"),
     ("水彩水墨", "Watercolor Ink"),
-    ("四格漫", "Four Panel Comic"),
-    ("页漫", "Page Comic"),
+    ("四格漫", "4-Koma Manga"),
+    ("页漫", "Page Manga"),
     ("条漫", "Webtoon"),
-    ("欢乐", "Joyful"),
+    ("欢乐", "Joy"),
     ("悲伤", "Sad"),
-    ("紧张", "Tense"),
+    ("紧张", "Nervous"),
     ("兴奋", "Excited"),
-    ("压抑", "Depressed"),
+    ("压抑", "Depress"),
     ("历史", "History"),
     // 英文模型直出别名（归一到同一概念）
     ("text", "Text"),
@@ -226,42 +226,42 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("screenshot", "Screenshot"),
     ("screen capture", "Screenshot"),
     ("design draft", "Design Draft"),
-    ("blueprint", "Blueprint"),
-    ("meme", "Meme"),
-    ("id document", "ID Document"),
-    ("invoice", "Invoice"),
+    ("blueprint", "Drawing"),
+    ("meme", "Emoticons"),
+    ("id document", "Licenses and Permits"),
+    ("invoice", "Bill"),
     ("contract", "Contract"),
     ("full color", "Full Color"),
     ("black and white", "Black And White"),
     ("black_and_white", "Black And White"),
-    ("image with text", "Image With Text"),
-    ("image without text", "Image Without Text"),
-    ("image with no text", "Image Without Text"),
+    ("image with text", "Text-in-Image"),
+    ("image without text", "Image with No Text"),
+    ("image with no text", "Image with No Text"),
     ("doodle", "Doodle"),
     ("character", "Character"),
     ("design", "Design"),
     ("designated", "Design"),
-    ("text image", "Image With Text"),
+    ("text image", "Text-in-Image"),
     ("anime", "Anime"),
     ("illustration", "Illustration"),
-    ("comic", "Comic"),
-    ("person photo", "Person Photo"),
-    ("still life photo", "Still Life Photo"),
+    ("comic", "Comics"),
+    ("person photo", "Portrait Photos"),
+    ("still life photo", "Still Life Photography"),
     ("natural landscape", "Natural Landscape"),
-    ("scenery photo", "Scenery Photo"),
-    ("travel photo", "Travel Photo"),
-    ("night photo", "Night Photo"),
+    ("scenery photo", "Landscape Photos"),
+    ("travel photo", "Travel Photos"),
+    ("night photo", "Nighttime Photos"),
     ("real shot", "Real Shot"),
-    ("cg render", "CG Render"),
+    ("cg render", "CG rendering"),
     ("painting", "Painting"),
-    ("photo", "Photo"),
+    ("photo", "Photography"),
     ("pornography", "Pornography"),
-    ("ui screenshot", "UI Screenshot"),
+    ("ui screenshot", "Screenshots of the UI"),
     ("code screenshot", "Code Screenshot"),
-    ("chat screenshot", "Chat Screenshot"),
+    ("chat screenshot", "Chat Screenshots"),
     ("confidential", "Confidential"),
-    ("exposure is normal", "Normal Exposure"),
-    ("normal exposure", "Normal Exposure"),
+    ("exposure is normal", "Exposure is normal"),
+    ("normal exposure", "Exposure is normal"),
     ("good exposure", "Good Exposure"),
     ("slight underexposure", "Slight Underexposure"),
     ("slight overexposure", "Slight Overexposure"),
@@ -269,8 +269,8 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("medium quality", "Medium Quality"),
     ("low quality", "Low Quality"),
     ("all ages", "All Ages"),
-    ("text-in-image", "Image With Text"),
-    ("text in image", "Image With Text"),
+    ("text-in-image", "Text-in-Image"),
+    ("text in image", "Text-in-Image"),
     ("长图", "Long Image"),
     ("正方形图", "Square Image"),
     ("横图", "Horizontal Image"),
@@ -287,47 +287,47 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("vertical image", "Vertical Image"),
     // 视觉细分与票据证照 (无 hash 规范化)
     ("合同", "Contract"),
-    ("发票", "Invoice"),
+    ("发票", "Bill"),
     ("红头文件", "Official Document"),
-    ("论文", "Paper"),
+    ("论文", "Thesis"),
     ("收据", "Receipt"),
-    ("对账单", "Statement"),
+    ("对账单", "Statement of Account"),
     ("银行回单", "Bank Receipt"),
     ("采购订单", "Purchase Order"),
-    ("报销凭证", "Expense Voucher"),
-    ("保函协议", "Letter Of Guarantee"),
-    ("投标文件", "Bidding Document"),
+    ("报销凭证", "Reimbursement Vouchers"),
+    ("保函协议", "Letter of Guarantee Agreement"),
+    ("投标文件", "Bid Documents"),
     ("身份证", "ID Card"),
-    ("房产证", "Property Certificate"),
+    ("房产证", "Property Ownership Certificate"),
     ("护照", "Passport"),
-    ("驾驶证", "Driver License"),
-    ("行驶证", "Vehicle License"),
+    ("驾驶证", "Driver's License"),
+    ("行驶证", "Vehicle Registration Certificate"),
     ("车牌", "License Plate"),
     ("银行卡", "Bank Card"),
     ("营业执照", "Business License"),
-    ("户口本", "Household Register"),
+    ("户口本", "Household Registration Book"),
     ("毕业证", "Diploma"),
     ("学位证", "Degree Certificate"),
-    ("工作证", "Work Permit"),
+    ("工作证", "Employee ID Card"),
     ("结婚证", "Marriage Certificate"),
     ("社保卡", "Social Security Card"),
     ("特写", "Close Up"),
-    ("半身", "Medium Shot"),
-    ("全身", "Full Shot"),
-    ("全景", "Panoramic Shot"),
+    ("半身", "Half body"),
+    ("全身", "Whole body"),
+    ("全景", "Panoramic view"),
     ("微距", "Macro"),
     ("日光", "Sunlight"),
     ("日落", "Sunset"),
-    ("夜景", "Night Scene"),
-    ("暗光", "Low Light"),
+    ("夜景", "Night view"),
+    ("暗光", "Dim light"),
     ("室内光", "Indoor Light"),
-    ("纯色背景", "Solid Background"),
+    ("纯色背景", "Solid color background"),
     ("平视", "Eye Level"),
-    ("俯视", "Top Down View"),
-    ("仰视", "Low Angle View"),
+    ("俯视", "Looking down"),
+    ("仰视", "Look up"),
     ("第一人称", "First Person"),
-    ("图表为主", "Chart Dominant"),
-    ("图文混合", "Text And Graphic"),
+    ("图表为主", "Chart-based"),
+    ("图文混合", "Mixed graphics and text"),
     ("手写笔记", "Handwritten Notes"),
     ("Windows截图", "Windows Screenshot"),
     ("macOS截图", "macOS Screenshots"),
@@ -337,26 +337,26 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("Android截图", "Android Screenshot"),
     ("Linux截图", "Linux Screenshot"),
     ("正方形", "Square"),
-    ("超宽长条", "Ultra Wide"),
+    ("超宽长条", "Extra wide strip"),
     ("微量文本", "Microtext"),
     ("Minimal Text", "Microtext"),
     ("图文标题", "Picture And Text Title"),
     ("Graphic Title", "Picture And Text Title"),
     ("密集排版", "Dense Typography"),
     ("Dense Layout", "Dense Typography"),
-    ("扁平极简", "Flat Minimalist"),
-    ("写实拟真", "Photorealistic"),
+    ("扁平极简", "Flat and minimalist"),
+    ("写实拟真", "Realistic"),
     ("复古胶片", "Vintage Film"),
     ("赛博朋克", "Cyberpunk"),
-    ("春季花景", "Spring Bloom"),
+    ("春季花景", "Spring flower scene"),
     ("夏季绿荫", "Summer Shade"),
-    ("秋季金黄", "Autumn Foliage"),
-    ("冬季雪景", "Winter Snow"),
+    ("秋季金黄", "Autumn golden"),
+    ("冬季雪景", "Winter snow scene"),
     ("红色", "Red"),
-    ("橙色", "Orange"),
+    ("橙色", "Orange color"),
     ("黄色", "Yellow"),
     ("绿色", "Green"),
-    ("青色", "Cyan"),
+    ("青色", "Blue"),
     ("蓝色", "Blue"),
     ("紫色", "Purple"),
     ("粉色", "Pink"),
@@ -364,69 +364,69 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("白色", "White"),
     ("黑色", "Black"),
     ("灰色", "Gray"),
-    ("商业志", "Commercial Manga"),
+    ("商业志", "Business Journal"),
     ("虚焦", "Out Of Focus"),
-    ("抖动", "Motion Blur"),
+    ("抖动", "Jitter"),
     ("曝光良好", "Good Exposure"),
     ("轻微欠曝", "Slight Underexposure"),
     ("轻微过曝", "Slight Overexposure"),
-    ("模糊废片", "Blurry Wastage"),
-    ("脱焦", "Defocused"),
-    ("运动抖动", "Motion Shake"),
-    ("曝光正常", "Normal Exposure"),
+    ("模糊废片", "Blurry, unusable photos"),
+    ("脱焦", "Decoking"),
+    ("运动抖动", "Motion Jitter"),
+    ("曝光正常", "Exposure is normal"),
     ("无码", "Uncensored"),
     ("薄码", "Light Mosaic"),
     ("有码", "Censored"),
-    ("无水印", "No Watermark"),
+    ("无水印", "No watermark"),
     ("轻水印", "Light Watermark"),
-    ("有水印", "Watermarked"),
+    ("有水印", "There is watermark"),
     ("高质量", "High Quality"),
     ("中等质量", "Medium Quality"),
     ("低质量", "Low Quality"),
-    ("暴恐", "Violence Terror"),
+    ("暴恐", "Violence & Terrorism"),
     ("生殖器暴露", "Genital Exposure"),
     ("性虐调教", "Sadomasochism"),
     ("乱伦淫秽", "Incest Pornography"),
     ("强奸轮奸", "Rape Assault"),
-    ("自慰高潮", "Masturbation"),
-    ("调教拘束", "Bondage"),
+    ("自慰高潮", "Orgasm Through Masturbation"),
+    ("调教拘束", "Training and Restraint"),
     ("情色文娱", "Erotic Entertainment"),
     ("暴露走光", "Exposure Wardrobe Malfunction"),
     ("残肢断臂", "Severed Limbs Mutilation"),
-    ("尸体残骸", "Corpse Remains"),
-    ("酷刑折磨", "Torture"),
-    ("重口猎奇", "Hardcore Grotesque"),
-    ("暴恐惨案", "Terror Tragedy"),
-    ("自残放血", "Self Harm Bleeding"),
-    ("血肉模糊", "Flesh Mutilation"),
+    ("尸体残骸", "Remains of a body"),
+    ("酷刑折磨", "Torture and Cruel Treatment"),
+    ("重口猎奇", "Extreme and Bizarre"),
+    ("暴恐惨案", "Violent Terrorist Attacks"),
+    ("自残放血", "Self-harm and bloodletting"),
+    ("血肉模糊", "A bloody mess"),
     ("涉政违规", "Political Sensitive Violation"),
-    ("反党反政", "Subversive Politics"),
-    ("颠覆政权", "Subversion"),
+    ("反党反政", "Anti-Party and Anti-Government"),
+    ("颠覆政权", "Overthrow the government"),
     ("邪教分裂", "Cult Separatism"),
-    ("邪教组织", "Cult Organization"),
-    ("暴乱动乱", "Riots Turmoil"),
+    ("邪教组织", "Cult Organizations"),
+    ("暴乱动乱", "Riots and Unrest"),
     ("违法违规", "Illegal Violation"),
     ("毒品交易", "Drug Trafficking"),
-    ("走私贩私", "Smuggling"),
+    ("走私贩私", "Smugglers"),
     ("网络赌博", "Online Gambling"),
     ("洗钱诈骗", "Money Laundering Fraud"),
     ("暗网黑产", "Darknet Underground"),
-    ("洗钱黑产", "Laundering Industry"),
+    ("洗钱黑产", "Money Laundering and Illegal Activities"),
     ("电信诈骗", "Telecom Fraud"),
-    ("各地美食", "Local Delicacy"),
-    ("治愈", "Healing"),
-    ("致郁", "Depressing"),
-    ("轻松", "Relaxed"),
-    ("感动", "Touching"),
+    ("各地美食", "Food from all over the world"),
+    ("治愈", "Cure"),
+    ("致郁", "Causing Depression"),
+    ("轻松", "Easy"),
+    ("感动", "Move"),
     ("欲望", "Desire"),
     ("罪恶感", "Guilt"),
-    ("背德感", "Transgression"),
+    ("背德感", "Sense of Immorality"),
     ("羞耻", "Shame"),
-    ("支配", "Dominance"),
+    ("支配", "Dominate"),
     ("写实", "Realistic"),
     ("内容标签", "Content Tags"),
     ("content_tags", "Content Tags"),
-    ("图片细分", "Image Subdivision"),
+    ("图片细分", "Image segmentation"),
     // 权威事实维度与事实标签别名对齐（统一 builtin.* 严格受控体系）
     ("文件来源", "File Source"),
     ("file_source", "File Source"),
@@ -493,11 +493,11 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     // `Human Subject` 由各自**专属**别名承载（`设计稿` / `design draft`、`人物主体` / `人物`）。
     ("艺术", "Painting"),
     ("art", "Painting"),
-    ("cartoon", "Comic"),
+    ("cartoon", "Comics"),
     ("肖像", "Portrait Photography"),
-    ("人物", "Human Subject"),
-    ("扁平", "Flat Minimalist"),
-    ("flat", "Flat Minimalist"),
+    ("人物", "Character subject"),
+    ("扁平", "Flat and minimalist"),
+    ("flat", "Flat and minimalist"),
     // 敏感内容 / 成人色情 12 大垂直门类与细分子标签跨语言对齐 (PRD 0052)
     // （同上：`调教拘束` / `露骨性行为` / `自慰高潮` 已在上文登记，此处不再重复声明，避免末次胜出覆盖）
     ("家庭乱伦", "Family incest"),
@@ -622,8 +622,8 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("incest obscene", "Incest Pornography"),
     ("severed limbs mutilation", "Severed Limbs Mutilation"),
     ("severed limbs", "Severed Limbs Mutilation"),
-    ("hardcore grotesque", "Hardcore Grotesque"),
-    ("hardcore bizarre", "Hardcore Grotesque"),
+    ("hardcore grotesque", "Extreme and Bizarre"),
+    ("hardcore bizarre", "Extreme and Bizarre"),
     ("wax play & whip", "Wax Play & Whip"),
     ("dripping wax whip", "Wax Play & Whip"),
     ("extreme public exposure", "Extreme Public Exposure"),
@@ -1244,17 +1244,17 @@ pub const GATE_CODES: &[&str] = &[
     "builtin.low_quality",      // 低质量（← 画质低）
     // ── 水印程度（维度「水印程度」id 125）────────────────────────────────────
     "builtin.no_watermark",     // 无水印（← 去水印）
-    "builtin.watermarked",      // 有水印（← 带水印）
+    "builtin.there_is_watermark",      // 有水印（← 带水印）
     // ── 照片质量 / 曝光（维度「照片质量」id 127）──────────────────────────────
-    "builtin.normal_exposure",  // 曝光正常
+    "builtin.exposure_is_normal",  // 曝光正常
     "builtin.good_exposure",    // 曝光良好
-    "builtin.underexposed",     // 暗光欠曝（← 曝光不足）
-    "builtin.backlight_blowout", // 逆光死白（← 曝光过度）
+    "builtin.underexposure_in_low_light",     // 暗光欠曝（← 曝光不足）
+    "builtin.blown_out_highlights_in_backlighting", // 逆光死白（← 曝光过度）
     // ── 文字密度（维度「文字密度」id 146）────────────────────────────────────
     "builtin.plain_text",         // 纯文字
     "builtin.microtext",          // 微量文本
-    "builtin.image_with_text",    // 有字图（D12 泄漏修复：en 侧 `Image With Text` 曾漏判）
-    "builtin.image_without_text", // 无字图
+    "builtin.text_in_image",    // 有字图（D12 泄漏修复：en 侧 `Image With Text` 曾漏判）
+    "builtin.image_with_no_text", // 无字图
 ];
 
 /// 门控维度的**口语 / 近义词 → 受控规范词**桥接表（**目标词必须已在 [`BUILTIN_ALIASES`] 内**）。
@@ -1408,9 +1408,9 @@ mod tests {
             ("designated", "builtin.design"),
             ("角色", "builtin.character"),
             ("character", "builtin.character"),
-            ("露骨性行为", "builtin.explicit_sexual_act"),
-            ("自慰高潮", "builtin.masturbation"),
-            ("调教拘束", "builtin.bondage"),
+            ("露骨性行为", "builtin.explicit_sexual_acts"),
+            ("自慰高潮", "builtin.orgasm_through_masturbation"),
+            ("调教拘束", "builtin.training_and_restraint"),
         ] {
             assert_eq!(
                 resolve_controlled_tag_two_stage(alias, Some("zh")).map(|(c, _)| c),
@@ -1423,8 +1423,8 @@ mod tests {
         for (alias, expected_code) in [
             ("设计稿", "builtin.design_draft"),
             ("design draft", "builtin.design_draft"),
-            ("人物主体", "builtin.human_subject"),
-            ("人物", "builtin.human_subject"),
+            ("人物主体", "builtin.character_subject"),
+            ("人物", "builtin.character_subject"),
             ("explicit sexual acts", "builtin.explicit_sexual_acts"),
         ] {
             assert_eq!(
@@ -1495,7 +1495,7 @@ mod tests {
     #[test]
     fn tag_matches_concept_works_across_languages() {
         assert!(tag_matches_concept("Screenshot", "截图"));
-        assert!(tag_matches_concept("有字图", "Image With Text"));
+        assert!(tag_matches_concept("有字图", "Text-in-Image"));
         assert!(!tag_matches_concept("Screenshot", "设计稿"));
     }
 
@@ -1505,8 +1505,8 @@ mod tests {
     fn gate_tag_is_language_agnostic_across_zh_and_en() {
         // (zh 词面, en 词面) 均须判为门控。
         const PAIRS: &[(&str, &str)] = &[
-            ("有字图", "Image With Text"),
-            ("无字图", "Image Without Text"),
+            ("有字图", "Text-in-Image"),
+            ("无字图", "Image with No Text"),
             ("纯文字", "Plain Text"),
             ("微量文本", "Microtext"),
             ("安全", "Safe"),
@@ -1518,9 +1518,9 @@ mod tests {
             ("高质量", "High Quality"),
             ("中等质量", "Medium Quality"),
             ("低质量", "Low Quality"),
-            ("无水印", "No Watermark"),
-            ("有水印", "Watermarked"),
-            ("曝光正常", "Normal Exposure"),
+            ("无水印", "No watermark"),
+            ("有水印", "There is watermark"),
+            ("曝光正常", "Exposure is normal"),
             ("曝光良好", "Good Exposure"),
             ("R-18", "R-18"),
             ("R-15", "R-15"),
@@ -1574,29 +1574,92 @@ mod tests {
     /// `Concept::from_code` 会静默落空 —— `concept_from_code` 必须仍能解析到同一概念。
     #[test]
     fn concept_from_code_bridges_cross_registry_divergence() {
-        // 已知分歧：别名表 code != Concept 注册表 code。
-        // 有字图: 别名表 builtin.image_with_text vs Concept builtin.text_in_image
-        let concept = concept_from_code("builtin.image_with_text")
-            .expect("有字图 应经桥接解析到 Concept");
-        assert_eq!(concept.zh_name(), "有字图");
-
-        // 截图: 别名表 builtin.screenshot vs Concept hownet.000000135085.v
-        let shot = concept_from_code("builtin.screenshot").expect("截图 应经桥接解析到 Concept");
-        assert_eq!(shot.zh_name(), "截图");
-
-        // 直查路径不受影响：Concept 注册表自己的 code 仍走零开销主路径（不经桥接）。
+        // 纯命名分歧已随「② 对齐 ③」而归零：`有字图` 现在**直查命中**（零开销主路径）。
         assert_eq!(
             concept_from_code("builtin.text_in_image").map(|it| it.zh_name()),
             Some("有字图")
         );
 
+        // 剩余「分层差异」仍靠桥接：别名表 builtin.screenshot vs Concept hownet.000000135085.v
+        let shot = concept_from_code("builtin.screenshot").expect("截图 应经桥接解析到 Concept");
+        assert_eq!(shot.zh_name(), "截图");
+
         // 桥接**只依赖 code**：同一 code 无论调用方传入何种语言词面，结果一致。
         // （这是 D12 幂等的前提；若桥接退化成 from_zh(词面) 则 en 侧会落空。）
-        assert_eq!(concept_from_code("builtin.image_with_text"), concept_from_code("builtin.image_with_text"));
+        assert_eq!(
+            concept_from_code("builtin.screenshot"),
+            concept_from_code("builtin.screenshot")
+        );
 
         // 未受控 / 未知 code 必须返回 None，不得误命中。
         assert!(concept_from_code("_ext.unknown.abc123").is_none());
         assert!(concept_from_code("").is_none());
+    }
+
+    /// ★ 跨注册表一致性门禁（GH #719）：`BUILTIN_ALIASES`（②）与
+    /// `builtin-tag-identity.json`（③，pro `step0` 由 `fileDimension_en-US.json` 派生）
+    /// 对同一 zh 别名必须给出**同一 code**。
+    ///
+    /// 2026-10-04 已把 ② 的 121 条漂移修正为对齐 ③（**仅修分歧、不扩表**，行数保持 537）。
+    /// 本门禁防止再次漂移。③ 文件属 `apps/desktop/build/`（构建产物，可能不存在于干净环境），
+    /// 故文件缺失时**跳过**而非失败。
+    #[test]
+    fn builtin_aliases_agree_with_tag_identity_json() {
+        let json_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../apps/desktop/build/presetResources/taxonomy/builtin-tag-identity.json");
+        let text = match std::fs::read_to_string(&json_path) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("[skip] 未找到 {json_path:?}（构建产物缺失），跳过 ②↔③ 门禁");
+                return;
+            }
+        };
+
+        // 极简提取：从 JSON 里取每个 tags[] 条目的 code 与 aliases["zh-CN"]。
+        // （不引入 serde_json 依赖；③ 的条目字段顺序稳定，按文本匹配足够可靠。）
+        let mut expected: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for cap in text.split("\"code\": \"").skip(1) {
+            let code = cap.split('"').next().unwrap_or("");
+            if !code.starts_with("builtin.") {
+                continue;
+            }
+            if let Some(seg) = cap.split("\"zh-CN\": \"").nth(1) {
+                let zh = seg.split('"').next().unwrap_or("");
+                if !zh.is_empty() {
+                    expected.entry(zh.to_string()).or_insert_with(|| code.to_string());
+                }
+            }
+        }
+        assert!(
+            expected.len() > 500,
+            "③ 解析异常（仅 {} 条 zh 别名），怀疑 JSON 结构变更",
+            expected.len()
+        );
+
+        let mut drift: Vec<String> = Vec::new();
+        // 已知豁免：③ 的数据瑕疵，不视为漂移。
+        // `img`：fileDimension_zh-CN.json 里存在**字面拉丁标签** "img"（en-US 未翻译成独立概念），
+        // ③ 遂为其单立 `builtin.img`；但 `img` 语义上就是 `image` 的缩写，② 保持归并入
+        // `builtin.image`（与 图片/图像/画面/picture/pic 同码），避免概念碎片化。
+        const KNOWN_EXCEPTIONS: &[&str] = &["img"];
+        for zh in expected.keys() {
+            if KNOWN_EXCEPTIONS.contains(&zh.as_str()) {
+                continue;
+            }
+            if let Some(actual) = builtin_tag_code(zh) {
+                if actual != expected[zh] {
+                    drift.push(format!("{zh}: ②={actual} ③={}", expected[zh]));
+                }
+            }
+        }
+        drift.sort();
+        assert!(
+            drift.is_empty(),
+            "② BUILTIN_ALIASES 与 ③ builtin-tag-identity.json 漂移（{} 条）:\n{}",
+            drift.len(),
+            drift.join("\n")
+        );
     }
 
     /// 桥接表契约：目标词必须已在别名表内且落在 [`GATE_CODES`]；源词必须不在别名表（防冗余）。
@@ -1829,14 +1892,14 @@ mod tests {
 
         // ─── 场景 4：核心视觉画质与尺度受控标签 100% 确定性解析与 _ext 防污染 ───
         assert_eq!(resolve_controlled_tag_code("高质量"), Some("builtin.high_quality"));
-        assert_eq!(resolve_controlled_tag_code("曝光正常"), Some("builtin.normal_exposure"));
+        assert_eq!(resolve_controlled_tag_code("曝光正常"), Some("builtin.exposure_is_normal"));
         assert_eq!(resolve_controlled_tag_code("全年龄"), Some("builtin.all_ages"));
-        assert_eq!(resolve_controlled_tag_code("有字图"), Some("builtin.image_with_text"));
-        assert_eq!(resolve_controlled_tag_code("无字图"), Some("builtin.image_without_text"));
+        assert_eq!(resolve_controlled_tag_code("有字图"), Some("builtin.text_in_image"));
+        assert_eq!(resolve_controlled_tag_code("无字图"), Some("builtin.image_with_no_text"));
         assert_eq!(normalize_tag_to_code("高质量"), "builtin.high_quality");
-        assert_eq!(normalize_tag_to_code("曝光正常"), "builtin.normal_exposure");
+        assert_eq!(normalize_tag_to_code("曝光正常"), "builtin.exposure_is_normal");
         assert_eq!(normalize_tag_to_code("全年龄"), "builtin.all_ages");
-        assert_eq!(normalize_tag_to_code("有字图"), "builtin.image_with_text");
+        assert_eq!(normalize_tag_to_code("有字图"), "builtin.text_in_image");
 
         // 验证非法/污染的 _ext.* 绝对无法覆盖已有的受控代码
         load_aliases_from_entries(vec![
@@ -1844,7 +1907,7 @@ mod tests {
             ("曝光正常", "_ext.guang_zhen_chang.ee8a87d9"),
         ]);
         assert_eq!(resolve_controlled_tag_code("高质量"), Some("builtin.high_quality"));
-        assert_eq!(resolve_controlled_tag_code("曝光正常"), Some("builtin.normal_exposure"));
+        assert_eq!(resolve_controlled_tag_code("曝光正常"), Some("builtin.exposure_is_normal"));
 
         // 验证维度 123 内容尺度全量标签解析
         assert_eq!(resolve_controlled_tag_code("PG-13"), Some("builtin.pg_13"));
@@ -1889,7 +1952,7 @@ mod tests {
         assert_eq!(outcome_design, Some(("builtin.design", Some("设计".to_string()))));
 
         let outcome_cartoon = resolve_controlled_tag_two_stage("cartoon", Some("zh"));
-        assert_eq!(outcome_cartoon, Some(("builtin.comic", Some("漫画".to_string()))));
+        assert_eq!(outcome_cartoon, Some(("builtin.comics", Some("漫画".to_string()))));
 
         // 同上：裸词 `character` 归 `Character`（`builtin.character` / 角色）；
         // 复合概念 `Human Subject` 由专属别名 `人物主体` / `人物` 承载。
