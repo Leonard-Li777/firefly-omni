@@ -1216,21 +1216,26 @@ pub fn builtin_tag_code(tag: &str) -> Option<&'static str> {
 /// （实测 RAM 词表 ∩ 门控词表 = 25 条：漫画/截图/特写/全景/9 色/证件票据类等）。
 /// 受控 code 直接作为比较键：r.code 与 canonical 的 code 同出 dynamic_aliases 同一词面
 /// 查询（omw.* > hownet.* > builtin.* 仲裁一致，同词面必同 code），无 #719 跨注册表分歧。
+/// 已知假设（R2 复验 nitpick）：动态表载入失败时 canonical 落静态轨而 r.code 来自投影
+/// 产物，可能分属不同注册表 → 残余**漏判**（非误判），属环境退化场景。
 /// 开放集 `_ext.*` / `dim.*` 无受控语义，保持 fallback 串等价旧行为。
 pub fn tag_matches_concept(tag: &str, canonical_zh_or_en: &str) -> bool {
+    // R2 复验 nitpick：入口统一 trim，防止 " builtin.x" 形态漏过 code 通道落回 fallback
+    let tag = tag.trim();
+    let canonical_zh_or_en = canonical_zh_or_en.trim();
     let tag_code = if is_controlled_code(tag) {
-        Some(tag.trim())
+        Some(tag)
     } else {
         builtin_tag_code(tag)
     };
     let canon_code = if is_controlled_code(canonical_zh_or_en) {
-        Some(canonical_zh_or_en.trim())
+        Some(canonical_zh_or_en)
     } else {
         builtin_tag_code(canonical_zh_or_en)
     };
     match (tag_code, canon_code) {
         (Some(a), Some(b)) => a == b,
-        _ => tag.trim() == canonical_zh_or_en.trim(),
+        _ => tag == canonical_zh_or_en,
     }
 }
 
