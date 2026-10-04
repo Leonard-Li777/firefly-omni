@@ -32,8 +32,22 @@ use std::sync::OnceLock;
 
 /// R-G1-01 非白名单文种
 pub const R_G1_01: &str = "R-G1-01";
+/// R-G1-02 超长（zh > 10 字 / 拉丁 > 4 词，照搬既有 `is_valid_tag` 阈值，不发明新数字）
+pub const R_G1_02: &str = "R-G1-02";
 /// R-G1-03 纯数字 / 纯标点 / 纯符号（零文种字符子类，2026-10-02 用户裁决收敛进本模块单点拦截）
 pub const R_G1_03: &str = "R-G1-03";
+/// R-G1-04 hex / hash / 流水号形态
+pub const R_G1_04: &str = "R-G1-04";
+/// R-G1-05 命中停用词表（唯一能拦 to/the/of 的判据；词表读规则资源，中英对称）
+pub const R_G1_05: &str = "R-G1-05";
+/// R-G1-06 命中句型框架模式（HowNet 句式整句残渣）
+pub const R_G1_06: &str = "R-G1-06";
+/// R-G1-07 CJK 单字
+pub const R_G1_07: &str = "R-G1-07";
+/// R-G1-08 括号 / 引号截断
+pub const R_G1_08: &str = "R-G1-08";
+/// R-G1-09 命中保留字 / 元字段（词表读规则资源）
+pub const R_G1_09: &str = "R-G1-09";
 /// R-G1-10 含不可入列码位（一票否决）
 pub const R_G1_10: &str = "R-G1-10";
 /// R-G1-11 单串多脚本混杂
@@ -213,6 +227,12 @@ pub struct TagAdmissibility {
     neutral_chars: Vec<char>,
     /// 互斥文种对：同串内同时出现且**无分隔** → 拒（R-G1-11）
     exclusive_pairs: Vec<(Script, Script)>,
+    /// 停用词表（R-G1-05，中英对称；读规则资源，内置默认为空 = 资源缺失时判据跳过）
+    stopwords: Vec<String>,
+    /// 句型框架特征串（R-G1-06，子串命中即拒；读规则资源）
+    sentence_framework_patterns: Vec<String>,
+    /// 保留字 / 元字段（R-G1-09，整串精确命中即拒；读规则资源）
+    reserved_words: Vec<String>,
     /// 配置来源是否为内置默认（false = 命中外部资产）。供诊断/单测使用。
     builtin_default: bool,
 }
@@ -251,6 +271,11 @@ impl TagAdmissibility {
                 (Hangul, Cyrillic),
                 (Hangul, Arabic),
             ],
+            // 词表类数据（GH #708 S2）**严禁内置副本**——单源 = taxonomy/tag-admissibility.json
+            // （与 TS 桌面闸 S3 共用）。资源缺失时对应判据跳过（降级不降契约：文种类 4 条仍生效）。
+            stopwords: Vec::new(),
+            sentence_framework_patterns: Vec::new(),
+            reserved_words: Vec::new(),
             builtin_default: true,
         }
     }
@@ -308,6 +333,46 @@ impl TagAdmissibility {
             allowed_scripts,
             neutral_chars,
             exclusive_pairs,
+            // 词表类数据（GH #708 S2）：资源缺失/字段缺失 → 空表（对应判据跳过）
+            stopwords: g1
+                .and_then(|g| g.get("stopwords"))
+                .map(|s| {
+                    let mut all: Vec<String> = Vec::new();
+                    for key in ["zh", "en"] {
+                        if let Some(arr) = s.get(key).and_then(|x| x.as_array()) {
+                            all.extend(
+                                arr.iter()
+                                    .filter_map(|w| w.as_str())
+                                    .map(|w| w.trim().to_lowercase())
+                                    .filter(|w| !w.is_empty()),
+                            );
+                        }
+                    }
+                    all
+                })
+                .unwrap_or_default(),
+            sentence_framework_patterns: g1
+                .and_then(|g| g.get("sentence_framework_patterns"))
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|p| p.as_str())
+                        .filter(|p| !p.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            reserved_words: g1
+                .and_then(|g| g.get("reserved_words"))
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|w| w.as_str())
+                        .map(|w| w.trim().to_lowercase())
+                        .filter(|w| !w.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
             builtin_default: false,
         }
     }
@@ -386,14 +451,28 @@ pub fn config() -> &'static TagAdmissibility {
 // ============ 聚合计数（spec §7 D8：拒绝原因落日志 + 聚合计数，不建审计表） ============
 
 static REJECT_R_G1_01: AtomicU64 = AtomicU64::new(0);
+static REJECT_R_G1_02: AtomicU64 = AtomicU64::new(0);
 static REJECT_R_G1_03: AtomicU64 = AtomicU64::new(0);
+static REJECT_R_G1_04: AtomicU64 = AtomicU64::new(0);
+static REJECT_R_G1_05: AtomicU64 = AtomicU64::new(0);
+static REJECT_R_G1_06: AtomicU64 = AtomicU64::new(0);
+static REJECT_R_G1_07: AtomicU64 = AtomicU64::new(0);
+static REJECT_R_G1_08: AtomicU64 = AtomicU64::new(0);
+static REJECT_R_G1_09: AtomicU64 = AtomicU64::new(0);
 static REJECT_R_G1_10: AtomicU64 = AtomicU64::new(0);
 static REJECT_R_G1_11: AtomicU64 = AtomicU64::new(0);
 
 fn counter_for(rule: &str) -> Option<&'static AtomicU64> {
     match rule {
         R_G1_01 => Some(&REJECT_R_G1_01),
+        R_G1_02 => Some(&REJECT_R_G1_02),
         R_G1_03 => Some(&REJECT_R_G1_03),
+        R_G1_04 => Some(&REJECT_R_G1_04),
+        R_G1_05 => Some(&REJECT_R_G1_05),
+        R_G1_06 => Some(&REJECT_R_G1_06),
+        R_G1_07 => Some(&REJECT_R_G1_07),
+        R_G1_08 => Some(&REJECT_R_G1_08),
+        R_G1_09 => Some(&REJECT_R_G1_09),
         R_G1_10 => Some(&REJECT_R_G1_10),
         R_G1_11 => Some(&REJECT_R_G1_11),
         _ => None,
@@ -401,25 +480,34 @@ fn counter_for(rule: &str) -> Option<&'static AtomicU64> {
 }
 
 /// 单条规则的累计拒绝次数
-pub fn rejection_count(rule: &str) -> u64 {
-    counter_for(rule)
-        .map(|c| c.load(Ordering::Relaxed))
-        .unwrap_or(0)
+pub fn rejection_count(rule: &str) -> Option<u64> {
+    counter_for(rule).map(|c| c.load(Ordering::Relaxed))
 }
 
 /// 全部规则的累计拒绝次数（规则 ID → 次数）
-pub fn rejection_counts() -> [(&'static str, u64); 4] {
+pub fn rejection_counts() -> [(&'static str, u64); 11] {
     [
-        (R_G1_01, rejection_count(R_G1_01)),
-        (R_G1_03, rejection_count(R_G1_03)),
-        (R_G1_10, rejection_count(R_G1_10)),
-        (R_G1_11, rejection_count(R_G1_11)),
+        (R_G1_01, REJECT_R_G1_01.load(Ordering::Relaxed)),
+        (R_G1_02, REJECT_R_G1_02.load(Ordering::Relaxed)),
+        (R_G1_03, REJECT_R_G1_03.load(Ordering::Relaxed)),
+        (R_G1_04, REJECT_R_G1_04.load(Ordering::Relaxed)),
+        (R_G1_05, REJECT_R_G1_05.load(Ordering::Relaxed)),
+        (R_G1_06, REJECT_R_G1_06.load(Ordering::Relaxed)),
+        (R_G1_07, REJECT_R_G1_07.load(Ordering::Relaxed)),
+        (R_G1_08, REJECT_R_G1_08.load(Ordering::Relaxed)),
+        (R_G1_09, REJECT_R_G1_09.load(Ordering::Relaxed)),
+        (R_G1_10, REJECT_R_G1_10.load(Ordering::Relaxed)),
+        (R_G1_11, REJECT_R_G1_11.load(Ordering::Relaxed)),
     ]
 }
 
 /// 清零计数（仅供测试与诊断，不影响生产语义）
 pub fn reset_rejection_counts() {
-    for c in [&REJECT_R_G1_01, &REJECT_R_G1_03, &REJECT_R_G1_10, &REJECT_R_G1_11] {
+    for c in [
+        &REJECT_R_G1_01, &REJECT_R_G1_02, &REJECT_R_G1_03, &REJECT_R_G1_04, &REJECT_R_G1_05,
+        &REJECT_R_G1_06, &REJECT_R_G1_07, &REJECT_R_G1_08, &REJECT_R_G1_09, &REJECT_R_G1_10,
+        &REJECT_R_G1_11,
+    ] {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -515,7 +603,195 @@ pub fn g1_verdict(tag: &str) -> Verdict {
         }
     }
 
+    // ④ 词表类判据（GH #708 S2）。顺序说明：文种类规则（10/01/03/11）先行是
+    // R-G1-10 一票否决语义的既有偏离（见函数头注）；本组按 spec ID 升序排列，
+    // 首个命中即裁决。词表数据读规则资源（与 TS 桌面闸 S3 共用同一 JSON），
+    // 资源缺失时对应判据跳过——降级不降契约。
+    let lemma = trimmed.to_lowercase();
+
+    // R-G1-02 超长：zh > 10 字 / 拉丁 > 4 词（照搬既有 is_valid_tag 阈值，不发明新数字）。
+    // 混合串取宽口径（汉字数与拉丁词数分别计，仅纯拉丁串计词数）——零误杀优先。
+    let han_count = trimmed.chars().filter(|c| Script::of(*c) == Some(Script::Han)).count();
+    if han_count > 10 {
+        return Verdict::Reject {
+            rule: R_G1_02,
+            reason: "超长（中文 > 10 字）",
+        };
+    }
+    if han_count == 0 {
+        let latin_words = trimmed
+            .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '·')
+            .filter(|s| !s.is_empty())
+            .count();
+        if latin_words > 4 {
+            return Verdict::Reject {
+                rule: R_G1_02,
+                reason: "超长（拉丁 > 4 词）",
+            };
+        }
+    }
+
+    // R-G1-04 hex / hash / 流水号形态
+    // （算法与 omni-text `TextTokenizer::is_hex_or_hash_stem` / `is_serial_filename_token`
+    //   等价——omni-core 不能反向依赖 omni-pro，逻辑登记此处为铸造闸权威实现。）
+    if is_hex_or_hash_stem(trimmed) || is_serial_filename_token(trimmed) {
+        return Verdict::Reject {
+            rule: R_G1_04,
+            reason: "hex / hash / 流水号形态",
+        };
+    }
+
+    // R-G1-05 停用词（唯一能拦 to/the/of 的判据；整串精确命中，多词串不会误中单词表项）
+    if !cfg.stopwords.is_empty() && cfg.stopwords.iter().any(|w| w == lemma.as_str()) {
+        return Verdict::Reject {
+            rule: R_G1_05,
+            reason: "命中停用词表",
+        };
+    }
+
+    // R-G1-06 句型框架 / 整句残渣
+    if !cfg.sentence_framework_patterns.is_empty()
+        && cfg
+            .sentence_framework_patterns
+            .iter()
+            .any(|p| trimmed.contains(p.as_str()))
+    {
+        return Verdict::Reject {
+            rule: R_G1_06,
+            reason: "命中句型框架特征",
+        };
+    }
+    // HowNet 句式整句：中文逗号/分号多分句（与 TS S3 同口径）或疑问语气尾缀
+    let clauses: Vec<&str> = trimmed
+        .split([',', '，', ';', '；', '.', '。', '!', '！', '?', '？'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if clauses.len() >= 2 && clauses.iter().any(|c| c.chars().count() >= 3) {
+        return Verdict::Reject {
+            rule: R_G1_06,
+            reason: "整句/多分句形态（HowNet 句式残渣）",
+        };
+    }
+    if trimmed.ends_with(['吗', '吧', '呢']) {
+        return Verdict::Reject {
+            rule: R_G1_06,
+            reason: "疑问语气尾缀（整句残渣）",
+        };
+    }
+
+    // R-G1-07 CJK 单字（全串仅一个 CJK 字符且无其他文种字符）
+    {
+        let cjk_count = trimmed
+            .chars()
+            .filter(|c| {
+                matches!(
+                    Script::of(*c),
+                    Some(Script::Han) | Some(Script::Hiragana) | Some(Script::Katakana) | Some(Script::Hangul)
+                )
+            })
+            .count();
+        let other_script_count = trimmed
+            .chars()
+            .filter(|c| {
+                !c.is_whitespace()
+                    && !c.is_ascii_digit()
+                    && !cfg.neutral_chars.contains(c)
+                    && matches!(
+                        Script::of(*c),
+                        Some(Script::Latin) | Some(Script::Cyrillic) | Some(Script::Arabic)
+                    )
+            })
+            .count();
+        if cjk_count == 1 && other_script_count == 0 {
+            return Verdict::Reject {
+                rule: R_G1_07,
+                reason: "CJK 单字",
+            };
+        }
+    }
+
+    // R-G1-08 括号 / 引号截断（与 TS ai-content-validation #9 同口径）。
+    // 注意：G1 白名单（R-G1-01）先于本规则，括号字符不在任何白名单文种/中性集内，
+    // 故经 g1_verdict 时含括号串恒被 R-G1-01 先拦（首个命中即裁决）——本规则是
+    // 纵深防御：若未来白名单放宽或该判据被单独复用，仍拦得住截断串。
+    if is_bracket_truncated(trimmed) {
+        return Verdict::Reject {
+            rule: R_G1_08,
+            reason: "括号 / 引号截断",
+        };
+    }
+
+    // R-G1-09 保留字 / 元字段
+    if !cfg.reserved_words.is_empty() && cfg.reserved_words.iter().any(|w| w == lemma.as_str()) {
+        return Verdict::Reject {
+            rule: R_G1_09,
+            reason: "命中保留字 / 元字段",
+        };
+    }
+
     Verdict::Allow
+}
+
+/// hex / hash 形态判定（R-G1-04）。与 omni-text `TextTokenizer::is_hex_or_hash_stem` 等价：
+/// ≥4 位纯十六进制字符，且混合字母数字，或长度恰为标准哈希长度（8/16/32/40/64）。
+fn is_hex_or_hash_stem(token: &str) -> bool {
+    let clean = token.trim();
+    let len = clean.chars().count();
+    if len < 4 {
+        return false;
+    }
+    let all_hex = clean.chars().all(|c| c.is_ascii_hexdigit());
+    if all_hex {
+        let has_digit = clean.chars().any(|c| c.is_ascii_digit());
+        let has_alpha = clean.chars().any(|c| c.is_ascii_alphabetic());
+        if (has_digit && has_alpha)
+            || matches!(len, 8 | 16 | 32 | 40 | 64)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 括号截断判定（R-G1-08）。规范 F9 的现成实现映射 = TS `ai-content-validation.ts`
+/// **#14 圆括号配对检测**（开≠闭数 → 截断残留）+ **#15 括号注释混入**（标签含圆括号即拒）。
+/// #14 是 #15 的子集（配对不齐 ⇒ 含括号），联合语义即「含半角/全角圆括号即拒」。
+/// 独立成函数以便直测——经 `g1_verdict` 时该规则被 R-G1-01（文种白名单）遮蔽
+/// （括号不在白名单文种/中性集内，首个命中即裁决），见 R-G1-08 调用点注释。
+fn is_bracket_truncated(tag: &str) -> bool {
+    tag.contains(['(', ')', '（', '）'])
+}
+
+/// 流水号型文件名 token 判定（R-G1-04）。与 omni-text `TextTokenizer::is_serial_filename_token`
+/// 等价：字母+数字混合、数字 ≥3 且数字数 ≥ 字母数（字母 ≤5），或相机前缀 + 纯数字尾。
+fn is_serial_filename_token(token: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "DSC", "DSCN", "IMG", "VID", "PXL", "MVI", "SCREENSHOT", "PHOTO", "IMAGE", "DJI", "GOPR",
+    ];
+    let t = token.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if !t.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    let alpha = t.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let digit = t.chars().filter(|c| c.is_ascii_digit()).count();
+    if alpha == 0 || digit == 0 {
+        return false;
+    }
+    if digit >= 3 && alpha <= 5 && digit >= alpha {
+        return true;
+    }
+    let upper = t.to_ascii_uppercase();
+    PREFIXES.iter().any(|p| {
+        upper.len() > p.len()
+            && upper.starts_with(p)
+            && t[p.len()..]
+                .chars()
+                .all(|c| c.is_ascii_digit())
+    })
 }
 
 /// 带副作用（日志 + 聚合计数）的判定，供铸造路径调用。
@@ -715,14 +991,126 @@ mod tests {
         assert!(Verdict::Exempt { reason: "user" }.is_admitted());
     }
 
+    /// GH #708 S2：词表类判据回归（R-G1-02/04/05/06/07/08/09）。
+    /// 停用词/句型/保留字读规则资源（与 TS 桌面闸 S3 共用同一 JSON）；
+    /// 资源缺失（干净环境）时词表类断言跳过，形态类（02/04/07/08）恒可测。
+    #[test]
+    fn g1_lexical_rules_reject_function_words_and_sentences() {
+        // 资源在场性探测（OnceLock 单例：本测试先触发加载）
+        let has_wordlists = !config().stopwords.is_empty()
+            && !config().sentence_framework_patterns.is_empty()
+            && !config().reserved_words.is_empty();
+        if !has_wordlists {
+            eprintln!("[skip] tag-admissibility.json 词表字段缺失，跳过词表类断言");
+        }
+
+        // R-G1-05 停用词：唯一能拦 to/the/of 的判据（验收 1）
+        if !config().stopwords.is_empty() {
+            for w in ["to", "the", "of", "and", "with", "The"] {
+                let v = g1_verdict(w);
+                assert!(
+                    v.is_reject() && v.rule() == Some(R_G1_05),
+                    "虚词 {w} 应被 R-G1-05 拒，实际 {v:?}"
+                );
+            }
+        }
+
+        // R-G1-06 句型框架（验收 2：HowNet 句式整句不产生 _ext.*）
+        if !config().sentence_framework_patterns.is_empty() {
+            for s in ["一分耕耘，一分收获", "今天星期几", "总而言之", "等等"] {
+                let v = g1_verdict(s);
+            // 首个命中即裁决：含全角标点的整句（如「一分耕耘，一分收获」）会被
+            // 更早的 R-G1-01（非白名单文种）先拦；纯 CJK 句式走 R-G1-06/02/07。
+            assert!(
+                v.is_reject()
+                    && matches!(
+                        v.rule(),
+                        Some(R_G1_01) | Some(R_G1_02) | Some(R_G1_06) | Some(R_G1_07)
+                    ),
+                "整句 {s} 应被拒，实际 {v:?}"
+            );
+            }
+        }
+
+        // R-G1-09 保留字 / 元字段
+        if !config().reserved_words.is_empty() {
+            for w in ["function", "schema", "暂无", "未知"] {
+                let v = g1_verdict(w);
+                assert!(
+                    v.is_reject() && v.rule() == Some(R_G1_09),
+                    "保留字 {w} 应被 R-G1-09 拒，实际 {v:?}"
+                );
+            }
+        }
+
+        // R-G1-02 超长（阈值照搬 is_valid_tag，不发明新数字）
+        assert_eq!(g1_verdict("一二三四五六七八九十").rule(), None, "恰好 10 字应放行");
+        assert_eq!(g1_verdict("一二三四五六七八九十一").rule(), Some(R_G1_02), "11 字应拒");
+        assert_eq!(
+            g1_verdict("one two three four five").rule(),
+            Some(R_G1_02),
+            "5 个拉丁词应拒"
+        );
+        assert_eq!(g1_verdict("one two three four").rule(), None, "4 词应放行");
+
+        // R-G1-04 hex / hash / 流水号
+        assert_eq!(g1_verdict("3ae491fe").rule(), Some(R_G1_04));
+        assert_eq!(g1_verdict("DSC02307").rule(), Some(R_G1_04));
+        assert_eq!(g1_verdict("IMG0061").rule(), Some(R_G1_04));
+        assert_eq!(g1_verdict("gothic").rule(), None, "普通拉丁词不得误杀");
+
+        // R-G1-07 CJK 单字
+        assert_eq!(g1_verdict("红").rule(), Some(R_G1_07));
+        assert_eq!(g1_verdict("截图").rule(), None, "双字 CJK 应放行");
+
+        // R-G1-08 括号截断：经 g1_verdict 时被 R-G1-01（文种白名单）先拦——
+        // 括号不在白名单文种/中性字符集内，首个命中即裁决（与 TS 白名单口径一致，
+        // `川菜（辣）`/`C++` 同理被拒是 S1 冻结行为）。规则本体（TS #14/#15：
+        // 含半角/全角圆括号即拒）经助手直测（纵深防御）。
+        assert_eq!(g1_verdict("(test").rule(), Some(R_G1_01), "verdict 层：R-G1-01 先拦");
+        assert!(is_bracket_truncated("(test"), "截断残留");
+        assert!(is_bracket_truncated("abc)"), "截断残留");
+        assert!(is_bracket_truncated("(test)"), "成对也拒（TS #15 括号注释混入）");
+        assert!(is_bracket_truncated("720P (4K)"), "成对也拒（TS #15 例）");
+        assert!(is_bracket_truncated("（截图"), "全角括号同口径");
+        assert!(!is_bracket_truncated("截图"), "无括号不触发");
+
+        // 正例零误杀（验收 6）
+        assert_eq!(g1_verdict("macOS截图").rule(), None);
+        assert_eq!(g1_verdict("2024年度报告").rule(), None);
+    }
+
+    /// 验收 3：词库（别名表）中虚词/动词未被删除——闸门只拦「标注铸造」，
+    /// 受控反查在闸前。别名表自身的行集不受本票影响（架构性证明 + 抽样断言）。
+    #[test]
+    fn g1_gate_does_not_touch_alias_vocabulary() {
+        // 受控词（词库成员）在闸前命中，G1 不会拒绝它们
+        for w in ["有水印", "无码", "高质量", "截图", "设计稿"] {
+            assert!(
+                crate::tag_identity::builtin_tag_code(w).is_some(),
+                "词库成员 {w} 必须经受控反查命中（闸前），不受 G1 影响"
+            );
+        }
+        // 未受控虚词经归一被拒 → 不铸造 _ext.*（验收 1 的链路级证明）
+        let codes = crate::tag_identity::normalize_tag_set_to_codes(&[
+            "to".to_string(),
+            "the".to_string(),
+            "of".to_string(),
+        ]);
+        assert!(
+            codes.iter().all(|c| !c.starts_with("_ext.")),
+            "虚词不得铸造出 _ext.* 概念，实际 {codes:?}"
+        );
+    }
+
     #[test]
     fn gate_counts_rejections_by_rule() {
         reset_rejection_counts();
         let _ = g1_gate("��Ϊ�ֻ�����");
         let _ = g1_gate("ӉӉӉ汉");
-        assert_eq!(rejection_count(R_G1_10), 1);
-        assert_eq!(rejection_count(R_G1_11), 1);
-        assert_eq!(rejection_count(R_G1_01), 0);
+        assert_eq!(rejection_count(R_G1_10), Some(1));
+        assert_eq!(rejection_count(R_G1_11), Some(1));
+        assert_eq!(rejection_count(R_G1_01), Some(0));
         reset_rejection_counts();
     }
 
