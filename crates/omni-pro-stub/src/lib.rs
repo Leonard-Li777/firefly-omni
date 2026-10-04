@@ -582,6 +582,23 @@ pub mod text {
     use chrono::{DateTime, Utc};
     use std::collections::HashMap;
 
+    /// 量词接线存根（GH #710 S9）：CE 开源版无 semantic.pack classifier 数据源，
+    /// API 面与 `omni-pro::text::classifier_lookup` 对齐以保证 omni-server 双版本可编译。
+    pub mod classifier_lookup {
+        /// 存根恒 miss：无可消费量词数据（造句直接落无量词名词）
+        pub fn clf_for(_lemma: &str) -> Option<String> {
+            None
+        }
+
+        /// 存根复位（no-op：缓存从未灌入）
+        pub fn reset_classifier_map() {}
+
+        /// 存根恒 `Err`：CE 无 `tag_aliases_zh_CN.classifier` 列（调用方按无量词数据降级）
+        pub fn hydrate_from_conn(_conn: &rusqlite::Connection) -> anyhow::Result<usize> {
+            anyhow::bail!("open-core stub: classifier column unavailable (no semantic.pack)")
+        }
+    }
+
     pub const EMBEDDING_DIM: usize = 384;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
