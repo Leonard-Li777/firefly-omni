@@ -642,12 +642,14 @@ pub async fn start_server(
     // 规范解耦：--pack-path 专用于只读语义包；--db-path 专用于桌面业务主库
     let omw = OmwDb::unavailable();
     let mut pack_mounted = false;
+    let mut omw_connected = false;
     let pack_to_load = pack_path.or_else(SemanticPackLoader::discover_pack_path);
     if let Some(target_pack_path) = pack_to_load {
         match omw.connect_pack(&target_pack_path) {
             Ok(()) => {
                 info!("semantic.pack zero-disk mounted to OmwDb from {}", target_pack_path.display());
                 pack_mounted = true;
+                omw_connected = true;
             }
             Err(err) => tracing::warn!("Failed to mount semantic.pack: {err}"),
         }
@@ -656,7 +658,10 @@ pub async fn start_server(
     if !pack_mounted {
         if let Some(path) = &db_path {
             match omw.connect(path) {
-                Ok(()) => info!("omw db fallback connected read-only at {}", path.display()),
+                Ok(()) => {
+                    info!("omw db fallback connected read-only at {}", path.display());
+                    omw_connected = true;
+                }
                 Err(err) => {
                     tracing::warn!("omw db open failed ({}), omw subsystem starts unavailable", err)
                 }
@@ -664,6 +669,14 @@ pub async fn start_server(
         }
     } else if let Some(path) = &db_path {
         info!("semantic.pack mounted into memory; db-path is reserved for desktop master database ({})", path.display());
+    }
+
+    // 量词接线（GH #710 S9）：词库就绪后一次性灌入 omni-text 真实搭配量词进程缓存
+    // （列 `tag_aliases_zh_CN.classifier`；灌库失败仅降级为量词 miss，不影响服务启动）
+    if omw_connected {
+        if let Err(err) = omw.with_conn(|conn| omni_pro::text::classifier_lookup::hydrate_from_conn(conn)) {
+            tracing::warn!("classifier map hydrate skipped: {err}");
+        }
     }
 
     // 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 WeMM-Embedding 2B 2048 维)
