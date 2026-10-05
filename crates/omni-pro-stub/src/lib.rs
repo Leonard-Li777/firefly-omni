@@ -214,10 +214,22 @@ pub mod perceive {
     pub fn extract_fact_tags(_metadata: &serde_json::Value) -> Vec<omni_core::TagChainItem> {
         Vec::new()
     }
+
+    pub fn detect_video_dynamic_watermark(_video_path: &Path) -> (u8, &'static str) {
+        (0, "none")
+    }
 }
 
 pub mod vision {
     use std::path::Path;
+
+    pub fn is_nsfw_or_restricted_tag(_word: &str) -> bool {
+        false
+    }
+
+    pub fn is_vocab_layer_blocked(_word: &str) -> bool {
+        false
+    }
 
     #[derive(Debug, Clone)]
     pub struct OCRBoxResult {
@@ -317,6 +329,33 @@ pub mod vision {
                 confidence,
                 ..Default::default()
             }
+        }
+
+        pub fn resolve_tag_to_chain_item_with_lang(
+            tag: &str,
+            confidence: f32,
+            _current_lang: Option<&str>,
+        ) -> omni_core::TagChainItem {
+            Self::resolve_tag_to_chain_item(tag, confidence)
+        }
+
+        pub fn calibrate_clip_score(sim: f32) -> f32 {
+            sim
+        }
+
+        pub fn apply_domain_matrix_gating(
+            _tags: &mut Vec<String>,
+            _clip_mutual_tags: &[(String, f32, &'static str)],
+            _photo_type: Option<&str>,
+            _engine_lookup: &std::collections::HashMap<String, String>,
+        ) {}
+
+        pub fn extract_clip_visual_tags_scored_from_image(
+            _img: &image::DynamicImage,
+            _lang: Option<&str>,
+            _top_k: usize,
+        ) -> Vec<(String, f32)> {
+            Vec::new()
         }
 
         pub fn extract_clip_visual_tags_from_image_with_hint(
@@ -470,7 +509,7 @@ pub mod vision {
     }
 }
 
-pub use vision::{OCRBoxResult, OmniVisionEngine};
+pub use vision::{is_nsfw_or_restricted_tag, is_vocab_layer_blocked, OCRBoxResult, OmniVisionEngine};
 
 pub mod hownet {
     use super::*;
@@ -676,6 +715,70 @@ pub mod text {
         }
     }
 
+    /// 快速识别输入上下文 (对齐 MultimodalContext)
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FastRecognizeContext {
+        pub file_name: Option<String>,
+        pub text: Option<String>,
+        pub ocr: Option<String>,
+        pub language: Option<String>,
+        pub threshold: Option<f32>,
+        pub max_candidates: Option<usize>,
+        pub top_k: Option<usize>,
+    }
+
+    /// 识别命中的标签项
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct RecognizedTagItem {
+        pub tag_code: String,
+        pub lemma: String,
+        pub score: f32,
+        pub confidence: f64,
+        pub source: String,
+    }
+
+    /// 快速识别标准化响应
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FastRecognizeResponse {
+        pub tags: Vec<RecognizedTagItem>,
+        pub elapsed_ms: f64,
+        pub total_candidates: usize,
+    }
+
+    /// 预固化向量表存根
+    #[derive(Debug, Clone, Default)]
+    pub struct PrecomputedVectorTable;
+
+    impl PrecomputedVectorTable {
+        pub fn discover_table_path() -> Option<std::path::PathBuf> {
+            None
+        }
+        pub fn load_from_file<P: AsRef<std::path::Path>>(_path: P) -> anyhow::Result<Self> {
+            Ok(Self)
+        }
+    }
+
+    /// 两阶段快速标签识别编排器存根
+    pub struct FastTagRecognizer;
+
+    impl FastTagRecognizer {
+        pub fn recognize(
+            _ctx: &FastRecognizeContext,
+            _conn: Option<&rusqlite::Connection>,
+            _vector_table: Option<&PrecomputedVectorTable>,
+            _embedder: &BekkoEmbedder,
+        ) -> FastRecognizeResponse {
+            FastRecognizeResponse {
+                tags: Vec::new(),
+                elapsed_ms: 0.0,
+                total_candidates: 0,
+            }
+        }
+    }
+
     pub struct KeyBertExtractor;
     impl KeyBertExtractor {
         pub fn extract_keywords(
@@ -853,6 +956,10 @@ pub mod text {
                 fused_tags: ctx.visual_tags.clone(),
                 candidate_hypotheses: Vec::new(),
             }
+        }
+
+        pub fn resolve_ext_tag_parent(_tag_name: &str, _tag_code: &str) -> String {
+            String::new()
         }
     }
 
@@ -1078,6 +1185,9 @@ pub mod semantic_loader {
         }
         pub fn create_semantic_pack(_sqlite_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("Open-core mode: semantic pack requires omni-pro");
+        }
+        pub fn load_dense_embeddings() -> anyhow::Result<crate::text::PrecomputedVectorTable> {
+            anyhow::bail!("Open-core mode: dense embeddings require omni-pro");
         }
     }
 }
@@ -1391,7 +1501,55 @@ pub mod omw_query {
             "tag_aliases_en_US"
         }
     }
+
+    pub fn lookup(
+        _conn: &rusqlite::Connection,
+        _word: &str,
+        _language: &str,
+    ) -> anyhow::Result<Vec<OmwSynsetResult>> {
+        Ok(Vec::new())
+    }
+
+    pub fn hierarchy(
+        _conn: &rusqlite::Connection,
+        _synset_id: &str,
+    ) -> anyhow::Result<Vec<OmwSynsetNode>> {
+        Ok(Vec::new())
+    }
+
+    pub fn antonyms(
+        _conn: &rusqlite::Connection,
+        _word: &str,
+        _language: &str,
+    ) -> anyhow::Result<Vec<OmwAntonymResult>> {
+        Ok(Vec::new())
+    }
+
+    pub fn mapping(
+        _conn: &rusqlite::Connection,
+        _tag_name: &str,
+    ) -> anyhow::Result<Vec<OmwTagResult>> {
+        Ok(Vec::new())
+    }
+
+    pub fn tree(
+        _conn: &rusqlite::Connection,
+        _root: &str,
+        _depth: i64,
+    ) -> anyhow::Result<Vec<TreeNode>> {
+        Ok(Vec::new())
+    }
+
+    pub fn unmapped_stats(
+        _conn: &rusqlite::Connection,
+    ) -> anyhow::Result<UnmappedStats> {
+        Ok(UnmappedStats {
+            by_lexfile: Vec::new(),
+            by_top_ancestor: Vec::new(),
+        })
+    }
 }
+
 
 pub use semantic_loader::SemanticPackLoader;
 pub use vector_engine::{
@@ -1400,12 +1558,92 @@ pub use vector_engine::{
 };
 pub use omw_db::OmwDb;
 pub use omw_query::{
-    resolve_tag_aliases_table, AliasEntry, GroupCount, OmwAntonymResult, OmwAntonymsRequest,
-    OmwDescribeRequest, OmwHierarchyRequest, OmwLookupRequest, OmwMappingRequest, OmwSynsetNode,
-    OmwSynsetResult, OmwTagResult, OmwTreeRequest, TaxonomyAliasesResponse, TaxonomyNode,
-    TaxonomyTreeResponse, TreeNode, UnmappedStats,
+    antonyms, hierarchy, lookup, mapping, resolve_tag_aliases_table, tree, unmapped_stats,
+    AliasEntry, GroupCount, OmwAntonymResult, OmwAntonymsRequest, OmwDescribeRequest,
+    OmwHierarchyRequest, OmwLookupRequest, OmwMappingRequest, OmwSynsetNode, OmwSynsetResult,
+    OmwTagResult, OmwTreeRequest, TaxonomyAliasesResponse, TaxonomyNode, TaxonomyTreeResponse,
+    TreeNode, UnmappedStats,
 };
 pub use text::FastTextNsfwClassifier;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ce_stub_basic_flags() {
+        assert!(!is_pro_enabled());
+    }
+
+    #[test]
+    fn test_ce_stub_nsfw_and_vocab_blocked() {
+        assert!(!is_nsfw_or_restricted_tag("any_word"));
+        assert!(!is_vocab_layer_blocked("any_word"));
+    }
+
+    #[test]
+    fn test_ce_stub_video_watermark() {
+        let (lvl, status) = perceive::detect_video_dynamic_watermark(std::path::Path::new("dummy.mp4"));
+        assert_eq!(lvl, 0);
+        assert_eq!(status, "none");
+    }
+
+    #[test]
+    fn test_ce_stub_vision_engine_methods() {
+        assert_eq!(OmniVisionEngine::calibrate_clip_score(0.75), 0.75);
+
+        let mut tags = vec!["tag1".to_string()];
+        let engine_lookup = std::collections::HashMap::new();
+        OmniVisionEngine::apply_domain_matrix_gating(&mut tags, &[], None, &engine_lookup);
+        assert_eq!(tags.len(), 1);
+
+        let scored = OmniVisionEngine::extract_clip_visual_tags_scored_from_image(
+            &image::DynamicImage::new_rgb8(1, 1),
+            None,
+            5,
+        );
+        assert!(scored.is_empty());
+
+        let chain = OmniVisionEngine::resolve_tag_to_chain_item_with_lang("测试", 0.9, Some("zh"));
+        assert_eq!(chain.name, "测试");
+        assert_eq!(chain.code, "builtin.测试");
+    }
+
+    #[test]
+    fn test_ce_stub_multimodal_fusion() {
+        let parent = text::OmniMultimodalFusionEngine::resolve_ext_tag_parent("cat", "builtin.cat");
+        assert_eq!(parent, "");
+    }
+
+    #[test]
+    fn test_ce_stub_fast_tag_recognizer() {
+        let ctx = text::FastRecognizeContext::default();
+        let embedder = text::BekkoEmbedder::new();
+        let res = text::FastTagRecognizer::recognize(&ctx, None, None, &embedder);
+        assert!(res.tags.is_empty());
+        assert_eq!(res.total_candidates, 0);
+    }
+
+    #[test]
+    fn test_ce_stub_semantic_loader() {
+        let res = SemanticPackLoader::load_dense_embeddings();
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_ce_stub_omw_query() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(omw_query::lookup(&conn, "word", "en").unwrap().is_empty());
+        assert!(omw_query::hierarchy(&conn, "00001740-n").unwrap().is_empty());
+        assert!(omw_query::antonyms(&conn, "word", "cmn").unwrap().is_empty());
+        assert!(omw_query::mapping(&conn, "tag").unwrap().is_empty());
+        assert!(omw_query::tree(&conn, "root", 1).unwrap().is_empty());
+        let stats = omw_query::unmapped_stats(&conn).unwrap();
+        assert!(stats.by_lexfile.is_empty());
+        assert!(stats.by_top_ancestor.is_empty());
+    }
+}
+
 
 
 
