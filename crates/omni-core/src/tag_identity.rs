@@ -371,7 +371,7 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("橙色", "Orange color"),
     ("黄色", "Yellow"),
     ("绿色", "Green"),
-    ("青色", "Blue"),
+    ("青色", "Cyan"),
     ("蓝色", "Blue"),
     ("紫色", "Purple"),
     ("粉色", "Pink"),
@@ -558,7 +558,7 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("人妻美妇", "Beautiful married woman"),
     ("少妇熟女", "Young mature woman"),
     ("3p", "3P"),
-    ("群交", "Group sex"),
+    ("群交", "Orgy"),
     ("多人派对", "Multi-person party"),
     ("sm", "SM"),
     ("性奴隶", "Sex slave"),
@@ -1751,9 +1751,10 @@ mod tests {
 
         let mut drift: Vec<String> = Vec::new();
         // 已知豁免：③ 的数据瑕疵，不视为漂移。
-        // `img`：fileDimension_zh-CN.json 里存在**字面拉丁标签** "img"（en-US 未翻译成独立概念），
-        // ③ 遂为其单立 `builtin.img`；但 `img` 语义上就是 `image` 的缩写，② 保持归并入
-        // `builtin.image`（与 图片/图像/画面/picture/pic 同码），避免概念碎片化。
+        // `img`：fileDimension 的 `img` 位于 dim 104「磁盘映像扩展名」
+        // （(104,3)，与 vhd/vhdx/vmdk/nrg… 并列）= `.img` 文件格式，**不是「图片」**。
+        // ③ 单立 `builtin.img` 与维度语义一致；② 仍归并入 `builtin.image`（保留历史行为，
+        // 未在本轮改动范围内）。二者语义分歧已登记于 GH #719，待裁决是否拆分。
         const KNOWN_EXCEPTIONS: &[&str] = &["img"];
         for zh in expected.keys() {
             if KNOWN_EXCEPTIONS.contains(&zh.as_str()) {
