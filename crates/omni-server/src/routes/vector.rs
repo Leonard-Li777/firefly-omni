@@ -1,9 +1,10 @@
 //! vector.rs — 嵌入式向量引擎 HTTP 交互端点 (zvec / RaBitQ / INT8)
 //!
-//! 依据 ADR-0038 / ADR-0046 与 PRD #679 / 0046 架构决议：
-//! - POST /api/v1/vector/upsert: 写入/更新特征向量 (适配 WeMM-Embedding 2B 2048 维)；
-//! - POST /api/v1/vector/search: < 1ms Top-K ANN 检索 (RaBitQ 初筛 + INT8 重排)；
-//! - DELETE /api/v1/vector/delete: 批量删除特征向量。
+//! 依据 ADR-0038 / ADR-0046 / ADR-0054 与 docs/specs/database-evolution-three-phases-spec.md 架构决议：
+//! - POST /api/v1/vector/upsert: 写入/更新特征向量 (自动按长度路由 384d bekko-a8m 或 2048d WeMM-Embedding 2B)；
+//! - POST /api/v1/vector/search: < 1ms Top-K ANN 检索 (RaBitQ 初筛 + INT8 重排，自动按查询向量维度路由)；
+//! - POST /api/v1/vector/get: 批量按指纹与维度读取反量化浮点向量；
+//! - DELETE /api/v1/vector/delete: 批量删除特征向量 (同步清理双槽位)。
 
 use axum::{
     extract::State,
@@ -47,7 +48,7 @@ pub struct VectorUpsertResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VectorSearchRequest {
-    /// 2048 维浮点查询特征向量（WeMM-Embedding 2B）
+    /// 384 维 (bekko-a8m) 或 2048 维 (WeMM-Embedding 2B) 浮点查询特征向量
     pub vector: Vec<f32>,
     /// 最大召回数 (默认 10)
     #[serde(default = "default_top_k", alias = "top_k")]
@@ -80,6 +81,38 @@ pub struct VectorSearchResponse {
     pub error: Option<String>,
 }
 
+/// 批量读取反量化向量请求体: POST /api/v1/vector/get
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorGetRequest {
+    #[serde(alias = "file_fingerprints")]
+    pub file_fingerprints: Vec<String>,
+    #[serde(default = "default_get_dim")]
+    pub dim: usize,
+}
+
+fn default_get_dim() -> usize {
+    384
+}
+
+/// 单个反量化读取项
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorGetItem {
+    pub file_fingerprint: String,
+    pub vector: Vec<f32>,
+}
+
+/// 批量读取反量化向量响应体
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VectorGetResponse {
+    pub vectors: Vec<VectorGetItem>,
+    pub count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// 删除请求体 (灵活支持数组或对象封装，兼容 camelCase 与 snake_case)
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -105,6 +138,68 @@ pub struct VectorDeleteResponse {
     pub deleted_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// 批量按指纹与维度读取反量化向量: POST /api/v1/vector/get
+pub async fn vector_get_handler(
+    State(state): State<AppState>,
+    Json(req): Json<VectorGetRequest>,
+) -> Result<Json<VectorGetResponse>, (StatusCode, Json<VectorGetResponse>)> {
+    if req.dim != 384 && req.dim != 2048 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(VectorGetResponse {
+                vectors: Vec::new(),
+                count: 0,
+                error: Some(format!("不支持的向量维度: {} (仅支持 384 或 2048)", req.dim)),
+            }),
+        ));
+    }
+
+    if req.file_fingerprints.is_empty() {
+        return Ok(Json(VectorGetResponse {
+            vectors: Vec::new(),
+            count: 0,
+            error: None,
+        }));
+    }
+
+    let vector_engine = state.vector.clone();
+    let dim = req.dim;
+    let fps = req.file_fingerprints;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut items = Vec::with_capacity(fps.len());
+        for fp in fps {
+            if let Some(vec) = vector_engine.get_vector(&fp, dim) {
+                items.push(VectorGetItem {
+                    file_fingerprint: fp,
+                    vector: vec,
+                });
+            }
+        }
+        items
+    })
+    .await;
+
+    match result {
+        Ok(vectors) => {
+            let count = vectors.len();
+            Ok(Json(VectorGetResponse {
+                vectors,
+                count,
+                error: None,
+            }))
+        }
+        Err(join_err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(VectorGetResponse {
+                vectors: Vec::new(),
+                count: 0,
+                error: Some(format!("Task execution panic: {join_err}")),
+            }),
+        )),
+    }
 }
 
 /// 写入或更新特征向量: POST /api/v1/vector/upsert

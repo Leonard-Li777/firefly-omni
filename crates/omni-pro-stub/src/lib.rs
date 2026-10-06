@@ -1196,8 +1196,12 @@ pub mod vector_engine {
     use serde::{Deserialize, Serialize};
     use std::path::Path;
 
-    /// 向量维度契约：适配腾讯 WeMM-Embedding 2B 多模态模型 (2048 维，ADR-0046)
-    pub const VECTOR_DIM: usize = 2048;
+    /// 向量维度契约：适配 384 维 bekko-a8m 与 2048 维腾讯 WeMM-Embedding 2B 多模态模型 (ADR-0054)
+    pub const VECTOR_DIM_384: usize = 384;
+    pub const VECTOR_DIM_DENSE: usize = VECTOR_DIM_384;
+    pub const VECTOR_DIM_2048: usize = 2048;
+    pub const VECTOR_DIM_WEMM: usize = VECTOR_DIM_2048;
+    pub const VECTOR_DIM: usize = VECTOR_DIM_2048;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -1255,6 +1259,9 @@ pub mod vector_engine {
         pub fn count(&self) -> usize {
             0
         }
+        pub fn count_by_dim(&self, _dim: usize) -> usize {
+            0
+        }
         pub fn upsert(&self, _fingerprint: &str, _vec: &[f32]) -> anyhow::Result<()> {
             anyhow::bail!("Open-core mode: vector engine requires omni-pro");
         }
@@ -1266,8 +1273,14 @@ pub mod vector_engine {
         ) -> anyhow::Result<Vec<VectorMatchResult>> {
             Ok(Vec::new())
         }
+        pub fn get_vector(&self, _fingerprint: &str, _dim: usize) -> Option<Vec<f32>> {
+            None
+        }
         pub fn delete(&self, _fingerprints: &[String]) -> anyhow::Result<usize> {
             Ok(0)
+        }
+        pub fn clear(&self) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 }
@@ -1554,7 +1567,7 @@ pub mod omw_query {
 pub use semantic_loader::SemanticPackLoader;
 pub use vector_engine::{
     VectorDeleteRequest, VectorEngine, VectorMatch, VectorMatchResult, VectorSearchRequest,
-    VectorUpsertItem, VectorUpsertRequest, VECTOR_DIM,
+    VectorUpsertItem, VectorUpsertRequest, VECTOR_DIM, VECTOR_DIM_2048, VECTOR_DIM_384,
 };
 pub use omw_db::OmwDb;
 pub use omw_query::{

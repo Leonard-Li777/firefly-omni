@@ -29,7 +29,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-pub use omni_pro::{OmwDb, SemanticPackLoader, VectorEngine, VectorMatch, VECTOR_DIM};
+pub use omni_pro::{
+    OmwDb, SemanticPackLoader, VectorEngine, VectorMatch, VECTOR_DIM, VECTOR_DIM_2048,
+    VECTOR_DIM_384, VECTOR_DIM_DENSE, VECTOR_DIM_WEMM,
+};
 use omni_pro::omw_query;
 use omni_pro::{
     OmwAntonymResult, OmwAntonymsRequest, OmwDescribeRequest, OmwHierarchyRequest, OmwLookupRequest,
@@ -57,7 +60,7 @@ pub struct AppState {
     pub search: Arc<omni_pro::search::OmniSearchService>,
     /// OMW 多语言标签词库只读连接池（未传入 --db-path 时为软不可用实例）
     pub omw: OmwDb,
-    /// 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 WeMM-Embedding 2B 2048 维，闭源优先 🔒)
+    /// 阿里巴巴 zvec 嵌入式双槽位向量引擎 (RaBitQ + INT8 量化，适配 384d bekko-a8m 与 2048d WeMM-Embedding 2B，闭源优先 🔒)
     pub vector: Arc<VectorEngine>,
     /// 桌面端 SQLite 业务主库路径（只读访问 file_tag_relations 等主库表）
     pub master_db_path: Arc<Mutex<Option<PathBuf>>>,
@@ -155,6 +158,7 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/v1/taxonomy/reload-policies", post(routes::taxonomy::reload_policies_handler))
             .route("/api/v1/vector/upsert", post(routes::vector::vector_upsert_handler))
             .route("/api/v1/vector/search", post(routes::vector::vector_search_handler))
+            .route("/api/v1/vector/get", post(routes::vector::vector_get_handler))
             .route(
                 "/api/v1/vector/delete",
                 axum::routing::delete(routes::vector::vector_delete_handler)
@@ -2664,7 +2668,34 @@ async fn search_cluster_handler(
     Json(req): Json<SearchClusterRequest>,
 ) -> Json<SearchClusterResponse> {
     let search = state.search.clone();
+    let vector = state.vector.clone();
     let res = tokio::task::spawn_blocking(move || {
+        // 进程内向量补齐 (ADR-0054)：
+        // 1. 若 doc.embedding.len() == 384，直接使用；
+        // 2. 若 doc.embedding 为空或维度非 384，从端侧 zvec 384d 槽位读取反量化向量回填；
+        // 3. 过滤未能获得 384d 有效向量的文档，若有效文档数 < 2 则拦截报错。
+        let requested_count = req.documents.len();
+        let mut docs: Vec<omni_pro::search::ClusterDocument> =
+            Vec::with_capacity(requested_count);
+        for mut doc in req.documents {
+            if doc.embedding.len() == omni_pro::search::EMBEDDING_DIM {
+                docs.push(doc);
+            } else if let Some(vec) =
+                vector.get_vector(&doc.fingerprint, omni_pro::search::EMBEDDING_DIM)
+            {
+                doc.embedding = vec;
+                docs.push(doc);
+            }
+        }
+
+        if requested_count > 0 && docs.len() < 2 {
+            anyhow::bail!(
+                "具备 384d 有效向量的文档不足 2 份 (请求 {} 份，有效 {} 份)，无法执行 HAC 聚类",
+                requested_count,
+                docs.len()
+            );
+        }
+
         // 跨支柱补缝：若未显式提供 prompt_embedding，但提供了自然语言 prompt，自动通过 BekkoEmbedder 计算聚类引导向量
         let prompt_emb = match (req.prompt_embedding, req.prompt.as_deref()) {
             (Some(emb), _) => Some(emb),
@@ -2675,7 +2706,7 @@ async fn search_cluster_handler(
         };
 
         search.cluster(
-            &req.documents,
+            &docs,
             prompt_emb.as_deref(),
             req.distance_threshold,
             req.max_leaf_size,
