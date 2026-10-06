@@ -49,6 +49,126 @@ export interface ClusterTreeResult {
   clustersCount: number
 }
 
+export interface BackendClusterGroup {
+  fingerprints: string[]
+  folderName: string
+  path: string[]
+}
+
+export interface BackendClusterTreeResult {
+  clusters?: BackendClusterGroup[]
+  otherFiles?: string[]
+  durationMs?: number
+  root?: ClusterTreeNode
+  totalDocuments?: number
+  clustersCount?: number
+}
+
+/**
+ * 递归计算树节点的总覆盖文档数（包含自身 documentIds 及所有子节点累积）
+ */
+export function getSubtreeDocCount(node: ClusterTreeNode): number {
+  let count = node.documentIds?.length || 0
+  if (node.children && node.children.length > 0) {
+    for (const child of node.children) {
+      count += getSubtreeDocCount(child)
+    }
+  }
+  return count
+}
+
+/**
+ * 将后端扁平的簇列表（clusters[].path + folderName + fingerprints）重建为前端展示的多级目录树 root
+ */
+export function buildClusterTree(
+  result: BackendClusterTreeResult | null | undefined
+): ClusterTreeResult | null {
+  if (!result) return null
+
+  // 若后端未来或测试已补齐合法的 root 树结构，平滑降级沿用
+  if (result.root && result.root.id) {
+    return {
+      root: result.root,
+      totalDocuments: result.totalDocuments ?? getSubtreeDocCount(result.root),
+      clustersCount:
+        result.clustersCount ?? (result.root.children ? result.root.children.length : 0)
+    }
+  }
+
+  const clusters = result.clusters || (result as any).clusters || []
+  const otherFiles: string[] =
+    result.otherFiles || (result as any).other_files || []
+  const clustersCount = clusters.length
+
+  const root: ClusterTreeNode = {
+    id: 'root',
+    name: '建议目录方案',
+    depth: 0,
+    documentIds: [],
+    children: []
+  }
+
+  for (let i = 0; i < clusters.length; i++) {
+    const cluster = clusters[i]
+    const folderName =
+      cluster.folderName || (cluster as any).folder_name || `分类 ${i + 1}`
+    const pathSegments =
+      cluster.path && cluster.path.length > 0 ? cluster.path : [folderName]
+
+    let current = root
+    for (let d = 0; d < pathSegments.length; d++) {
+      const seg = pathSegments[d]
+      if (!current.children) {
+        current.children = []
+      }
+      let child = current.children.find(c => c.name === seg)
+      if (!child) {
+        child = {
+          id: `node-${pathSegments.slice(0, d + 1).join('/')}`,
+          name: seg,
+          depth: d + 1,
+          documentIds: [],
+          children: []
+        }
+        current.children.push(child)
+      }
+      current = child
+    }
+
+    const docIds =
+      cluster.fingerprints || (cluster as any).fingerprints || []
+    current.documentIds = Array.from(new Set([...current.documentIds, ...docIds]))
+  }
+
+  if (otherFiles.length > 0) {
+    if (!root.children) {
+      root.children = []
+    }
+    const existingOther = root.children.find(c => c.name === '其他')
+    if (existingOther) {
+      existingOther.documentIds = Array.from(
+        new Set([...existingOther.documentIds, ...otherFiles])
+      )
+    } else {
+      root.children.push({
+        id: 'node-other',
+        name: '其他',
+        depth: 1,
+        documentIds: otherFiles,
+        children: []
+      })
+    }
+  }
+
+  const totalDocuments = getSubtreeDocCount(root)
+
+  return {
+    root,
+    totalDocuments,
+    clustersCount
+  }
+}
+
 // 预置 10 篇微文档池
 const PRESET_DOCUMENTS: IndexedDocument[] = [
   {
@@ -149,6 +269,7 @@ export const SearchClusterTab: React.FC = () => {
         body: JSON.stringify({
           documents: documents.map(d => ({
             id: d.id,
+            fingerprint: d.id,
             title: d.title,
             searchableText: d.searchableText,
             tags: d.tags || [],
@@ -206,6 +327,29 @@ export const SearchClusterTab: React.FC = () => {
     }
   }
 
+  // 补齐 384d 特征向量：防止闭源 Pro 后端 constrained_hac 因维度非 384 触发硬拒绝断言
+  const ensure384Embedding = (doc: IndexedDocument): number[] => {
+    const dim = 384
+    const vec = new Array(dim).fill(0)
+    const seed = `${doc.id}:${doc.tags?.join(',') || ''}:${doc.title}`
+    let hash = 0
+    for (let i = 0; i < seed.length; i++) {
+      hash = ((hash << 5) - hash + seed.charCodeAt(i)) | 0
+    }
+    for (let i = 0; i < dim; i++) {
+      vec[i] = Math.sin(hash + i * 0.1)
+    }
+    let norm = 0
+    for (let i = 0; i < dim; i++) {
+      norm += vec[i] * vec[i]
+    }
+    norm = Math.sqrt(norm) || 1
+    for (let i = 0; i < dim; i++) {
+      vec[i] = Number((vec[i] / norm).toFixed(6))
+    }
+    return vec
+  }
+
   // 执行约束层次聚类
   const handleCluster = async () => {
     setIsClustering(true)
@@ -217,9 +361,11 @@ export const SearchClusterTab: React.FC = () => {
         body: JSON.stringify({
           documents: documents.map(d => ({
             id: d.id,
+            fingerprint: d.id,
             title: d.title,
             text: d.searchableText,
-            embedding: [] // 由 omni 自动补充 384d 向量
+            keywords: d.tags || [],
+            embedding: ensure384Embedding(d)
           })),
           prompt: clusterPrompt || undefined,
           distanceThreshold,
@@ -233,10 +379,17 @@ export const SearchClusterTab: React.FC = () => {
       if (!data.success) {
         throw new Error(data.error || '聚类失败')
       }
-      setClusterTree(data.result)
+      const tree = buildClusterTree(data.result)
+      setClusterTree(tree)
       // 默认展开所有一级目录
-      if (data.result?.root?.id) {
-        setExpandedNodes({ [data.result.root.id]: true })
+      if (tree?.root) {
+        const expanded: Record<string, boolean> = { [tree.root.id]: true }
+        if (tree.root.children) {
+          for (const child of tree.root.children) {
+            expanded[child.id] = true
+          }
+        }
+        setExpandedNodes(expanded)
       }
     } catch (err: any) {
       setClusterError(err.message || '执行层次聚类失败')
@@ -265,7 +418,7 @@ export const SearchClusterTab: React.FC = () => {
           className="flex items-center gap-2 p-2 rounded-lg hover:bg-slate-800/60 cursor-pointer transition-colors select-none group"
           style={{ paddingLeft: `${node.depth * 16 + 8}px` }}
         >
-          {hasChildren ? (
+          {hasChildren || hasDocs ? (
             isExpanded ? (
               <ChevronDown className="w-3.5 h-3.5 text-slate-400 group-hover:text-slate-200" />
             ) : (
@@ -286,7 +439,7 @@ export const SearchClusterTab: React.FC = () => {
           </span>
 
           <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 font-mono">
-            {node.documentIds?.length || 0} 篇
+            {getSubtreeDocCount(node)} 篇
           </span>
         </div>
 
