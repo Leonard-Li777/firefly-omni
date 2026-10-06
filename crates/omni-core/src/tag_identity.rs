@@ -90,7 +90,7 @@ pub const UNKNOWN_TAG_CODE: &str = "builtin.unknown";
 const BUILTIN_ALIASES: &[(&str, &str)] = &[
     // 文件类型 / 版面等规则高频项
     ("文本", "Text"),
-    ("纯文字", "Plain Text"),
+    ("纯文字", "Text Only"),
     ("文档", "Document"),
     ("文件", "Document"),
     ("图片", "Image"),
@@ -113,25 +113,25 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     // 闭环视觉规则高频项
     ("截图", "Screenshot"),
     ("设计稿", "Design Draft"),
-    ("图纸", "Drawing"),
-    ("表情包", "Emoticons"),
-    ("证照", "Licenses and Permits"),
+    ("图纸", "Blueprint"),
+    ("表情包", "Meme"),
+    ("证照", "Certificates and Licenses"),
     ("合同票据", "Contract Instruments"),
-    ("海报宣发", "Poster Promotion"),
+    ("海报宣发", "Poster Promo"),
     ("医学影像", "Medical Imaging"),
-    ("网页长截图", "Long Screenshot of a Webpage"),
-    ("UI界面截图", "Screenshots of the UI"),
-    ("聊天截图", "Chat Screenshots"),
+    ("网页长截图", "Long Webpage Screenshot"),
+    ("UI界面截图", "UI Screenshot"),
+    ("聊天截图", "Chat Screenshot"),
     ("代码截图", "Code Screenshot"),
-    ("游戏截图", "Game Screenshots"),
+    ("游戏截图", "Game Screenshot"),
     ("有字图", "Text-in-Image"),
-    ("无字图", "Image with No Text"),
+    ("无字图", "Image without Text"),
     ("全彩", "Full Color"),
     ("黑白", "Black And White"),
     ("摄影照片", "Photography"),
     ("人像写真", "Portrait Photography"),
     ("人物照", "Portrait Photos"),
-    ("私房写真", "Private Photo Shoot"),
+    ("私房写真", "Boudoir Photo"),
     ("婚纱照", "Wedding Photos"),
     ("静物照", "Still Life Photography"),
     ("自然景观", "Natural Landscape"),
@@ -180,7 +180,7 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("植物花草", "Plants and flowers"),
     ("静物商品", "Still life merchandise"),
     ("环境建筑", "Environmental architecture"),
-    ("无人空镜", "Unmanned aerial mirror"),
+    ("无人空镜", "Empty Scene"),
     ("单人", "Single"),
     ("双人", "Double"),
     ("多人合影", "Group Photo"),
@@ -189,8 +189,8 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("涉政", "Political Issues"),
     ("违规", "Violation"),
     ("高ISO噪点", "High ISO Noise"),
-    ("逆光死白", "Blown-out highlights in backlighting"),
-    ("暗光欠曝", "Underexposure in Low Light"),
+    ("逆光死白", "Blown Highlights in Backlight"),
+    ("暗光欠曝", "Underexposed in Low Light"),
     ("同人本", "Doujinshi"),
     ("剧情", "Plot"),
     ("二次元色情", "Anime Pornography"),
@@ -222,21 +222,21 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("image", "Image"),
     ("picture", "Image"),
     ("pic", "Image"),
-    ("img", "Image"),
+    ("img", "img"),
     ("screenshot", "Screenshot"),
     ("screen capture", "Screenshot"),
     ("design draft", "Design Draft"),
-    ("blueprint", "Drawing"),
-    ("meme", "Emoticons"),
-    ("id document", "Licenses and Permits"),
+    ("blueprint", "Blueprint"),
+    ("meme", "Meme"),
+    ("id document", "Certificates and Licenses"),
     ("invoice", "Bill"),
     ("contract", "Contract"),
     ("full color", "Full Color"),
     ("black and white", "Black And White"),
     ("black_and_white", "Black And White"),
     ("image with text", "Text-in-Image"),
-    ("image without text", "Image with No Text"),
-    ("image with no text", "Image with No Text"),
+    ("image without text", "Image without Text"),
+    ("image with no text", "Image without Text"),
     ("doodle", "Doodle"),
     ("character", "Character"),
     ("design", "Design"),
@@ -256,27 +256,27 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("painting", "Painting"),
     ("photo", "Photography"),
     ("pornography", "Pornography"),
-    ("ui screenshot", "Screenshots of the UI"),
+    ("ui screenshot", "UI Screenshot"),
     ("code screenshot", "Code Screenshot"),
-    ("chat screenshot", "Chat Screenshots"),
+    ("chat screenshot", "Chat Screenshot"),
     ("confidential", "Confidential"),
-    ("exposure is normal", "Exposure is normal"),
-    ("normal exposure", "Exposure is normal"),
-    // ③ en 展示名劣化已纠偏（scripts/i18n-helper.js TRANSLATION_FIX_MAP），新译名形式在此补别名。
-    // 右侧规范名必须保持 code 冻结的旧形式：en_builtin_code(en) = builtin.{slug(en)} 不得漂移，
-    // 否则与 ① concepts.rs / semantic.pack / GATE_CODES 中的既有 code 断链。
-    // 若未来 step0 以新 en 重生成 ③，必须先加 slug 保持映射（见 issue-cross-registry-code-divergence.md）。
-    ("watermarked", "There is watermark"),
-    ("there is watermark", "There is watermark"),
-    ("underexposed in low light", "Underexposure in Low Light"),
-    ("underexposure in low light", "Underexposure in Low Light"),
-    ("blown highlights in backlight", "Blown-out highlights in backlighting"),
+    ("exposure is normal", "Normal Exposure"),
+    ("normal exposure", "Normal Exposure"),
+    // ③ en 展示名劣化已反哺上游并重生成（GH #719 / #729），右侧统一为新规范英文名（派生新 builtin.{slug(en)}），
+    // 左侧保留旧机器直译词面作为兼容入场别名，确保新旧英文词面均归一到同一权威受控 code。
+    ("text only", "Text Only"),
+    ("plain text", "Text Only"),
+    ("watermarked", "Watermarked"),
+    ("there is watermark", "Watermarked"),
+    ("underexposed in low light", "Underexposed in Low Light"),
+    ("underexposure in low light", "Underexposed in Low Light"),
+    ("blown highlights in backlight", "Blown Highlights in Backlight"),
     (
         "blown-out highlights in backlighting",
-        "Blown-out highlights in backlighting"
+        "Blown Highlights in Backlight"
     ),
-    ("certificates and licenses", "Licenses and Permits"),
-    ("licenses and permits", "Licenses and Permits"),
+    ("certificates and licenses", "Certificates and Licenses"),
+    ("licenses and permits", "Certificates and Licenses"),
     ("good exposure", "Good Exposure"),
     ("slight underexposure", "Slight Underexposure"),
     ("slight overexposure", "Slight Overexposure"),
@@ -386,15 +386,15 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("轻微欠曝", "Slight Underexposure"),
     ("轻微过曝", "Slight Overexposure"),
     ("模糊废片", "Blurry, unusable photos"),
-    ("脱焦", "Decoking"),
+    ("脱焦", "Defocused"),
     ("运动抖动", "Motion Jitter"),
-    ("曝光正常", "Exposure is normal"),
+    ("曝光正常", "Normal Exposure"),
     ("无码", "Uncensored"),
     ("薄码", "Light Mosaic"),
     ("有码", "Censored"),
     ("无水印", "No watermark"),
     ("轻水印", "Light Watermark"),
-    ("有水印", "There is watermark"),
+    ("有水印", "Watermarked"),
     ("高质量", "High Quality"),
     ("中等质量", "Medium Quality"),
     ("低质量", "Low Quality"),
@@ -408,12 +408,12 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("情色文娱", "Erotic Entertainment"),
     ("暴露走光", "Exposure Wardrobe Malfunction"),
     ("残肢断臂", "Severed Limbs Mutilation"),
-    ("尸体残骸", "Remains of a body"),
-    ("酷刑折磨", "Torture and Cruel Treatment"),
-    ("重口猎奇", "Extreme and Bizarre"),
-    ("暴恐惨案", "Violent Terrorist Attacks"),
-    ("自残放血", "Self-harm and bloodletting"),
-    ("血肉模糊", "A bloody mess"),
+    ("尸体残骸", "Corpse Remains"),
+    ("酷刑折磨", "Torture"),
+    ("重口猎奇", "Hardcore Grotesque"),
+    ("暴恐惨案", "Terror Tragedy"),
+    ("自残放血", "Self-Harm Bleeding"),
+    ("血肉模糊", "Flesh Mutilation"),
     ("涉政违规", "Political Sensitive Violation"),
     ("反党反政", "Anti-Party and Anti-Government"),
     ("颠覆政权", "Overthrow the government"),
@@ -422,7 +422,7 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("暴乱动乱", "Riots and Unrest"),
     ("违法违规", "Illegal Violation"),
     ("毒品交易", "Drug Trafficking"),
-    ("走私贩私", "Smugglers"),
+    ("走私贩私", "Smuggling"),
     ("网络赌博", "Online Gambling"),
     ("洗钱诈骗", "Money Laundering Fraud"),
     ("暗网黑产", "Darknet Underground"),
@@ -430,7 +430,7 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("电信诈骗", "Telecom Fraud"),
     ("各地美食", "Food from all over the world"),
     ("治愈", "Cure"),
-    ("致郁", "Causing Depression"),
+    ("致郁", "Depressing"),
     ("轻松", "Easy"),
     ("感动", "Move"),
     ("欲望", "Desire"),
@@ -637,8 +637,8 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("incest obscene", "Incest Pornography"),
     ("severed limbs mutilation", "Severed Limbs Mutilation"),
     ("severed limbs", "Severed Limbs Mutilation"),
-    ("hardcore grotesque", "Extreme and Bizarre"),
-    ("hardcore bizarre", "Extreme and Bizarre"),
+    ("hardcore grotesque", "Hardcore Grotesque"),
+    ("hardcore bizarre", "Hardcore Grotesque"),
     ("wax play & whip", "Wax Play & Whip"),
     ("dripping wax whip", "Wax Play & Whip"),
     ("extreme public exposure", "Extreme Public Exposure"),
@@ -1190,6 +1190,28 @@ pub fn concept_from_code(code: &str) -> Option<crate::concepts::Concept> {
     })
 }
 
+/// 受控 code、双轨多语言别名或中文规范名 → [`crate::concepts::Concept`]（**跨入口唯一收口，GH #729 D4**）。
+///
+/// 优先级：
+/// 1. 已是受控 code → 委托 [`concept_from_code`]；
+/// 2. 命中双轨受控别名表（[`resolve_controlled_tag_code`]）→ 委托 [`concept_from_code`]；
+/// 3. 兜底走 `Concept::from_zh` 精确匹配中文词面。
+pub fn concept_from_code_or_alias(raw: &str) -> Option<crate::concepts::Concept> {
+    let clean = raw.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    if is_controlled_code(clean) {
+        return concept_from_code(clean);
+    }
+    if let Some(code) = resolve_controlled_tag_code(clean) {
+        if let Some(matched_concept) = concept_from_code(code) {
+            return Some(matched_concept);
+        }
+    }
+    crate::concepts::Concept::from_zh(clean)
+}
+
 /// 别名/规范名 → builtin code（精确字典，非向量）
 pub fn builtin_tag_code(tag: &str) -> Option<&'static str> {
     let key = normalize_lemma(tag);
@@ -1283,17 +1305,18 @@ pub const GATE_CODES: &[&str] = &[
     "builtin.low_quality",      // 低质量（← 画质低）
     // ── 水印程度（维度「水印程度」id 125）────────────────────────────────────
     "builtin.no_watermark",     // 无水印（← 去水印）
-    "builtin.there_is_watermark",      // 有水印（← 带水印）
+    "builtin.watermarked",             // 有水印（← 带水印）
     // ── 照片质量 / 曝光（维度「照片质量」id 127）──────────────────────────────
-    "builtin.exposure_is_normal",  // 曝光正常
+    "builtin.normal_exposure",     // 曝光正常
     "builtin.good_exposure",    // 曝光良好
-    "builtin.underexposure_in_low_light",     // 暗光欠曝（← 曝光不足）
-    "builtin.blown_out_highlights_in_backlighting", // 逆光死白（← 曝光过度）
-    // ── 文字密度（维度「文字密度」id 146）────────────────────────────────────
-    "builtin.plain_text",         // 纯文字
+    "builtin.underexposed_in_low_light",      // 暗光欠曝（← 曝光不足）
+    "builtin.blown_highlights_in_backlight",        // 逆光死白（← 曝光过度）
+    // ── 文字密度 / 版面（维度「文字密度」id 146 /「版面」id 141）───────────────
+    "builtin.text_only",          // 纯文字
+    "builtin.plain_text",         // 纯文本 / 旧版纯文字兼容
     "builtin.microtext",          // 微量文本
     "builtin.text_in_image",    // 有字图（D12 泄漏修复：en 侧 `Image With Text` 曾漏判）
-    "builtin.image_with_no_text", // 无字图
+    "builtin.image_without_text", // 无字图
 ];
 
 /// 门控维度的**口语 / 近义词 → 受控规范词**桥接表（**目标词必须已在 [`BUILTIN_ALIASES`] 内**）。
@@ -1545,7 +1568,8 @@ mod tests {
         // (zh 词面, en 词面) 均须判为门控。
         const PAIRS: &[(&str, &str)] = &[
             ("有字图", "Text-in-Image"),
-            ("无字图", "Image with No Text"),
+            ("无字图", "Image without Text"),
+            ("纯文字", "Text Only"),
             ("纯文字", "Plain Text"),
             ("微量文本", "Microtext"),
             ("安全", "Safe"),
@@ -1558,8 +1582,8 @@ mod tests {
             ("中等质量", "Medium Quality"),
             ("低质量", "Low Quality"),
             ("无水印", "No watermark"),
-            ("有水印", "There is watermark"),
-            ("曝光正常", "Exposure is normal"),
+            ("有水印", "Watermarked"),
+            ("曝光正常", "Normal Exposure"),
             ("曝光良好", "Good Exposure"),
             ("R-18", "R-18"),
             ("R-15", "R-15"),
@@ -1615,19 +1639,19 @@ mod tests {
     #[test]
     fn improved_en_display_forms_resolve_to_frozen_codes() {
         for (new_form, legacy_form, frozen_code) in [
-            ("Watermarked", "There is watermark", "builtin.there_is_watermark"),
-            ("Normal Exposure", "Exposure is normal", "builtin.exposure_is_normal"),
+            ("Watermarked", "There is watermark", "builtin.watermarked"),
+            ("Normal Exposure", "Exposure is normal", "builtin.normal_exposure"),
             (
                 "Underexposed in Low Light",
                 "Underexposure in Low Light",
-                "builtin.underexposure_in_low_light"
+                "builtin.underexposed_in_low_light"
             ),
             (
                 "Blown Highlights in Backlight",
                 "Blown-out highlights in backlighting",
-                "builtin.blown_out_highlights_in_backlighting"
+                "builtin.blown_highlights_in_backlight"
             ),
-            ("Certificates and Licenses", "Licenses and Permits", "builtin.licenses_and_permits"),
+            ("Certificates and Licenses", "Licenses and Permits", "builtin.certificates_and_licenses"),
         ] {
             assert_eq!(
                 builtin_tag_code(new_form),
@@ -1646,11 +1670,32 @@ mod tests {
     /// `Concept::from_code` 会静默落空 —— `concept_from_code` 必须仍能解析到同一概念。
     #[test]
     fn concept_from_code_bridges_cross_registry_divergence() {
-        // 纯命名分歧已随「② 对齐 ③」而归零：`有字图` 现在**直查命中**（零开销主路径）。
-        assert_eq!(
-            concept_from_code("builtin.text_in_image").map(|it| it.zh_name()),
-            Some("有字图")
-        );
+        // 纯命名分歧已随「②↔③↔① 闭环对齐」而归零：`有字图` 及 #719/#729 纠偏项现在**直查命中**（零开销主路径）。
+        for (code, expected_zh) in [
+            ("builtin.text_in_image", "有字图"),
+            ("builtin.text_only", "纯文字"),
+            ("builtin.hardcore_sex", "粗野性交"),
+            ("builtin.img", "img"),
+            ("omw.00370869.s", "蓝色"),
+            ("builtin.cyan", "青色"),
+            ("builtin.orgy", "群交"),
+            ("builtin.maternal_uncle_and_nephew", "舅甥"),
+            ("builtin.elder_brother_s_wife", "嫂嫂"),
+            ("builtin.defocused", "脱焦"),
+            ("builtin.empty_scene", "无人空镜"),
+            ("builtin.watermarked", "有水印"),
+            ("builtin.normal_exposure", "曝光正常"),
+        ] {
+            assert_eq!(
+                crate::concepts::Concept::from_code(code).map(|it| it.zh_name()),
+                Some(expected_zh),
+                "Concept::from_code({code}) 应直查命中 {expected_zh}"
+            );
+            assert_eq!(
+                concept_from_code(code).map(|it| it.zh_name()),
+                Some(expected_zh)
+            );
+        }
 
         // 剩余「分层差异」仍靠桥接：别名表 builtin.screenshot vs Concept hownet.000000135085.v
         let shot = concept_from_code("builtin.screenshot").expect("截图 应经桥接解析到 Concept");
@@ -1666,6 +1711,38 @@ mod tests {
         // 未受控 / 未知 code 必须返回 None，不得误命中。
         assert!(concept_from_code("_ext.unknown.abc123").is_none());
         assert!(concept_from_code("").is_none());
+    }
+
+    /// D4 跨入口收口测试（GH #729）：`concept_from_code_or_alias` 同时兼容受控 code、英文/多语言别名与中文词面。
+    #[test]
+    fn concept_from_code_or_alias_handles_code_alias_and_zh() {
+        use crate::concepts::Concept;
+        for (raw, expected) in [
+            ("builtin.soft_porn", Concept::软色情),
+            ("Soft Porn", Concept::软色情),
+            ("soft porn", Concept::软色情),
+            ("软色情", Concept::软色情),
+            ("builtin.image", Concept::图片),
+            ("Image", Concept::图片),
+            ("picture", Concept::图片),
+            ("图片", Concept::图片),
+            ("builtin.img", Concept::img),
+            ("img", Concept::img),
+            ("builtin.text_only", Concept::纯文字),
+            ("Text Only", Concept::纯文字),
+            ("纯文字", Concept::纯文字),
+            ("builtin.sex_training", Concept::性爱调教),
+            ("Sex training", Concept::性爱调教),
+            ("性爱调教", Concept::性爱调教),
+        ] {
+            assert_eq!(
+                concept_from_code_or_alias(raw),
+                Some(expected),
+                "concept_from_code_or_alias({raw:?}) 应解析为 {expected:?}"
+            );
+        }
+        assert!(concept_from_code_or_alias("").is_none());
+        assert!(concept_from_code_or_alias("_ext.unknown.12345678").is_none());
     }
 
     /// RAM++ 投影受控命中率量化（GH #718 前置核验 1）：
@@ -1750,16 +1827,8 @@ mod tests {
         );
 
         let mut drift: Vec<String> = Vec::new();
-        // 已知豁免：③ 的数据瑕疵，不视为漂移。
-        // `img`：fileDimension 的 `img` 位于 dim 104「磁盘映像扩展名」
-        // （(104,3)，与 vhd/vhdx/vmdk/nrg… 并列）= `.img` 文件格式，**不是「图片」**。
-        // ③ 单立 `builtin.img` 与维度语义一致；② 仍归并入 `builtin.image`（保留历史行为，
-        // 未在本轮改动范围内）。二者语义分歧已登记于 GH #719，待裁决是否拆分。
-        const KNOWN_EXCEPTIONS: &[&str] = &["img"];
+        // #729 裁决落地：`img` 与 `纯文字` 均已对齐 ③ builtin-tag-identity.json，实现 0 豁免闭环。
         for zh in expected.keys() {
-            if KNOWN_EXCEPTIONS.contains(&zh.as_str()) {
-                continue;
-            }
             if let Some(actual) = builtin_tag_code(zh) {
                 if actual != expected[zh] {
                     drift.push(format!("{zh}: ②={actual} ③={}", expected[zh]));
