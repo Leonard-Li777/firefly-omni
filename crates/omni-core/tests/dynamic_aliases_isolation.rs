@@ -108,22 +108,24 @@ fn dynamic_aliases_lifecycle_all_in_one() {
 
     // ─── 场景 4：核心视觉画质与尺度受控标签 100% 确定性解析与 _ext 防污染 ───
     assert_eq!(resolve_controlled_tag_code("高质量"), Some("builtin.high_quality"));
-    assert_eq!(resolve_controlled_tag_code("曝光正常"), Some("builtin.exposure_is_normal"));
+    assert_eq!(resolve_controlled_tag_code("曝光正常"), Some("builtin.normal_exposure"));
     assert_eq!(resolve_controlled_tag_code("全年龄"), Some("builtin.all_ages"));
     assert_eq!(resolve_controlled_tag_code("有字图"), Some("builtin.text_in_image"));
-    assert_eq!(resolve_controlled_tag_code("无字图"), Some("builtin.image_with_no_text"));
+    assert_eq!(resolve_controlled_tag_code("无字图"), Some("builtin.image_without_text"));
     assert_eq!(normalize_tag_to_code("高质量"), "builtin.high_quality");
-    assert_eq!(normalize_tag_to_code("曝光正常"), "builtin.exposure_is_normal");
+    assert_eq!(normalize_tag_to_code("曝光正常"), "builtin.normal_exposure");
     assert_eq!(normalize_tag_to_code("全年龄"), "builtin.all_ages");
     assert_eq!(normalize_tag_to_code("有字图"), "builtin.text_in_image");
 
-    // 验证非法/污染的 _ext.* 绝对无法覆盖已有的受控代码
+    // 验证非法/污染的 _ext.* 绝对无法覆盖已有的受控代码；合法的受控代码正常生效
     load_aliases_from_entries(vec![
         ("高质量", "_ext.gaozhiliang.4973d142"),
         ("曝光正常", "_ext.guang_zhen_chang.ee8a87d9"),
+        ("脱焦", "builtin.defocused"),
     ]);
     assert_eq!(resolve_controlled_tag_code("高质量"), Some("builtin.high_quality"));
-    assert_eq!(resolve_controlled_tag_code("曝光正常"), Some("builtin.exposure_is_normal"));
+    assert_eq!(resolve_controlled_tag_code("曝光正常"), Some("builtin.normal_exposure"));
+    assert_eq!(resolve_controlled_tag_code("脱焦"), Some("builtin.defocused"));
 
     // 验证维度 123 内容尺度全量标签解析
     assert_eq!(resolve_controlled_tag_code("PG-13"), Some("builtin.pg_13"));
