@@ -59,13 +59,13 @@ fn create_test_sqlite_bytes() -> Vec<u8> {
         );
 
         INSERT INTO file_tags (code, name, parent_codes, source, sort_order) VALUES
-            ('builtin.document', '文档', '[]', 'dimension', 1),
-            ('builtin.finance', '财务', '[\"builtin.document\"]', 'dimension', 2),
+            ('builtin.file_type', '文件类型', '[]', 'dimension', 1),
+            ('builtin.finance', '财务', '[\"builtin.file_type\"]', 'dimension', 2),
             ('builtin.invoice', '发票', '[\"builtin.finance\"]', 'tag', 3),
             ('builtin.receipt', '收据', '[\"builtin.finance\"]', 'tag', 4);
 
         INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical, n, count) VALUES
-            ('builtin.document', '文档', 1, 1, 100),
+            ('builtin.file_type', '文件类型', 1, 1, 100),
             ('builtin.finance', '财务', 1, 1, 90),
             ('builtin.finance', '金融', 0, 1, 50),
             ('builtin.invoice', '发票', 1, 1, 80),
@@ -73,7 +73,7 @@ fn create_test_sqlite_bytes() -> Vec<u8> {
             ('builtin.receipt', '收据', 1, 1, 70);
 
         INSERT INTO tag_aliases_en_US (tag_code, lemma, is_canonical, n, count) VALUES
-            ('builtin.document', 'Document', 1, 1, 100),
+            ('builtin.file_type', 'File Type', 1, 1, 100),
             ('builtin.finance', 'Finance', 1, 1, 90),
             ('builtin.invoice', 'Invoice', 1, 1, 80),
             ('builtin.receipt', 'Receipt', 1, 1, 70);
@@ -210,44 +210,61 @@ fn test_semantic_pack_load_raw_from_file_and_discovery() {
 
 #[test]
 fn test_vector_engine_rabitq_and_int8_ann() {
-    // 维度契约固定为 WeMM-Embedding 2B 的 2048 维（Issue 0046 §2「替代 bekko-a8m」）
-    assert_eq!(VECTOR_DIM, 2048, "zvec 维度契约必须为 2048 维");
+    assert_eq!(VECTOR_DIM, 2048, "默认高维契约常量应为 2048 维");
 
     let temp_dir = tempfile::tempdir().expect("创建临时目录失败");
     let engine = VectorEngine::open(temp_dir.path()).expect("打开向量引擎失败");
 
-    // 构造测试向量 (VECTOR_DIM 维，随引擎维度契约 = 2048 维)
+    // 构造 2048 维测试向量 (WeMM-Embedding 2B)
     let mut base_vec = vec![0.0f32; VECTOR_DIM];
     for i in 0..VECTOR_DIM {
         base_vec[i] = (i as f32).sin();
     }
 
-    // 相似向量 (微小扰动)
     let mut similar_vec = base_vec.clone();
     similar_vec[0] += 0.05;
     similar_vec[1] -= 0.05;
 
-    // 正交/无关向量
     let mut diff_vec = vec![0.0f32; VECTOR_DIM];
     for i in 0..VECTOR_DIM {
         diff_vec[i] = (i as f32).cos();
     }
 
-    // 1. 维度契约校验
+    // 构造 384 维测试向量 (bekko-a8m)
+    let mut base_vec_384 = vec![0.0f32; 384];
+    for i in 0..384 {
+        base_vec_384[i] = ((i as f32) * 0.17).sin();
+    }
+
+    // 1. 维度契约校验（仅接受 384 维与 2048 维，拒绝非法维度与 NaN）
     assert!(engine.upsert("fp_invalid", &[0.1, 0.2]).is_err());
+    assert!(engine.upsert("fp_invalid_512", &vec![0.1f32; 512]).is_err());
     assert!(engine.upsert("fp_nan", &vec![f32::NAN; VECTOR_DIM]).is_err());
-    assert!(
-        engine.upsert("fp_legacy_384", &vec![0.5f32; 384]).is_err(),
-        "384 维 bekko-a8m 旧契约向量必须被 2048 维新契约拒绝"
-    );
 
-    // 2. 写入特征向量
-    engine.upsert("fp_base", &base_vec).expect("写入 base 失败");
-    engine.upsert("fp_similar", &similar_vec).expect("写入 similar 失败");
-    engine.upsert("fp_diff", &diff_vec).expect("写入 diff 失败");
-    assert_eq!(engine.count(), 3);
+    // 2. 写入 2048d 与 384d 双槽位特征向量
+    engine.upsert("fp_base", &base_vec).expect("写入 2048d base 失败");
+    engine.upsert("fp_similar", &similar_vec).expect("写入 2048d similar 失败");
+    engine.upsert("fp_diff", &diff_vec).expect("写入 2048d diff 失败");
+    engine
+        .upsert("fp_base", &base_vec_384)
+        .expect("写入 384d base 失败");
 
-    // 3. 极速 Top-K 检索性能与精度
+    assert_eq!(engine.count_by_dim(2048), 3);
+    assert_eq!(engine.count_by_dim(384), 1);
+    assert_eq!(engine.count(), 4);
+
+    // 验证 get_vector 反量化读取
+    let restored_384 = engine.get_vector("fp_base", 384).expect("读取 384d 向量失败");
+    assert_eq!(restored_384.len(), 384);
+    let restored_2048 = engine.get_vector("fp_base", 2048).expect("读取 2048d 向量失败");
+    assert_eq!(restored_2048.len(), 2048);
+
+    // 3. 极速 Top-K 检索性能与精度 (2048d + 384d)
+    let matches_384 = engine.search(&base_vec_384, 2, None).expect("384d 检索失败");
+    assert_eq!(matches_384.len(), 1);
+    assert_eq!(matches_384[0].file_fingerprint, "fp_base");
+    assert!((matches_384[0].score - 1.0).abs() < 0.05);
+
     // 预热热身 (消除 debug 模式冷启动页缺失与首次内存分配抖动)
     let _ = engine.search(&base_vec, 1, None);
 
@@ -284,15 +301,19 @@ fn test_vector_engine_rabitq_and_int8_ann() {
     // 4. 批量删除
     let deleted = engine.delete(&["fp_diff".to_string()]).expect("删除失败");
     assert_eq!(deleted, 1);
-    assert_eq!(engine.count(), 2);
+    assert_eq!(engine.count_by_dim(2048), 2);
+    assert_eq!(engine.count_by_dim(384), 1);
 
-    // 5. 持久化与重启恢复测试
+    // 5. 持久化与重启恢复测试 (`vectors_384.bin` + `vectors_2048.bin`)
     drop(engine);
     let reloaded = VectorEngine::open(temp_dir.path()).expect("重新打开向量引擎失败");
-    assert_eq!(reloaded.count(), 2);
-    let reloaded_matches = reloaded.search(&base_vec, 2, None).expect("重启后检索失败");
+    assert_eq!(reloaded.count_by_dim(2048), 2);
+    assert_eq!(reloaded.count_by_dim(384), 1);
+    let reloaded_matches = reloaded.search(&base_vec, 2, None).expect("重启后 2048d 检索失败");
     assert_eq!(reloaded_matches[0].file_fingerprint, "fp_base");
     assert_eq!(reloaded_matches[1].file_fingerprint, "fp_similar");
+    let reloaded_384 = reloaded.search(&base_vec_384, 2, None).expect("重启后 384d 检索失败");
+    assert_eq!(reloaded_384[0].file_fingerprint, "fp_base");
 }
 
 fn setup_test_app_with_pack_and_vector() -> axum::Router {
@@ -379,9 +400,9 @@ async fn test_http_taxonomy_and_vector_endpoints() {
         .unwrap();
     let tree_resp: TaxonomyTreeResponse = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(tree_resp.locale, "zh-CN");
-    assert_eq!(tree_resp.root_nodes.len(), 1); // builtin.document 为顶层根
-    assert_eq!(tree_resp.root_nodes[0].code, "builtin.document");
-    assert_eq!(tree_resp.root_nodes[0].name, "文档");
+    assert_eq!(tree_resp.root_nodes.len(), 1); // builtin.file_type 为顶层受控根维度
+    assert_eq!(tree_resp.root_nodes[0].code, "builtin.file_type");
+    assert_eq!(tree_resp.root_nodes[0].name, "文件类型");
     assert_eq!(tree_resp.root_nodes[0].children.len(), 1); // builtin.finance
     assert_eq!(tree_resp.root_nodes[0].children[0].code, "builtin.finance");
     assert_eq!(tree_resp.root_nodes[0].children[0].children.len(), 2); // invoice, receipt
@@ -424,16 +445,24 @@ async fn test_http_taxonomy_and_vector_endpoints() {
         .unwrap();
     let codes_rows: Vec<TagAliasRow> = serde_json::from_slice(&body_bytes_codes).unwrap();
     assert!(codes_rows.iter().any(|r| r.tag_code == "builtin.finance"));
-    assert!(!codes_rows.iter().any(|r| r.tag_code == "builtin.document"));
+    assert!(!codes_rows.iter().any(|r| r.tag_code == "builtin.file_type"));
 
-    // 3. POST /api/v1/vector/upsert
+    // 3. POST /api/v1/vector/upsert (2048d + 384d)
     let mut test_vec = vec![0.0f32; VECTOR_DIM];
     for i in 0..VECTOR_DIM {
         test_vec[i] = ((i as f32) * 0.1).sin();
     }
+    let mut test_vec_384 = vec![0.0f32; 384];
+    for i in 0..384 {
+        test_vec_384[i] = ((i as f32) * 0.15).cos();
+    }
     let upsert_payload = serde_json::json!({
-        "fileFingerprint": "fp-unit-test-1",
-        "vector": test_vec
+        "items": [
+            { "fileFingerprint": "fp-unit-test-1", "vector": test_vec },
+            { "fileFingerprint": "fp-unit-test-1", "vector": test_vec_384 },
+            { "fileFingerprint": "fp-unit-test-2", "vector": test_vec_384 },
+            { "fileFingerprint": "fp-unit-test-3", "vector": test_vec_384 }
+        ]
     });
 
     let req = Request::builder()
@@ -451,9 +480,59 @@ async fn test_http_taxonomy_and_vector_endpoints() {
         .unwrap();
     let upsert_resp: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(upsert_resp["success"], true);
-    assert_eq!(upsert_resp["count"], 1);
+    assert_eq!(upsert_resp["count"], 4);
 
-    // 4. POST /api/v1/vector/search
+    // 3.1 POST /api/v1/vector/get (384d 反量化读取)
+    let get_payload = serde_json::json!({
+        "fileFingerprints": ["fp-unit-test-1", "fp-not-exist"],
+        "dim": 384
+    });
+    let req_get = Request::builder()
+        .uri("/api/v1/vector/get")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(get_payload.to_string()))
+        .unwrap();
+    let resp_get = app.clone().oneshot(req_get).await.unwrap();
+    assert_eq!(resp_get.status(), StatusCode::OK);
+    let get_bytes = axum::body::to_bytes(resp_get.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_resp: Value = serde_json::from_slice(&get_bytes).unwrap();
+    assert_eq!(get_resp["count"], 1);
+    assert_eq!(get_resp["vectors"][0]["fileFingerprint"], "fp-unit-test-1");
+    assert_eq!(get_resp["vectors"][0]["vector"].as_array().unwrap().len(), 384);
+
+    // 3.2 POST /api/search/cluster (传空 embedding: []，验证进程内自动从 zvec 384d 槽位回填)
+    let cluster_payload = serde_json::json!({
+        "documents": [
+            { "fingerprint": "fp-unit-test-1", "embedding": [], "keywords": ["财务", "发票"] },
+            { "fingerprint": "fp-unit-test-2", "embedding": [], "keywords": ["财务", "发票"] },
+            { "fingerprint": "fp-unit-test-3", "embedding": [], "keywords": ["财务", "发票"] }
+        ]
+    });
+    let req_cluster = Request::builder()
+        .uri("/api/search/cluster")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(cluster_payload.to_string()))
+        .unwrap();
+    let resp_cluster = app.clone().oneshot(req_cluster).await.unwrap();
+    assert_eq!(resp_cluster.status(), StatusCode::OK);
+    let cluster_bytes = axum::body::to_bytes(resp_cluster.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let cluster_resp: Value = serde_json::from_slice(&cluster_bytes).unwrap();
+    assert_eq!(cluster_resp["success"], true);
+    assert_eq!(
+        cluster_resp["result"]["clusters"][0]["fingerprints"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // 4. POST /api/v1/vector/search (2048d)
     let search_payload = serde_json::json!({
         "vector": test_vec,
         "topK": 5
@@ -482,7 +561,7 @@ async fn test_http_taxonomy_and_vector_endpoints() {
 
     // 5. DELETE /api/v1/vector/delete
     let delete_payload = serde_json::json!({
-        "fileFingerprints": ["fp-unit-test-1"]
+        "fileFingerprints": ["fp-unit-test-1", "fp-unit-test-2", "fp-unit-test-3"]
     });
 
     let req = Request::builder()
@@ -500,7 +579,7 @@ async fn test_http_taxonomy_and_vector_endpoints() {
         .unwrap();
     let delete_resp: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(delete_resp["success"], true);
-    assert_eq!(delete_resp["deletedCount"], 1);
+    assert_eq!(delete_resp["deletedCount"], 3);
 
     // 6. 验证删除后搜索不再召回
     let req = Request::builder()
