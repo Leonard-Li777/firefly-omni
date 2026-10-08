@@ -48,6 +48,9 @@ aes-gcm = { version = "0.10", features = ["aes"] }
 crc32fast = "1.4"
 rand = "0.8"
 jieba-rs = "0.7"
+# sherpa-onnx: 全栈音频 AI 引擎（ASR / TTS / VAD / Audio Tagging / 说话人分离）
+# 替换 audio.cpp CLI 调度方案，原生 Rust 集成，支持 ONNX Runtime EP 硬件加速
+sherpa-onnx = "1.13"
 
 [patch.crates-io]
 mupdf-sys = { path = "crates/mupdf-sys" }
