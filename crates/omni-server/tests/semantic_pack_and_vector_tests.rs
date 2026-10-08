@@ -210,12 +210,12 @@ fn test_semantic_pack_load_raw_from_file_and_discovery() {
 
 #[test]
 fn test_vector_engine_rabitq_and_int8_ann() {
-    assert_eq!(VECTOR_DIM, 2048, "默认高维契约常量应为 2048 维");
+    assert_eq!(VECTOR_DIM, 512, "默认高维契约常量应为 512 维");
 
     let temp_dir = tempfile::tempdir().expect("创建临时目录失败");
     let engine = VectorEngine::open(temp_dir.path()).expect("打开向量引擎失败");
 
-    // 构造 2048 维测试向量 (WeMM-Embedding 2B)
+    // 构造 512 维测试向量 (EmbeddingGemma 512d)
     let mut base_vec = vec![0.0f32; VECTOR_DIM];
     for i in 0..VECTOR_DIM {
         base_vec[i] = (i as f32).sin();
@@ -236,28 +236,28 @@ fn test_vector_engine_rabitq_and_int8_ann() {
         base_vec_384[i] = ((i as f32) * 0.17).sin();
     }
 
-    // 1. 维度契约校验（仅接受 384 维与 2048 维，拒绝非法维度与 NaN）
+    // 1. 维度契约校验（仅接受 384 维与 512 维，拒绝非法维度与 NaN）
     assert!(engine.upsert("fp_invalid", &[0.1, 0.2]).is_err());
-    assert!(engine.upsert("fp_invalid_512", &vec![0.1f32; 512]).is_err());
+    assert!(engine.upsert("fp_invalid_256", &vec![0.1f32; 256]).is_err());
     assert!(engine.upsert("fp_nan", &vec![f32::NAN; VECTOR_DIM]).is_err());
 
-    // 2. 写入 2048d 与 384d 双槽位特征向量
-    engine.upsert("fp_base", &base_vec).expect("写入 2048d base 失败");
-    engine.upsert("fp_similar", &similar_vec).expect("写入 2048d similar 失败");
-    engine.upsert("fp_diff", &diff_vec).expect("写入 2048d diff 失败");
+    // 2. 写入 512d 与 384d 双槽位特征向量
+    engine.upsert("fp_base", &base_vec).expect("写入 512d base 失败");
+    engine.upsert("fp_similar", &similar_vec).expect("写入 512d similar 失败");
+    engine.upsert("fp_diff", &diff_vec).expect("写入 512d diff 失败");
     engine
         .upsert("fp_base", &base_vec_384)
         .expect("写入 384d base 失败");
 
-    assert_eq!(engine.count_by_dim(2048), 3);
+    assert_eq!(engine.count_by_dim(512), 3);
     assert_eq!(engine.count_by_dim(384), 1);
     assert_eq!(engine.count(), 4);
 
     // 验证 get_vector 反量化读取
     let restored_384 = engine.get_vector("fp_base", 384).expect("读取 384d 向量失败");
     assert_eq!(restored_384.len(), 384);
-    let restored_2048 = engine.get_vector("fp_base", 2048).expect("读取 2048d 向量失败");
-    assert_eq!(restored_2048.len(), 2048);
+    let restored_512 = engine.get_vector("fp_base", 512).expect("读取 512d 向量失败");
+    assert_eq!(restored_512.len(), 512);
 
     // 3. 极速 Top-K 检索性能与精度 (2048d + 384d)
     let matches_384 = engine.search(&base_vec_384, 2, None).expect("384d 检索失败");
@@ -301,15 +301,15 @@ fn test_vector_engine_rabitq_and_int8_ann() {
     // 4. 批量删除
     let deleted = engine.delete(&["fp_diff".to_string()]).expect("删除失败");
     assert_eq!(deleted, 1);
-    assert_eq!(engine.count_by_dim(2048), 2);
+    assert_eq!(engine.count_by_dim(512), 2);
     assert_eq!(engine.count_by_dim(384), 1);
 
-    // 5. 持久化与重启恢复测试 (`vectors_384.bin` + `vectors_2048.bin`)
+    // 5. 持久化与重启恢复测试 (`vectors_384.bin` + `vectors_512.bin`)
     drop(engine);
     let reloaded = VectorEngine::open(temp_dir.path()).expect("重新打开向量引擎失败");
-    assert_eq!(reloaded.count_by_dim(2048), 2);
+    assert_eq!(reloaded.count_by_dim(512), 2);
     assert_eq!(reloaded.count_by_dim(384), 1);
-    let reloaded_matches = reloaded.search(&base_vec, 2, None).expect("重启后 2048d 检索失败");
+    let reloaded_matches = reloaded.search(&base_vec, 2, None).expect("重启后 512d 检索失败");
     assert_eq!(reloaded_matches[0].file_fingerprint, "fp_base");
     assert_eq!(reloaded_matches[1].file_fingerprint, "fp_similar");
     let reloaded_384 = reloaded.search(&base_vec_384, 2, None).expect("重启后 384d 检索失败");
@@ -447,7 +447,7 @@ async fn test_http_taxonomy_and_vector_endpoints() {
     assert!(codes_rows.iter().any(|r| r.tag_code == "builtin.finance"));
     assert!(!codes_rows.iter().any(|r| r.tag_code == "builtin.file_type"));
 
-    // 3. POST /api/v1/vector/upsert (2048d + 384d)
+    // 3. POST /api/v1/vector/upsert (512d + 384d)
     let mut test_vec = vec![0.0f32; VECTOR_DIM];
     for i in 0..VECTOR_DIM {
         test_vec[i] = ((i as f32) * 0.1).sin();
@@ -532,7 +532,7 @@ async fn test_http_taxonomy_and_vector_endpoints() {
         3
     );
 
-    // 4. POST /api/v1/vector/search (2048d)
+    // 4. POST /api/v1/vector/search (512d)
     let search_payload = serde_json::json!({
         "vector": test_vec,
         "topK": 5

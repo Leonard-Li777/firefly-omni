@@ -31,6 +31,9 @@ enum Commands {
         /// 只读语义包 semantic.pack 路径（零磁盘挂载至内存独占托管；缺省时自动 discover 预置语义包）
         #[arg(long)]
         pack_path: Option<String>,
+        /// 激活的嵌入画像档位（classic_light 或 gemma_unified，缺省 classic_light）
+        #[arg(long)]
+        embedding_profile: Option<String>,
     },
     /// 提取指定文件的信息与 Markdown 文本
     Extract {
@@ -50,11 +53,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Serve { addr, db_path, pack_path }) => {
+        Some(Commands::Serve { addr, db_path, pack_path, embedding_profile }) => {
             let socket_addr: SocketAddr = addr.parse()?;
             let db_path = db_path.as_deref().map(std::path::PathBuf::from);
             let pack_path = pack_path.as_deref().map(std::path::PathBuf::from);
-            omni_server::start_server(socket_addr, db_path, pack_path).await?;
+            omni_server::start_server(socket_addr, db_path, pack_path, embedding_profile.clone()).await?;
         }
         Some(Commands::Extract { file }) => {
             let config = omni_core::OmniConfig::default();

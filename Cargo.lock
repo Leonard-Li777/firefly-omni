@@ -4418,6 +4418,7 @@ dependencies = [
  "omni-text",
  "omni-vision",
  "rand 0.8.8",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
