@@ -16,6 +16,11 @@ pub mod tag_admissibility;
 pub mod dimension_policies_generated;
 pub use dimension_policies_generated::*;
 
+/// ONNX Runtime 统一动态底座、EP 两阶段路由与分级看门狗 (Ticket 2)
+pub mod ort_runtime;
+pub use ort_runtime::*;
+pub use ort;
+
 /// 编译/运行期受控标签宏：开发时书写中文或英文直观名称，自动解析为系统标准 tag_code
 ///
 /// 示例：`tag_code!("截图")` → `"builtin.screenshot"`
@@ -798,17 +803,21 @@ pub fn get_canonical_concept_name(code: &str) -> Option<&'static str> {
     tag_identity::concept_from_code(code).map(|item| item.zh_name())
 }
 
-/// 6 大受控根维度强类型枚举集合 (file-dimension-source.ts level=1)
+/// 核心受控根维度强类型枚举集合
 pub const ROOT_DIMENSION_CONCEPTS: &[concepts::Concept] = &[
     concepts::Concept::文件类型,
     concepts::Concept::文件用途,
     concepts::Concept::文件来源,
     concepts::Concept::作者,
     concepts::Concept::文件质量,
+    concepts::Concept::安全等级,
+    concepts::Concept::语言细分,
+    concepts::Concept::处理状态,
+    concepts::Concept::内容尺度,
     concepts::Concept::内容标签,
 ];
 
-/// 判定指定 code 是否为 6 大受控根维度 (内置 builtin.author / builtin.fileType 别名收敛)
+/// 判定指定 code 是否为受控根维度 (内置 builtin.author / builtin.fileType 别名收敛)
 #[inline]
 pub fn is_root_dimension(code: &str) -> bool {
     code == "builtin.author" || code == "builtin.fileType" || ROOT_DIMENSION_CONCEPTS.iter().any(|item| item.code() == code)
