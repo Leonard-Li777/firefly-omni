@@ -378,7 +378,15 @@ pub fn query_taxonomy_tree_fast(
             code_segs[0] = "builtin.file_type".to_string();
         }
 
-        // 受控根维度封闭性：若顶层非 6 大受控根维度，强制前置挂载到 builtin.content_tags 下
+        // 历史存量数据自愈：若前缀误被包装为 /builtin.content_tags/<root_dim>/...，剥除顶层伪 content_tags 前缀
+        if code_segs.len() > 1 && code_segs[0] == "builtin.content_tags" && omni_core::is_root_dimension(&code_segs[1]) {
+            code_segs.remove(0);
+            if !name_segs.is_empty() {
+                name_segs.remove(0);
+            }
+        }
+
+        // 受控根维度封闭性：若顶层非受控根维度，强制前置挂载到 builtin.content_tags 下
         if !omni_core::is_root_dimension(&code_segs[0]) && code_segs[0] != "builtin.content_tags" {
             code_segs.insert(0, "builtin.content_tags".to_string());
             name_segs.insert(0, "内容标签".to_string());
@@ -2039,6 +2047,84 @@ mod tests {
             vid_uncensored.name_path.as_deref(),
             Some("/文件类型/视频/打码程度/无码")
         );
+    }
+
+    #[test]
+    fn test_inverted_trie_healing_and_fact_dimension_independence() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE tag_aliases_zh_CN (
+                tag_code TEXT PRIMARY KEY,
+                lemma TEXT NOT NULL,
+                is_canonical INTEGER NOT NULL DEFAULT 1,
+                source TEXT NOT NULL DEFAULT 'builtin',
+                count INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical, source, count) VALUES
+                ('builtin.security_level', '安全等级', 1, 'builtin', 10),
+                ('omw.01704761.a', '公开', 1, 'omw', 10),
+                ('builtin.language_segmentation', '语言细分', 1, 'builtin', 10),
+                ('builtin.chinese', '中文', 1, 'builtin', 10),
+                ('builtin.content_tags', '内容标签', 1, 'builtin', 10);
+            "#,
+        ).unwrap();
+
+        let master_conn = rusqlite::Connection::open_in_memory().unwrap();
+        master_conn.execute_batch(
+            r#"
+            CREATE TABLE file_tag_relations (
+                file_fingerprint TEXT NOT NULL,
+                tag_code TEXT NOT NULL,
+                via_parent_code TEXT,
+                code_path TEXT NOT NULL DEFAULT '',
+                name_path TEXT NOT NULL DEFAULT '',
+                depth INTEGER NOT NULL DEFAULT 1
+            );
+            -- 模拟存量脏数据：被错误包裹了 /builtin.content_tags/ 前缀
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, via_parent_code, code_path, name_path, depth) VALUES
+                ('fp_1', 'omw.01704761.a', 'builtin.security_level', '/builtin.content_tags/builtin.security_level/omw.01704761.a', '/内容标签/安全等级/公开', 3),
+                ('fp_1', 'builtin.chinese', 'builtin.language_segmentation', '/builtin.content_tags/builtin.language_segmentation/builtin.chinese', '/内容标签/语言细分/中文', 3),
+                ('fp_1', '_ext.he.9ec86979', 'builtin.content_tags', '/builtin.content_tags/_ext.he.9ec86979', '/内容标签/合歆', 2);
+            "#,
+        ).unwrap();
+
+        let resp = query_taxonomy_tree_fast(
+            &conn,
+            "zh-CN",
+            None,
+            &master_conn,
+            false,
+            None,
+            None,
+        ).unwrap();
+
+        // 1. 验证安全等级独立建根，自愈剥离顶层伪 content_tags
+        let sec_root = resp.root_nodes.iter().find(|n| n.code == "builtin.security_level");
+        assert!(sec_root.is_some(), "安全等级必须独立建根，不得丢失");
+        let sec_root = sec_root.unwrap();
+        assert_eq!(sec_root.code_path.as_deref(), Some("/builtin.security_level"));
+        assert_eq!(sec_root.name, "安全等级");
+        assert_eq!(sec_root.children.len(), 1);
+        assert_eq!(sec_root.children[0].code, "omw.01704761.a");
+        assert_eq!(sec_root.children[0].code_path.as_deref(), Some("/builtin.security_level/omw.01704761.a"));
+
+        // 2. 验证语言细分独立建根
+        let lang_root = resp.root_nodes.iter().find(|n| n.code == "builtin.language_segmentation");
+        assert!(lang_root.is_some(), "语言细分必须独立建根，不得丢失");
+        let lang_root = lang_root.unwrap();
+        assert_eq!(lang_root.code_path.as_deref(), Some("/builtin.language_segmentation"));
+        assert_eq!(lang_root.name, "语言细分");
+        assert_eq!(lang_root.children.len(), 1);
+        assert_eq!(lang_root.children[0].code, "builtin.chinese");
+        assert_eq!(lang_root.children[0].code_path.as_deref(), Some("/builtin.language_segmentation/builtin.chinese"));
+
+        // 3. 验证内容标签下仅有纯业务扩展标签，绝无安全等级或语言细分
+        let content_root = resp.root_nodes.iter().find(|n| n.code == "builtin.content_tags");
+        assert!(content_root.is_some());
+        let content_root = content_root.unwrap();
+        assert!(content_root.children.iter().all(|c| c.code != "builtin.security_level" && c.code != "builtin.language_segmentation"));
+        assert!(content_root.children.iter().any(|c| c.code == "_ext.he.9ec86979"));
     }
 }
 

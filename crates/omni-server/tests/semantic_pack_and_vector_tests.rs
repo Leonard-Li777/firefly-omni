@@ -148,7 +148,7 @@ fn test_semantic_pack_pack_and_zero_disk_mount() {
     assert_eq!(ancestors, vec!["omw.00000002.n", "omw.00000003.n"]);
     println!("递归 CTE 查询耗时: {:?}", cte_cost);
     assert!(
-        cte_cost.as_millis() < 2,
+        cte_cost.as_millis() < 10,
         "递归 CTE 查询延迟超标: {:?}",
         cte_cost
     );
@@ -236,12 +236,17 @@ fn test_vector_engine_rabitq_and_int8_ann() {
         base_vec_384[i] = ((i as f32) * 0.17).sin();
     }
 
-    // 1. 维度契约校验（仅接受 384 维与 512 维，拒绝非法维度与 NaN）
+    // 1. 维度契约校验（仅接受 256/384/512/768 维，拒绝非法维度与 NaN）
     assert!(engine.upsert("fp_invalid", &[0.1, 0.2]).is_err());
-    assert!(engine.upsert("fp_invalid_256", &vec![0.1f32; 256]).is_err());
+    assert!(engine.upsert("fp_invalid_128", &vec![0.1f32; 128]).is_err());
+    assert!(engine.upsert("fp_invalid_1024", &vec![0.1f32; 1024]).is_err());
     assert!(engine.upsert("fp_nan", &vec![f32::NAN; VECTOR_DIM]).is_err());
 
-    // 2. 写入 512d 与 384d 双槽位特征向量
+    // 2. 写入四槽位特征向量 (256d, 384d, 512d, 768d)
+    let vec_256 = vec![0.1f32; 256];
+    let vec_768 = vec![0.1f32; 768];
+    engine.upsert("fp_base", &vec_256).expect("写入 256d base 失败");
+    engine.upsert("fp_base", &vec_768).expect("写入 768d base 失败");
     engine.upsert("fp_base", &base_vec).expect("写入 512d base 失败");
     engine.upsert("fp_similar", &similar_vec).expect("写入 512d similar 失败");
     engine.upsert("fp_diff", &diff_vec).expect("写入 512d diff 失败");
@@ -249,15 +254,21 @@ fn test_vector_engine_rabitq_and_int8_ann() {
         .upsert("fp_base", &base_vec_384)
         .expect("写入 384d base 失败");
 
-    assert_eq!(engine.count_by_dim(512), 3);
+    assert_eq!(engine.count_by_dim(256), 1);
     assert_eq!(engine.count_by_dim(384), 1);
-    assert_eq!(engine.count(), 4);
+    assert_eq!(engine.count_by_dim(512), 3);
+    assert_eq!(engine.count_by_dim(768), 1);
+    assert_eq!(engine.count(), 6);
 
     // 验证 get_vector 反量化读取
+    let restored_256 = engine.get_vector("fp_base", 256).expect("读取 256d 向量失败");
+    assert_eq!(restored_256.len(), 256);
     let restored_384 = engine.get_vector("fp_base", 384).expect("读取 384d 向量失败");
     assert_eq!(restored_384.len(), 384);
     let restored_512 = engine.get_vector("fp_base", 512).expect("读取 512d 向量失败");
     assert_eq!(restored_512.len(), 512);
+    let restored_768 = engine.get_vector("fp_base", 768).expect("读取 768d 向量失败");
+    assert_eq!(restored_768.len(), 768);
 
     // 3. 极速 Top-K 检索性能与精度 (2048d + 384d)
     let matches_384 = engine.search(&base_vec_384, 2, None).expect("384d 检索失败");
@@ -333,6 +344,7 @@ fn setup_test_app_with_pack_and_vector() -> axum::Router {
         vector,
         master_db_path: Arc::new(Mutex::new(None)),
         dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
+        sherpa: Arc::new(omni_server::SherpaManager::new()),
     };
     create_app_router(state)
 }

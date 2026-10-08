@@ -14,6 +14,7 @@ members = [
     "omni-pro/crates/omni-cleanup",
     "omni-pro/crates/omni-cover",
     "omni-pro/crates/omni-vision",
+    "omni-pro/crates/omni-text",
 ]
 
 [workspace.package]
@@ -50,7 +51,9 @@ rand = "0.8"
 jieba-rs = "0.7"
 # sherpa-onnx: 全栈音频 AI 引擎（ASR / TTS / VAD / Audio Tagging / 说话人分离）
 # 替换 audio.cpp CLI 调度方案，原生 Rust 集成，支持 ONNX Runtime EP 硬件加速
-sherpa-onnx = "1.13"
+sherpa-onnx = { version = "1.13.8", default-features = false, features = ["shared"] }
+# 统一 ONNX Runtime 动态链接底座，解耦编译期静态绑定，彻底消除 Windows MSVC /MT vs /MD (LNK2038) 冲突
+ort = { version = "=2.0.0-rc.9", features = ["load-dynamic"] }
 
 [patch.crates-io]
 mupdf-sys = { path = "crates/mupdf-sys" }

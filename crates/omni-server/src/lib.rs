@@ -41,6 +41,9 @@ use omni_pro::{
 };
 
 pub mod routes;
+pub mod sherpa_manager;
+
+pub use sherpa_manager::{decode_audio_to_16k_mono, normalize_ced_audio_event, SherpaManager};
 
 /// CLIP 互斥组标准名称定义
 const GROUP_COLOR_MODE: &str = "色彩模式";
@@ -66,6 +69,8 @@ pub struct AppState {
     pub master_db_path: Arc<Mutex<Option<PathBuf>>>,
     /// 动态维度执行策略（由本地主库 system_config.DIMENSION_POLICIES 动态驱动，缺省回退内置）
     pub dimension_policies: Arc<std::sync::RwLock<std::collections::HashMap<String, omni_core::DimensionExecutionPolicy>>>,
+    /// Sherpa-ONNX 全栈音频 AI 管理引擎 (SenseVoice ASR / Silero VAD / GTCRN 降噪 / CED-mini 打标)
+    pub sherpa: Arc<SherpaManager>,
 }
 
 #[derive(Deserialize)]
@@ -748,6 +753,7 @@ pub async fn start_server(
     }));
 
     let initial_policies = routes::taxonomy::load_dimension_policies_from_db(db_path.as_deref());
+    let sherpa = Arc::new(SherpaManager::new());
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),
         geo,
@@ -757,6 +763,7 @@ pub async fn start_server(
         vector,
         master_db_path: Arc::new(Mutex::new(db_path)),
         dimension_policies: Arc::new(std::sync::RwLock::new(initial_policies)),
+        sherpa,
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本
@@ -1433,13 +1440,13 @@ async fn perceive_file_handler(
                 v.watermark_status = Some(v_wm_status.to_string());
             }
 
-            // 音频/视频文件: 截取降噪 → SenseVoice 转录
+            // 音频/视频文件: 纯内存解码 (16kHz 单声道) → GTCRN 降噪 + Silero VAD + SenseVoice 转录 + CED-mini 声学打标
             let is_audio = mime_type.starts_with("audio/")
                 || matches!(ext.as_str(), "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "opus" | "ape" | "aiff");
             let is_audio_or_video = is_audio || is_video;
             let mut audio_ms: Option<u64> = None;
 
-            // 仅在音视频文件且 enable_asr 未显式关闭时执行 SenseVoice 转录
+            // 仅在音视频文件且 enable_asr 未显式关闭时执行纯内存声学流水线
             let should_transcribe = is_audio_or_video
                 && req.enable_asr.unwrap_or(true);
 
@@ -1448,33 +1455,46 @@ async fn perceive_file_handler(
                 // 优先使用请求中传入的截取时长，否则读取全局配置
                 let duration_seconds = req.audio_analysis_duration.unwrap_or(cfg.audio_analysis_duration);
                 let file_path_for_audio = file_path.clone();
-                let language = req.language.clone();
+                let sherpa_engine = state.sherpa.clone();
 
-                // spawn_blocking: FFmpeg 截取降噪 + SenseVoice 转录（全部阻塞操作）
-                let transcript_result = tokio::task::spawn_blocking(move || {
-                    // Step 1: 截取降噪，输出标准 WAV
-                    let wav_path = convert_audio_standard(&file_path_for_audio, duration_seconds)?;
-                    // Step 2: SenseVoice ASR 转录
-                    transcribe_with_sense_asr(&wav_path, language.as_deref())
+                // spawn_blocking: 纯内存管道解码 + 纯内存 GTCRN 降噪 + VAD + SenseVoice ASR + CED-mini 打标
+                let (transcript_result, events_result) = tokio::task::spawn_blocking(move || {
+                    let path = std::path::Path::new(&file_path_for_audio);
+                    if let Some(samples) = decode_audio_to_16k_mono(path, Some(duration_seconds)) {
+                        sherpa_engine.process_audio_pipeline(&samples, 16000)
+                    } else {
+                        (None, Vec::new())
+                    }
                 })
                 .await
-                .ok()
-                .flatten();
+                .unwrap_or((None, Vec::new()));
 
                 audio_ms = Some(t_audio.elapsed().as_millis() as u64);
 
-                if let Some(transcript) = transcript_result {
-                    tracing::info!(
-                        "[OmniServer] 音频转录完成: file={}, len={}, audio_ms={:?}",
-                        file_path, transcript.len(), audio_ms
-                    );
-                    // Issue 0046 §1：ASR 结果独占 `asr` 字段（不再回填 markdown_content，
-                    // 保证音视频文件的「正文」结构与语音转录事实物理分离）。
-                    if let serde_json::Value::Object(ref mut map) = ext_res.metadata {
+                if let serde_json::Value::Object(ref mut map) = ext_res.metadata {
+                    if let Some(transcript) = transcript_result {
+                        tracing::info!(
+                            "[OmniServer] 音频转录完成: file={}, len={}, audio_ms={:?}",
+                            file_path, transcript.len(), audio_ms
+                        );
+                        // Issue 0046 §1：ASR 结果独占 `asr` 字段（不再回填 markdown_content，
+                        // 保证音视频文件的「正文」结构与语音转录事实物理分离）。
                         map.insert("asr".to_string(), serde_json::Value::String(transcript));
+                    } else {
+                        tracing::info!("[OmniServer] 音频转录无语音内容或模型未就绪: file={}", file_path);
                     }
-                } else {
-                    tracing::info!("[OmniServer] 音频转录无结果或模型/ffmpeg未就绪: file={}", file_path);
+
+                    if !events_result.is_empty() {
+                        tracing::info!(
+                            "[OmniServer] 声学事件打标完成: file={}, events={:?}",
+                            file_path, events_result
+                        );
+                        let events_json: Vec<serde_json::Value> = events_result
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect();
+                        map.insert("audio_events".to_string(), serde_json::Value::Array(events_json));
+                    }
                 }
             }
 
@@ -2773,7 +2793,7 @@ async fn search_cluster_handler(
     }
 }
 
-/// 单指标音频转录处理: POST /api/audio/transcribe
+/// 单指标音频转录处理: POST /api/audio/transcribe (SherpaManager 纯内存进程内推理)
 async fn audio_transcribe_handler(
     State(state): State<AppState>,
     Json(req): Json<AudioTranscribeRequest>,
@@ -2783,26 +2803,24 @@ async fn audio_transcribe_handler(
     let file_path = req.file_path.clone();
     // 优先使用请求中的截取时长，否则使用配置默认值
     let duration_seconds = req.duration_seconds.unwrap_or(cfg.audio_analysis_duration);
-    let language = req.language.clone();
 
-    let mut transcript = None;
-    let mut events = Vec::new();
-
-    // Step 1: 优先通过 SenseVoice 转录（截取降噪 → ASR）
     let file_path_c = file_path.clone();
-    let lang_c = language.clone();
-    let sense_result = tokio::task::spawn_blocking(move || {
-        let wav_path = convert_audio_standard(&file_path_c, duration_seconds)?;
-        transcribe_with_sense_asr(&wav_path, lang_c.as_deref())
+    let sherpa_engine = state.sherpa.clone();
+
+    // Step 1: 优先通过 SherpaManager 进程内转录 (纯内存解码 -> GTCRN 降噪 -> VAD -> SenseVoice ASR + CED-mini 打标)
+    let (mut transcript, mut events) = tokio::task::spawn_blocking(move || {
+        let path = std::path::Path::new(&file_path_c);
+        if let Some(samples) = decode_audio_to_16k_mono(path, Some(duration_seconds)) {
+            sherpa_engine.process_audio_pipeline(&samples, 16000)
+        } else {
+            (None, Vec::new())
+        }
     })
     .await
-    .ok()
-    .flatten();
+    .unwrap_or((None, Vec::new()));
 
-    if let Some(text) = sense_result {
-        transcript = Some(text);
-    } else {
-        // Step 2: 降级：从 OmniExtractor 元数据中取 asr（若已有提取结果）
+    // Step 2: 降级：从 OmniExtractor 元数据中取 asr（若已有提取结果）
+    if transcript.is_none() {
         if let Ok(res) = OmniExtractor::extract(&file_path, &cfg).await {
             if let Some(t) = res.metadata.get("asr").and_then(|v| v.as_str()) {
                 transcript = Some(t.to_string());
@@ -2812,8 +2830,10 @@ async fn audio_transcribe_handler(
                 transcript = Some(res.markdown_content);
             }
 
-            if let Some(ev) = res.metadata.get("audio_events").and_then(|v| v.as_array()) {
-                events = ev.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+            if events.is_empty() {
+                if let Some(ev) = res.metadata.get("audio_events").and_then(|v| v.as_array()) {
+                    events = ev.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+                }
             }
         }
     }
@@ -2828,231 +2848,8 @@ async fn audio_transcribe_handler(
     })
 }
 
-/// 将音频/视频截取指定时长并降噪重采样为标准格式 (16kHz Mono PCM WAV)
-/// 结果缓存于系统临时目录 firefly-ai-audio-cache/<md5(path+duration)>.wav
-/// 成功时返回缓存文件路径；失败时返回 None
-fn convert_audio_standard(file_path: &str, duration_seconds: u32) -> Option<PathBuf> {
-    // 复用 omni-cover video.rs 的 resolve_ffmpeg 定位思路（直接内联实现以解耦）
-    let ffmpeg_exe = if cfg!(target_os = "windows") { "ffmpeg.exe" } else { "ffmpeg" };
-    let ffmpeg = {
-        let search_roots = [
-            std::env::current_dir().unwrap_or_default(),
-            std::env::current_exe()
-                .map(|p| p.parent().unwrap_or(p.as_path()).to_path_buf())
-                .unwrap_or_default(),
-        ];
-        let mut found: Option<PathBuf> = None;
-        'outer: for root in &search_roots {
-            let mut cur = root.clone();
-            for _ in 0..8 {
-                let candidates = [
-                    cur.join(format!("apps/desktop/build/extraResources/bin/ffmpeg/{}", ffmpeg_exe)),
-                    cur.join(format!("resources/bin/ffmpeg/{}", ffmpeg_exe)),
-                    cur.join(format!("resources/bin/{}", ffmpeg_exe)),
-                    cur.join(format!("Contents/Resources/bin/ffmpeg/{}", ffmpeg_exe)),
-                ];
-                for c in &candidates {
-                    if c.exists() {
-                        found = Some(c.clone());
-                        break 'outer;
-                    }
-                }
-                if let Some(parent) = cur.parent() {
-                    cur = parent.to_path_buf();
-                } else {
-                    break;
-                }
-            }
-        }
-        // 兜底：系统 PATH
-        found.or_else(|| {
-            std::process::Command::new("where")
-                .arg(ffmpeg_exe)
-                .output()
-                .ok()
-                .and_then(|out| {
-                    String::from_utf8(out.stdout).ok()
-                        .and_then(|s| s.lines().next().map(|l| PathBuf::from(l.trim())))
-                })
-        })?
-    };
-
-    // 以 md5(file_path + duration) 为缓存键
-    let cache_key = {
-        let raw = format!("{}:{}", file_path, duration_seconds);
-        let digest = md5_hex(raw.as_bytes());
-        digest
-    };
-    let cache_dir = std::env::temp_dir().join("firefly-ai-audio-cache");
-    let _ = std::fs::create_dir_all(&cache_dir);
-    let cache_path = cache_dir.join(format!("{}.wav", cache_key));
-
-    if cache_path.exists() {
-        tracing::info!("[OmniServer] 音频转换缓存命中: {:?}", cache_path);
-        return Some(cache_path);
-    }
-
-    tracing::info!(
-        "[OmniServer] 开始音频截取降噪: file={}, duration={}s, output={:?}",
-        file_path, duration_seconds, cache_path
-    );
-
-    // ffmpeg -y -i <input> -t <duration> -af highpass=f=80,lowpass=f=7800,afftdn=nf=-25dB -ar 16000 -ac 1 -c:a pcm_s16le <output>
-    let status = std::process::Command::new(&ffmpeg)
-        .args([
-            "-y",
-            "-i", file_path,
-            "-t", &duration_seconds.to_string(),
-            "-af", "highpass=f=80,lowpass=f=7800,afftdn=nf=-25dB",
-            "-ar", "16000",
-            "-ac", "1",
-            "-c:a", "pcm_s16le",
-            cache_path.to_str().unwrap_or(""),
-        ])
-        .status();
-
-    match status {
-        Ok(s) if s.success() && cache_path.exists() => {
-            tracing::info!("[OmniServer] 音频截取降噪完成: {:?}", cache_path);
-            Some(cache_path)
-        }
-        Ok(s) => {
-            tracing::warn!("[OmniServer] ffmpeg 音频转换失败: exit={}", s);
-            None
-        }
-        Err(e) => {
-            tracing::warn!("[OmniServer] ffmpeg 启动失败: {}", e);
-            None
-        }
-    }
-}
-
-/// 简单 MD5 十六进制字符串（内联实现，不引入额外依赖）
-fn md5_hex(data: &[u8]) -> String {
-    // 使用 std 库无 md5 依赖的简易 hash（Rust 标准库没有 md5，用 FNV-1a 64-bit 代替）
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x00000100000001b3);
-    }
-    format!("{:016x}", h)
-}
-
-/// 使用 audio.cpp (sense_asr) 对 WAV 文件进行语音转录，返回转录文本
-fn transcribe_with_sense_asr(wav_path: &PathBuf, language: Option<&str>) -> Option<String> {
-    let audio_exe_name = if cfg!(target_os = "windows") { "audio.exe" } else { "audio" };
-    let model_gguf_name = "sensevoice-small-q4_k.gguf";
-
-    // 定位 audio.exe
-    let audio_exe = {
-        let search_roots = [
-            std::env::current_dir().unwrap_or_default(),
-            std::env::current_exe()
-                .map(|p| p.parent().unwrap_or(p.as_path()).to_path_buf())
-                .unwrap_or_default(),
-        ];
-        let mut found: Option<PathBuf> = None;
-        'outer: for root in &search_roots {
-            let mut cur = root.clone();
-            for _ in 0..8 {
-                let candidates = [
-                    cur.join(format!("apps/desktop/build/extraResources/bin/audio-cpp/{}", audio_exe_name)),
-                    cur.join(format!("resources/bin/audio-cpp/{}", audio_exe_name)),
-                    cur.join(format!("resources/bin/{}", audio_exe_name)),
-                ];
-                for c in &candidates {
-                    if c.exists() {
-                        found = Some(c.clone());
-                        break 'outer;
-                    }
-                }
-                if let Some(parent) = cur.parent() {
-                    cur = parent.to_path_buf();
-                } else {
-                    break;
-                }
-            }
-        }
-        found?
-    };
-
-    // 定位 sensevoice-small-q4_k.gguf
-    let model_path = {
-        let search_roots = [
-            std::env::current_dir().unwrap_or_default(),
-            std::env::current_exe()
-                .map(|p| p.parent().unwrap_or(p.as_path()).to_path_buf())
-                .unwrap_or_default(),
-        ];
-        let mut found: Option<PathBuf> = None;
-        'outer: for root in &search_roots {
-            let mut cur = root.clone();
-            for _ in 0..8 {
-                let candidates = [
-                    cur.join(format!("apps/desktop/build/extraResources/models/sensevoice/{}", model_gguf_name)),
-                    cur.join(format!("resources/models/sensevoice/{}", model_gguf_name)),
-                    cur.join(format!("resources/sensevoice/{}", model_gguf_name)),
-                ];
-                for c in &candidates {
-                    if c.exists() {
-                        found = Some(c.clone());
-                        break 'outer;
-                    }
-                }
-                if let Some(parent) = cur.parent() {
-                    cur = parent.to_path_buf();
-                } else {
-                    break;
-                }
-            }
-        }
-        found?
-    };
-
-    tracing::info!(
-        "[OmniServer] 开始 SenseVoice 语音转录: wav={:?}, model={:?}",
-        wav_path, model_path
-    );
-
-    // 调用 audio.cpp CLI: audio --task asr --family sense_asr --model <gguf> --audio <wav>
-    let mut cmd = std::process::Command::new(&audio_exe);
-    cmd.args([
-        "--task", "asr",
-        "--family", "sense_asr",
-        "--model", model_path.to_str().unwrap_or(""),
-        "--audio", wav_path.to_str().unwrap_or(""),
-    ]);
-    if let Some(lang) = language {
-        // 取前2位作为语言代码
-        let lang_code = &lang[..lang.len().min(2)];
-        cmd.args(["--language", lang_code]);
-    }
-
-    let output = cmd.output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if !output.status.success() {
-        tracing::warn!("[OmniServer] SenseVoice 转录失败: stderr={}", stderr.trim());
-        return None;
-    }
-
-    let text = stdout.trim().to_string();
-    if text.is_empty() {
-        tracing::info!("[OmniServer] SenseVoice 转录结果为空");
-        None
-    } else {
-        tracing::info!(
-            "[OmniServer] SenseVoice 转录成功: len={}, preview={}...",
-            text.len(),
-            &text[..text.len().min(100)]
-        );
-        Some(text)
-    }
-}
-
 /// 音频标准化转换接口: POST /api/audio/convert
-/// 截取指定时长、降噪、重采样至 16kHz Mono PCM WAV（适配 SenseVoice 等端侧模型）
+/// 纯内存解码至 16kHz Mono，经由 GTCRN 深度学习降噪后写出标准 PCM WAV
 async fn audio_convert_handler(
     State(state): State<AppState>,
     Json(req): Json<AudioConvertRequest>,
@@ -3063,8 +2860,28 @@ async fn audio_convert_handler(
     let duration_seconds = req.duration_seconds.unwrap_or(cfg.audio_analysis_duration);
 
     let file_path_c = file_path.clone();
+    let sherpa = state.sherpa.clone();
     let output_path = tokio::task::spawn_blocking(move || {
-        convert_audio_standard(&file_path_c, duration_seconds)
+        let p = std::path::Path::new(&file_path_c);
+        let samples = decode_audio_to_16k_mono(p, Some(duration_seconds))?;
+        let denoised_samples = sherpa.denoise(&samples, 16000);
+
+        // 写入临时缓存目录
+        let cache_key = {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for &b in format!("{}:{}", file_path_c, duration_seconds).as_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x00000100000001b3);
+            }
+            format!("{:016x}", h)
+        };
+        let cache_dir = std::env::temp_dir().join("firefly-ai-audio-cache");
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let cache_path = cache_dir.join(format!("{}.wav", cache_key));
+
+        // 写入标准 16-bit PCM WAV (16000Hz 单声道)
+        write_wav_s16le(&cache_path, &denoised_samples, 16000).ok()?;
+        Some(cache_path)
     }).await.ok().flatten();
 
     let duration_ms = t_start.elapsed().as_millis() as u64;
@@ -3080,6 +2897,47 @@ async fn audio_convert_handler(
         duration_seconds,
         duration_ms,
     })
+}
+
+/// 将 f32 样本转为 16-bit PCM WAV 写入指定路径
+fn write_wav_s16le(path: &std::path::Path, samples: &[f32], sample_rate: u32) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    let num_channels: u16 = 1;
+    let bits_per_sample: u16 = 16;
+    let byte_rate = sample_rate * (num_channels as u32) * (bits_per_sample as u32 / 8);
+    let block_align = num_channels * (bits_per_sample / 8);
+    let data_len = (samples.len() * 2) as u32;
+    let riff_chunk_size = 36 + data_len;
+
+    // RIFF header
+    file.write_all(b"RIFF")?;
+    file.write_all(&riff_chunk_size.to_le_bytes())?;
+    file.write_all(b"WAVE")?;
+
+    // fmt subchunk
+    file.write_all(b"fmt ")?;
+    file.write_all(&16u32.to_le_bytes())?; // Subchunk1Size (16 for PCM)
+    file.write_all(&1u16.to_le_bytes())?;  // AudioFormat (1 for PCM)
+    file.write_all(&num_channels.to_le_bytes())?;
+    file.write_all(&sample_rate.to_le_bytes())?;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&block_align.to_le_bytes())?;
+    file.write_all(&bits_per_sample.to_le_bytes())?;
+
+    // data subchunk
+    file.write_all(b"data")?;
+    file.write_all(&data_len.to_le_bytes())?;
+
+    for &s in samples {
+        // Clamp and convert to i16
+        let clamped = s.max(-1.0).min(1.0);
+        let val = (clamped * 32767.0) as i16;
+        file.write_all(&val.to_le_bytes())?;
+    }
+
+    file.flush()?;
+    Ok(())
 }
 
 /// 单指标视觉标签处理: POST /api/vision/tags
