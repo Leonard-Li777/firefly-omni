@@ -358,6 +358,17 @@ pub mod vision {
             Vec::new()
         }
 
+        pub fn extract_gemma_visual_tags_scored_from_image(
+            _img: &image::DynamicImage,
+            _top_k: usize,
+        ) -> Vec<(String, f32)> {
+            Vec::new()
+        }
+
+        pub fn gemma_vision_status() -> String {
+            "uninitialized".to_string()
+        }
+
         pub fn extract_clip_visual_tags_from_image_with_hint(
             _img: &image::DynamicImage,
             _path_hint: Option<&str>,
@@ -1196,12 +1207,11 @@ pub mod vector_engine {
     use serde::{Deserialize, Serialize};
     use std::path::Path;
 
-    /// 向量维度契约：适配 384 维 bekko-a8m 与 2048 维腾讯 WeMM-Embedding 2B 多模态模型 (ADR-0054)
+    /// 向量维度契约：适配 384 维 bekko-a8m 与 512 维 EmbeddingGemma 模型
     pub const VECTOR_DIM_384: usize = 384;
     pub const VECTOR_DIM_DENSE: usize = VECTOR_DIM_384;
-    pub const VECTOR_DIM_2048: usize = 2048;
-    pub const VECTOR_DIM_WEMM: usize = VECTOR_DIM_2048;
-    pub const VECTOR_DIM: usize = VECTOR_DIM_2048;
+    pub const VECTOR_DIM_512: usize = 512;
+    pub const VECTOR_DIM: usize = VECTOR_DIM_512;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -1567,7 +1577,7 @@ pub mod omw_query {
 pub use semantic_loader::SemanticPackLoader;
 pub use vector_engine::{
     VectorDeleteRequest, VectorEngine, VectorMatch, VectorMatchResult, VectorSearchRequest,
-    VectorUpsertItem, VectorUpsertRequest, VECTOR_DIM, VECTOR_DIM_2048, VECTOR_DIM_384,
+    VectorUpsertItem, VectorUpsertRequest, VECTOR_DIM, VECTOR_DIM_512, VECTOR_DIM_384,
 };
 pub use omw_db::OmwDb;
 pub use omw_query::{

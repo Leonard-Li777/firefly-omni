@@ -781,7 +781,7 @@ where
             continue;
         }
         let should_insert = match lang_map.get(&norm_lemma) {
-            Some(existing) => prefer_incoming(existing, code_ref),
+            Some(existing) => is_canonical && prefer_incoming(existing, code_ref),
             None => true,
         };
 
@@ -797,7 +797,7 @@ where
             // 维持 omw.* 优先，其余后写覆盖，与分表规则一致）
             match global_guard.get(&norm_lemma) {
                 Some(&existing) if existing == leaked_code => {}
-                Some(&existing) if !prefer_incoming(existing, leaked_code) => {}
+                Some(&existing) if !is_canonical || !prefer_incoming(existing, leaked_code) => {}
                 _ => {
                     global_guard.insert(norm_lemma.clone(), leaked_code);
                 }

@@ -30,8 +30,8 @@ use std::sync::{Arc, Mutex};
 use tracing::info;
 
 pub use omni_pro::{
-    OmwDb, SemanticPackLoader, VectorEngine, VectorMatch, VECTOR_DIM, VECTOR_DIM_2048,
-    VECTOR_DIM_384, VECTOR_DIM_DENSE, VECTOR_DIM_WEMM,
+    OmwDb, SemanticPackLoader, VectorEngine, VectorMatch, VECTOR_DIM, VECTOR_DIM_512,
+    VECTOR_DIM_384, VECTOR_DIM_DENSE,
 };
 use omni_pro::omw_query;
 use omni_pro::{
@@ -60,7 +60,7 @@ pub struct AppState {
     pub search: Arc<omni_pro::search::OmniSearchService>,
     /// OMW 多语言标签词库只读连接池（未传入 --db-path 时为软不可用实例）
     pub omw: OmwDb,
-    /// 阿里巴巴 zvec 嵌入式双槽位向量引擎 (RaBitQ + INT8 量化，适配 384d bekko-a8m 与 2048d WeMM-Embedding 2B，闭源优先 🔒)
+    /// 阿里巴巴 zvec 嵌入式双槽位向量引擎 (RaBitQ + INT8 量化，适配 384d bekko-a8m 与 512d EmbeddingGemma，闭源优先 🔒)
     pub vector: Arc<VectorEngine>,
     /// 桌面端 SQLite 业务主库路径（只读访问 file_tag_relations 等主库表）
     pub master_db_path: Arc<Mutex<Option<PathBuf>>>,
@@ -106,11 +106,9 @@ pub struct GeoReverseRequest {
 pub fn create_app_router(state: AppState) -> Router {
     // 1. 基础开源接口 (Open-Core Endpoints)
     let mut router = Router::new()
-        .route(
-            "/health",
-            get(health_handler),
-        )
+        .route("/health", get(health_handler))
         .route("/api/version", get(version_handler))
+        .route("/api/v1/engine/status", get(engine_status_handler))
         .route("/api/config", get(get_config).post(update_config).put(update_config))
         .route("/api/extract", post(extract_file_handler))
         .route("/api/extract/upload", post(extract_multipart_handler));
@@ -182,6 +180,24 @@ async fn version_handler() -> Json<serde_json::Value> {
         "server": "firefly-omni",
         "version": env!("CARGO_PKG_VERSION"),
         "isPro": is_pro
+    }))
+}
+
+/// 引擎与多模态塔运行时状态查询: GET /api/v1/engine/status
+async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let profile = state.config.lock().unwrap().embedding_profile.clone();
+    let is_pro = omni_pro::is_pro_enabled();
+    let vision_status = if is_pro {
+        omni_pro::OmniVisionEngine::gemma_vision_status()
+    } else {
+        "uninitialized".to_string()
+    };
+    Json(serde_json::json!({
+        "status": "ok",
+        "profile": profile,
+        "visionStatus": vision_status,
+        "isPro": is_pro,
+        "version": env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -652,8 +668,12 @@ pub async fn start_server(
     addr: SocketAddr,
     db_path: Option<PathBuf>,
     pack_path: Option<PathBuf>,
+    embedding_profile: Option<String>,
 ) -> anyhow::Result<()> {
-    let initial_config = load_config_from_disk();
+    let mut initial_config = load_config_from_disk();
+    if let Some(profile) = embedding_profile {
+        initial_config.embedding_profile = profile;
+    }
     // 地理数据集发现链：环境变量 → exe 相对目录 → cwd 候选；落空或开源存根时软不可用
     let geo = match omni_pro::geo::discover_dataset_path() {
         Some(path) => {
@@ -721,7 +741,7 @@ pub async fn start_server(
             .unwrap_or_else(|err| tracing::warn!("classifier map refresh join failed: {err}"));
     }
 
-    // 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 WeMM-Embedding 2B 2048 维)
+    // 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 384d bekko-a8m 与 512d EmbeddingGemma)
     let vector = Arc::new(VectorEngine::open_default().unwrap_or_else(|err| {
         tracing::warn!("Failed to open default vector engine ({err}), falling back to memory");
         VectorEngine::in_memory()
@@ -1239,6 +1259,7 @@ async fn perceive_file_handler(
     // 2. 根据 MIME 类型与扩展名判定大类分支
     let is_image = mime_type.starts_with("image/") || matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff");
     let is_video = mime_type.starts_with("video/") || matches!(ext.as_str(), "mp4" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "webm");
+    let is_audio = mime_type.starts_with("audio/") || matches!(ext.as_str(), "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "opus" | "ape" | "aiff");
 
     // 并行任务: NTFS ADS 溯源
     let f_ads = {
@@ -1825,7 +1846,24 @@ async fn perceive_file_handler(
         .cloned()
         .collect();
     let sem_graph = if is_pro { state.omw.semantic_graph() } else { None };
-    let current_file_group = if is_image { Some("image") } else { None };
+    let current_file_group = if is_video {
+        Some("video")
+    } else if is_image {
+        let is_manga = photo_type.as_deref().map_or(false, |p| {
+            p == Concept::漫画.zh_name() || p == Concept::漫画.code() || p == "omw.06780678.n"
+        }) || detected_visual_tags.iter().any(|t| {
+            t == Concept::漫画.code() || t == "omw.06780678.n" || t == Concept::漫画.zh_name()
+        });
+        if is_manga {
+            Some("manga")
+        } else {
+            Some("image")
+        }
+    } else if is_audio {
+        Some("audio")
+    } else {
+        Some("document")
+    };
     let enrich_tag = |tag: &mut omni_core::TagChainItem| {
         if let Some(ref g) = sem_graph {
             g.enrich_tag_chain_item_with_context(tag, current_file_group);
@@ -2279,6 +2317,9 @@ async fn perceive_file_handler(
         };
         omni_extract::OmniFactTagExtractor::extract(&ctx)
     };
+    for item in &mut fact_tags {
+        enrich_tag(item);
+    }
 
     // 核心安全合规契约：无论什么类型的文件（图片/视频/音频/文本/文档），
     // 若通过 nsfw_tags 或 nsfw_text_tags 专职判定为非 NSFW 的内容 (is_all_ages_content)，全面过滤所有通道的敏感标签！
@@ -3051,12 +3092,25 @@ async fn vision_tags_handler(
     let file_path = req.file_path.clone();
 
     let mut tags = Vec::new();
+    let mut scored_tags: Option<Vec<(String, f32)>> = None;
     if omni_pro::is_pro_enabled() {
-        tags = omni_pro::OmniVisionEngine::extract_clip_visual_tags(
-            &file_path,
-            req.language.as_deref(),
-            req.top_k.unwrap_or(5),
-        );
+        if cfg.embedding_profile == "gemma_unified" {
+            if let Ok(img) = image::open(&file_path) {
+                let scored = omni_pro::OmniVisionEngine::extract_gemma_visual_tags_scored_from_image(
+                    &img,
+                    req.top_k.unwrap_or(5),
+                );
+                tags = scored.iter().map(|(c, _)| c.clone()).collect();
+                scored_tags = Some(scored);
+            }
+        }
+        if tags.is_empty() {
+            tags = omni_pro::OmniVisionEngine::extract_clip_visual_tags(
+                &file_path,
+                req.language.as_deref(),
+                req.top_k.unwrap_or(5),
+            );
+        }
     }
 
     if tags.is_empty() {
@@ -3071,12 +3125,18 @@ async fn vision_tags_handler(
         if tags.len() > top_k {
             tags.truncate(top_k);
         }
+        if let Some(ref mut st) = scored_tags {
+            if st.len() > top_k {
+                st.truncate(top_k);
+            }
+        }
     }
 
     let duration_ms = t_start.elapsed().as_millis() as u64;
     Json(VisionTagsResponse {
         file_path,
         tags,
+        scored_tags,
         duration_ms,
     })
 }

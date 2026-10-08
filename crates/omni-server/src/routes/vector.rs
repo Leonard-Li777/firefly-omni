@@ -1,7 +1,7 @@
 //! vector.rs — 嵌入式向量引擎 HTTP 交互端点 (zvec / RaBitQ / INT8)
 //!
 //! 依据 ADR-0038 / ADR-0046 / ADR-0054 与 docs/specs/database-evolution-three-phases-spec.md 架构决议：
-//! - POST /api/v1/vector/upsert: 写入/更新特征向量 (自动按长度路由 384d bekko-a8m 或 2048d WeMM-Embedding 2B)；
+//! - POST /api/v1/vector/upsert: 写入/更新特征向量 (自动按长度路由 384d bekko-a8m 或 512d EmbeddingGemma)；
 //! - POST /api/v1/vector/search: < 1ms Top-K ANN 检索 (RaBitQ 初筛 + INT8 重排，自动按查询向量维度路由)；
 //! - POST /api/v1/vector/get: 批量按指纹与维度读取反量化浮点向量；
 //! - DELETE /api/v1/vector/delete: 批量删除特征向量 (同步清理双槽位)。
@@ -48,7 +48,7 @@ pub struct VectorUpsertResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VectorSearchRequest {
-    /// 384 维 (bekko-a8m) 或 2048 维 (WeMM-Embedding 2B) 浮点查询特征向量
+    /// 384 维 (bekko-a8m) 或 512 维 (EmbeddingGemma) 浮点查询特征向量
     pub vector: Vec<f32>,
     /// 最大召回数 (默认 10)
     #[serde(default = "default_top_k", alias = "top_k")]
@@ -145,13 +145,13 @@ pub async fn vector_get_handler(
     State(state): State<AppState>,
     Json(req): Json<VectorGetRequest>,
 ) -> Result<Json<VectorGetResponse>, (StatusCode, Json<VectorGetResponse>)> {
-    if req.dim != 384 && req.dim != 2048 {
+    if req.dim != 384 && req.dim != 512 {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(VectorGetResponse {
                 vectors: Vec::new(),
                 count: 0,
-                error: Some(format!("不支持的向量维度: {} (仅支持 384 或 2048)", req.dim)),
+                error: Some(format!("不支持的向量维度: {} (仅支持 384 或 512)", req.dim)),
             }),
         ));
     }

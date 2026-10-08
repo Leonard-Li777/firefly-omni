@@ -70,6 +70,9 @@ pub struct OmniConfig {
     /// 当前用户界面语言（BCP-47，如 zh-CN），由桌面端 /api/config 同步
     #[serde(default)]
     pub language: Option<String>,
+    /// 激活的嵌入画像档位 ('classic_light' | 'gemma_unified'，缺省 'classic_light')
+    #[serde(default = "default_embedding_profile")]
+    pub embedding_profile: String,
 }
 
 fn default_audio_analysis_duration() -> u32 {
@@ -78,6 +81,10 @@ fn default_audio_analysis_duration() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_embedding_profile() -> String {
+    "classic_light".to_string()
 }
 
 impl Default for OmniConfig {
@@ -95,6 +102,7 @@ impl Default for OmniConfig {
             excluded_items: Vec::new(),
             enable_text_analysis: true,
             language: None,
+            embedding_profile: "classic_light".to_string(),
         }
     }
 }
@@ -222,6 +230,37 @@ macro_rules! timed_spawn {
     };
 }
 
+/// 强类型媒体领域枚举 (多父通用拓扑仲裁，Task 1 / ADR-0030)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaDomain {
+    Video,
+    Audio,
+    Ebook,
+    Manga,
+    Image,
+    Archive,
+    Code,
+    Document,
+    General,
+}
+
+impl MediaDomain {
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "video" | "影视" | "视频" => Self::Video,
+            "audio" | "音频" | "音乐" => Self::Audio,
+            "ebook" | "e_book" | "book" | "电子书" | "小说" => Self::Ebook,
+            "manga" | "comic" | "漫画" => Self::Manga,
+            "image" | "picture" | "photo" | "图片" | "图像" => Self::Image,
+            "archive" | "zip" | "压缩包" => Self::Archive,
+            "code" | "source_code" | "源代码" | "代码" => Self::Code,
+            "document" | "doc" | "文档" => Self::Document,
+            _ => Self::General,
+        }
+    }
+}
+
 /// 统一多模态标签链项 (融合语义数据库 file_tags 全字段属性)
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TagChainItem {
@@ -242,13 +281,8 @@ pub struct TagChainItem {
     /// 完整物化展示名路径 (如 "/文件类型/图片/主体类型/鸭子")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_path: Option<String>,
-    /// 完整父级标签名链 (如 "/主体类型/动物宠物/鸭子")
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_name_chain: Option<String>,
-    /// 完整父级标签Code链 (如 "/builtin.subject_type/builtin.animal/omw.01846331.n")
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_code_chain: Option<String>,
-    // 创世字段治理：pack 来源列已收敛为 source（dimension/tag/hownet/omw），废除 category
+    // 创世字段治理：parent_name_chain / parent_code_chain 已彻底废除，由 name_path / code_path 取代；
+    // pack 来源列已收敛为 source（dimension/tag/hownet/omw），废除 category
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -545,19 +579,26 @@ pub struct AudioConvertResponse {
 
 /// 单指标视觉标签请求: POST /api/vision/tags
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VisionTagsRequest {
+    #[serde(alias = "file_path")]
     pub file_path: String,
     #[serde(default)]
     pub language: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "top_k")]
     pub top_k: Option<usize>,
 }
 
 /// 单指标视觉标签响应
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct VisionTagsResponse {
+    #[serde(alias = "file_path")]
     pub file_path: String,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scored_tags: Option<Vec<(String, f32)>>,
+    #[serde(alias = "duration_ms")]
     pub duration_ms: u64,
 }
 
@@ -767,10 +808,10 @@ pub const ROOT_DIMENSION_CONCEPTS: &[concepts::Concept] = &[
     concepts::Concept::内容标签,
 ];
 
-/// 判定指定 code 是否为 6 大受控根维度 (内置 builtin.author 别名收敛)
+/// 判定指定 code 是否为 6 大受控根维度 (内置 builtin.author / builtin.fileType 别名收敛)
 #[inline]
 pub fn is_root_dimension(code: &str) -> bool {
-    code == "builtin.author" || ROOT_DIMENSION_CONCEPTS.iter().any(|item| item.code() == code)
+    code == "builtin.author" || code == "builtin.fileType" || ROOT_DIMENSION_CONCEPTS.iter().any(|item| item.code() == code)
 }
 
 

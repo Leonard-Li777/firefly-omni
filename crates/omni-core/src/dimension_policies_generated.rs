@@ -1909,16 +1909,7 @@ pub fn find_tag_dimension_code(
             return Some(p.clone());
         }
     }
-    // 3. 检查 parent_code_chain (如 "/builtin.file_type/builtin.image/builtin.subject_type")
-    if let Some(ref chain) = tag.parent_code_chain {
-        for part in chain.rsplit('/') {
-            let trimmed = part.trim();
-            if !trimmed.is_empty() && (policies.contains_key(trimmed) || get_dimension_policy(trimmed).is_some()) {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    // 4. 检查 code_path
+    // 3. 检查 code_path (parent_code_chain 已废除，由 code_path 取代)
     if let Some(ref path) = tag.code_path {
         for part in path.rsplit('/') {
             let trimmed = part.trim();
@@ -1927,7 +1918,7 @@ pub fn find_tag_dimension_code(
             }
         }
     }
-    // 5. 检查自身 code 是否为维度
+    // 4. 检查自身 code 是否为维度
     if policies.contains_key(&tag.code) || get_dimension_policy(&tag.code).is_some() {
         return Some(tag.code.clone());
     }
