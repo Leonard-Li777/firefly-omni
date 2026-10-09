@@ -1001,13 +1001,6 @@ pub mod text {
         }
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    pub struct MaterializedPathItem {
-        pub code_path: String,
-        pub name_path: String,
-        pub depth: u32,
-    }
-
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ResolveParentOutcome {
         pub success: bool,
@@ -1015,7 +1008,6 @@ pub mod text {
         pub parent_name: String,
         pub confidence: f32,
         pub suggested_depth: u32,
-        pub materialized_paths: Vec<MaterializedPathItem>,
     }
 
     #[derive(Clone, Default)]
@@ -1038,11 +1030,6 @@ pub mod text {
                 parent_name: "主题内容".to_string(),
                 confidence: 0.50,
                 suggested_depth: 2,
-                materialized_paths: vec![MaterializedPathItem {
-                    code_path: "/topic/builtin.zhu_ti_nei_rong.13364ec8".to_string(),
-                    name_path: "/通用/主题内容".to_string(),
-                    depth: 2,
-                }],
             }
         }
     }

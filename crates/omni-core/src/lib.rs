@@ -286,8 +286,6 @@ pub struct TagChainItem {
     /// 本次标注实际经由的消歧父级 code（概念 B 消歧锚；真根为 None 或空串，与概念 A parent_codes 标签树多父数组正交，ADR-0047）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via_parent_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub materialized_paths: Option<String>,
     /// 完整物化代码路径 (如 "/builtin.file_type/builtin.image/builtin.subject_type/omw.01846331.n")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_path: Option<String>,

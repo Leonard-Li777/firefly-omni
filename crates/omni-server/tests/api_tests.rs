@@ -1332,11 +1332,6 @@ async fn test_taxonomy_resolve_parent_technical_term() {
     assert_eq!(json["parent_name"], "人工智能");
     assert!(json["confidence"].as_f64().unwrap() >= 0.65);
     assert!(json["suggested_depth"].as_u64().unwrap() >= 2);
-
-    let paths = json["materialized_paths"].as_array().expect("materialized_paths 数组");
-    assert!(!paths.is_empty(), "物化路径非空");
-    let code_path = paths[0]["code_path"].as_str().unwrap();
-    assert!(code_path.contains("tech.ai"));
 }
 
 #[tokio::test]
