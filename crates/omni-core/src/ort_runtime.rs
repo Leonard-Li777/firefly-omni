@@ -101,6 +101,8 @@ impl OmniOrtRuntime {
             let mut cur = base;
             for _ in 0..6 {
                 let candidates = [
+                    cur.join("onnxruntime.dll"),
+                    cur.join("bin/omni/onnxruntime.dll"),
                     cur.join("resources/bin/onnx/onnxruntime.dll"),
                     cur.join("apps/desktop/build/extraResources/bin/onnx/onnxruntime.dll"),
                     cur.join("build/extraResources/bin/onnx/onnxruntime.dll"),

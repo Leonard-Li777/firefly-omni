@@ -243,13 +243,14 @@ impl SherpaManager {
         config.silero_vad = SileroVadModelConfig {
             model: Some(model_path.to_str()?.to_string()),
             threshold: 0.5,
-            min_silence_duration: 0.25,
+            min_silence_duration: 0.5,
             min_speech_duration: 0.1,
             window_size: 512,
             max_speech_duration: 30.0,
         };
         config.sample_rate = 16000;
         config.num_threads = 1;
+        config.provider = Some("cpu".to_string());
         config.debug = false;
 
         tracing::info!("[SherpaManager] 成功定位 Silero VAD 模型: {:?}", model_path);
@@ -323,6 +324,10 @@ impl SherpaManager {
     /// 【防 Panic 守卫契约】:
     /// 若输入样本有效语音累计总时长 < 0.1s (1600 个样本 @ 16kHz) 或全为静音，
     /// 直接安全返回 (false, Vec::new())，杜绝空张量传入下游 SenseVoice 引发 Panic。
+    ///
+    /// 【流式窗口契约】:
+    /// sherpa-onnx 的 VoiceActivityDetector::accept_waveform 必须按 window_size (512) 分块喂入，
+    /// 并在每次喂入后及时 pop SpeechSegment，严禁一次性塞入整段长音频导致内部缓冲区重置丢帧。
     pub fn vad_filter(&self, samples: &[f32], sample_rate: i32) -> (bool, Vec<f32>) {
         if samples.is_empty() {
             return (false, Vec::new());
@@ -354,25 +359,42 @@ impl SherpaManager {
             }
         };
 
-        vad.accept_waveform(samples);
-        vad.flush();
-
+        let window_size = vad_cfg.silero_vad.window_size.max(512) as usize;
+        // 相邻语音段之间保留 0.2s 自然静音过渡垫片，防止句间停顿被完全剪除后前后字音硬连读失真
+        let pause_padding_len = (sample_rate.max(8000) as usize) / 5;
         let mut voice_samples: Vec<f32> = Vec::new();
-        while !vad.is_empty() {
-            if let Some(segment) = vad.front() {
-                let seg_samples: &[f32] = segment.samples();
-                voice_samples.extend_from_slice(seg_samples);
-                vad.pop();
-            } else {
-                break;
+        let mut speech_only_len: usize = 0;
+
+        let mut drain_segments = |vad_inst: &VoiceActivityDetector| {
+            while !vad_inst.is_empty() {
+                if let Some(segment) = vad_inst.front() {
+                    let seg_samples: &[f32] = segment.samples();
+                    if !seg_samples.is_empty() {
+                        if !voice_samples.is_empty() {
+                            voice_samples.resize(voice_samples.len() + pause_padding_len, 0.0f32);
+                        }
+                        voice_samples.extend_from_slice(seg_samples);
+                        speech_only_len += seg_samples.len();
+                    }
+                    vad_inst.pop();
+                } else {
+                    break;
+                }
             }
+        };
+
+        for chunk in samples.chunks(window_size) {
+            vad.accept_waveform(chunk);
+            drain_segments(&vad);
         }
+        vad.flush();
+        drain_segments(&vad);
 
         let min_samples = (sample_rate as f32 * 0.1) as usize;
-        if voice_samples.len() < min_samples {
+        if speech_only_len < min_samples {
             tracing::debug!(
                 "[SherpaManager] VAD 过滤后有效语音长度不足 0.1s ({} 样本)，安全返回空",
-                voice_samples.len()
+                speech_only_len
             );
             (false, Vec::new())
         } else {
@@ -771,5 +793,44 @@ mod tests {
         // 不存在的文件返回 None
         let not_found = decode_audio_to_16k_mono(&temp_dir.path().join("none.wav"), None);
         assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_diagnose_azure_yunxi_wav() {
+        let wav_path = Path::new(r"F:\workspace\CosyVoice2-Ex\audios\Azure - 云希.wav");
+        if !wav_path.exists() {
+            println!("Skip diagnostic: {:?} does not exist", wav_path);
+            return;
+        }
+        let manager = SherpaManager::new();
+        println!(
+            "Models ready: recognizer={}, vad={}, denoiser={}, tagger={}",
+            manager.recognizer.is_some(),
+            manager.vad_config.is_some(),
+            manager.denoiser.is_some(),
+            manager.tagger.is_some()
+        );
+        assert!(manager.recognizer.is_some(), "SenseVoice recognizer must be loaded");
+        assert!(manager.vad_config.is_some(), "Silero VAD config must be loaded");
+        assert!(manager.denoiser.is_some(), "GTCRN denoiser must be loaded");
+        assert!(manager.tagger.is_some(), "CED-mini tagger must be loaded");
+
+        let samples = decode_audio_to_16k_mono(wav_path, Some(60)).expect("decode_audio_to_16k_mono failed");
+        let (transcript, events) = manager.process_audio_pipeline(&samples, 16000);
+        println!("Pipeline transcript: {:?}", transcript);
+        println!("Pipeline audio_events: {:?}", events);
+
+        let text = transcript.expect("ASR transcript should not be None");
+        assert!(
+            text.chars().count() > 15,
+            "ASR transcript length should be > 15 chars, got: {}",
+            text
+        );
+        assert!(
+            text.contains("没有说什么") && text.contains("发动车子"),
+            "ASR transcript should contain expected Chinese speech content, got: {}",
+            text
+        );
+        assert!(!events.is_empty(), "CED-mini audio events should not be empty");
     }
 }
