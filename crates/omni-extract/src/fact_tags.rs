@@ -96,7 +96,7 @@ impl OmniFactTagExtractor {
                     Self::push_tag(
                         out,
                         "作者",
-                        Self::ext_code("creator", &display),
+                        Self::resolve_or_derive_code(&display),
                         &display,
                         CONF_FACT,
                         Some(key),
@@ -105,27 +105,25 @@ impl OmniFactTagExtractor {
                     );
                 }
             }
-            // Album → 专辑
+            // Album → 专辑 (归入内容标签通用维度，不随文件硬编码特化业务前缀)
             for key in ["Album", "album"] {
                 if let Some(val) = Self::get_str(scope, key) {
                     Self::push_tag(
                         out,
                         "专辑",
-                        Self::ext_code("album", &val),
+                        Self::resolve_or_derive_code(&val),
                         &val,
                         CONF_FACT,
                         Some(key),
                         &val,
-                        Some("builtin.audio_segmentation"),
+                        Some("builtin.content_tags"),
                     );
                 }
             }
             // Genre → 音乐流派 (受控维度优先，未受控时降级为扩展 code)
             for key in ["Genre", "genre"] {
                 if let Some(val) = Self::get_str(scope, key) {
-                    let code = omni_core::tag_identity::resolve_controlled_tag_code(&val)
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| Self::ext_code("music_genre", &val));
+                    let code = Self::resolve_or_derive_code(&val);
                     Self::push_tag(out, "音乐流派", code, &val, CONF_FACT, Some(key), &val, Some("builtin.music_type"));
                 }
             }
@@ -141,7 +139,7 @@ impl OmniFactTagExtractor {
                     Self::push_tag(
                         out,
                         "相机品牌",
-                        Self::ext_code("camera_brand", &val),
+                        Self::resolve_or_derive_code(&val),
                         &val,
                         CONF_FACT,
                         Some(key),
@@ -159,7 +157,7 @@ impl OmniFactTagExtractor {
                     Self::push_tag(
                         out,
                         "器材型号",
-                        Self::ext_code("camera_model", &val),
+                        Self::resolve_or_derive_code(&val),
                         &val,
                         CONF_FACT,
                         Some(key),
@@ -176,9 +174,7 @@ impl OmniFactTagExtractor {
                     if name.is_empty() {
                         continue;
                     }
-                    let code = omni_core::tag_identity::resolve_controlled_tag_code(&name)
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| Self::ext_code("creation_tool", &name));
+                    let code = Self::resolve_or_derive_code(&name);
                     Self::push_tag(out, "创作软件", code, &name, CONF_FACT, Some(key), &val, Some("builtin.content_tags"));
                 }
             }
@@ -197,7 +193,7 @@ impl OmniFactTagExtractor {
                     Self::push_tag(
                         out,
                         "出品机构",
-                        Self::ext_code("organization", &val),
+                        Self::resolve_or_derive_code(&val),
                         &val,
                         CONF_FACT,
                         Some(key),
@@ -219,9 +215,7 @@ impl OmniFactTagExtractor {
         } else {
             "低质量"
         };
-        let code = omni_core::tag_identity::resolve_controlled_tag_code(grade)
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| Self::ext_code("document_quality", grade));
+        let code = Self::resolve_or_derive_code(grade);
         Self::push_tag(
             out,
             "文件质量",
@@ -292,13 +286,8 @@ impl OmniFactTagExtractor {
         if clean_val.is_empty() {
             return;
         }
-        // 优先通过受控词表反查受控 code (omw.* > builtin.*)，未命中时使用 _ext 派生，杜绝拼接 dim.*
-        let code = omni_core::tag_identity::resolve_controlled_tag_code(clean_val)
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| {
-                let parent_slug = parent_dim_code.strip_prefix("builtin.").unwrap_or(parent_dim_code);
-                Self::ext_code(parent_slug, clean_val)
-            });
+        // 优先通过受控词表反查受控 code (omw.* > builtin.*)，未命中时使用标准 _ext 派生，杜绝拼接 dim.* 与业务特化前缀
+        let code = Self::resolve_or_derive_code(clean_val);
         Self::push_tag(
             out,
             dimension_name,
@@ -391,40 +380,13 @@ impl OmniFactTagExtractor {
         s.trim().to_string()
     }
 
-    /// 生成稳定 slug（用于扩展 code 规范化，保证同一实体 code 幂等）
-    ///
-    /// 仅保留 ASCII 字母数字，其余（含 CJK）折叠为下划线；
-    /// 若折叠后为空（如纯中文实体名），回退为确定性 `hash8` 前缀，避免 code 冲突。
-    fn slug(raw: &str) -> String {
-        let lower = raw.trim().to_lowercase();
-        let mut out = String::with_capacity(lower.len());
-        let mut last_us = false;
-        for ch in lower.chars() {
-            if ch.is_ascii_alphanumeric() {
-                out.push(ch);
-                last_us = false;
-            } else if !last_us && !out.is_empty() {
-                out.push('_');
-                last_us = true;
-            }
-        }
-        let trimmed = out.trim_matches('_').to_string();
-        if trimmed.is_empty() {
-            omni_core::tag_identity::content_hash8(raw.trim())
-        } else {
-            trimmed
-        }
-    }
-
-    /// 为开放集实体派生 `_ext.{slug}.{hash8}` 形式的扩展 code（与 Desktop 端约定对齐）
-    fn ext_code(prefix: &str, name: &str) -> String {
+    /// 为实体解析受控 code，未命中时派生标准开放集扩展 code（_ext.{slug}.{hash8} 或 _ext.{hash8}）
+    /// 严禁拼接特化业务前缀（如 _ext.album 等），实体 code 保持独立幂等
+    fn resolve_or_derive_code(name: &str) -> String {
         let clean = name.trim();
-        format!(
-            "_ext.{}.{}.{}",
-            prefix,
-            Self::slug(clean),
-            omni_core::tag_identity::content_hash8(clean)
-        )
+        omni_core::tag_identity::resolve_controlled_tag_code(clean)
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| omni_core::tag_identity::derive_ext_tag_code(clean))
     }
 }
 
@@ -622,5 +584,28 @@ mod tests {
         }
         // 与物理层回退分对齐
         assert!(CONF_FACT >= LAYER_FALLBACK_PHYSICAL);
+    }
+
+    /// 开放集标签必须保持概念独立：不拼接 _ext.creator./_ext.album. 前缀，无双重 hash，专辑父级为 builtin.content_tags
+    #[test]
+    fn test_ext_tag_code_orthogonality_and_no_double_hash() {
+        let metadata = json!({
+            "audio": {
+                "artist": "沐可儿",
+                "album": "21"
+            }
+        });
+        let tags = extract_fact_tags(&metadata);
+        let artist_tag = tags.iter().find(|t| t.name == "沐可儿").expect("应提取作者沐可儿");
+        assert_eq!(artist_tag.code, "_ext.c252094c", "纯中文作者名不得出现双重 hash 或 creator 前缀");
+        assert_eq!(artist_tag.via_parent_code.as_deref(), Some("builtin.author"));
+
+        let album_tag = tags.iter().find(|t| t.name == "21").expect("应提取专辑21");
+        assert_eq!(album_tag.code, "_ext.21.6f4b6612", "非受控专辑名不得拼接 album 前缀");
+        assert_eq!(
+            album_tag.via_parent_code.as_deref(),
+            Some("builtin.content_tags"),
+            "专辑不得误挂在 builtin.audio_segmentation，必须归入 builtin.content_tags"
+        );
     }
 }
