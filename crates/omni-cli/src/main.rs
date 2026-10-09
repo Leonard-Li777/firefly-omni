@@ -34,6 +34,9 @@ enum Commands {
         /// 激活的嵌入画像档位（classic_light 或 gemma_unified，缺省 classic_light）
         #[arg(long)]
         embedding_profile: Option<String>,
+        /// MRL 弹性降维维度（256、512 或 768，缺省 512）
+        #[arg(long)]
+        mrl_dimension: Option<usize>,
     },
     /// 提取指定文件的信息与 Markdown 文本
     Extract {
@@ -53,11 +56,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Serve { addr, db_path, pack_path, embedding_profile }) => {
+        Some(Commands::Serve { addr, db_path, pack_path, embedding_profile, mrl_dimension }) => {
             let socket_addr: SocketAddr = addr.parse()?;
             let db_path = db_path.as_deref().map(std::path::PathBuf::from);
             let pack_path = pack_path.as_deref().map(std::path::PathBuf::from);
-            omni_server::start_server(socket_addr, db_path, pack_path, embedding_profile.clone()).await?;
+            omni_server::start_server(socket_addr, db_path, pack_path, embedding_profile.clone(), *mrl_dimension).await?;
         }
         Some(Commands::Extract { file }) => {
             let config = omni_core::OmniConfig::default();
