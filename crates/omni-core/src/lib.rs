@@ -78,6 +78,9 @@ pub struct OmniConfig {
     /// 激活的嵌入画像档位 ('classic_light' | 'gemma_unified'，缺省 'classic_light')
     #[serde(default = "default_embedding_profile")]
     pub embedding_profile: String,
+    /// MRL 弹性降维维度 (256, 512 或 768，缺省 512)
+    #[serde(default = "default_mrl_dimension")]
+    pub mrl_dimension: usize,
 }
 
 fn default_audio_analysis_duration() -> u32 {
@@ -90,6 +93,10 @@ fn default_true() -> bool {
 
 fn default_embedding_profile() -> String {
     "classic_light".to_string()
+}
+
+fn default_mrl_dimension() -> usize {
+    512
 }
 
 impl Default for OmniConfig {
@@ -108,6 +115,7 @@ impl Default for OmniConfig {
             enable_text_analysis: true,
             language: None,
             embedding_profile: "classic_light".to_string(),
+            mrl_dimension: 512,
         }
     }
 }

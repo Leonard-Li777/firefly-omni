@@ -190,7 +190,9 @@ async fn version_handler() -> Json<serde_json::Value> {
 
 /// 引擎与多模态塔运行时状态查询: GET /api/v1/engine/status
 async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let profile = state.config.lock().unwrap().embedding_profile.clone();
+    let cfg = state.config.lock().unwrap().clone();
+    let profile = cfg.embedding_profile;
+    let mrl_dim = cfg.mrl_dimension;
     let is_pro = omni_pro::is_pro_enabled();
     let vision_status = if is_pro {
         omni_pro::OmniVisionEngine::gemma_vision_status()
@@ -200,11 +202,13 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
     Json(serde_json::json!({
         "status": "ok",
         "profile": profile,
+        "mrlDimension": mrl_dim,
         "visionStatus": vision_status,
         "isPro": is_pro,
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }
+
 
 /// 健康检查：附 Pro 模块与地理/HowNet 子系统可用性，供前端 UI 与桌面端启动时探测
 async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -674,10 +678,14 @@ pub async fn start_server(
     db_path: Option<PathBuf>,
     pack_path: Option<PathBuf>,
     embedding_profile: Option<String>,
+    mrl_dimension: Option<usize>,
 ) -> anyhow::Result<()> {
     let mut initial_config = load_config_from_disk();
     if let Some(profile) = embedding_profile {
         initial_config.embedding_profile = profile;
+    }
+    if let Some(mrl) = mrl_dimension {
+        initial_config.mrl_dimension = mrl;
     }
     // 地理数据集发现链：环境变量 → exe 相对目录 → cwd 候选；落空或开源存根时软不可用
     let geo = match omni_pro::geo::discover_dataset_path() {
