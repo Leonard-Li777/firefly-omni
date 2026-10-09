@@ -57,7 +57,7 @@ pub const R_G1_11: &str = "R-G1-11";
 ///
 /// 约定：任何铸造入口在 G1 拒绝时必须返回该哨兵，而**不是**一个 `_ext.*` code。
 /// 消费端（标签链汇聚、落库前）看到空 code 即视为「未通过准入」，**必须丢弃**，
-/// 不得写入 `file_tags` / 别名表 / `materialized_paths` 标签树。
+/// 不得写入 `file_tags` / 别名表 / 标签树。
 ///
 /// 选择空串而非 `Option` 的理由：`derive_ext_tag_code` 是横跨 omni-core / omni-vision /
 /// omni-text 三处的低层工具，改签名会波及 20+ 调用点；而空串在合法 code 空间内**不可能出现**

@@ -2061,7 +2061,7 @@ async fn perceive_file_handler(
                         req.language.as_deref(),
                     );
                 // G1 词形闸哨兵：空 code 表示该词未通过准入——**必须丢弃**，
-                // 否则坏概念会写进概念表、别名表与 materialized_paths 标签树（spec §6.9.1）。
+                // 否则坏概念会写进概念表、别名表与标签树（spec §6.9.1）。
                 // 正常路径下 normalize_tag_set_to_codes 已滤除坏词，此处是防御性二道保险；
                 // 注意必须判在 code 覆盖**之前**，否则 raw_code 会把哨兵盖掉。
                 if omni_core::tag_admissibility::is_rejected_code(&resolved.code) {
@@ -2541,10 +2541,9 @@ pub struct ResolveParentResponse {
     pub parent_name: String,
     pub confidence: f32,
     pub suggested_depth: u32,
-    pub materialized_paths: Vec<omni_pro::text::MaterializedPathItem>,
 }
 
-/// 语义标签父级推荐与物化路径推导 API: POST /api/taxonomy/resolve-parent
+/// 语义标签父级推荐 API: POST /api/taxonomy/resolve-parent
 async fn taxonomy_resolve_parent_handler(
     Json(req): Json<ResolveParentRequest>,
 ) -> Json<ResolveParentResponse> {
@@ -2564,11 +2563,6 @@ async fn taxonomy_resolve_parent_handler(
             parent_name: "主题内容".to_string(),
             confidence: 0.50,
             suggested_depth: 2,
-            materialized_paths: vec![omni_pro::text::MaterializedPathItem {
-                code_path: "/topic/builtin.zhu_ti_nei_rong.13364ec8".to_string(),
-                name_path: "/通用/主题内容".to_string(),
-                depth: 2,
-            }],
         }
     });
 
@@ -2579,7 +2573,6 @@ async fn taxonomy_resolve_parent_handler(
         parent_name: outcome.parent_name,
         confidence: outcome.confidence,
         suggested_depth: outcome.suggested_depth,
-        materialized_paths: outcome.materialized_paths,
     })
 }
 
