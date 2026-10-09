@@ -1903,10 +1903,12 @@ async fn perceive_file_handler(
     }
 
     // 4. 离线逆地理编码 (若元数据中含 GPS 坐标且开启了地理反查，Pro 专享)
+    // 维度 16「地理位置」的 trigger 文件类型分支为「图片 / 视频」⇒ 仅 image / video 参与逆地理编码，
+    // 避免文档 / 音频 / 压缩包等介质仅因携带 GPS 元数据而被挂上地理位置维度。
     let mut geo_address = None;
     let enable_geo = req.enable_geo_reverse.unwrap_or(true);
 
-    if is_pro && enable_geo {
+    if is_pro && enable_geo && (is_image || is_video) {
         let t_geo = std::time::Instant::now();
         let lat_opt = metadata
             .get("GPSLatitude")
@@ -2324,16 +2326,12 @@ async fn perceive_file_handler(
     let mut fused_tags = arbitrate_tags_by_dimension_policies(fused_tags, &current_policies);
 
     // 10. 原生事实标签抽取 (Task 2)：元数据直读 + 下沉物理事实 → fact_tags 直出
-    let language_label: Option<String> = req.language.as_deref().and_then(|l| {
-        let lower = l.to_ascii_lowercase();
-        if lower.starts_with("zh") || lower.starts_with("cmn") {
-            Some("中文".to_string())
-        } else if lower.starts_with("en") {
-            Some("英文".to_string())
-        } else {
-            None
-        }
-    });
+    //
+    // 语言细分 (dim 11)：**停用 UI 语言推导**。`req.language` 是 Desktop 的 UI 默认语言
+    // (`DEFAULT_LANGUAGE`)，并非文件内容语种；此前据其直接产出「语言细分」事实，
+    // 导致 UI=zh-CN 时所有文件（含 wav / 压缩包）被挂「中文」，且图片（applicable 不含 image）同样被挂。
+    // Omni 侧真正的语种检测器为 `omni_text::lang::LanguageDetector`（fastText + 字符分布），
+    // 待接入文件文本 / ASR 语料后再产出；在此之前不产出语言事实（宁缺勿错）。
     let mut fact_tags: Vec<omni_core::TagChainItem> = {
         let ctx = omni_extract::FactTagContext {
             metadata: &metadata,
@@ -2341,12 +2339,24 @@ async fn perceive_file_handler(
             workflow_state: workflow_state.clone(),
             security_level: security_level.clone(),
             quality_score,
-            language_label: language_label.clone(),
+            language_label: None,
         };
         omni_extract::OmniFactTagExtractor::extract(&ctx)
     };
     for item in &mut fact_tags {
         enrich_tag(item);
+    }
+
+    // 维度 126「摄影照片细分」声明 `applicable=['image']` + `trigger=图片细分(摄影照片)`（双声明一致），
+    // 但其事实抽取（EXIF / QuickTime 的 Make / Model）对任意文件类型均生效
+    // （手机拍摄的 MP4 亦含 QuickTime Make / Model）⇒ 按媒体文件组后置门控，仅图片保留。
+    // 注：源头门控需在 `omni-extract` 的 `FactTagContext` 补 file_group 后实施，此处先行兜底。
+    if !is_image {
+        fact_tags.retain(|t| {
+            let under_photography = t.via_parent_code.as_deref() == Some("builtin.photography_categories")
+                || t.parent_codes.iter().any(|c| c == "builtin.photography_categories");
+            !under_photography
+        });
     }
 
     // 核心安全合规契约：无论什么类型的文件（图片/视频/音频/文本/文档），
