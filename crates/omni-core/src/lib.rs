@@ -819,15 +819,20 @@ pub const ROOT_DIMENSION_CONCEPTS: &[concepts::Concept] = &[
     concepts::Concept::安全等级,
     concepts::Concept::语言细分,
     concepts::Concept::处理状态,
-    concepts::Concept::内容尺度,
+    concepts::Concept::内容分级,
     concepts::Concept::内容标签,
 ];
 
-/// 判定指定 code 是否为受控根维度 (内置 builtin.author / builtin.fileType 别名收敛)
+/// 判定指定 code 是否为受控根维度 (内置 builtin.author / builtin.fileType / builtin.content_rating 别名收敛)
 #[inline]
 pub fn is_root_dimension(code: &str) -> bool {
-    code == "builtin.author" || code == "builtin.fileType" || ROOT_DIMENSION_CONCEPTS.iter().any(|item| item.code() == code)
+    code == "builtin.author"
+        || code == "builtin.fileType"
+        || code == "builtin.content_rating"
+        || ROOT_DIMENSION_CONCEPTS.iter().any(|item| item.code() == code)
 }
+
+pub use tag_identity::{concept_from_language_code, detect_fact_language};
 
 
 

@@ -1,7 +1,7 @@
 // =====================================================================
 // Omni 受控概念强类型枚举 (Controlled Concepts Generated)
 // 由 scripts/taxonomy/generate-controlled-concepts.ts 自动生成，请勿手动编辑！
-// 事实源: fileDimension_zh-CN.json (1020 个全量核心受控词汇)
+// 事实源: fileDimension_zh-CN.json (1021 个全量核心受控词汇)
 // =====================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,7 +35,7 @@ pub enum Concept {
     暗网交易,
     /// 概念: 霸总 | 代码: builtin.overlord
     霸总,
-    /// 概念: 白色 | 代码: omw.00243180.a
+    /// 概念: 白色 | 代码: omw.04960729.n
     白色,
     /// 概念: 版面 | 代码: builtin.layout
     版面,
@@ -351,7 +351,7 @@ pub enum Concept {
     汉化组,
     /// 概念: 航空航拍 | 代码: builtin.aerial_photography
     航空航拍,
-    /// 概念: 合同 | 代码: omw.00087736.v
+    /// 概念: 合同 | 代码: omw.06737394.n
     合同,
     /// 概念: 合同票据 | 代码: builtin.contract_instruments
     合同票据,
@@ -361,11 +361,11 @@ pub enum Concept {
     荷兰语,
     /// 概念: 黑白 | 代码: omw.00394331.a
     黑白,
-    /// 概念: 黑色 | 代码: omw.00114797.s
+    /// 概念: 黑色 | 代码: builtin.black
     黑色,
     /// 概念: 横屏 | 代码: hownet.000000169382.v
     横屏,
-    /// 概念: 红色 | 代码: omw.00248560.s
+    /// 概念: 红色 | 代码: omw.00395626.s
     红色,
     /// 概念: 红头文件 | 代码: builtin.official_document
     红头文件,
@@ -399,9 +399,9 @@ pub enum Concept {
     缓存,
     /// 概念: 换妻 | 代码: builtin.wife_swapping
     换妻,
-    /// 概念: 黄色 | 代码: omw.00289840.v
+    /// 概念: 黄色 | 代码: omw.00385756.s
     黄色,
-    /// 概念: 灰色 | 代码: builtin.gray
+    /// 概念: 灰色 | 代码: omw.00289392.v
     灰色,
     /// 概念: 会议录像 | 代码: builtin.meeting_video
     会议录像,
@@ -435,7 +435,7 @@ pub enum Concept {
     家常饮食,
     /// 概念: 家居购物 | 代码: builtin.home_shopping
     家居购物,
-    /// 概念: 家庭 | 代码: omw.07970406.n
+    /// 概念: 家庭 | 代码: omw.02940759.a
     家庭,
     /// 概念: 家庭教师 | 代码: hownet.000000105475.n
     家庭教师,
@@ -463,7 +463,7 @@ pub enum Concept {
     建筑摄影,
     /// 概念: 交响 | 代码: builtin.symphonic_music
     交响,
-    /// 概念: 脚本 | 代码: builtin.script
+    /// 概念: 脚本 | 代码: omw.06351613.n
     脚本,
     /// 概念: 教材 | 代码: builtin.textbook
     教材,
@@ -471,7 +471,7 @@ pub enum Concept {
     教师学生,
     /// 概念: 教学视频 | 代码: builtin.instructional_video
     教学视频,
-    /// 概念: 教育 | 代码: omw.00611433.n
+    /// 概念: 教育 | 代码: builtin.education
     教育,
     /// 概念: 街机 | 代码: builtin.arcade
     街机,
@@ -579,7 +579,7 @@ pub enum Concept {
     旅行内容,
     /// 概念: 旅行照 | 代码: builtin.travel_photos
     旅行照,
-    /// 概念: 绿色 | 代码: omw.00521478.v
+    /// 概念: 绿色 | 代码: omw.03069937.a
     绿色,
     /// 概念: 绿色版 | 代码: builtin.green_version
     绿色版,
@@ -611,7 +611,7 @@ pub enum Concept {
     模糊废片,
     /// 概念: 模特车模 | 代码: builtin.mannequin_car_model
     模特车模,
-    /// 概念: 模型 | 代码: omw.00898804.n
+    /// 概念: 模型 | 代码: omw.02979662.n
     模型,
     /// 概念: 魔幻 | 代码: builtin.magic
     魔幻,
@@ -627,8 +627,8 @@ pub enum Concept {
     内部,
     /// 概念: 内容标签 | 代码: builtin.content_tags
     内容标签,
-    /// 概念: 内容尺度 | 代码: builtin.content_scale
-    内容尺度,
+    /// 概念: 内容分级 | 代码: builtin.content_rating
+    内容分级,
     /// 概念: 逆光死白 | 代码: builtin.blown_highlights_in_backlight
     逆光死白,
     /// 概念: 女教师 | 代码: hownet.000000097717.n
@@ -755,6 +755,8 @@ pub enum Concept {
     色偏严重,
     /// 概念: 色情 | 代码: builtin.pornography
     色情,
+    /// 概念: 色情分级 | 代码: builtin.erotic_scale
+    色情分级,
     /// 概念: 色情细分 | 代码: builtin.pornography_subgenres
     色情细分,
     /// 概念: 删减版 | 代码: builtin.abridged_version
@@ -949,7 +951,7 @@ pub enum Concept {
     未加密压缩包,
     /// 概念: 未删减 | 代码: builtin.uncut
     未删减,
-    /// 概念: 文本 | 代码: omw.06388579.n
+    /// 概念: 文本 | 代码: builtin.text
     文本,
     /// 概念: 文本扩展名 | 代码: builtin.text_extensions
     文本扩展名,
@@ -1027,7 +1029,7 @@ pub enum Concept {
     乡村,
     /// 概念: 乡间记趣 | 代码: builtin.countryside_notes
     乡间记趣,
-    /// 概念: 小说 | 代码: omw.03833065.n
+    /// 概念: 小说 | 代码: omw.06367879.n
     小说,
     /// 概念: 小姨子 | 代码: builtin.sister_in_law
     小姨子,
@@ -1127,7 +1129,7 @@ pub enum Concept {
     艺术设计,
     /// 概念: 意大利语 | 代码: builtin.italian
     意大利语,
-    /// 概念: 音乐 | 代码: omw.00543233.n
+    /// 概念: 音乐 | 代码: omw.01505462.a
     音乐,
     /// 概念: 音乐类型 | 代码: builtin.music_type
     音乐类型,
@@ -1285,7 +1287,7 @@ pub enum Concept {
     资产证明,
     /// 概念: 子女教育 | 代码: builtin.children_s_education
     子女教育,
-    /// 概念: 紫色 | 代码: omw.00289297.v
+    /// 概念: 紫色 | 代码: omw.00380312.s
     紫色,
     /// 概念: 字幕 | 代码: hownet.000000100766.n
     字幕,
@@ -1299,7 +1301,7 @@ pub enum Concept {
     自残放血,
     /// 概念: 自动生成 | 代码: builtin.automatically_generated
     自动生成,
-    /// 概念: 自然 | 代码: omw.04623113.n
+    /// 概念: 自然 | 代码: omw.04786595.n
     自然,
     /// 概念: 自然景观 | 代码: builtin.natural_landscape
     自然景观,
@@ -1307,7 +1309,7 @@ pub enum Concept {
     自慰高潮,
     /// 概念: 宗教极端 | 代码: builtin.religious_extremism
     宗教极端,
-    /// 概念: 棕色 | 代码: omw.00320246.v
+    /// 概念: 棕色 | 代码: omw.00245112.s
     棕色,
     /// 概念: 走光露底 | 代码: builtin.exposed
     走光露底,
@@ -1319,7 +1321,7 @@ pub enum Concept {
     左邻右舍,
     /// 概念: 作品来源 | 代码: builtin.source_of_work
     作品来源,
-    /// 概念: 作者 | 代码: omw.10126177.n
+    /// 概念: 作者 | 代码: hownet.000000043396.n
     作者,
     /// 概念: aac | 代码: builtin.aac
     aac,
@@ -2069,7 +2071,7 @@ impl Concept {
             Concept::暗光欠曝 => "builtin.underexposed_in_low_light",
             Concept::暗网交易 => "builtin.dark_web_transactions",
             Concept::霸总 => "builtin.overlord",
-            Concept::白色 => "omw.00243180.a",
+            Concept::白色 => "omw.04960729.n",
             Concept::版面 => "builtin.layout",
             Concept::半肉 => "builtin.half_meat",
             Concept::半身 => "builtin.half_body",
@@ -2227,14 +2229,14 @@ impl Concept {
             Concept::汉化版 => "builtin.chinese_version",
             Concept::汉化组 => "builtin.translation_team",
             Concept::航空航拍 => "builtin.aerial_photography",
-            Concept::合同 => "omw.00087736.v",
+            Concept::合同 => "omw.06737394.n",
             Concept::合同票据 => "builtin.contract_instruments",
             Concept::合同票据细分 => "builtin.breakdown_of_contracts_and_bills",
             Concept::荷兰语 => "builtin.dutch",
             Concept::黑白 => "omw.00394331.a",
-            Concept::黑色 => "omw.00114797.s",
+            Concept::黑色 => "builtin.black",
             Concept::横屏 => "hownet.000000169382.v",
-            Concept::红色 => "omw.00248560.s",
+            Concept::红色 => "omw.00395626.s",
             Concept::红头文件 => "builtin.official_document",
             Concept::后端 => "omw.00725775.n",
             Concept::后宫 => "builtin.harem",
@@ -2251,8 +2253,8 @@ impl Concept {
             Concept::环境建筑 => "builtin.environmental_architecture",
             Concept::缓存 => "hownet.000000231207.n",
             Concept::换妻 => "builtin.wife_swapping",
-            Concept::黄色 => "omw.00289840.v",
-            Concept::灰色 => "builtin.gray",
+            Concept::黄色 => "omw.00385756.s",
+            Concept::灰色 => "omw.00289392.v",
             Concept::会议录像 => "builtin.meeting_video",
             Concept::会议录音 => "builtin.meeting_recording",
             Concept::绘画 => "builtin.painting",
@@ -2269,7 +2271,7 @@ impl Concept {
             Concept::加密压缩包 => "builtin.encrypted_compressed_package",
             Concept::家常饮食 => "builtin.home_cooked_meals",
             Concept::家居购物 => "builtin.home_shopping",
-            Concept::家庭 => "omw.07970406.n",
+            Concept::家庭 => "omw.02940759.a",
             Concept::家庭教师 => "hownet.000000105475.n",
             Concept::家庭乱伦 => "builtin.family_incest",
             Concept::家庭乱伦细分 => "builtin.family_incest_breakdown",
@@ -2283,11 +2285,11 @@ impl Concept {
             Concept::监控录像 => "hownet.000000211878.n",
             Concept::建筑摄影 => "builtin.architectural_photography",
             Concept::交响 => "builtin.symphonic_music",
-            Concept::脚本 => "builtin.script",
+            Concept::脚本 => "omw.06351613.n",
             Concept::教材 => "builtin.textbook",
             Concept::教师学生 => "builtin.teacher_student",
             Concept::教学视频 => "builtin.instructional_video",
-            Concept::教育 => "omw.00611433.n",
+            Concept::教育 => "builtin.education",
             Concept::街机 => "builtin.arcade",
             Concept::街拍抓拍 => "builtin.street_photography_candid_shots",
             Concept::结婚证 => "hownet.000000229694.n",
@@ -2341,7 +2343,7 @@ impl Concept {
             Concept::旅行记录 => "builtin.travel_records",
             Concept::旅行内容 => "builtin.travel_content",
             Concept::旅行照 => "builtin.travel_photos",
-            Concept::绿色 => "omw.00521478.v",
+            Concept::绿色 => "omw.03069937.a",
             Concept::绿色版 => "builtin.green_version",
             Concept::伦理 => "omw.02723563.a",
             Concept::轮奸侵犯 => "builtin.gang_rape_assault",
@@ -2357,7 +2359,7 @@ impl Concept {
             Concept::敏感内容 => "builtin.sensitive_content",
             Concept::模糊废片 => "builtin.blurry_unusable_photos",
             Concept::模特车模 => "builtin.mannequin_car_model",
-            Concept::模型 => "omw.00898804.n",
+            Concept::模型 => "omw.02979662.n",
             Concept::魔幻 => "builtin.magic",
             Concept::母子 => "builtin.mother_and_son",
             Concept::男老师 => "builtin.male_teacher",
@@ -2365,7 +2367,7 @@ impl Concept {
             Concept::男同耽美 => "builtin.gay_yaoi",
             Concept::内部 => "omw.00951831.s",
             Concept::内容标签 => "builtin.content_tags",
-            Concept::内容尺度 => "builtin.content_scale",
+            Concept::内容分级 => "builtin.content_rating",
             Concept::逆光死白 => "builtin.blown_highlights_in_backlight",
             Concept::女教师 => "hownet.000000097717.n",
             Concept::女警 => "builtin.policewoman",
@@ -2429,6 +2431,7 @@ impl Concept {
             Concept::嫂嫂 => "builtin.elder_brother_s_wife",
             Concept::色偏严重 => "builtin.severe_color_cast",
             Concept::色情 => "builtin.pornography",
+            Concept::色情分级 => "builtin.erotic_scale",
             Concept::色情细分 => "builtin.pornography_subgenres",
             Concept::删减版 => "builtin.abridged_version",
             Concept::商业涉黄 => "builtin.commercial_pornography",
@@ -2526,7 +2529,7 @@ impl Concept {
             Concept::未归档 => "builtin.not_archived",
             Concept::未加密压缩包 => "builtin.unencrypted_compressed_package",
             Concept::未删减 => "builtin.uncut",
-            Concept::文本 => "omw.06388579.n",
+            Concept::文本 => "builtin.text",
             Concept::文本扩展名 => "builtin.text_extensions",
             Concept::文本细分 => "builtin.text_subdivision",
             Concept::文档 => "builtin.document",
@@ -2565,7 +2568,7 @@ impl Concept {
             Concept::仙侠 => "builtin.xianxia",
             Concept::乡村 => "omw.02050452.a",
             Concept::乡间记趣 => "builtin.countryside_notes",
-            Concept::小说 => "omw.03833065.n",
+            Concept::小说 => "omw.06367879.n",
             Concept::小姨子 => "builtin.sister_in_law",
             Concept::校花 => "builtin.school_beauty",
             Concept::校园 => "hownet.000000166642.n",
@@ -2615,7 +2618,7 @@ impl Concept {
             Concept::已完结 => "builtin.completed",
             Concept::艺术设计 => "builtin.art_design",
             Concept::意大利语 => "builtin.italian",
-            Concept::音乐 => "omw.00543233.n",
+            Concept::音乐 => "omw.01505462.a",
             Concept::音乐类型 => "builtin.music_type",
             Concept::音频 => "builtin.audio",
             Concept::音频扩展名 => "builtin.audio_extensions",
@@ -2694,24 +2697,24 @@ impl Concept {
             Concept::桌面全屏截图 => "builtin.full_screen_desktop_screenshot",
             Concept::资产证明 => "builtin.proof_of_assets",
             Concept::子女教育 => "builtin.children_s_education",
-            Concept::紫色 => "omw.00289297.v",
+            Concept::紫色 => "omw.00380312.s",
             Concept::字幕 => "hownet.000000100766.n",
             Concept::字体 => "omw.06825399.n",
             Concept::字体扩展名 => "builtin.font_extensions",
             Concept::字体细分 => "builtin.font_segmentation",
             Concept::自残放血 => "builtin.self_harm_bleeding",
             Concept::自动生成 => "builtin.automatically_generated",
-            Concept::自然 => "omw.04623113.n",
+            Concept::自然 => "omw.04786595.n",
             Concept::自然景观 => "builtin.natural_landscape",
             Concept::自慰高潮 => "builtin.orgasm_through_masturbation",
             Concept::宗教极端 => "builtin.religious_extremism",
-            Concept::棕色 => "omw.00320246.v",
+            Concept::棕色 => "omw.00245112.s",
             Concept::走光露底 => "builtin.exposed",
             Concept::走私贩私 => "builtin.smuggling",
             Concept::罪恶感 => "builtin.guilt",
             Concept::左邻右舍 => "hownet.000000112774.n",
             Concept::作品来源 => "builtin.source_of_work",
-            Concept::作者 => "omw.10126177.n",
+            Concept::作者 => "hownet.000000043396.n",
             Concept::aac => "builtin.aac",
             Concept::ac3 => "builtin.ac3",
             Concept::accdb => "builtin.accdb",
@@ -3392,7 +3395,7 @@ impl Concept {
             Concept::男同耽美 => "男同耽美",
             Concept::内部 => "内部",
             Concept::内容标签 => "内容标签",
-            Concept::内容尺度 => "内容尺度",
+            Concept::内容分级 => "内容分级",
             Concept::逆光死白 => "逆光死白",
             Concept::女教师 => "女教师",
             Concept::女警 => "女警",
@@ -3456,6 +3459,7 @@ impl Concept {
             Concept::嫂嫂 => "嫂嫂",
             Concept::色偏严重 => "色偏严重",
             Concept::色情 => "色情",
+            Concept::色情分级 => "色情分级",
             Concept::色情细分 => "色情细分",
             Concept::删减版 => "删减版",
             Concept::商业涉黄 => "商业涉黄",
@@ -4418,7 +4422,7 @@ impl Concept {
             "男同耽美" => Some(Concept::男同耽美),
             "内部" => Some(Concept::内部),
             "内容标签" => Some(Concept::内容标签),
-            "内容尺度" => Some(Concept::内容尺度),
+            "内容分级" => Some(Concept::内容分级),
             "逆光死白" => Some(Concept::逆光死白),
             "女教师" => Some(Concept::女教师),
             "女警" => Some(Concept::女警),
@@ -4482,6 +4486,7 @@ impl Concept {
             "嫂嫂" => Some(Concept::嫂嫂),
             "色偏严重" => Some(Concept::色偏严重),
             "色情" => Some(Concept::色情),
+            "色情分级" => Some(Concept::色情分级),
             "色情细分" => Some(Concept::色情细分),
             "删减版" => Some(Concept::删减版),
             "商业涉黄" => Some(Concept::商业涉黄),
@@ -5149,7 +5154,7 @@ impl Concept {
             "builtin.underexposed_in_low_light" => Some(Concept::暗光欠曝),
             "builtin.dark_web_transactions" => Some(Concept::暗网交易),
             "builtin.overlord" => Some(Concept::霸总),
-            "omw.00243180.a" => Some(Concept::白色),
+            "omw.04960729.n" => Some(Concept::白色),
             "builtin.layout" => Some(Concept::版面),
             "builtin.half_meat" => Some(Concept::半肉),
             "builtin.half_body" => Some(Concept::半身),
@@ -5307,14 +5312,14 @@ impl Concept {
             "builtin.chinese_version" => Some(Concept::汉化版),
             "builtin.translation_team" => Some(Concept::汉化组),
             "builtin.aerial_photography" => Some(Concept::航空航拍),
-            "omw.00087736.v" => Some(Concept::合同),
+            "omw.06737394.n" => Some(Concept::合同),
             "builtin.contract_instruments" => Some(Concept::合同票据),
             "builtin.breakdown_of_contracts_and_bills" => Some(Concept::合同票据细分),
             "builtin.dutch" => Some(Concept::荷兰语),
             "omw.00394331.a" => Some(Concept::黑白),
-            "omw.00114797.s" => Some(Concept::黑色),
+            "builtin.black" => Some(Concept::黑色),
             "hownet.000000169382.v" => Some(Concept::横屏),
-            "omw.00248560.s" => Some(Concept::红色),
+            "omw.00395626.s" => Some(Concept::红色),
             "builtin.official_document" => Some(Concept::红头文件),
             "omw.00725775.n" => Some(Concept::后端),
             "builtin.harem" => Some(Concept::后宫),
@@ -5331,8 +5336,8 @@ impl Concept {
             "builtin.environmental_architecture" => Some(Concept::环境建筑),
             "hownet.000000231207.n" => Some(Concept::缓存),
             "builtin.wife_swapping" => Some(Concept::换妻),
-            "omw.00289840.v" => Some(Concept::黄色),
-            "builtin.gray" => Some(Concept::灰色),
+            "omw.00385756.s" => Some(Concept::黄色),
+            "omw.00289392.v" => Some(Concept::灰色),
             "builtin.meeting_video" => Some(Concept::会议录像),
             "builtin.meeting_recording" => Some(Concept::会议录音),
             "builtin.painting" => Some(Concept::绘画),
@@ -5349,7 +5354,7 @@ impl Concept {
             "builtin.encrypted_compressed_package" => Some(Concept::加密压缩包),
             "builtin.home_cooked_meals" => Some(Concept::家常饮食),
             "builtin.home_shopping" => Some(Concept::家居购物),
-            "omw.07970406.n" => Some(Concept::家庭),
+            "omw.02940759.a" => Some(Concept::家庭),
             "hownet.000000105475.n" => Some(Concept::家庭教师),
             "builtin.family_incest" => Some(Concept::家庭乱伦),
             "builtin.family_incest_breakdown" => Some(Concept::家庭乱伦细分),
@@ -5363,11 +5368,11 @@ impl Concept {
             "hownet.000000211878.n" => Some(Concept::监控录像),
             "builtin.architectural_photography" => Some(Concept::建筑摄影),
             "builtin.symphonic_music" => Some(Concept::交响),
-            "builtin.script" => Some(Concept::脚本),
+            "omw.06351613.n" => Some(Concept::脚本),
             "builtin.textbook" => Some(Concept::教材),
             "builtin.teacher_student" => Some(Concept::教师学生),
             "builtin.instructional_video" => Some(Concept::教学视频),
-            "omw.00611433.n" => Some(Concept::教育),
+            "builtin.education" => Some(Concept::教育),
             "builtin.arcade" => Some(Concept::街机),
             "builtin.street_photography_candid_shots" => Some(Concept::街拍抓拍),
             "hownet.000000229694.n" => Some(Concept::结婚证),
@@ -5421,7 +5426,7 @@ impl Concept {
             "builtin.travel_records" => Some(Concept::旅行记录),
             "builtin.travel_content" => Some(Concept::旅行内容),
             "builtin.travel_photos" => Some(Concept::旅行照),
-            "omw.00521478.v" => Some(Concept::绿色),
+            "omw.03069937.a" => Some(Concept::绿色),
             "builtin.green_version" => Some(Concept::绿色版),
             "omw.02723563.a" => Some(Concept::伦理),
             "builtin.gang_rape_assault" => Some(Concept::轮奸侵犯),
@@ -5437,7 +5442,7 @@ impl Concept {
             "builtin.sensitive_content" => Some(Concept::敏感内容),
             "builtin.blurry_unusable_photos" => Some(Concept::模糊废片),
             "builtin.mannequin_car_model" => Some(Concept::模特车模),
-            "omw.00898804.n" => Some(Concept::模型),
+            "omw.02979662.n" => Some(Concept::模型),
             "builtin.magic" => Some(Concept::魔幻),
             "builtin.mother_and_son" => Some(Concept::母子),
             "builtin.male_teacher" => Some(Concept::男老师),
@@ -5445,7 +5450,7 @@ impl Concept {
             "builtin.gay_yaoi" => Some(Concept::男同耽美),
             "omw.00951831.s" => Some(Concept::内部),
             "builtin.content_tags" => Some(Concept::内容标签),
-            "builtin.content_scale" => Some(Concept::内容尺度),
+            "builtin.content_rating" => Some(Concept::内容分级),
             "builtin.blown_highlights_in_backlight" => Some(Concept::逆光死白),
             "hownet.000000097717.n" => Some(Concept::女教师),
             "builtin.policewoman" => Some(Concept::女警),
@@ -5509,6 +5514,7 @@ impl Concept {
             "builtin.elder_brother_s_wife" => Some(Concept::嫂嫂),
             "builtin.severe_color_cast" => Some(Concept::色偏严重),
             "builtin.pornography" => Some(Concept::色情),
+            "builtin.erotic_scale" => Some(Concept::色情分级),
             "builtin.pornography_subgenres" => Some(Concept::色情细分),
             "builtin.abridged_version" => Some(Concept::删减版),
             "builtin.commercial_pornography" => Some(Concept::商业涉黄),
@@ -5606,7 +5612,7 @@ impl Concept {
             "builtin.not_archived" => Some(Concept::未归档),
             "builtin.unencrypted_compressed_package" => Some(Concept::未加密压缩包),
             "builtin.uncut" => Some(Concept::未删减),
-            "omw.06388579.n" => Some(Concept::文本),
+            "builtin.text" => Some(Concept::文本),
             "builtin.text_extensions" => Some(Concept::文本扩展名),
             "builtin.text_subdivision" => Some(Concept::文本细分),
             "builtin.document" => Some(Concept::文档),
@@ -5645,7 +5651,7 @@ impl Concept {
             "builtin.xianxia" => Some(Concept::仙侠),
             "omw.02050452.a" => Some(Concept::乡村),
             "builtin.countryside_notes" => Some(Concept::乡间记趣),
-            "omw.03833065.n" => Some(Concept::小说),
+            "omw.06367879.n" => Some(Concept::小说),
             "builtin.sister_in_law" => Some(Concept::小姨子),
             "builtin.school_beauty" => Some(Concept::校花),
             "hownet.000000166642.n" => Some(Concept::校园),
@@ -5694,7 +5700,7 @@ impl Concept {
             "builtin.completed" => Some(Concept::已完成),
             "builtin.art_design" => Some(Concept::艺术设计),
             "builtin.italian" => Some(Concept::意大利语),
-            "omw.00543233.n" => Some(Concept::音乐),
+            "omw.01505462.a" => Some(Concept::音乐),
             "builtin.music_type" => Some(Concept::音乐类型),
             "builtin.audio" => Some(Concept::音频),
             "builtin.audio_extensions" => Some(Concept::音频扩展名),
@@ -5773,24 +5779,24 @@ impl Concept {
             "builtin.full_screen_desktop_screenshot" => Some(Concept::桌面全屏截图),
             "builtin.proof_of_assets" => Some(Concept::资产证明),
             "builtin.children_s_education" => Some(Concept::子女教育),
-            "omw.00289297.v" => Some(Concept::紫色),
+            "omw.00380312.s" => Some(Concept::紫色),
             "hownet.000000100766.n" => Some(Concept::字幕),
             "omw.06825399.n" => Some(Concept::字体),
             "builtin.font_extensions" => Some(Concept::字体扩展名),
             "builtin.font_segmentation" => Some(Concept::字体细分),
             "builtin.self_harm_bleeding" => Some(Concept::自残放血),
             "builtin.automatically_generated" => Some(Concept::自动生成),
-            "omw.04623113.n" => Some(Concept::自然),
+            "omw.04786595.n" => Some(Concept::自然),
             "builtin.natural_landscape" => Some(Concept::自然景观),
             "builtin.orgasm_through_masturbation" => Some(Concept::自慰高潮),
             "builtin.religious_extremism" => Some(Concept::宗教极端),
-            "omw.00320246.v" => Some(Concept::棕色),
+            "omw.00245112.s" => Some(Concept::棕色),
             "builtin.exposed" => Some(Concept::走光露底),
             "builtin.smuggling" => Some(Concept::走私贩私),
             "builtin.guilt" => Some(Concept::罪恶感),
             "hownet.000000112774.n" => Some(Concept::左邻右舍),
             "builtin.source_of_work" => Some(Concept::作品来源),
-            "omw.10126177.n" => Some(Concept::作者),
+            "hownet.000000043396.n" => Some(Concept::作者),
             "builtin.aac" => Some(Concept::aac),
             "builtin.ac3" => Some(Concept::ac3),
             "builtin.accdb" => Some(Concept::accdb),
@@ -6153,6 +6159,34 @@ impl Concept {
             "builtin.yml" => Some(Concept::yml),
             "builtin.zig" => Some(Concept::zig),
             "builtin.zip" => Some(Concept::zip),
+            "builtin.aspect_ratio" => Some(Concept::画幅),
+            "builtin.image_subdivision" => Some(Concept::图片细分),
+            "builtin.author" => Some(Concept::作者),
+            "builtin.background" => Some(Concept::背景),
+            "builtin.perspective" => Some(Concept::视角),
+            "builtin.file_use" => Some(Concept::文件用途),
+            "builtin.picture_quality" => Some(Concept::画质等级),
+            "builtin.color_tone" => Some(Concept::主色调),
+            "builtin.image" => Some(Concept::图片),
+            "builtin.video" => Some(Concept::视频),
+            "builtin.source_code" => Some(Concept::源代码),
+            "builtin.ebook" => Some(Concept::电子书),
+            "builtin.program" => Some(Concept::程序),
+            "builtin.compressed_package" => Some(Concept::压缩包),
+            "builtin.system_file" => Some(Concept::系统文件),
+            "builtin.font" => Some(Concept::字体),
+            "omw.10126177.n" => Some(Concept::作者),
+            "omw.06780678.n" => Some(Concept::漫画),
+            "builtin.image_with_text" => Some(Concept::有字图),
+            "builtin.horizontal_screen" => Some(Concept::横屏),
+            "builtin.vertical_screen" => Some(Concept::竖屏),
+            "builtin.landscape" => Some(Concept::横屏),
+            "builtin.portrait" => Some(Concept::竖屏),
+            "omw.03833065.n" => Some(Concept::小说),
+            "omw.00543233.n" => Some(Concept::音乐),
+            "builtin.novel" => Some(Concept::小说),
+            "builtin.music" => Some(Concept::音乐),
+            "builtin.square" => Some(Concept::正方形),
             _ => None,
         }
     }

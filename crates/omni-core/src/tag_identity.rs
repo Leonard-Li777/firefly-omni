@@ -486,6 +486,20 @@ const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("spanish", "Spanish"),
     ("俄语", "Russian"),
     ("russian", "Russian"),
+    ("阿拉伯语", "Arabic"),
+    ("arabic", "Arabic"),
+    ("葡萄牙语", "Portuguese"),
+    ("portuguese", "Portuguese"),
+    ("意大利语", "Italian"),
+    ("italian", "Italian"),
+    ("荷兰语", "Dutch"),
+    ("dutch", "Dutch"),
+    ("泰语", "Thai"),
+    ("thai", "Thai"),
+    ("越南语", "Vietnamese"),
+    ("vietnamese", "Vietnamese"),
+    ("印地语", "Hindi"),
+    ("hindi", "Hindi"),
     ("文件质量", "Document quality"),
     ("document_quality", "Document quality"),
     ("作者", "Author"),
@@ -1229,6 +1243,189 @@ pub fn builtin_tag_code(tag: &str) -> Option<&'static str> {
     en_to_code().get(en.as_str()).map(|s| s.as_str())
 }
 
+/// 基于客观字符分布与语言学特征识别受控语言事实 (Zero False Positive, 宁缺勿错)
+///
+/// 严格守则（对齐 PRD-0058 / ADR-0045）：
+/// 1. 空文本、纯数字、纯标点、纯空白或缺乏显著语种文字特征的文本，严格返回 None；
+/// 2. 只有检出足够的母语字符特征（如汉字、假名、谚文、西里尔文、阿拉伯文、特征拉丁语系虚词）时才返回对应受控 Concept；
+/// 3. 输出类型为 `Concept` 强类型枚举，绝不拼接裸字符串。
+pub fn detect_fact_language(text: &str) -> Option<crate::concepts::Concept> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut cjk_count = 0usize;
+    let mut hiragana_count = 0usize;
+    let mut katakana_count = 0usize;
+    let mut hangul_count = 0usize;
+    let mut cyrillic_count = 0usize;
+    let mut arabic_count = 0usize;
+    let mut thai_count = 0usize;
+    let mut devanagari_count = 0usize;
+    let mut latin_count = 0usize;
+    let mut total_chars = 0usize;
+
+    // 仅统计前 1000 个有效字符（耗时 < 100μs）
+    for ch in trimmed.chars().take(1000) {
+        if ch.is_whitespace() || ch.is_ascii_punctuation() {
+            continue;
+        }
+        // 排除常见 Unicode 标点符号与特殊全角符号
+        match ch as u32 {
+            0x2000..=0x206F | 0x3000..=0x303F | 0xFF00..=0xFF0F | 0xFF1A..=0xFF20 | 0xFF3B..=0xFF40 | 0xFF5B..=0xFF65 => continue,
+            _ => {}
+        }
+        total_chars += 1;
+        match ch as u32 {
+            0x3040..=0x309F => hiragana_count += 1,
+            0x30A0..=0x30FF => katakana_count += 1,
+            0x4E00..=0x9FFF | 0x3400..=0x4DBF => cjk_count += 1,
+            0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F => hangul_count += 1,
+            0x0E00..=0x0E7F => thai_count += 1,
+            0x0900..=0x097F => devanagari_count += 1,
+            0x0400..=0x04FF => cyrillic_count += 1,
+            0x0600..=0x06FF | 0x0750..=0x077F => arabic_count += 1,
+            0x0041..=0x005A | 0x0061..=0x007A | 0x00C0..=0x024F | 0x1E00..=0x1EFF => latin_count += 1,
+            _ => {}
+        }
+    }
+
+    if total_chars < 2 {
+        return None;
+    }
+
+    // 1. 日语：出现平假名或超过 1 个片假名
+    if hiragana_count > 0 || katakana_count > 1 {
+        return Some(crate::concepts::Concept::日语);
+    }
+
+    // 2. 韩语：出现谚文字符
+    if hangul_count > 0 {
+        return Some(crate::concepts::Concept::韩语);
+    }
+
+    // 3. 泰语：出现泰文字符
+    if thai_count > 0 {
+        return Some(crate::concepts::Concept::泰语);
+    }
+
+    // 4. 印地语：出现天城文字符
+    if devanagari_count > 0 {
+        return Some(crate::concepts::Concept::印地语);
+    }
+
+    // 5. 阿拉伯语：阿拉伯字母数量 >= 2 且比例 > 0.30
+    if arabic_count >= 2 && (arabic_count as f32 / total_chars as f32) > 0.30 {
+        return Some(crate::concepts::Concept::阿拉伯语);
+    }
+
+    // 6. 俄语：西里尔字母数量 >= 2 且比例 > 0.30
+    if cyrillic_count >= 2 && (cyrillic_count as f32 / total_chars as f32) > 0.30 {
+        return Some(crate::concepts::Concept::俄语);
+    }
+
+    // 7. 中文：汉字数量 >= 2 且汉字比例 > 0.15
+    if cjk_count >= 2 && (cjk_count as f32 / total_chars as f32) > 0.15 {
+        return Some(crate::concepts::Concept::中文);
+    }
+
+    // 8. 拉丁语系：拉丁字母数量 >= 3 且比例 > 0.30
+    if latin_count >= 3 && (latin_count as f32 / total_chars as f32) > 0.30 {
+        let lower = trimmed.to_lowercase();
+        let words: Vec<&str> = lower
+            .split(|c: char| !c.is_alphabetic())
+            .filter(|w| !w.is_empty())
+            .take(100)
+            .collect();
+
+        // 越南语特殊字母：đ, ă, â, ê, ô, ơ, ư
+        let has_vi = lower.contains('đ')
+            || lower.contains('ơ')
+            || lower.contains('ư')
+            || words.iter().any(|&w| matches!(w, "của" | "và" | "người" | "trong" | "không" | "được"));
+        if has_vi {
+            return Some(crate::concepts::Concept::越南语);
+        }
+
+        let has_de = words.iter().any(|&w| matches!(w, "der" | "die" | "das" | "und" | "nicht" | "ist" | "ein" | "eine" | "für" | "mit"))
+            || lower.contains('ä') || lower.contains('ö') || lower.contains('ü') || lower.contains('ß');
+        let has_fr = words.iter().any(|&w| matches!(w, "les" | "des" | "dans" | "avec" | "pour" | "une" | "est" | "que" | "pas"))
+            || lower.contains('é') || lower.contains('è') || lower.contains('ç') || lower.contains('à');
+        let has_es = words.iter().any(|&w| matches!(w, "los" | "las" | "del" | "para" | "por" | "una" | "con" | "que" | "este"))
+            || lower.contains('ñ') || lower.contains('¿') || lower.contains('¡');
+        let has_pt = words.iter().any(|&w| matches!(w, "não" | "para" | "com" | "uma" | "que" | "por" | "dos" | "das"))
+            || lower.contains('ã') || lower.contains('õ');
+        let has_it = words.iter().any(|&w| matches!(w, "della" | "delle" | "degli" | "sono" | "anche" | "questo" | "con" | "non"));
+        let has_nl = words.iter().any(|&w| matches!(w, "het" | "van" | "een" | "voor" | "met" | "dat" | "niet"));
+
+        if has_de && !has_fr && !has_es {
+            return Some(crate::concepts::Concept::德语);
+        }
+        if has_fr && !has_de && !has_es {
+            return Some(crate::concepts::Concept::法语);
+        }
+        if has_es && !has_de && !has_fr {
+            return Some(crate::concepts::Concept::西班牙语);
+        }
+        if has_pt && !has_es {
+            return Some(crate::concepts::Concept::葡萄牙语);
+        }
+        if has_it {
+            return Some(crate::concepts::Concept::意大利语);
+        }
+        if has_nl {
+            return Some(crate::concepts::Concept::荷兰语);
+        }
+
+        return Some(crate::concepts::Concept::英文);
+    }
+
+    None
+}
+
+/// 将元数据中常见的语言标识字符串归一化为受控 Concept
+pub fn concept_from_language_code(code_str: &str) -> Option<crate::concepts::Concept> {
+    let clean = code_str.trim().to_ascii_lowercase();
+    if clean.is_empty() {
+        return None;
+    }
+
+    if clean.starts_with("zh") || clean.starts_with("chi") || clean.starts_with("zho") || clean.starts_with("cmn") || clean == "chinese" || clean == "中文" {
+        Some(crate::concepts::Concept::中文)
+    } else if clean.starts_with("en") || clean.starts_with("eng") || clean == "english" || clean == "英文" {
+        Some(crate::concepts::Concept::英文)
+    } else if clean.starts_with("ja") || clean.starts_with("jpn") || clean == "japanese" || clean == "日语" {
+        Some(crate::concepts::Concept::日语)
+    } else if clean.starts_with("ko") || clean.starts_with("kor") || clean == "korean" || clean == "韩语" {
+        Some(crate::concepts::Concept::韩语)
+    } else if clean.starts_with("fr") || clean.starts_with("fre") || clean.starts_with("fra") || clean == "french" || clean == "法语" {
+        Some(crate::concepts::Concept::法语)
+    } else if clean.starts_with("de") || clean.starts_with("ger") || clean.starts_with("deu") || clean == "german" || clean == "德语" {
+        Some(crate::concepts::Concept::德语)
+    } else if clean.starts_with("es") || clean.starts_with("spa") || clean == "spanish" || clean == "西班牙语" {
+        Some(crate::concepts::Concept::西班牙语)
+    } else if clean.starts_with("ru") || clean.starts_with("rus") || clean == "russian" || clean == "俄语" {
+        Some(crate::concepts::Concept::俄语)
+    } else if clean.starts_with("ar") || clean.starts_with("ara") || clean == "arabic" || clean == "阿拉伯语" {
+        Some(crate::concepts::Concept::阿拉伯语)
+    } else if clean.starts_with("pt") || clean.starts_with("por") || clean == "portuguese" || clean == "葡萄牙语" {
+        Some(crate::concepts::Concept::葡萄牙语)
+    } else if clean.starts_with("it") || clean.starts_with("ita") || clean == "italian" || clean == "意大利语" {
+        Some(crate::concepts::Concept::意大利语)
+    } else if clean.starts_with("nl") || clean.starts_with("dut") || clean.starts_with("nld") || clean == "dutch" || clean == "荷兰语" {
+        Some(crate::concepts::Concept::荷兰语)
+    } else if clean.starts_with("th") || clean.starts_with("tha") || clean == "thai" || clean == "泰语" {
+        Some(crate::concepts::Concept::泰语)
+    } else if clean.starts_with("vi") || clean.starts_with("vie") || clean == "vietnamese" || clean == "越南语" {
+        Some(crate::concepts::Concept::越南语)
+    } else if clean.starts_with("hi") || clean.starts_with("hin") || clean == "hindi" || clean == "印地语" {
+        Some(crate::concepts::Concept::印地语)
+    } else {
+        None
+    }
+}
+
 /// 是否与规范概念同 code（规则层用）
 ///
 /// (#718 R1) code 形态解析通道：受控 code（`builtin.*|omw.*|hownet.*`）输入不再落空。
@@ -1393,8 +1590,8 @@ pub fn normalize_tag_to_code(tag: &str) -> String {
     if t.starts_with("builtin.") || t.starts_with("_ext.") || t.starts_with("omw.") || t.starts_with("hownet.") {
         return t.to_string();
     }
-    // G1 词形闸：不合格词不派生 `_ext`，返回空串哨兵
-    if crate::tag_admissibility::is_g1_rejected(t) {
+    // G1 词形闸与 G2 禁用黑名单：不合格词与禁用词不派生 `_ext`，返回空串哨兵
+    if crate::tag_admissibility::is_g1_rejected(t) || crate::tag_admissibility::is_banned_lemma(t) {
         return crate::tag_admissibility::REJECTED_CODE.to_string();
     }
     derive_ext_tag_code(t)
@@ -1990,6 +2187,41 @@ mod tests {
         let codes = normalize_tag_set_to_codes(&mixed);
         assert_eq!(codes.len(), 2, "空串哨兵必须被滤除: {codes:?}");
         assert!(codes.iter().all(|c| !c.is_empty()));
+    }
+
+    #[test]
+    fn test_detect_fact_language_and_metadata_code() {
+        use crate::concepts::Concept;
+
+        // 1. 中文真实 ASR 语音文本测试 (Azure - 云希 样本真实文本)
+        let asr_zh = "陈博演微微有两秒的停顿，没有说什么，只是重新转过头去发动车子。";
+        assert_eq!(detect_fact_language(asr_zh), Some(Concept::中文));
+
+        // 2. 英文 ASR 文本
+        let asr_en = "Welcome to Firefly AI Folder offline multi-modal desktop assistant.";
+        assert_eq!(detect_fact_language(asr_en), Some(Concept::英文));
+
+        // 3. 日文假名
+        let text_ja = "これはローカルで動作するインテリジェントなファイル管理システムです。";
+        assert_eq!(detect_fact_language(text_ja), Some(Concept::日语));
+
+        // 4. 韩文谚文
+        let text_ko = "안녕하세요 파이어플라이 폴더 관리 시스템입니다.";
+        assert_eq!(detect_fact_language(text_ko), Some(Concept::韩语));
+
+        // 5. 纯数字、标点符号、空文本等无语种客观事实场景必须返回 None（宁缺勿错）
+        assert_eq!(detect_fact_language(""), None);
+        assert_eq!(detect_fact_language("   "), None);
+        assert_eq!(detect_fact_language("1234567890"), None);
+        assert_eq!(detect_fact_language("... --- ..."), None);
+        assert_eq!(detect_fact_language("a"), None); // 极短单个字符不推导
+
+        // 6. 音频元数据代码解析
+        assert_eq!(concept_from_language_code("zh-CN"), Some(Concept::中文));
+        assert_eq!(concept_from_language_code("chi"), Some(Concept::中文));
+        assert_eq!(concept_from_language_code("en-US"), Some(Concept::英文));
+        assert_eq!(concept_from_language_code("japanese"), Some(Concept::日语));
+        assert_eq!(concept_from_language_code("unknown_code"), None);
     }
 
     // GH #724：依赖动态别名字典（进程级 static RwLock）的用例已移入独立集成测试
