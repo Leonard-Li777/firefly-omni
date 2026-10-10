@@ -1051,7 +1051,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.content_scale": {
+  "builtin.erotic_scale": {
     "id": 123,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1852,6 +1852,30 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
         "isMultiSelect": false
       }
     }
+  },
+  "builtin.content_rating": {
+    "id": 162,
+    "threshold": 0.6,
+    "applicableFileTypes": [
+      "ebook",
+      "image",
+      "video",
+      "audio",
+      "archive",
+      "document"
+    ],
+    "contextHints": [
+      "年龄适宜性分级",
+      "内容分级",
+      "受众年龄审查"
+    ],
+    "metadata": {
+      "flag": {
+        "isPanDimension": false,
+        "isRequiresAI": false,
+        "isMultiSelect": false
+      }
+    }
   }
 }"##;
 
@@ -2015,7 +2039,7 @@ mod tests {
     #[test]
     fn test_default_dimension_policies_load() {
         let policies = get_default_dimension_policies();
-        assert_eq!(policies.len(), 91);
+        assert_eq!(policies.len(), 92);
 
         // 验证多选白名单维度
         let subject_type = policies.get("builtin.subject_type").expect("builtin.subject_type 必须存在");

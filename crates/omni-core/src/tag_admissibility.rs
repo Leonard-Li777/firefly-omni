@@ -219,7 +219,7 @@ impl ForbiddenClass {
     }
 }
 
-/// G1 规则配置（唯一数据源的解析结果）
+/// G1/G2 规则配置（唯一数据源的解析结果）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagAdmissibility {
     allowed_scripts: Vec<Script>,
@@ -233,6 +233,16 @@ pub struct TagAdmissibility {
     sentence_framework_patterns: Vec<String>,
     /// 保留字 / 元字段（R-G1-09，整串精确命中即拒；读规则资源）
     reserved_words: Vec<String>,
+    /// 闭类词性（R-G2-04: m数词/q量词/p介词/c连词/u助词/y代词/o拟声词/h疑问词）
+    closed_pos: Vec<String>,
+    /// 清洗词性（R-G2-05: w标点/g字母前缀/b单字）
+    cleaned_pos: Vec<String>,
+    /// 准入词性（R-G2-01: n名词/a形容词/s形容词卫星）
+    allowed_pos: Vec<String>,
+    /// 动词/副词词性（R-G2-02/03: v动词/r副词）
+    verb_adv_pos: Vec<String>,
+    /// 动词/副词禁用黑名单（R-G2-03: 默认放行，命中才拒）
+    banned_lemmas: Vec<String>,
     /// 配置来源是否为内置默认（false = 命中外部资产）。供诊断/单测使用。
     builtin_default: bool,
 }
@@ -251,6 +261,33 @@ impl TagAdmissibility {
     /// 互斥文种对（只读）
     pub fn exclusive_pairs(&self) -> &[(Script, Script)] {
         &self.exclusive_pairs
+    }
+
+    /// 闭类词性（只读）
+    pub fn closed_pos(&self) -> &[String] {
+        &self.closed_pos
+    }
+
+    /// 清洗词性（只读）
+    pub fn cleaned_pos(&self) -> &[String] {
+        &self.cleaned_pos
+    }
+
+    /// 禁用词形（只读）
+    pub fn banned_lemmas(&self) -> &[String] {
+        &self.banned_lemmas
+    }
+
+    /// 判定词形是否命中动词/副词禁用黑名单（R-G2-03；v/r 默认准入，命中才拒）
+    pub fn is_banned_lemma(&self, tag: &str) -> bool {
+        let t = tag.trim().to_lowercase();
+        self.banned_lemmas.iter().any(|b| b == &t)
+    }
+
+    /// 是否为闭类或清洗词性（禁止作为文件标签标注）
+    pub fn is_closed_or_cleaned_pos(&self, pos: &str) -> bool {
+        let p = pos.trim().to_lowercase();
+        self.closed_pos.iter().any(|x| x == &p) || self.cleaned_pos.iter().any(|x| x == &p)
     }
 
     fn default_config() -> TagAdmissibility {
@@ -276,12 +313,22 @@ impl TagAdmissibility {
             stopwords: Vec::new(),
             sentence_framework_patterns: Vec::new(),
             reserved_words: Vec::new(),
+            // G2 词性受控封闭枚举（ADR-0052 / tag-admissibility.json 单一数据源对齐）
+            closed_pos: vec![
+                "m".into(), "q".into(), "p".into(), "c".into(),
+                "u".into(), "y".into(), "o".into(), "h".into(),
+            ],
+            cleaned_pos: vec!["w".into(), "g".into(), "b".into()],
+            allowed_pos: vec!["n".into(), "a".into(), "s".into()],
+            verb_adv_pos: vec!["v".into(), "r".into()],
+            banned_lemmas: Vec::new(),
             builtin_default: true,
         }
     }
 
     fn from_json(v: &serde_json::Value, fallback: &TagAdmissibility) -> TagAdmissibility {
         let g1 = v.get("g1");
+        let g2 = v.get("g2");
         let pick_scripts = |key: &str, dflt: &[Script]| -> Vec<Script> {
             let parsed: Vec<Script> = g1
                 .and_then(|g| g.get(key))
@@ -373,9 +420,133 @@ impl TagAdmissibility {
                         .collect()
                 })
                 .unwrap_or_default(),
+            closed_pos: g2
+                .and_then(|g| g.get("closed_pos"))
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|w| w.as_str())
+                        .map(|w| w.trim().to_lowercase())
+                        .filter(|w| !w.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| fallback.closed_pos.clone()),
+            cleaned_pos: g2
+                .and_then(|g| g.get("cleaned_pos"))
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|w| w.as_str())
+                        .map(|w| w.trim().to_lowercase())
+                        .filter(|w| !w.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| fallback.cleaned_pos.clone()),
+            allowed_pos: g2
+                .and_then(|g| g.get("allowed_pos"))
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|w| w.as_str())
+                        .map(|w| w.trim().to_lowercase())
+                        .filter(|w| !w.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| fallback.allowed_pos.clone()),
+            verb_adv_pos: g2
+                .and_then(|g| g.get("verb_adv_pos"))
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|w| w.as_str())
+                        .map(|w| w.trim().to_lowercase())
+                        .filter(|w| !w.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| fallback.verb_adv_pos.clone()),
+            banned_lemmas: g2
+                .and_then(|g| g.get("banned_lemmas"))
+                .map(|s| {
+                    let mut all: Vec<String> = Vec::new();
+                    if let Some(arr) = s.as_array() {
+                        all.extend(
+                            arr.iter()
+                                .filter_map(|w| w.as_str())
+                                .map(|w| w.trim().to_lowercase())
+                                .filter(|w| !w.is_empty()),
+                        );
+                    } else {
+                        for key in ["zh", "en"] {
+                            if let Some(arr) = s.get(key).and_then(|x| x.as_array()) {
+                                all.extend(
+                                    arr.iter()
+                                        .filter_map(|w| w.as_str())
+                                        .map(|w| w.trim().to_lowercase())
+                                        .filter(|w| !w.is_empty()),
+                                );
+                            }
+                        }
+                    }
+                    all
+                })
+                .unwrap_or_default(),
             builtin_default: false,
         }
     }
+}
+
+/// 判定给定的受控词性 (POS) 是否为闭类虚词或清洗词性（禁止作为文件标签标注，R-G2-04/R-G2-05）
+pub fn is_tag_pos_rejected(pos: &str) -> bool {
+    config().is_closed_or_cleaned_pos(pos)
+}
+
+/// 判定词形是否命中动词/副词禁用黑名单（R-G2-03；v/r 默认准入，命中才拒）
+pub fn is_banned_lemma(tag: &str) -> bool {
+    config().is_banned_lemma(tag)
+}
+
+/// 判定 jieba 分词的 POS 标注是否为非实体/非主题词（助词、连词、介词、代词、副词、语气词、叹词、纯标点、未知残渣碎片等闭类虚词）
+pub fn is_jieba_tag_non_entity(tag: &str) -> bool {
+    let t = tag.trim();
+    if t.is_empty() {
+        return true;
+    }
+    // 助词 u*、连词 c*、介词 p*、代词 r*、副词 d*、语气词 y*、叹词 e*、拟声词 o*、标点 w*、非语素/未知 x*
+    // 数词 m*、量词 q*、方位词 f*
+    t.starts_with('u')
+        || t.starts_with('c')
+        || t.starts_with('p')
+        || t.starts_with('r')
+        || t.starts_with('d')
+        || t.starts_with('y')
+        || t.starts_with('e')
+        || t.starts_with('o')
+        || t.starts_with('w')
+        || t.starts_with('x')
+        || t.starts_with('m')
+        || t.starts_with('q')
+        || t.starts_with('f')
+}
+
+/// 判定 jieba 分词的 POS 标注是否可以作为二元复合实体的前置词 (Prefix)
+pub fn is_jieba_tag_compound_prefix(tag: &str) -> bool {
+    let t = tag.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // 名词族 (n, nr, ns, nt, nz, nl, ng, vn, an)、形容词族 (a, ag, al)、动词族 (v) 或 英文 (eng)
+    t.starts_with('n') || t.starts_with('a') || t.starts_with('v') || t == "eng"
+}
+
+/// 判定 jieba 分词的 POS 标注是否可以作为二元复合实体的中心语/后置词 (Suffix)
+pub fn is_jieba_tag_compound_suffix(tag: &str) -> bool {
+    let t = tag.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // 复合词中心语必须为名词族 (n, nr, ns, nt, nz, nl, ng)、名动词 (vn)、名形词 (an) 或 英文 (eng)
+    // 严禁纯动词族 (v, vd, vg 等) 充当非受控自由复合短语的词尾中心语
+    t.starts_with('n') || t == "vn" || t == "an" || t == "eng"
 }
 
 /// 规则资源所在目录候选。
@@ -1154,5 +1325,84 @@ mod tests {
             parsed.neutral_chars, builtin.neutral_chars,
             "neutral_chars 与内置默认漂移"
         );
+        assert_eq!(
+            parsed.closed_pos, builtin.closed_pos,
+            "closed_pos 与内置默认漂移"
+        );
+        assert_eq!(
+            parsed.cleaned_pos, builtin.cleaned_pos,
+            "cleaned_pos 与内置默认漂移"
+        );
+        assert_eq!(
+            parsed.allowed_pos, builtin.allowed_pos,
+            "allowed_pos 与内置默认漂移"
+        );
+        assert_eq!(
+            parsed.verb_adv_pos, builtin.verb_adv_pos,
+            "verb_adv_pos 与内置默认漂移"
+        );
+    }
+
+    #[test]
+    fn test_pos_and_jieba_tag_filters() {
+        // 受控闭类词性与清洗词性拒绝
+        assert!(is_tag_pos_rejected("u"));
+        assert!(is_tag_pos_rejected("c"));
+        assert!(is_tag_pos_rejected("p"));
+        assert!(is_tag_pos_rejected("y"));
+        assert!(is_tag_pos_rejected("w"));
+        assert!(!is_tag_pos_rejected("n"));
+        assert!(!is_tag_pos_rejected("a"));
+
+        // jieba 词性判断（纯闭类虚词判定）
+        assert!(is_jieba_tag_non_entity("u")); // 助词（如"了"）
+        assert!(is_jieba_tag_non_entity("c")); // 连词
+        assert!(is_jieba_tag_non_entity("r")); // 代词
+        assert!(is_jieba_tag_non_entity("d")); // 副词
+        assert!(is_jieba_tag_non_entity("x")); // 未知/非语素（如"孙去"、"云能"）
+        assert!(!is_jieba_tag_non_entity("v")); // 动词族（按 ADR-0052 默认准入）
+        assert!(!is_jieba_tag_non_entity("n")); // 普通名词
+        assert!(!is_jieba_tag_non_entity("nr")); // 人名
+        assert!(!is_jieba_tag_non_entity("nz")); // 专名
+        assert!(!is_jieba_tag_non_entity("vn")); // 动名词
+        assert!(!is_jieba_tag_non_entity("i")); // 成语
+
+        // 二元拼接前缀与后缀
+        assert!(is_jieba_tag_compound_prefix("n"));
+        assert!(is_jieba_tag_compound_prefix("a"));
+        assert!(is_jieba_tag_compound_prefix("vn"));
+        assert!(is_jieba_tag_compound_prefix("v")); // 允许动词前缀，如 治理(v)模式(n)
+        assert!(!is_jieba_tag_compound_prefix("u"));
+        assert!(!is_jieba_tag_compound_prefix("x"));
+
+        assert!(is_jieba_tag_compound_suffix("n"));
+        assert!(is_jieba_tag_compound_suffix("vn"));
+        assert!(!is_jieba_tag_compound_suffix("u"));
+        assert!(!is_jieba_tag_compound_suffix("x"));
+    }
+
+    #[test]
+    fn test_banned_lemmas_and_reserved_words() {
+        // G1 保留字/元字段一票否决（R-G1-09: 其它、其他、未分类、未知）
+        assert_eq!(g1_verdict("其它").rule(), Some(R_G1_09));
+        assert_eq!(g1_verdict("其他").rule(), Some(R_G1_09));
+        assert_eq!(g1_verdict("未知").rule(), Some(R_G1_09));
+        assert_eq!(g1_verdict("未分类").rule(), Some(R_G1_09));
+
+        // R-G2-03 动词/副词黑名单精准熔断（虚化认知动词）
+        assert!(is_banned_lemma("以为"));
+        assert!(is_banned_lemma("认为"));
+        assert!(is_banned_lemma("觉得"));
+        assert!(is_banned_lemma("看来"));
+        assert!(is_banned_lemma("希望"));
+        assert!(is_banned_lemma("好像"));
+        assert!(is_banned_lemma("似乎"));
+
+        // 实体动词/正常动作默认放行（零误杀）
+        assert!(!is_banned_lemma("阅读"));
+        assert!(!is_banned_lemma("摄影"));
+        assert!(!is_banned_lemma("烹饪"));
+        assert!(!is_banned_lemma("微笑"));
     }
 }
+
