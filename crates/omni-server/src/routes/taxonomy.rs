@@ -201,6 +201,46 @@ pub async fn taxonomy_aliases_handler(
     }
 }
 
+/// 从语义包 `file_tags` 读取 `sort_order > 0` 的 `code -> 序值` 映射（受控域排序值唯一事实源）。
+///
+/// - pack 只读：表或列缺失（本地主库/测试夹具）时返回空映射，调用方保留自身兜底值；
+/// - 语义约定与回退路径、desktop 服务端一致：**`sort_order > 0` 才视为已设置，0 = 未设置**。
+fn load_pack_sort_orders(conn: &Connection) -> HashMap<String, i64> {
+    let has_table: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file_tags'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_table {
+        return HashMap::new();
+    }
+
+    let has_sort_order_col = conn
+        .prepare("PRAGMA table_info(file_tags)")
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            Ok(rows.flatten().any(|c| c == "sort_order"))
+        })
+        .unwrap_or(false);
+    if !has_sort_order_col {
+        return HashMap::new();
+    }
+
+    let mut map = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT code, sort_order FROM file_tags WHERE sort_order > 0") {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }) {
+            for (code, sort_order) in rows.flatten() {
+                map.insert(code, sort_order);
+            }
+        }
+    }
+    map
+}
+
 /// 倒排 Trie 极速分类树构建引擎 (ADR-0038 / ADR-0053 / P95 <= 5ms)
 pub fn query_taxonomy_tree_fast(
     conn: &Connection,
@@ -469,6 +509,22 @@ pub fn query_taxonomy_tree_fast(
         }
     }
 
+    // 2.5 回填语义包 file_tags.sort_order（根 + 子节点）：
+    // fast path 只倒排主库 file_tag_relations，不读 pack，节点序值仅有硬编码兜底；
+    // pack 是受控域 sort_order 的唯一事实源，此处按 code 全量回填，未命中的节点（本地动态根/无序值标签）保留兜底。
+    // 特例：builtin.content_tags 维持硬编码 9999 恒定垫底，不被 pack 值覆盖。
+    let pack_sort_orders = load_pack_sort_orders(conn);
+    if !pack_sort_orders.is_empty() {
+        for node in node_map.values_mut() {
+            if node.code == "builtin.content_tags" {
+                continue;
+            }
+            if let Some(&sort_order) = pack_sort_orders.get(&node.code) {
+                node.sort_order = sort_order;
+            }
+        }
+    }
+
     if node_map.is_empty() {
         return Ok(TaxonomyTreeResponse {
             locale: locale.to_string(),
@@ -658,6 +714,8 @@ pub fn query_taxonomy_tree_fast(
             }
         }
 
+        // 顶层根节点排序：sort_order (>0 升序) 为主判据，其次 ROOT_DIMENSION_CONCEPTS 规范概念序，再次 code 字典序。
+        // 主判据与回退路径 (L1300 一带) 及 desktop 服务端 (TagTreeQuery) 的 `order > 0` 语义保持一致。
         roots.sort_by(|a, b| {
             let root_rank = |code: &str| -> usize {
                 omni_core::ROOT_DIMENSION_CONCEPTS
@@ -665,14 +723,18 @@ pub fn query_taxonomy_tree_fast(
                     .position(|concept_item| concept_item.code() == code)
                     .unwrap_or(usize::MAX)
             };
-            let rank_a = root_rank(&a.code);
-            let rank_b = root_rank(&b.code);
-            if rank_a != rank_b {
-                rank_a.cmp(&rank_b)
-            } else if a.sort_order != b.sort_order {
-                a.sort_order.cmp(&b.sort_order)
+            let order_a = if a.sort_order > 0 { a.sort_order } else { i64::MAX };
+            let order_b = if b.sort_order > 0 { b.sort_order } else { i64::MAX };
+            if order_a != order_b {
+                order_a.cmp(&order_b)
             } else {
-                a.code.cmp(&b.code)
+                let rank_a = root_rank(&a.code);
+                let rank_b = root_rank(&b.code);
+                if rank_a != rank_b {
+                    rank_a.cmp(&rank_b)
+                } else {
+                    a.code.cmp(&b.code)
+                }
             }
         });
     }
@@ -853,6 +915,12 @@ pub fn query_taxonomy_tree(
             .find(|p| pack_source_map.contains_key(*p) && *p != &raw.code)
             .cloned()
             .or_else(|| raw.parent_codes.first().cloned());
+        // 特例：builtin.content_tags 恒定垫底，与 fast path 的 9999 硬编码口径一致（pack 值 28 不参与根级排序）
+        let sort_order = if raw.code == "builtin.content_tags" {
+            9999
+        } else {
+            raw.sort_order
+        };
         node_map.insert(
             raw.code.clone(),
             TaxonomyNode {
@@ -861,7 +929,7 @@ pub fn query_taxonomy_tree(
                 parent_code: primary_parent,
                 parent_codes: raw.parent_codes,
                 source: raw.source,
-                sort_order: raw.sort_order,
+                sort_order,
                 file_count: 0,
                 files: Vec::new(),
                 children: Vec::new(),
@@ -2125,6 +2193,159 @@ mod tests {
         let content_root = content_root.unwrap();
         assert!(content_root.children.iter().all(|c| c.code != "builtin.security_level" && c.code != "builtin.language_segmentation"));
         assert!(content_root.children.iter().any(|c| c.code == "_ext.he.9ec86979"));
+    }
+
+    /// fast path 必须按 code 回填语义包 file_tags.sort_order：
+    /// 根节点与子节点均取 pack 值，根数组按 sort_order (>0) 升序；
+    /// builtin.content_tags 保留 9999 垫底特例（不被 pack 值 28 覆盖）。
+    #[test]
+    fn test_fast_path_backfills_pack_sort_order_for_roots_and_children() {
+        let pack_conn = Connection::open_in_memory().unwrap();
+        pack_conn
+            .execute_batch(
+                "CREATE TABLE file_tags (
+                    code TEXT PRIMARY KEY,
+                    parent_codes TEXT NOT NULL DEFAULT '[]',
+                    source TEXT NOT NULL DEFAULT 'dimension',
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO file_tags (code, sort_order) VALUES
+                    ('builtin.file_type', 1),
+                    ('builtin.author', 4),
+                    ('builtin.content_tags', 28),
+                    ('builtin.novel', 1),
+                    ('builtin.image', 5),
+                    ('builtin.zhangsan', 3);",
+            )
+            .unwrap();
+
+        let master_conn = Connection::open_in_memory().unwrap();
+        master_conn
+            .execute_batch(
+                "CREATE TABLE workspace_files (
+                file_fingerprint TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                workspace_id INTEGER NOT NULL DEFAULT 1,
+                status INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE file_tag_relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_fingerprint TEXT NOT NULL,
+                tag_code TEXT NOT NULL,
+                code_path TEXT,
+                name_path TEXT
+            );
+            INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
+                ('fp_1', 'D:\\\\files\\\\a.txt', 1, 1),
+                ('fp_2', 'D:\\\\files\\\\b.txt', 1, 1),
+                ('fp_3', 'D:\\\\files\\\\c.txt', 1, 1),
+                ('fp_4', 'D:\\\\files\\\\d.txt', 1, 1),
+                ('fp_5', 'D:\\\\files\\\\e.txt', 1, 1);
+
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_1', 'builtin.image', '/builtin.file_type/builtin.image', '/文件类型/图片'),
+                ('fp_2', 'builtin.novel', '/builtin.file_type/builtin.novel', '/文件类型/小说'),
+                ('fp_3', 'builtin.article', '/builtin.file_type/builtin.article', '/文件类型/文章'),
+                ('fp_4', 'builtin.zhangsan', '/builtin.author/builtin.zhangsan', '/作者/张三'),
+                ('fp_5', 'builtin.foo', '/builtin.content_tags/builtin.foo', '/内容标签/未知');",
+            )
+            .unwrap();
+
+        let resp = query_taxonomy_tree_fast(
+            &pack_conn,
+            "zh-CN",
+            None,
+            &master_conn,
+            false,
+            Some(1),
+            None,
+        )
+        .expect("query_taxonomy_tree_fast failed");
+
+        // 1. 根数组按 sort_order (>0) 升序：file_type(1) -> author(4) -> content_tags(9999)
+        let root_codes: Vec<&str> = resp.root_nodes.iter().map(|n| n.code.as_str()).collect();
+        assert_eq!(root_codes, vec!["builtin.file_type", "builtin.author", "builtin.content_tags"]);
+
+        // 2. 根节点 sort_order 取自 pack；content_tags 特例仍为 9999（pack 值 28 不参与）
+        assert_eq!(resp.root_nodes[0].sort_order, 1);
+        assert_eq!(resp.root_nodes[1].sort_order, 4);
+        assert_eq!(resp.root_nodes[2].sort_order, 9999);
+
+        // 3. 子节点 sort_order 取自 pack，并按 (>0 升序, 0 视为未设置垫底, code 兜底) 排序
+        let file_type_root = resp
+            .root_nodes
+            .iter()
+            .find(|n| n.code == "builtin.file_type")
+            .expect("missing builtin.file_type");
+        let child_codes: Vec<&str> = file_type_root
+            .children
+            .iter()
+            .map(|n| n.code.as_str())
+            .collect();
+        assert_eq!(child_codes, vec!["builtin.novel", "builtin.image", "builtin.article"]);
+        assert_eq!(file_type_root.children[0].sort_order, 1);
+        assert_eq!(file_type_root.children[1].sort_order, 5);
+        // pack 无该行 -> 保留 fast path 硬编码兜底 0（= 未设置）
+        assert_eq!(file_type_root.children[2].sort_order, 0);
+    }
+
+    /// pack 缺失 file_tags 表时（本地主库/测试夹具），回填映射为空，回退硬编码兜底不 panic。
+    #[test]
+    fn test_fast_path_without_pack_file_tags_keeps_hardcoded_sort_order() {
+        let pack_conn = Connection::open_in_memory().unwrap();
+        let master_conn = Connection::open_in_memory().unwrap();
+        master_conn
+            .execute_batch(
+                "CREATE TABLE workspace_files (
+                file_fingerprint TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                workspace_id INTEGER NOT NULL DEFAULT 1,
+                status INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE file_tag_relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_fingerprint TEXT NOT NULL,
+                tag_code TEXT NOT NULL,
+                code_path TEXT,
+                name_path TEXT
+            );
+            INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
+                ('fp_1', 'D:\\\\files\\\\a.txt', 1, 1),
+                ('fp_2', 'D:\\\\files\\\\b.txt', 1, 1);
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_1', 'builtin.image', '/builtin.file_type/builtin.image', '/文件类型/图片'),
+                ('fp_2', 'builtin.foo', '/builtin.content_tags/builtin.foo', '/内容标签/未知');",
+            )
+            .unwrap();
+
+        let resp = query_taxonomy_tree_fast(
+            &pack_conn,
+            "zh-CN",
+            None,
+            &master_conn,
+            false,
+            Some(1),
+            None,
+        )
+        .expect("query_taxonomy_tree_fast failed");
+
+        let file_type_root = resp
+            .root_nodes
+            .iter()
+            .find(|n| n.code == "builtin.file_type")
+            .expect("missing builtin.file_type");
+        assert_eq!(file_type_root.sort_order, 1);
+
+        let content_root = resp
+            .root_nodes
+            .iter()
+            .find(|n| n.code == "builtin.content_tags")
+            .expect("missing builtin.content_tags");
+        assert_eq!(content_root.sort_order, 9999);
+
+        // 子节点在 pack 缺失时保持硬编码 0，按 code 字典序稳定排序
+        assert_eq!(file_type_root.children.len(), 1);
+        assert_eq!(file_type_root.children[0].sort_order, 0);
     }
 }
 

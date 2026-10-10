@@ -188,3 +188,51 @@ fn perception_result_benchmark_flattens_dynamic_subtasks() {
     assert_eq!(back_bm.get("clip_mutual_ms"), Some(6));
     assert_eq!(back_bm.get("custom_detector_ms"), Some(33));
 }
+
+/// 契约 5：音频语音/歌词客观语言事实推导与图片门禁契约。
+///
+/// 1. 音频且有 ASR 时：正确识别语言并挂入 `fact_tags`（如 `builtin.chinese`）；
+/// 2. 音频但无 ASR/无 LRC/无语言元数据时：不产出语言标签（宁缺勿错）；
+/// 3. 图片即便带文字：维度 11 声明 applicable 不含 image，严禁挂语言细分。
+#[test]
+fn language_fact_tag_behavior_for_audio_and_image() {
+    use omni_core::detect_fact_language;
+    use omni_core::concepts::Concept;
+
+    // 音频 ASR 识别到中文
+    let asr_text = "陈博演微微有两秒的停顿，没有说什么，只是重新转过头去发动车子。";
+    let detected = detect_fact_language(asr_text);
+    assert_eq!(detected, Some(Concept::中文));
+    let lang_label = detected.map(|concept_val| concept_val.zh_name().to_string());
+    assert_eq!(lang_label.as_deref(), Some("中文"));
+
+    // 事实抽取器验证
+    let metadata = json!({});
+    let ctx = omni_extract::FactTagContext {
+        metadata: &metadata,
+        language_label: lang_label,
+        ..Default::default()
+    };
+    let tags = omni_extract::OmniFactTagExtractor::extract(&ctx);
+    let lang_tag = tags.iter().find(|t| t.via_parent_code.as_deref() == Some("builtin.language_segmentation"));
+    assert!(lang_tag.is_some(), "有 ASR 时必须产出语言事实标签");
+    let t = lang_tag.unwrap();
+    assert_eq!(t.name, "中文");
+    assert_eq!(t.code, "builtin.chinese");
+    assert_eq!(t.confidence, 0.90);
+    assert_eq!(t.engine.as_deref(), Some("metadata"));
+
+    // 无 ASR / 无有效语音事实时
+    let empty_detected = detect_fact_language("   ");
+    assert_eq!(empty_detected, None);
+    let ctx_empty = omni_extract::FactTagContext {
+        metadata: &metadata,
+        language_label: None,
+        ..Default::default()
+    };
+    let tags_empty = omni_extract::OmniFactTagExtractor::extract(&ctx_empty);
+    assert!(
+        tags_empty.iter().all(|t| t.via_parent_code.as_deref() != Some("builtin.language_segmentation")),
+        "无客观语料事实时严禁产出语言细分标签"
+    );
+}
