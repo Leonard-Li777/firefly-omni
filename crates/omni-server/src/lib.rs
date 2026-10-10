@@ -2327,11 +2327,41 @@ async fn perceive_file_handler(
 
     // 10. 原生事实标签抽取 (Task 2)：元数据直读 + 下沉物理事实 → fact_tags 直出
     //
-    // 语言细分 (dim 11)：**停用 UI 语言推导**。`req.language` 是 Desktop 的 UI 默认语言
-    // (`DEFAULT_LANGUAGE`)，并非文件内容语种；此前据其直接产出「语言细分」事实，
-    // 导致 UI=zh-CN 时所有文件（含 wav / 压缩包）被挂「中文」，且图片（applicable 不含 image）同样被挂。
-    // Omni 侧真正的语种检测器为 `omni_text::lang::LanguageDetector`（fastText + 字符分布），
-    // 待接入文件文本 / ASR 语料后再产出；在此之前不产出语言事实（宁缺勿错）。
+    // 语言细分 (dim 11, applicableFileTypes: document, text, ebook, audio, video):
+    // 严格按客观内容特征推导，严禁由 UI 语言 (req.language) 臆测，且严禁对图片 (applicable 不含 image) 及压缩包挂语言标签。
+    // ① 音频/视频：优先使用真实 ASR 语音转录语料，次选 LRC 歌词，再次选音视频元数据 language 字段；
+    // ② 文档/文本：使用提取的真实正文 markdown_content；
+    // ③ 纯图片/无语音音频/无文本文件：不产出语言事实标签 (None，宁缺勿错)。
+    let fact_language_concept: Option<omni_core::concepts::Concept> = if !is_image {
+        let candidate_text = if is_audio || is_video {
+            asr.as_deref().or(lrc.as_deref())
+        } else {
+            let trimmed = markdown_content.trim();
+            if !trimmed.is_empty() {
+                Some(trimmed)
+            } else {
+                None
+            }
+        };
+
+        if let Some(text) = candidate_text {
+            omni_core::detect_fact_language(text)
+        } else if is_audio || is_video {
+            // ASR 与 LRC 均为空时，尝试从音视频元数据读取语言标识 (如 metadata["audio"]["language"])
+            let meta_lang = metadata.get("audio").and_then(|a| a.get("language"))
+                .or_else(|| metadata.get("exiftool").and_then(|e| e.get("AudioLanguage").or_else(|| e.get("Language"))))
+                .or_else(|| metadata.get("language"))
+                .and_then(|v| v.as_str());
+            meta_lang.and_then(omni_core::concept_from_language_code)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let language_label = fact_language_concept.map(|concept_val| concept_val.zh_name().to_string());
+
     let mut fact_tags: Vec<omni_core::TagChainItem> = {
         let ctx = omni_extract::FactTagContext {
             metadata: &metadata,
@@ -2339,7 +2369,7 @@ async fn perceive_file_handler(
             workflow_state: workflow_state.clone(),
             security_level: security_level.clone(),
             quality_score,
-            language_label: None,
+            language_label,
         };
         omni_extract::OmniFactTagExtractor::extract(&ctx)
     };
