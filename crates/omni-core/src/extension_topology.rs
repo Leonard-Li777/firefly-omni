@@ -4,25 +4,13 @@
 use crate::concepts::Concept;
 use crate::MediaDomain;
 
-/// 扩展名解析结果（自带 4 级完整物化路径）
+/// 扩展名受控解析结果：纯粹表达扩展名标签身份与其所属扩展名维度与媒体大类
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionResolution {
     pub tag_code: String,
     pub tag_name: String,
     pub ext_dim_concept: Concept,
     pub category_concept: Concept,
-    pub code_path: String,
-    pub name_path: String,
-    pub depth: u32,
-}
-
-/// 媒体大类解析结果（自带 2 级完整物化路径）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CategoryResolution {
-    pub category_concept: Concept,
-    pub code_path: String,
-    pub name_path: String,
-    pub depth: u32,
 }
 
 pub struct ExtensionTopologyResolver;
@@ -450,7 +438,7 @@ impl ExtensionTopologyResolver {
         }
     }
 
-    /// 全链路求解扩展名完整 4 级物化路径
+    /// 求解扩展名受控概念与直接父维度
     pub fn resolve(ext: &str, domain_hint: Option<MediaDomain>) -> Option<ExtensionResolution> {
         let clean = ext.trim().trim_start_matches(".").to_ascii_lowercase();
         if clean.is_empty() { return None; }
@@ -460,29 +448,11 @@ impl ExtensionTopologyResolver {
         let tag_name = clean.clone();
         let tag_code = format!("builtin.{}", clean);
 
-        let code_path = format!(
-            "/{}/{}/{}/{}",
-            Concept::文件类型.code(),
-            category.code(),
-            ext_dim.code(),
-            tag_code
-        );
-        let name_path = format!(
-            "/{}/{}/{}/{}",
-            Concept::文件类型.zh_name(),
-            category.zh_name(),
-            ext_dim.zh_name(),
-            tag_name
-        );
-
         Some(ExtensionResolution {
             tag_code,
             tag_name,
             ext_dim_concept: ext_dim,
             category_concept: category,
-            code_path,
-            name_path,
-            depth: 4,
         })
     }
 }
@@ -492,14 +462,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolve_mp3_path() {
+    fn test_resolve_mp3_concept() {
         let res = ExtensionTopologyResolver::resolve("mp3", None).expect("mp3 should resolve");
         assert_eq!(res.tag_code, "builtin.mp3");
         assert_eq!(res.ext_dim_concept, Concept::音频扩展名);
         assert_eq!(res.category_concept, Concept::音频);
-        assert_eq!(res.code_path, "/builtin.file_type/builtin.audio/builtin.audio_extensions/builtin.mp3");
-        assert_eq!(res.name_path, "/文件类型/音频/音频扩展名/mp3");
-        assert_eq!(res.depth, 4);
     }
 
     #[test]
@@ -507,19 +474,17 @@ mod tests {
         let res_code = ExtensionTopologyResolver::resolve("ts", Some(MediaDomain::Code)).unwrap();
         assert_eq!(res_code.ext_dim_concept, Concept::源代码扩展名);
         assert_eq!(res_code.category_concept, Concept::源代码);
-        assert_eq!(res_code.code_path, "/builtin.file_type/hownet.000000194528.n/builtin.source_code_extensions/builtin.ts");
 
         let res_video = ExtensionTopologyResolver::resolve("ts", Some(MediaDomain::Video)).unwrap();
         assert_eq!(res_video.ext_dim_concept, Concept::视频扩展名);
         assert_eq!(res_video.category_concept, Concept::视频);
-        assert_eq!(res_video.code_path, "/builtin.file_type/omw.06277803.n/builtin.video_extensions/builtin.ts");
     }
 
     #[test]
     fn test_resolve_jpg() {
         let res = ExtensionTopologyResolver::resolve("jpg", None).unwrap();
         assert_eq!(res.category_concept, Concept::图片);
-        assert_eq!(res.code_path, "/builtin.file_type/omw.03234306.n/builtin.image_extensions/builtin.jpg");
+        assert_eq!(res.ext_dim_concept, Concept::图片扩展名);
     }
 
     #[test]
