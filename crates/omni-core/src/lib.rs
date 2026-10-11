@@ -6,6 +6,10 @@ pub mod tag_identity;
 /// AOT 受控概念强类型枚举（PRD-0050）
 pub mod concepts;
 
+/// 纯静态扩展名与大类受控拓扑解析器 (PRD-0058 / Fact Tags Migration)
+pub mod extension_topology;
+pub use extension_topology::{CategoryResolution, ExtensionResolution, ExtensionTopologyResolver};
+
 /// (WP5) 图片标签链路阈值集中定义（CLIP/RAM/互斥组 margin/出口 conf），单点可调
 pub mod tag_thresholds;
 
