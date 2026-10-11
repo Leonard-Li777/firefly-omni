@@ -2362,9 +2362,22 @@ async fn perceive_file_handler(
 
     let language_label = fact_language_concept.map(|concept_val| concept_val.zh_name().to_string());
 
+    let media_domain = if is_audio {
+        Some(omni_core::MediaDomain::Audio)
+    } else if is_video {
+        Some(omni_core::MediaDomain::Video)
+    } else if is_image {
+        Some(omni_core::MediaDomain::Image)
+    } else {
+        None
+    };
+
     let mut fact_tags: Vec<omni_core::TagChainItem> = {
         let ctx = omni_extract::FactTagContext {
             metadata: &metadata,
+            file_path: Some(&file_path),
+            extension: None,
+            media_domain,
             file_source: file_source.clone(),
             workflow_state: workflow_state.clone(),
             security_level: security_level.clone(),

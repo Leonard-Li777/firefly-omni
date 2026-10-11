@@ -13,6 +13,7 @@
 //! （物理直读与规则推导同级，历史各自的取值一律作废，见 ADR-0045 §Decision 1/2）；
 //! `engine` 统一标记为 `"metadata"`（产出引擎标识，与 `tag_group` 正交）。
 
+use omni_core::concepts::Concept;
 use omni_core::tag_thresholds::EXIT_CONFIDENCE_THRESHOLD;
 #[cfg(test)]
 use omni_core::tag_thresholds::LAYER_FALLBACK_PHYSICAL;
@@ -34,6 +35,12 @@ const CONF_FACT: f32 = 0.90;
 pub struct FactTagContext<'a> {
     /// 完整元数据 JSON (含 exiftool / audio / document / image 等子树)
     pub metadata: &'a Value,
+    /// 完整文件路径 (用于提取扩展名)
+    pub file_path: Option<&'a str>,
+    /// 显式扩展名 (可选覆盖，如 "mp3")
+    pub extension: Option<&'a str>,
+    /// 判定的媒体领域
+    pub media_domain: Option<omni_core::MediaDomain>,
     /// 文件来源展示名 (网络下载 / 局域网共享 / 本地磁盘 / 系统文件)
     pub file_source: Option<String>,
     /// 处理状态展示名 (草稿 / 待审核 / 已完成 / 已归档 / 未归档)
@@ -52,10 +59,15 @@ pub struct OmniFactTagExtractor;
 impl OmniFactTagExtractor {
     /// 从元数据 JSON 与下沉物理事实中抽取全套 `fact_tags`
     ///
-    /// 输出顺序稳定：先元数据实体维度（类别/作者/专辑/流派/器材/软件/机构），
-    /// 再下沉物理事实维度（来源/状态/密级/质量/语言），保证 Desktop 侧展示与落库顺序可预期。
+    /// 输出顺序稳定：
+    /// 0. 原生扩展名与媒体大类事实 (确定性直出 4 级与 2 级完整物化路径)
+    /// 1. 元数据实体维度 (类别/作者/专辑/流派/器材/软件/机构)
+    /// 2. 下沉物理事实维度 (来源/状态/密级/质量/语言)
     pub fn extract(ctx: &FactTagContext<'_>) -> Vec<TagChainItem> {
         let mut tags: Vec<TagChainItem> = Vec::new();
+
+        // 0. 原生扩展名与媒体大类事实确定性抽取 (PRD-0058 / Fact Tags Migration)
+        Self::extract_extension_and_category_facts(ctx, &mut tags);
 
         // 1. 元数据实体维度抽取 (音频 / 视觉器材 / 文档)
         Self::extract_audio_dimensions(ctx.metadata, &mut tags);
@@ -78,6 +90,66 @@ impl OmniFactTagExtractor {
             tags.iter().map(|t| (t.name.as_str(), t.code.as_str())).collect::<Vec<_>>()
         );
         tags
+    }
+
+    /// 抽取文件扩展名与媒体大类事实 (确定性直出 4 级与 2 级完整物化路径)
+    fn extract_extension_and_category_facts(ctx: &FactTagContext<'_>, out: &mut Vec<TagChainItem>) {
+        let ext_candidate = ctx.extension.or_else(|| {
+            ctx.file_path.and_then(|p| std::path::Path::new(p).extension().and_then(|e| e.to_str()))
+        });
+
+        if let Some(ext) = ext_candidate {
+            if let Some(res) = omni_core::ExtensionTopologyResolver::resolve(ext, ctx.media_domain) {
+                // 1. 扩展名事实 (4 级物化路径)
+                out.push(TagChainItem {
+                    code: res.tag_code,
+                    name: res.tag_name,
+                    confidence: CONF_FACT,
+                    parent_codes: vec![res.ext_dim_concept.code().to_string()],
+                    via_parent_code: Some(res.ext_dim_concept.code().to_string()),
+                    code_path: Some(res.code_path),
+                    name_path: Some(res.name_path),
+                    depth: Some(res.depth),
+                    engine: Some(ENGINE_METADATA.to_string()),
+                    source: Some("metadata".to_string()),
+                    ..Default::default()
+                });
+
+                // 2. 媒体大类事实 (2 级物化路径，直属 builtin.file_type)
+                let cat_code_path = format!("/{}/{}", Concept::文件类型.code(), res.category_concept.code());
+                let cat_name_path = format!("/{}/{}", Concept::文件类型.zh_name(), res.category_concept.zh_name());
+                out.push(TagChainItem {
+                    code: res.category_concept.code().to_string(),
+                    name: res.category_concept.zh_name().to_string(),
+                    confidence: CONF_FACT,
+                    parent_codes: vec![Concept::文件类型.code().to_string()],
+                    via_parent_code: Some(Concept::文件类型.code().to_string()),
+                    code_path: Some(cat_code_path),
+                    name_path: Some(cat_name_path),
+                    depth: Some(2),
+                    engine: Some(ENGINE_METADATA.to_string()),
+                    source: Some("metadata".to_string()),
+                    ..Default::default()
+                });
+            }
+        } else if let Some(domain) = ctx.media_domain {
+            // 若无扩展名但已知 media_domain，直出媒体大类事实
+            if let Some(cat_res) = omni_core::ExtensionTopologyResolver::resolve_category_by_domain(domain) {
+                out.push(TagChainItem {
+                    code: cat_res.category_concept.code().to_string(),
+                    name: cat_res.category_concept.zh_name().to_string(),
+                    confidence: CONF_FACT,
+                    parent_codes: vec![Concept::文件类型.code().to_string()],
+                    via_parent_code: Some(Concept::文件类型.code().to_string()),
+                    code_path: Some(cat_res.code_path),
+                    name_path: Some(cat_res.name_path),
+                    depth: Some(cat_res.depth),
+                    engine: Some(ENGINE_METADATA.to_string()),
+                    source: Some("metadata".to_string()),
+                    ..Default::default()
+                });
+            }
+        }
     }
 
     /// 音频维度：Artist → 作者/歌手；Album → 专辑；Genre → 音乐流派
@@ -403,6 +475,37 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 原生扩展名与媒体大类事实确定性抽取 (4 级与 2 级完整物化路径)
+    #[test]
+    fn test_extract_extension_and_category_facts() {
+        let empty_meta = json!({});
+        let ctx = FactTagContext {
+            metadata: &empty_meta,
+            file_path: Some("D:/music/beyond-海阔天空.mp3"),
+            media_domain: Some(omni_core::MediaDomain::Audio),
+            ..Default::default()
+        };
+        let tags = OmniFactTagExtractor::extract(&ctx);
+
+        let mp3_tag = tags.iter().find(|t| t.code == "builtin.mp3").expect("应包含 builtin.mp3");
+        assert_eq!(mp3_tag.via_parent_code.as_deref(), Some("builtin.audio_extensions"));
+        assert_eq!(
+            mp3_tag.code_path.as_deref(),
+            Some("/builtin.file_type/builtin.audio/builtin.audio_extensions/builtin.mp3")
+        );
+        assert_eq!(
+            mp3_tag.name_path.as_deref(),
+            Some("/文件类型/音频/音频扩展名/mp3")
+        );
+        assert_eq!(mp3_tag.depth, Some(4));
+
+        let cat_tag = tags.iter().find(|t| t.code == "builtin.audio").expect("应包含 builtin.audio 大类");
+        assert_eq!(cat_tag.via_parent_code.as_deref(), Some("builtin.file_type"));
+        assert_eq!(cat_tag.code_path.as_deref(), Some("/builtin.file_type/builtin.audio"));
+        assert_eq!(cat_tag.name_path.as_deref(), Some("/文件类型/音频"));
+        assert_eq!(cat_tag.depth, Some(2));
+    }
+
     /// 音频元数据：Artist / Album / Genre 应全部产出
     #[test]
     fn test_extract_audio_metadata_tags() {
@@ -483,6 +586,7 @@ mod tests {
             security_level: Some("内部".to_string()),
             quality_score: Some(8.7),
             language_label: Some("中文".to_string()),
+            ..Default::default()
         });
         let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
 

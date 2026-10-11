@@ -236,3 +236,123 @@ fn language_fact_tag_behavior_for_audio_and_image() {
         "无客观语料事实时严禁产出语言细分标签"
     );
 }
+
+/// 契约 6（AC-3 / PRD-0058 / Issue Fact Tags Migration）：
+/// 感知请求传入 `file_path` 时，原生直出 4 级扩展名与 2 级媒体大类事实标签，
+/// 且序列化为 JSON 时携带完整的 `code_path` / `name_path` / `depth`，契约防篡改。
+#[test]
+fn perception_fact_tags_extension_and_category_materialized_paths() {
+    use omni_core::MediaDomain;
+
+    // 1. MP3 音频路径：验证 4 级扩展名与 2 级大类路径
+    let metadata = serde_json::json!({});
+    let ctx_mp3 = omni_extract::FactTagContext {
+        file_path: Some("/music/test_audio.mp3"),
+        media_domain: Some(MediaDomain::Audio),
+        metadata: &metadata,
+        ..Default::default()
+    };
+    let tags_mp3 = omni_extract::OmniFactTagExtractor::extract(&ctx_mp3);
+
+    // 断言扩展名事实标签
+    let mp3_tag = tags_mp3.iter().find(|t| t.code == "builtin.mp3")
+        .expect("必须产出 builtin.mp3 扩展名事实标签");
+    assert_eq!(mp3_tag.name, "mp3");
+    assert_eq!(mp3_tag.depth, Some(4));
+    assert_eq!(
+        mp3_tag.code_path.as_deref(),
+        Some("/builtin.file_type/builtin.audio/builtin.audio_extensions/builtin.mp3")
+    );
+    assert_eq!(
+        mp3_tag.name_path.as_deref(),
+        Some("/文件类型/音频/音频扩展名/mp3")
+    );
+    assert_eq!(mp3_tag.via_parent_code.as_deref(), Some("builtin.audio_extensions"));
+    assert_eq!(mp3_tag.parent_codes, vec!["builtin.audio_extensions".to_string()]);
+
+    // 断言大类事实标签
+    let audio_cat_tag = tags_mp3.iter().find(|t| t.code == "builtin.audio")
+        .expect("必须产出 builtin.audio 媒体大类事实标签");
+    assert_eq!(audio_cat_tag.depth, Some(2));
+    assert_eq!(
+        audio_cat_tag.code_path.as_deref(),
+        Some("/builtin.file_type/builtin.audio")
+    );
+    assert_eq!(
+        audio_cat_tag.name_path.as_deref(),
+        Some("/文件类型/音频")
+    );
+    assert_eq!(audio_cat_tag.via_parent_code.as_deref(), Some("builtin.file_type"));
+
+    // 2. 歧义扩展名消歧测试 (.ts: 视频 vs 代码)
+    let ctx_ts_video = omni_extract::FactTagContext {
+        file_path: Some("/videos/stream.ts"),
+        media_domain: Some(MediaDomain::Video),
+        metadata: &metadata,
+        ..Default::default()
+    };
+    let tags_ts_video = omni_extract::OmniFactTagExtractor::extract(&ctx_ts_video);
+    let ts_video_tag = tags_ts_video.iter().find(|t| t.code == "builtin.ts")
+        .expect("视频 domain 下必须产出 builtin.ts");
+    assert_eq!(
+        ts_video_tag.code_path.as_deref(),
+        Some("/builtin.file_type/omw.06277803.n/builtin.video_extensions/builtin.ts")
+    );
+    assert_eq!(ts_video_tag.depth, Some(4));
+
+    let ctx_ts_code = omni_extract::FactTagContext {
+        file_path: Some("/src/index.ts"),
+        media_domain: Some(MediaDomain::Code),
+        metadata: &metadata,
+        ..Default::default()
+    };
+    let tags_ts_code = omni_extract::OmniFactTagExtractor::extract(&ctx_ts_code);
+    let ts_code_tag = tags_ts_code.iter().find(|t| t.code == "builtin.ts")
+        .expect("代码 domain 下必须产出 builtin.ts");
+    assert_eq!(
+        ts_code_tag.code_path.as_deref(),
+        Some("/builtin.file_type/hownet.000000194528.n/builtin.code_extensions/builtin.ts")
+    );
+    assert_eq!(ts_code_tag.depth, Some(4));
+
+    // 3. 标签准入铁律：未知冷门扩展名严格阻断，严禁私造 builtin.{ext}
+    let ctx_unknown = omni_extract::FactTagContext {
+        file_path: Some("/data/archive.unknownxyz"),
+        media_domain: Some(MediaDomain::Audio),
+        metadata: &metadata,
+        ..Default::default()
+    };
+    let tags_unknown = omni_extract::OmniFactTagExtractor::extract(&ctx_unknown);
+    assert!(
+        tags_unknown.iter().all(|t| t.code != "builtin.unknownxyz"),
+        "未知扩展名严禁伪造 builtin.* 受控标签"
+    );
+
+    // 4. API 契约无损往返：OmniPerceptionResult 携带 fact_tags 序列化与反序列化
+    let perception_result = OmniPerceptionResult {
+        file_path: "/music/test_audio.mp3".to_string(),
+        fact_tags: tags_mp3.clone(),
+        ..Default::default()
+    };
+    let json_val = serde_json::to_value(&perception_result).expect("序列化包含 fact_tags 的感知结果失败");
+    let json_tags = json_val.get("fact_tags").and_then(|v| v.as_array()).expect("fact_tags 必须为数组");
+    let serialized_mp3 = json_tags.iter().find(|t| t["code"] == "builtin.mp3").expect("序列化必须包含 mp3");
+    assert_eq!(
+        serialized_mp3["code_path"],
+        "/builtin.file_type/builtin.audio/builtin.audio_extensions/builtin.mp3"
+    );
+    assert_eq!(
+        serialized_mp3["name_path"],
+        "/文件类型/音频/音频扩展名/mp3"
+    );
+    assert_eq!(serialized_mp3["depth"], 4);
+
+    let roundtrip: OmniPerceptionResult = serde_json::from_value(json_val).expect("反序列化感知结果失败");
+    let roundtrip_mp3 = roundtrip.fact_tags.iter().find(|t| t.code == "builtin.mp3").unwrap();
+    assert_eq!(
+        roundtrip_mp3.code_path.as_deref(),
+        Some("/builtin.file_type/builtin.audio/builtin.audio_extensions/builtin.mp3")
+    );
+    assert_eq!(roundtrip_mp3.depth, Some(4));
+}
+
