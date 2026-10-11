@@ -100,33 +100,31 @@ impl OmniFactTagExtractor {
 
         if let Some(ext) = ext_candidate {
             if let Some(res) = omni_core::ExtensionTopologyResolver::resolve(ext, ctx.media_domain) {
-                // 1. 扩展名事实 (4 级物化路径)
+                // 1. 扩展名事实（仅产出客观身份与直接父级，物化路径由通用图引擎沿 parent_codes 自然追溯）
                 out.push(TagChainItem {
                     code: res.tag_code,
                     name: res.tag_name,
                     confidence: CONF_FACT,
                     parent_codes: vec![res.ext_dim_concept.code().to_string()],
                     via_parent_code: Some(res.ext_dim_concept.code().to_string()),
-                    code_path: Some(res.code_path),
-                    name_path: Some(res.name_path),
-                    depth: Some(res.depth),
+                    code_path: None,
+                    name_path: None,
+                    depth: None,
                     engine: Some(ENGINE_METADATA.to_string()),
                     source: Some("metadata".to_string()),
                     ..Default::default()
                 });
 
-                // 2. 媒体大类事实 (2 级物化路径，直属 builtin.file_type)
-                let cat_code_path = format!("/{}/{}", Concept::文件类型.code(), res.category_concept.code());
-                let cat_name_path = format!("/{}/{}", Concept::文件类型.zh_name(), res.category_concept.zh_name());
+                // 2. 媒体大类事实（直属 builtin.file_type）
                 out.push(TagChainItem {
                     code: res.category_concept.code().to_string(),
                     name: res.category_concept.zh_name().to_string(),
                     confidence: CONF_FACT,
                     parent_codes: vec![Concept::文件类型.code().to_string()],
                     via_parent_code: Some(Concept::文件类型.code().to_string()),
-                    code_path: Some(cat_code_path),
-                    name_path: Some(cat_name_path),
-                    depth: Some(2),
+                    code_path: None,
+                    name_path: None,
+                    depth: None,
                     engine: Some(ENGINE_METADATA.to_string()),
                     source: Some("metadata".to_string()),
                     ..Default::default()
@@ -134,16 +132,18 @@ impl OmniFactTagExtractor {
             }
         } else if let Some(domain) = ctx.media_domain {
             // 若无扩展名但已知 media_domain，直出媒体大类事实
-            if let Some(cat_res) = omni_core::ExtensionTopologyResolver::resolve_category_by_domain(domain) {
+            if let Some(cat_concept) = omni_core::ExtensionTopologyResolver::get_ext_dim_by_domain(domain)
+                .map(omni_core::ExtensionTopologyResolver::get_category_for_ext_dim)
+            {
                 out.push(TagChainItem {
-                    code: cat_res.category_concept.code().to_string(),
-                    name: cat_res.category_concept.zh_name().to_string(),
+                    code: cat_concept.code().to_string(),
+                    name: cat_concept.zh_name().to_string(),
                     confidence: CONF_FACT,
                     parent_codes: vec![Concept::文件类型.code().to_string()],
                     via_parent_code: Some(Concept::文件类型.code().to_string()),
-                    code_path: Some(cat_res.code_path),
-                    name_path: Some(cat_res.name_path),
-                    depth: Some(cat_res.depth),
+                    code_path: None,
+                    name_path: None,
+                    depth: None,
                     engine: Some(ENGINE_METADATA.to_string()),
                     source: Some("metadata".to_string()),
                     ..Default::default()
