@@ -38,10 +38,11 @@ fn sanitize_en_slug(raw: &str) -> String {
 /// slug 为空时过渡 h_{hash}；唯一性由构建门禁与别名表保证。
 pub fn en_builtin_code(en_name: &str) -> String {
     let trimmed = en_name.trim();
+    let has_cjk = trimmed.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
     let slug = sanitize_en_slug(trimmed);
-    if slug.is_empty() {
+    if has_cjk || slug.is_empty() {
         let hash = content_hash8(trimmed);
-        format!("builtin.{}", &hash[..hash.len().min(10)])
+        format!("builtin.h_{}", &hash[..hash.len().min(10)])
     } else {
         format!("builtin.{}", slug)
     }
@@ -85,595 +86,8 @@ pub fn is_controlled_code(code: &str) -> bool {
 /// 未知标签兜底代码
 pub const UNKNOWN_TAG_CODE: &str = "builtin.unknown";
 
-/// 受控别名表：(别名, 英文规范名)
-/// 同一概念的多语言别名必须指向同一 en 规范名。
-const BUILTIN_ALIASES: &[(&str, &str)] = &[
-    // 文件类型 / 版面等规则高频项
-    ("文本", "Text"),
-    ("纯文字", "Text Only"),
-    ("文档", "Document"),
-    ("文件", "Document"),
-    ("图片", "Image"),
-    ("图像", "Image"),
-    ("画面", "Image"),
-    ("照片", "Photography"),
-    ("素材", "Material"),
-    ("视频", "Video"),
-    ("音频", "Audio"),
-    ("压缩包", "Compressed Archive"),
-    ("源代码", "Source Code"),
-    ("程序", "Executable Program"),
-    ("字体", "Font"),
-    ("模型", "3D Model"),
-    ("系统文件", "System Files"),
-    ("数据库", "Database"),
-    ("磁盘映像", "Disk Image"),
-    ("应用数据", "Application Data"),
-    ("电子书", "E-Book"),
-    // 闭环视觉规则高频项
-    ("截图", "Screenshot"),
-    ("设计稿", "Design Draft"),
-    ("图纸", "Blueprint"),
-    ("表情包", "Meme"),
-    ("证照", "Certificates and Licenses"),
-    ("合同票据", "Contract Instruments"),
-    ("海报宣发", "Poster Promo"),
-    ("医学影像", "Medical Imaging"),
-    ("网页长截图", "Long Webpage Screenshot"),
-    ("UI界面截图", "UI Screenshot"),
-    ("聊天截图", "Chat Screenshot"),
-    ("代码截图", "Code Screenshot"),
-    ("游戏截图", "Game Screenshot"),
-    ("有字图", "Text-in-Image"),
-    ("无字图", "Image without Text"),
-    ("全彩", "Full Color"),
-    ("黑白", "Black And White"),
-    ("摄影照片", "Photography"),
-    ("人像写真", "Portrait Photography"),
-    ("人物照", "Portrait Photos"),
-    ("私房写真", "Boudoir Photo"),
-    ("婚纱照", "Wedding Photos"),
-    ("静物照", "Still Life Photography"),
-    ("自然景观", "Natural Landscape"),
-    ("城市建筑", "Urban Architecture"),
-    ("旅行照", "Travel Photos"),
-    ("风景照", "Landscape Photos"),
-    ("宠物照", "Pet Photos"),
-    ("二次元", "Anime Style"),
-    ("动漫", "Anime"),
-    ("插画", "Illustration"),
-    ("漫画", "Comics"),
-    ("手绘", "Hand Drawn"),
-    ("涂鸦", "Doodle"),
-    ("角色", "Character"),
-    ("设计", "Design"),
-    ("代码", "Code"),
-    ("保密", "Confidential"),
-    // 视觉门控补充
-    ("名人", "Celebrity"),
-    ("社会名流", "Celebrity"),
-    ("历史遗迹", "Historical Sites"),
-    ("户外活动", "Outdoor Activities"),
-    ("夜景照", "Nighttime Photos"),
-    ("怀旧", "Nostalgia"),
-    ("建筑摄影", "Architectural Photography"),
-    ("微距摄影", "Macro Photography"),
-    ("街拍抓拍", "Street Photography: Candid Shots"),
-    ("航空航拍", "Aerial Photography"),
-    ("青年漫", "Youth Comics"),
-    ("少年漫", "Shounen Comics"),
-    ("少女漫", "Girls' comics"),
-    ("成人漫", "Adult Comics"),
-    ("实拍", "Real Shot"),
-    ("CG渲染", "CG rendering"),
-    ("AI生成", "AI Generated"),
-    ("绘画", "Painting"),
-    ("应用图标", "Application Icon"),
-    ("高饱和鲜艳", "Highly saturated and vivid"),
-    ("暖色调", "Warm colors"),
-    ("冷色调", "Cool colors"),
-    ("中性黑白灰", "Neutral black, white and gray"),
-    ("透明背景", "Transparent Background"),
-    ("实景背景", "Live background"),
-    ("人物主体", "Character subject"),
-    ("动物宠物", "Animal pets"),
-    ("植物花草", "Plants and flowers"),
-    ("静物商品", "Still life merchandise"),
-    ("环境建筑", "Environmental architecture"),
-    ("无人空镜", "Empty Scene"),
-    ("单人", "Single"),
-    ("双人", "Double"),
-    ("多人合影", "Group Photo"),
-    ("色情", "Pornography"),
-    ("血腥", "Bloody"),
-    ("涉政", "Political Issues"),
-    ("违规", "Violation"),
-    ("高ISO噪点", "High ISO Noise"),
-    ("逆光死白", "Blown Highlights in Backlight"),
-    ("暗光欠曝", "Underexposed in Low Light"),
-    ("同人本", "Doujinshi"),
-    ("剧情", "Plot"),
-    ("二次元色情", "Anime Pornography"),
-    ("软色情", "Soft Porn"),
-    ("性感", "Sexy"),
-    ("擦边诱惑", "Temptation on the Edge"),
-    ("血腥暴力", "Bloody Violence"),
-    ("断头斩首", "Beheading"),
-    ("肢解碎尸", "Dismemberment and Dismantling of a Corpse"),
-    ("血腥虐杀", "Bloody Massacre"),
-    ("露骨", "Explicit"),
-    ("露骨性行为", "Explicit Sexual Acts"),
-    ("安全", "Safe"),
-    ("全年龄", "All Ages"),
-    ("水彩水墨", "Watercolor Ink"),
-    ("四格漫", "4-Koma Manga"),
-    ("页漫", "Page Manga"),
-    ("条漫", "Webtoon"),
-    ("欢乐", "Joy"),
-    ("悲伤", "Sad"),
-    ("紧张", "Nervous"),
-    ("兴奋", "Excited"),
-    ("压抑", "Depress"),
-    ("历史", "History"),
-    // 英文模型直出别名（归一到同一概念）
-    ("text", "Text"),
-    ("document", "Document"),
-    ("file", "Document"),
-    ("image", "Image"),
-    ("picture", "Image"),
-    ("pic", "Image"),
-    ("img", "img"),
-    ("screenshot", "Screenshot"),
-    ("screen capture", "Screenshot"),
-    ("design draft", "Design Draft"),
-    ("blueprint", "Blueprint"),
-    ("meme", "Meme"),
-    ("id document", "Certificates and Licenses"),
-    ("invoice", "Bill"),
-    ("contract", "Contract"),
-    ("full color", "Full Color"),
-    ("black and white", "Black And White"),
-    ("black_and_white", "Black And White"),
-    ("image with text", "Text-in-Image"),
-    ("image without text", "Image without Text"),
-    ("image with no text", "Image without Text"),
-    ("doodle", "Doodle"),
-    ("character", "Character"),
-    ("design", "Design"),
-    ("designated", "Design"),
-    ("text image", "Text-in-Image"),
-    ("anime", "Anime"),
-    ("illustration", "Illustration"),
-    ("comic", "Comics"),
-    ("person photo", "Portrait Photos"),
-    ("still life photo", "Still Life Photography"),
-    ("natural landscape", "Natural Landscape"),
-    ("scenery photo", "Landscape Photos"),
-    ("travel photo", "Travel Photos"),
-    ("night photo", "Nighttime Photos"),
-    ("real shot", "Real Shot"),
-    ("cg render", "CG rendering"),
-    ("painting", "Painting"),
-    ("photo", "Photography"),
-    ("pornography", "Pornography"),
-    ("ui screenshot", "UI Screenshot"),
-    ("code screenshot", "Code Screenshot"),
-    ("chat screenshot", "Chat Screenshot"),
-    ("confidential", "Confidential"),
-    ("exposure is normal", "Normal Exposure"),
-    ("normal exposure", "Normal Exposure"),
-    // ③ en 展示名劣化已反哺上游并重生成（GH #719 / #729），右侧统一为新规范英文名（派生新 builtin.{slug(en)}），
-    // 左侧保留旧机器直译词面作为兼容入场别名，确保新旧英文词面均归一到同一权威受控 code。
-    ("text only", "Text Only"),
-    ("plain text", "Text Only"),
-    ("watermarked", "Watermarked"),
-    ("there is watermark", "Watermarked"),
-    ("underexposed in low light", "Underexposed in Low Light"),
-    ("underexposure in low light", "Underexposed in Low Light"),
-    ("blown highlights in backlight", "Blown Highlights in Backlight"),
-    (
-        "blown-out highlights in backlighting",
-        "Blown Highlights in Backlight"
-    ),
-    ("certificates and licenses", "Certificates and Licenses"),
-    ("licenses and permits", "Certificates and Licenses"),
-    ("good exposure", "Good Exposure"),
-    ("slight underexposure", "Slight Underexposure"),
-    ("slight overexposure", "Slight Overexposure"),
-    ("high quality", "High Quality"),
-    ("medium quality", "Medium Quality"),
-    ("low quality", "Low Quality"),
-    ("all ages", "All Ages"),
-    ("text-in-image", "Text-in-Image"),
-    ("text in image", "Text-in-Image"),
-    ("长图", "Long Image"),
-    ("正方形图", "Square Image"),
-    ("横图", "Horizontal Image"),
-    ("竖图", "Vertical Image"),
-    ("横屏", "Horizontal Screen"),
-    ("Landscape", "Horizontal Screen"),
-    ("竖屏", "Vertical Screen"),
-    ("Portrait", "Vertical Screen"),
-    ("主题内容", "Topic"),
-    ("topic", "Topic"),
-    ("long image", "Long Image"),
-    ("square image", "Square Image"),
-    ("horizontal image", "Horizontal Image"),
-    ("vertical image", "Vertical Image"),
-    // 视觉细分与票据证照 (无 hash 规范化)
-    ("合同", "Contract"),
-    ("发票", "Bill"),
-    ("红头文件", "Official Document"),
-    ("论文", "Thesis"),
-    ("收据", "Receipt"),
-    ("对账单", "Statement of Account"),
-    ("银行回单", "Bank Receipt"),
-    ("采购订单", "Purchase Order"),
-    ("报销凭证", "Reimbursement Vouchers"),
-    ("保函协议", "Letter of Guarantee Agreement"),
-    ("投标文件", "Bid Documents"),
-    ("身份证", "ID Card"),
-    ("房产证", "Property Ownership Certificate"),
-    ("护照", "Passport"),
-    ("驾驶证", "Driver's License"),
-    ("行驶证", "Vehicle Registration Certificate"),
-    ("车牌", "License Plate"),
-    ("银行卡", "Bank Card"),
-    ("营业执照", "Business License"),
-    ("户口本", "Household Registration Book"),
-    ("毕业证", "Diploma"),
-    ("学位证", "Degree Certificate"),
-    ("工作证", "Employee ID Card"),
-    ("结婚证", "Marriage Certificate"),
-    ("社保卡", "Social Security Card"),
-    ("特写", "Close Up"),
-    ("半身", "Half body"),
-    ("全身", "Whole body"),
-    ("全景", "Panoramic view"),
-    ("微距", "Macro"),
-    ("日光", "Sunlight"),
-    ("日落", "Sunset"),
-    ("夜景", "Night view"),
-    ("暗光", "Dim light"),
-    ("室内光", "Indoor Light"),
-    ("纯色背景", "Solid color background"),
-    ("平视", "Eye Level"),
-    ("俯视", "Looking down"),
-    ("仰视", "Look up"),
-    ("第一人称", "First Person"),
-    ("图表为主", "Chart-based"),
-    ("图文混合", "Mixed graphics and text"),
-    ("手写笔记", "Handwritten Notes"),
-    ("Windows截图", "Windows Screenshot"),
-    ("macOS截图", "macOS Screenshots"),
-    ("macOS Screenshot", "macOS Screenshots"),
-    ("iOS截图", "iOS Screenshots"),
-    ("iOS Screenshot", "iOS Screenshots"),
-    ("Android截图", "Android Screenshot"),
-    ("Linux截图", "Linux Screenshot"),
-    ("正方形", "Square"),
-    ("超宽长条", "Extra wide strip"),
-    ("微量文本", "Microtext"),
-    ("Minimal Text", "Microtext"),
-    ("图文标题", "Picture And Text Title"),
-    ("Graphic Title", "Picture And Text Title"),
-    ("密集排版", "Dense Typography"),
-    ("Dense Layout", "Dense Typography"),
-    ("扁平极简", "Flat and minimalist"),
-    ("写实拟真", "Realistic"),
-    ("复古胶片", "Vintage Film"),
-    ("赛博朋克", "Cyberpunk"),
-    ("春季花景", "Spring flower scene"),
-    ("夏季绿荫", "Summer Shade"),
-    ("秋季金黄", "Autumn golden"),
-    ("冬季雪景", "Winter snow scene"),
-    ("红色", "Red"),
-    ("橙色", "Orange color"),
-    ("黄色", "Yellow"),
-    ("绿色", "Green"),
-    ("青色", "Cyan"),
-    ("蓝色", "Blue"),
-    ("紫色", "Purple"),
-    ("粉色", "Pink"),
-    ("棕色", "Brown"),
-    ("白色", "White"),
-    ("黑色", "Black"),
-    ("灰色", "Gray"),
-    ("商业志", "Business Journal"),
-    ("虚焦", "Out Of Focus"),
-    ("抖动", "Jitter"),
-    ("曝光良好", "Good Exposure"),
-    ("轻微欠曝", "Slight Underexposure"),
-    ("轻微过曝", "Slight Overexposure"),
-    ("模糊废片", "Blurry, unusable photos"),
-    ("脱焦", "Defocused"),
-    ("运动抖动", "Motion Jitter"),
-    ("曝光正常", "Normal Exposure"),
-    ("无码", "Uncensored"),
-    ("薄码", "Light Mosaic"),
-    ("有码", "Censored"),
-    ("无水印", "No watermark"),
-    ("轻水印", "Light Watermark"),
-    ("有水印", "Watermarked"),
-    ("高质量", "High Quality"),
-    ("中等质量", "Medium Quality"),
-    ("低质量", "Low Quality"),
-    ("暴恐", "Violence & Terrorism"),
-    ("生殖器暴露", "Genital Exposure"),
-    ("性虐调教", "Sadomasochism"),
-    ("乱伦淫秽", "Incest Pornography"),
-    ("强奸轮奸", "Rape Assault"),
-    ("自慰高潮", "Orgasm Through Masturbation"),
-    ("调教拘束", "Training and Restraint"),
-    ("情色文娱", "Erotic Entertainment"),
-    ("暴露走光", "Exposure Wardrobe Malfunction"),
-    ("残肢断臂", "Severed Limbs Mutilation"),
-    ("尸体残骸", "Corpse Remains"),
-    ("酷刑折磨", "Torture"),
-    ("重口猎奇", "Hardcore Grotesque"),
-    ("暴恐惨案", "Terror Tragedy"),
-    ("自残放血", "Self-Harm Bleeding"),
-    ("血肉模糊", "Flesh Mutilation"),
-    ("涉政违规", "Political Sensitive Violation"),
-    ("反党反政", "Anti-Party and Anti-Government"),
-    ("颠覆政权", "Overthrow the government"),
-    ("邪教分裂", "Cult Separatism"),
-    ("邪教组织", "Cult Organizations"),
-    ("暴乱动乱", "Riots and Unrest"),
-    ("违法违规", "Illegal Violation"),
-    ("毒品交易", "Drug Trafficking"),
-    ("走私贩私", "Smuggling"),
-    ("网络赌博", "Online Gambling"),
-    ("洗钱诈骗", "Money Laundering Fraud"),
-    ("暗网黑产", "Darknet Underground"),
-    ("洗钱黑产", "Money Laundering and Illegal Activities"),
-    ("电信诈骗", "Telecom Fraud"),
-    ("各地美食", "Food from all over the world"),
-    ("治愈", "Cure"),
-    ("致郁", "Depressing"),
-    ("轻松", "Easy"),
-    ("感动", "Move"),
-    ("欲望", "Desire"),
-    ("罪恶感", "Guilt"),
-    ("背德感", "Sense of Immorality"),
-    ("羞耻", "Shame"),
-    ("支配", "Dominate"),
-    ("写实", "Realistic"),
-    ("内容标签", "Content Tags"),
-    ("content_tags", "Content Tags"),
-    ("图片细分", "Image segmentation"),
-    // 权威事实维度与事实标签别名对齐（统一 builtin.* 严格受控体系）
-    ("文件来源", "File Source"),
-    ("file_source", "File Source"),
-    ("网络下载", "Web Downloads"),
-    ("web_downloads", "Web Downloads"),
-    ("web_download", "Web Downloads"),
-    ("本地创建", "Created Locally"),
-    ("created_locally", "Created Locally"),
-    ("原创", "Original"),
-    ("备份归档", "Backup Archive"),
-    ("处理状态", "Processing status"),
-    ("processing_status", "Processing status"),
-    ("未归档", "Not archived"),
-    ("not_archived", "Not archived"),
-    ("unarchived", "Not archived"),
-    ("已归档", "Archived"),
-    ("archived", "Archived"),
-    ("草稿", "Draft"),
-    ("draft", "Draft"),
-    ("安全等级", "Security level"),
-    ("security_level", "Security level"),
-    ("公开", "Public"),
-    ("public", "Public"),
-    ("内部", "Internal"),
-    ("internal", "Internal"),
-    ("语言细分", "Language segmentation"),
-    ("language_segmentation", "Language segmentation"),
-    ("语言", "Language segmentation"),
-    ("中文", "Chinese"),
-    ("chinese", "Chinese"),
-    ("英文", "English"),
-    ("english", "English"),
-    ("日语", "Japanese"),
-    ("japanese", "Japanese"),
-    ("韩语", "Korean"),
-    ("korean", "Korean"),
-    ("法语", "French"),
-    ("french", "French"),
-    ("德语", "German"),
-    ("german", "German"),
-    ("西班牙语", "Spanish"),
-    ("spanish", "Spanish"),
-    ("俄语", "Russian"),
-    ("russian", "Russian"),
-    ("阿拉伯语", "Arabic"),
-    ("arabic", "Arabic"),
-    ("葡萄牙语", "Portuguese"),
-    ("portuguese", "Portuguese"),
-    ("意大利语", "Italian"),
-    ("italian", "Italian"),
-    ("荷兰语", "Dutch"),
-    ("dutch", "Dutch"),
-    ("泰语", "Thai"),
-    ("thai", "Thai"),
-    ("越南语", "Vietnamese"),
-    ("vietnamese", "Vietnamese"),
-    ("印地语", "Hindi"),
-    ("hindi", "Hindi"),
-    ("文件质量", "Document quality"),
-    ("document_quality", "Document quality"),
-    ("作者", "Author"),
-    ("author", "Author"),
-    ("音乐类型", "Music Type"),
-    ("音乐流派", "Music Type"),
-    ("music_type", "Music Type"),
-    ("音频细分", "Audio Segmentation"),
-    ("audio_segmentation", "Audio Segmentation"),
-    ("摄影照片细分", "Photography Categories"),
-    ("photography_categories", "Photography Categories"),
-    // 视觉与多模态高频候选词跨语言对齐（避免误被派生为 _ext.* 并确保规范母语本地化）
-    //
-    // 本段只补**本段专属**的跨语言别名。凡与上文既有条目**同名**者一律不在此重复声明
-    // （`设计` / `design` / `designated` / `角色` / `character` 均已在上文登记）——
-    // `alias_map()` 用 `HashMap::insert`（**末次胜出**），在此重复会**静默覆盖**上文的规范名，
-    // 属死数据 + 隐含行序依赖。裁决口径（方向 B，见
-    // docs/issues/issue-builtin-aliases-duplicate-keys.md）：**裸词 → 裸概念**
-    // （`design`→`Design`、`character`→`Character`）；复合概念 `Design Draft` /
-    // `Human Subject` 由各自**专属**别名承载（`设计稿` / `design draft`、`人物主体` / `人物`）。
-    ("艺术", "Painting"),
-    ("art", "Painting"),
-    ("cartoon", "Comics"),
-    ("肖像", "Portrait Photography"),
-    ("人物", "Character subject"),
-    ("扁平", "Flat and minimalist"),
-    ("flat", "Flat and minimalist"),
-    // 敏感内容 / 成人色情 12 大垂直门类与细分子标签跨语言对齐 (PRD 0052)
-    // （同上：`调教拘束` / `露骨性行为` / `自慰高潮` 已在上文登记，此处不再重复声明，避免末次胜出覆盖）
-    ("家庭乱伦", "Family incest"),
-    ("family incest", "Family incest"),
-    ("婚外情欲", "Extramarital lust"),
-    ("extramarital lust", "Extramarital lust"),
-    ("校园师生", "Campus teachers and students"),
-    ("campus teachers and students", "Campus teachers and students"),
-    ("职场社交", "Workplace social"),
-    ("workplace social", "Workplace social"),
-    ("多人群交", "Group sex"),
-    ("group sex", "Group sex"),
-    ("性爱调教", "Sex training"),
-    ("sex training", "Sex training"),
-    ("窥视暴露", "Peeping exposed"),
-    ("peeping exposed", "Peeping exposed"),
-    ("职业制服", "Professional uniform"),
-    ("professional uniform", "Professional uniform"),
-    ("文学题材", "Literary themes"),
-    ("literary themes", "Literary themes"),
-    ("情欲生理", "Erotic Physiology"),
-    ("erotic physiology", "Erotic Physiology"),
-    ("非自愿侵犯", "Involuntary assault"),
-    ("involuntary assault", "Involuntary assault"),
-    ("多元取向", "Multiple orientations"),
-    ("multiple orientations", "Multiple orientations"),
-    // 重点 L4 细分标签
-    ("近亲乱伦", "Incest"),
-    ("incest", "Incest"),
-    ("母子", "Mother and son"),
-    ("mother and son", "Mother and son"),
-    ("父女", "Father and daughter"),
-    ("father and daughter", "Father and daughter"),
-    ("兄妹", "Brother and sister"),
-    ("brother and sister", "Brother and sister"),
-    ("姐弟", "Siblings"),
-    ("伴侣交换", "Partner swap"),
-    ("partner swap", "Partner swap"),
-    ("换妻", "Wife swapping"),
-    ("wife swapping", "Wife swapping"),
-    ("偷情出轨", "Cheating"),
-    ("cheating", "Cheating"),
-    ("人妻美妇", "Beautiful married woman"),
-    ("少妇熟女", "Young mature woman"),
-    ("3p", "3P"),
-    ("群交", "Orgy"),
-    ("多人派对", "Multi-person party"),
-    ("sm", "SM"),
-    ("性奴隶", "Sex slave"),
-    ("粗暴性爱", "Rough sex"),
-    ("重口变态", "Hardcore Perversion"),
-    ("滴蜡皮鞭", "Wax Play & Whip"),
-    ("特定恋物", "Specific fetish"),
-    ("疯狂暴露", "Extreme Public Exposure"),
-    ("公共空间暴露", "Public Exposure"),
-    ("户外露出", "Exposed outdoors"),
-    ("车震", "Car Sex"),
-    ("偷拍窥视", "Covert Photography and Peeping"),
-    ("covert photography and peeping", "Covert Photography and Peeping"),
-    ("隐私盗摄", "Spy Camera & Peeping"),
-    ("privacy camera", "Spy Camera & Peeping"),
-    ("spy camera & peeping", "Spy Camera & Peeping"),
-    ("洗澡窥视", "Voyeurism"),
-    ("走光露底", "Exposed"),
-    ("医生护士", "Doctor & Nurse Roleplay"),
-    ("空姐", "Airline stewardess"),
-    ("女警", "Policewoman"),
-    ("商业涉黄", "Commercial pornography"),
-    ("援交嫖妓", "Paid Dating and Prostitution"),
-    ("paid dating and prostitution", "Paid Dating and Prostitution"),
-    ("情色武侠", "Erotic Wuxia"),
-    ("古典情色", "Classical Erotica"),
-    ("日本情色", "Japanese erotica"),
-    ("japanese erotica", "Japanese erotica"),
-    ("西洋情色", "Western erotica"),
-    ("explicit sexual acts", "Explicit Sexual Acts"),
-    ("口交", "Oral sex"),
-    ("oral sex", "Oral sex"),
-    ("肛交", "Anal sex"),
-    ("anal sex", "Anal sex"),
-    ("颜射吞精", "Facial & Swallowing"),
-    ("强暴强奸", "Rape and Sexual Assault"),
-    ("迷奸下药", "Drug-facilitated Sexual Assault"),
-    ("违背意愿", "Against one's will"),
-    ("轮奸侵犯", "Gang rape assault"),
-    ("同性情色", "Homoerotic"),
-    ("女同百合", "Lesbian Yuri"),
-    ("男同耽美", "Gay Yaoi"),
-    ("跨性别", "Transgender"),
-    ("transgender", "Transgender"),
-    // 维度 123 内容尺度 (Rating Track & Scale Track)
-    ("PG-13", "PG-13"),
-    ("pg-13", "PG-13"),
-    ("pg13", "PG-13"),
-    ("R-15", "R-15"),
-    ("r-15", "R-15"),
-    ("r15", "R-15"),
-    ("R-18", "R-18"),
-    ("r-18", "R-18"),
-    ("r18", "R-18"),
-    ("R-18G", "R-18G"),
-    ("r-18g", "R-18G"),
-    ("r18g", "R-18G"),
-    ("soft porn", "Soft Porn"),
-    ("soft pornography", "Soft Porn"),
-    ("半肉", "Half Meat"),
-    ("half meat", "Half Meat"),
-    ("纯肉", "Pure Meat"),
-    ("pure meat", "Pure Meat"),
-    ("特殊XP", "Special XP"),
-    ("special xp", "Special XP"),
-    ("special_xp", "Special XP"),
-    ("重度猎奇", "Extreme Grotesque"),
-    ("extreme grotesque", "Extreme Grotesque"),
-    ("severe curiosity", "Extreme Grotesque"),
-    ("car sex", "Car Sex"),
-    ("car shock", "Car Sex"),
-    ("rape and sexual assault", "Rape and Sexual Assault"),
-    ("rape rape", "Rape and Sexual Assault"),
-    ("hardcore perversion", "Hardcore Perversion"),
-    ("incest pornography", "Incest Pornography"),
-    ("incest obscene", "Incest Pornography"),
-    ("severed limbs mutilation", "Severed Limbs Mutilation"),
-    ("severed limbs", "Severed Limbs Mutilation"),
-    ("hardcore grotesque", "Hardcore Grotesque"),
-    ("hardcore bizarre", "Hardcore Grotesque"),
-    ("wax play & whip", "Wax Play & Whip"),
-    ("dripping wax whip", "Wax Play & Whip"),
-    ("extreme public exposure", "Extreme Public Exposure"),
-    ("crazy exposure", "Extreme Public Exposure"),
-    ("public exposure", "Public Exposure"),
-    ("public space exposure", "Public Exposure"),
-    ("voyeurism", "Voyeurism"),
-    ("bath peeping", "Voyeurism"),
-    ("doctor & nurse roleplay", "Doctor & Nurse Roleplay"),
-    ("doctor nurse", "Doctor & Nurse Roleplay"),
-    ("erotic wuxia", "Erotic Wuxia"),
-    ("erotic martial arts", "Erotic Wuxia"),
-    ("facial & swallowing", "Facial & Swallowing"),
-    ("facial cum swallowing", "Facial & Swallowing"),
-    ("drug-facilitated sexual assault", "Drug-facilitated Sexual Assault"),
-    ("raped and drugged", "Drug-facilitated Sexual Assault"),
-    ("lesbian yuri", "Lesbian Yuri"),
-    ("lesbian lily", "Lesbian Yuri"),
-    ("gay yaoi", "Gay Yaoi"),
-    ("gay beauty", "Gay Yaoi"),
-];
+/// AOT 自动生成的受控标签别名常量切片（单一事实源自 file-dimension-source.ts + curated-model-aliases.json）
+pub use crate::builtin_aliases_generated::BUILTIN_ALIASES;
 
 use std::sync::RwLock;
 
@@ -1087,13 +501,17 @@ fn alias_map() -> &'static HashMap<String, String> {
     })
 }
 
+
 fn code_to_canonical_zh() -> &'static HashMap<String, String> {
     static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
     MAP.get_or_init(|| {
         let mut m = HashMap::new();
-        for (zh, en) in BUILTIN_ALIASES {
-            let code = en_builtin_code(en);
-            m.entry(code).or_insert_with(|| (*zh).to_string());
+        for (alias, en) in BUILTIN_ALIASES {
+            // 仅当别名包含 CJK 字符时，才作为对应 code 的中文展示名 (彻底免疫英文别名字典序前置倒灌)
+            if alias.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+                let code = en_builtin_code(en);
+                m.entry(code).or_insert_with(|| (*alias).to_string());
+            }
         }
         m
     })
@@ -1128,20 +546,20 @@ pub fn tag_display(code: &str, lang: &str) -> String {
     let l = lang.to_lowercase();
     let is_zh = l.starts_with("zh");
 
-    if is_zh {
-        if let Some(zh) = code_to_canonical_zh().get(clean_code) {
-            return zh.clone();
-        }
-    } else {
-        if let Some(en) = code_to_canonical_en().get(clean_code) {
-            return en.clone();
+    // 1. 优先查阅 AOT 编译期 Concept 权威枚举字典 (PRD-0058 / 三级本体权威优先)
+    // 零堆分配、常数时间，全量覆盖 OMW / HowNet / Builtin 受控体系
+    if let Some(concept) = crate::concepts::Concept::from_code(clean_code) {
+        if is_zh {
+            return concept.zh_name().to_string();
+        } else {
+            let en = concept.en_name();
+            if !en.is_empty() {
+                return en.to_string();
+            }
         }
     }
 
-    // 动态规范词典兜底：静态 BUILTIN_ALIASES 只登记 builtin.* 的规范名，
-    // omw.*/hownet.* 的母语规范展示名由 semantic.pack 热载入轨写入 dynamic_canonical_by_lang，
-    // 若不查这张表，这两层受控概念的展示名会被降级成裸 code（违背 omw ≻ hownet ≻ builtin 分层）。
-    // 命中值等于 code 时视为无效（脏别名表可能把 code 冻结成词形），继续走 slug 兜底。
+    // 2. 动态规范词典：omw.*/hownet.* 的母语规范展示名由 semantic.pack 热载入轨写入 dynamic_canonical_by_lang
     if let Ok(canon_guard) = dynamic_canonical_by_lang().read() {
         if let Some(cmap) = canon_guard.get(normalize_language_code(lang)) {
             if let Some(&name) = cmap.get(clean_code) {
@@ -1152,8 +570,27 @@ pub fn tag_display(code: &str, lang: &str) -> String {
         }
     }
 
-    // 针对 _ext.slug.hash 或 builtin.slug 提取人类可读部分
+    // 3. 别名表权威反查：若 Concept 直查未命中（分层差异如 builtin.screenshot），
+    // 依母语反查中文规范名（带 CJK 防护）或英文规范名
+    if is_zh {
+        if let Some(zh) = code_to_canonical_zh().get(clean_code) {
+            return zh.clone();
+        }
+    } else {
+        if let Some(en) = code_to_canonical_en().get(clean_code) {
+            return en.clone();
+        }
+    }
+
+    // 4. 针对 _ext.slug.hash 或 builtin.slug 提取人类可读部分兜底
     if let Some(stripped) = clean_code.strip_prefix("builtin.") {
+        if stripped.starts_with("h_") {
+            // 内部过渡态散列代码（未翻译态），若未能在前序解析出展示名，按母语输出规范未归类哨兵，阻断哈希泄漏
+            if let Some(zh) = code_to_canonical_zh().get(clean_code) {
+                return zh.clone();
+            }
+            return if is_zh { "未归类".to_string() } else { "Unclassified".to_string() };
+        }
         return stripped.replace('_', " ");
     }
     if let Some(stripped) = clean_code.strip_prefix("_ext.") {
@@ -2222,6 +1659,22 @@ mod tests {
         assert_eq!(concept_from_language_code("en-US"), Some(Concept::英文));
         assert_eq!(concept_from_language_code("japanese"), Some(Concept::日语));
         assert_eq!(concept_from_language_code("unknown_code"), None);
+    }
+
+    #[test]
+    fn test_tag_display_content_rating_and_root_dimensions() {
+        // 核心受控根维度及二级分级维度中英文展示验证 (杜绝中文环境下误退化为英文 slug)
+        assert_eq!(tag_display("builtin.content_rating", "zh"), "内容分级");
+        assert_eq!(tag_display("builtin.content_rating", "en"), "Content Rating");
+
+        // 色情分级虽未在 BUILTIN_ALIASES 登记，但在中文环境下经 Concept 权威兜底稳定输出 "色情分级"
+        assert_eq!(tag_display("builtin.erotic_scale", "zh"), "色情分级");
+
+        assert_eq!(tag_display("builtin.file_type", "zh"), "文件类型");
+        assert_eq!(tag_display("builtin.file_type", "en"), "File Type");
+
+        assert_eq!(tag_display("builtin.file_purpose", "zh"), "文件用途");
+        assert_eq!(tag_display("builtin.file_purpose", "en"), "File Purpose");
     }
 
     // GH #724：依赖动态别名字典（进程级 static RwLock）的用例已移入独立集成测试

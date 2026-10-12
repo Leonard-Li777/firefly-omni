@@ -264,6 +264,61 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
+  "builtin.operating_platform": {
+    "id": 163,
+    "threshold": 0.6,
+    "applicableFileTypes": [
+      "executable"
+    ],
+    "contextHints": [
+      "PE头特征",
+      "ELF头特征",
+      "Mach-O头特征"
+    ],
+    "metadata": {
+      "flag": {
+        "isPanDimension": false,
+        "isRequiresAI": false,
+        "isMultiSelect": false
+      }
+    }
+  },
+  "builtin.runtime_framework": {
+    "id": 164,
+    "threshold": 0.6,
+    "applicableFileTypes": [
+      "executable"
+    ],
+    "contextHints": [
+      "依赖库探测",
+      "打包特征"
+    ],
+    "metadata": {
+      "flag": {
+        "isPanDimension": false,
+        "isRequiresAI": false,
+        "isMultiSelect": false
+      }
+    }
+  },
+  "builtin.program_ability_characteristics": {
+    "id": 165,
+    "threshold": 0.6,
+    "applicableFileTypes": [
+      "executable"
+    ],
+    "contextHints": [
+      "IAT符号聚类",
+      "能力探测"
+    ],
+    "metadata": {
+      "flag": {
+        "isPanDimension": false,
+        "isRequiresAI": false,
+        "isMultiSelect": true
+      }
+    }
+  },
   "builtin.language_segmentation": {
     "id": 11,
     "threshold": 0.6,
@@ -1051,7 +1106,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.erotic_scale": {
+  "builtin.pornography_rating": {
     "id": 123,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -2039,7 +2094,7 @@ mod tests {
     #[test]
     fn test_default_dimension_policies_load() {
         let policies = get_default_dimension_policies();
-        assert_eq!(policies.len(), 92);
+        assert_eq!(policies.len(), 95);
 
         // 验证多选白名单维度
         let subject_type = policies.get("builtin.subject_type").expect("builtin.subject_type 必须存在");
