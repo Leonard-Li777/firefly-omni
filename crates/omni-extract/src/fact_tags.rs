@@ -489,21 +489,13 @@ mod tests {
 
         let mp3_tag = tags.iter().find(|t| t.code == "builtin.mp3").expect("应包含 builtin.mp3");
         assert_eq!(mp3_tag.via_parent_code.as_deref(), Some("builtin.audio_extensions"));
-        assert_eq!(
-            mp3_tag.code_path.as_deref(),
-            Some("/builtin.file_type/builtin.audio/builtin.audio_extensions/builtin.mp3")
-        );
-        assert_eq!(
-            mp3_tag.name_path.as_deref(),
-            Some("/文件类型/音频/音频扩展名/mp3")
-        );
-        assert_eq!(mp3_tag.depth, Some(4));
+        assert_eq!(mp3_tag.parent_codes, vec!["builtin.audio_extensions".to_string()]);
+        assert_eq!(mp3_tag.code_path, None, "抽取器阶段不应硬编码物化路径，交由图引擎统一回溯");
 
         let cat_tag = tags.iter().find(|t| t.code == "builtin.audio").expect("应包含 builtin.audio 大类");
         assert_eq!(cat_tag.via_parent_code.as_deref(), Some("builtin.file_type"));
-        assert_eq!(cat_tag.code_path.as_deref(), Some("/builtin.file_type/builtin.audio"));
-        assert_eq!(cat_tag.name_path.as_deref(), Some("/文件类型/音频"));
-        assert_eq!(cat_tag.depth, Some(2));
+        assert_eq!(cat_tag.parent_codes, vec!["builtin.file_type".to_string()]);
+        assert_eq!(cat_tag.code_path, None, "抽取器阶段不应硬编码物化路径，交由图引擎统一回溯");
     }
 
     /// 音频元数据：Artist / Album / Genre 应全部产出
