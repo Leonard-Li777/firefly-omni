@@ -162,6 +162,7 @@ impl ExtensionTopologyResolver {
             "dff" => Some(Concept::音频扩展名),
             "diff" => Some(Concept::文本扩展名),
             "djvu" => Some(Concept::电子书扩展名),
+            "dylib" => Some(Concept::程序扩展名),
             "dll" => match domain_hint {
                 _ => Some(Concept::系统文件扩展名),
             },
@@ -273,7 +274,10 @@ impl ExtensionTopologyResolver {
             "mpeg" => Some(Concept::视频扩展名),
             "mpg" => Some(Concept::视频扩展名),
             "mqa" => Some(Concept::音频扩展名),
-            "msi" => Some(Concept::压缩包扩展名),
+            "msi" => match domain_hint {
+                Some(MediaDomain::Archive) => Some(Concept::压缩包扩展名),
+                _ => Some(Concept::程序扩展名),
+            },
             "mts" => Some(Concept::源代码扩展名),
             "mum" => Some(Concept::应用数据扩展名),
             "mxf" => Some(Concept::视频扩展名),
@@ -352,6 +356,7 @@ impl ExtensionTopologyResolver {
             "snd" => Some(Concept::音频扩展名),
             "socket" => Some(Concept::系统文件扩展名),
             "sol" => Some(Concept::源代码扩展名),
+            "so" => Some(Concept::程序扩展名),
             "sql" => Some(Concept::源代码扩展名),
             "sqlite" => Some(Concept::应用数据扩展名),
             "sqlite3" => Some(Concept::应用数据扩展名),

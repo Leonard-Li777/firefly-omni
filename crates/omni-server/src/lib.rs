@@ -1526,6 +1526,30 @@ async fn perceive_file_handler(
 
     benchmark.ads_ms = ads_ms;
 
+    // 二进制文件静态分析 (BinaryLens: PE/ELF/Mach-O)
+    let is_binary_prog = !is_image && !is_video && !is_audio && (
+        matches!(ext.as_str(), "exe" | "dll" | "sys" | "elf" | "so" | "dylib" | "msi" | "app" | "bin")
+            || mime_type.starts_with("application/x-executable")
+            || mime_type.starts_with("application/x-dosexec")
+            || mime_type.starts_with("application/vnd.microsoft.portable-executable")
+            || mime_type.starts_with("application/x-sharedlib")
+    );
+
+    let (binary_analysis_info, binary_ms) = if is_binary_prog {
+        let t_bin = std::time::Instant::now();
+        let fp = file_path.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            omni_core::analyze_binary(std::path::Path::new(&fp)).ok()
+        })
+        .await
+        .unwrap_or(None);
+        let elapsed = t_bin.elapsed().as_millis() as u64;
+        (res, Some(elapsed))
+    } else {
+        (None, None)
+    };
+    benchmark.record_opt("binary_ms", binary_ms);
+
     // ASR 语音转录事实（Issue 0046 §1：metadata 键统一为 `asr`）
     let asr = metadata
         .get("asr")
@@ -2263,8 +2287,30 @@ async fn perceive_file_handler(
 
     // 终局智能重命名与描述：优先取第三阶段双锚点交叉验证胜出者 (Fusion 轨单轨出厂，PRD §7.1.4)
     // 视觉内联旁路已退役，图片路径绝不回退至 text 5W 范畴错配
-    let smart_name = fusion_outcome.smart_name.or(if is_image { None } else { text_smart_name });
+    let mut smart_name = fusion_outcome.smart_name.or(if is_image { None } else { text_smart_name });
     let content_description = fusion_outcome.content_description.or_else(|| if is_image { None } else { text_one_desc.clone() });
+
+    if let Some(ref bin) = binary_analysis_info {
+        if let Some(ref prod) = bin.product_name {
+            if !prod.trim().is_empty() {
+                smart_name = Some(prod.clone());
+            }
+        }
+    }
+
+    let author: Option<String> = if let Some(ref bin) = binary_analysis_info {
+        bin.company_name.clone().or_else(|| bin.signer_organization.clone())
+    } else {
+        metadata.get("authors").or_else(|| metadata.get("author")).and_then(|v| {
+            if let Some(s) = v.as_str() {
+                Some(s.to_string())
+            } else if let Some(arr) = v.as_array() {
+                arr.first().and_then(|item| item.as_str()).map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+    };
     
     // 置信度门限控制：低于 EXIT_CONFIDENCE_THRESHOLD 的候选标签严禁透出到接口返回结果中 (日志中已输出完整候选打分)
     structured_visual_tags.retain(|t| t.confidence >= EXIT_CONFIDENCE_THRESHOLD);
@@ -2324,6 +2370,112 @@ async fn perceive_file_handler(
     // 9.1 基于维度策略执行单选互斥 argmax 与多选维度放行最终一致性仲裁
     let mut structured_visual_tags = arbitrate_tags_by_dimension_policies(structured_visual_tags, &current_policies);
     let mut fused_tags = arbitrate_tags_by_dimension_policies(fused_tags, &current_policies);
+
+    // 9.2 二进制文件 (BinaryLens) 事实标签与正交多路径标签派生
+    if let Some(ref bin) = binary_analysis_info {
+        // A. 运行平台标签 (Windows / Linux / macOS)
+        let plat_tag = match bin.format.as_str() {
+            "PE" => Some((omni_core::concepts::Concept::Windows.code(), omni_core::concepts::Concept::Windows.zh_name())),
+            "ELF" => Some((omni_core::concepts::Concept::Linux.code(), omni_core::concepts::Concept::Linux.zh_name())),
+            "Mach-O" => Some((omni_core::concepts::Concept::macOS.code(), omni_core::concepts::Concept::macOS.zh_name())),
+            _ => None,
+        };
+        if let Some((code, name)) = plat_tag {
+            fused_tags.push(omni_core::TagChainItem {
+                code: code.to_string(),
+                name: name.to_string(),
+                confidence: 1.0,
+                source: Some("fact".to_string()),
+                engine: Some("rule".to_string()),
+                via_parent_code: Some(omni_core::concepts::Concept::运行平台.code().to_string()),
+                parent_codes: vec![omni_core::concepts::Concept::运行平台.code().to_string()],
+                depth: Some(2),
+                ..Default::default()
+            });
+        }
+
+        // B. 运行时框架
+        if let Some(ref fw_code) = bin.detected_framework_code {
+            if let Some(fw_name) = omni_core::get_canonical_concept_name(fw_code) {
+                fused_tags.push(omni_core::TagChainItem {
+                    code: fw_code.clone(),
+                    name: fw_name.to_string(),
+                    confidence: 0.95,
+                    source: Some("fact".to_string()),
+                    engine: Some("rule".to_string()),
+                    via_parent_code: Some(omni_core::concepts::Concept::运行时框架.code().to_string()),
+                    parent_codes: vec![omni_core::concepts::Concept::运行时框架.code().to_string()],
+                    depth: Some(2),
+                    ..Default::default()
+                });
+            }
+        }
+
+        // C. 能力特征 (多选放行)
+        for cap_code in &bin.capability_codes {
+            if let Some(cap_name) = omni_core::get_canonical_concept_name(cap_code) {
+                fused_tags.push(omni_core::TagChainItem {
+                    code: cap_code.clone(),
+                    name: cap_name.to_string(),
+                    confidence: 0.90,
+                    source: Some("fact".to_string()),
+                    engine: Some("rule".to_string()),
+                    via_parent_code: Some(omni_core::concepts::Concept::程序能力特征.code().to_string()),
+                    parent_codes: vec![omni_core::concepts::Concept::程序能力特征.code().to_string()],
+                    depth: Some(2),
+                    ..Default::default()
+                });
+            }
+        }
+
+        // D. 程序细分与正交多路径派生 (如分类为开发工具，自动派生工具应用)
+        let dev_tools_concept = omni_core::concepts::Concept::开发工具;
+        let cat_code = bin.category_code.as_deref().unwrap_or(dev_tools_concept.code());
+        if let Some(cat_name) = omni_core::get_canonical_concept_name(cat_code) {
+            // 根据 tagImplications 映射规则求解对应【文件用途】受控概念
+            let implied_purpose_concept: Option<omni_core::concepts::Concept> = match cat_code {
+                c if c == omni_core::concepts::Concept::开发工具.code() => Some(omni_core::concepts::Concept::工具应用),
+                c if c == omni_core::concepts::Concept::影音创作.code() => Some(omni_core::concepts::Concept::创意项目),
+                c if c == omni_core::concepts::Concept::网络通信工具.code() => Some(omni_core::concepts::Concept::工具应用),
+                c if c == omni_core::concepts::Concept::系统运维.code() => Some(omni_core::concepts::Concept::系统维护),
+                c if c == omni_core::concepts::Concept::办公实用.code() => Some(omni_core::concepts::Concept::工具应用),
+                c if c == omni_core::concepts::Concept::游戏程序.code() => Some(omni_core::concepts::Concept::游戏娱乐),
+                _ => None,
+            };
+
+            let mut parent_codes = vec![omni_core::concepts::Concept::程序细分.code().to_string()];
+            if let Some(ref purpose) = implied_purpose_concept {
+                parent_codes.push(purpose.code().to_string());
+            }
+
+            fused_tags.push(omni_core::TagChainItem {
+                code: cat_code.to_string(),
+                name: cat_name.to_string(),
+                confidence: bin.confidence_score,
+                source: Some("fusion".to_string()),
+                engine: Some("rule".to_string()),
+                via_parent_code: Some(omni_core::concepts::Concept::程序细分.code().to_string()),
+                parent_codes,
+                depth: Some(2),
+                ..Default::default()
+            });
+
+            // 正交非排他派生至【文件用途】
+            if let Some(usage_concept) = implied_purpose_concept {
+                fused_tags.push(omni_core::TagChainItem {
+                    code: usage_concept.code().to_string(),
+                    name: usage_concept.zh_name().to_string(),
+                    confidence: bin.confidence_score,
+                    source: Some("fusion".to_string()),
+                    engine: Some("rule".to_string()),
+                    via_parent_code: Some(omni_core::concepts::Concept::文件用途.code().to_string()),
+                    parent_codes: vec![omni_core::concepts::Concept::文件用途.code().to_string()],
+                    depth: Some(2),
+                    ..Default::default()
+                });
+            }
+        }
+    }
 
     // 10. 原生事实标签抽取 (Task 2)：元数据直读 + 下沉物理事实 → fact_tags 直出
     //
@@ -2499,6 +2651,8 @@ async fn perceive_file_handler(
         name_slots: text_slots,
         embedding_dense: text_emb.clone(),
         benchmark: Some(benchmark),
+        author,
+        binary_info: binary_analysis_info,
     });
 
     // 跨支柱自动索引 (Pillar 4 -> Pillar 5): 若感知产出了稠密特征向量且有文本，自动异步入库双轨混合索引

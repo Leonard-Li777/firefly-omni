@@ -418,11 +418,35 @@ pub fn query_taxonomy_tree_fast(
             code_segs[0] = "builtin.file_type".to_string();
         }
 
-        // 历史存量数据自愈：若前缀误被包装为 /builtin.content_tags/<root_dim>/...，剥除顶层伪 content_tags 前缀
-        if code_segs.len() > 1 && code_segs[0] == "builtin.content_tags" && omni_core::is_root_dimension(&code_segs[1]) {
-            code_segs.remove(0);
+        // 历史存量数据自愈：若前缀误被包装为 /builtin.content_tags/<subdim>/... 或 /builtin.content_tags/<root_dim>/...，剥除顶层伪 content_tags 前缀
+        if code_segs.len() > 1 && code_segs[0] == "builtin.content_tags" {
+            let is_subdim_to_heal = code_segs[1] == "builtin.language_segmentation"
+                || code_segs[1] == "builtin.security_level"
+                || code_segs[1] == "builtin.processing_status";
+            if is_subdim_to_heal || omni_core::is_root_dimension(&code_segs[1]) {
+                code_segs.remove(0);
+                if !name_segs.is_empty() {
+                    name_segs.remove(0);
+                }
+            }
+        }
+
+        // 历史截断短路径自愈：子维度若缺失顶层祖先，自动根据本体拓扑补齐真实父级路径
+        if code_segs[0] == "builtin.language_segmentation" {
+            // 语言细分属于 文件类型 -> 文档/文本
+            code_segs.insert(0, "builtin.document".to_string());
+            code_segs.insert(0, "builtin.file_type".to_string());
             if !name_segs.is_empty() {
-                name_segs.remove(0);
+                name_segs.insert(0, "文档".to_string());
+                name_segs.insert(0, "文件类型".to_string());
+            }
+        } else if code_segs[0] == "builtin.security_level" || code_segs[0] == "builtin.processing_status" {
+            // 安全等级 / 处理状态属于 文件用途 -> 工作文档
+            code_segs.insert(0, "builtin.work_documents".to_string());
+            code_segs.insert(0, "builtin.file_purpose".to_string());
+            if !name_segs.is_empty() {
+                name_segs.insert(0, "工作文档".to_string());
+                name_segs.insert(0, "文件用途".to_string());
             }
         }
 
@@ -621,7 +645,13 @@ pub fn query_taxonomy_tree_fast(
         let display_name = if let Some(n) = resolved_names.get(&node.code) {
             n.clone()
         } else if omni_core::is_root_dimension(&node.code) || node.code.starts_with("builtin.") {
-            omni_core::tag_identity::tag_display(&node.code, lang)
+            let td = omni_core::tag_identity::tag_display(&node.code, lang);
+            // 中文环境防击穿：若 tag_display 回退为了裸英文 slug，而 node.name 本身包含合法的非 ASCII 中文字符，优先保留 node.name
+            if lang.starts_with("zh") && td.is_ascii() && !node.name.is_empty() && !node.name.is_ascii() && node.name != node.code {
+                node.name.clone()
+            } else {
+                td
+            }
         } else if !node.name.is_empty() && node.name != node.code {
             node.name.clone()
         } else {
@@ -2167,25 +2197,37 @@ mod tests {
             None,
         ).unwrap();
 
-        // 1. 验证安全等级独立建根，自愈剥离顶层伪 content_tags
-        let sec_root = resp.root_nodes.iter().find(|n| n.code == "builtin.security_level");
-        assert!(sec_root.is_some(), "安全等级必须独立建根，不得丢失");
-        let sec_root = sec_root.unwrap();
-        assert_eq!(sec_root.code_path.as_deref(), Some("/builtin.security_level"));
-        assert_eq!(sec_root.name, "安全等级");
-        assert_eq!(sec_root.children.len(), 1);
-        assert_eq!(sec_root.children[0].code, "omw.01704761.a");
-        assert_eq!(sec_root.children[0].code_path.as_deref(), Some("/builtin.security_level/omw.01704761.a"));
+        // 1. 验证安全等级自愈归位于「文件用途」->「工作文档」下，严禁独立建根
+        assert!(!resp.root_nodes.iter().any(|n| n.code == "builtin.security_level"), "安全等级严禁独立建根");
+        let purpose_root = resp.root_nodes.iter().find(|n| n.code == "builtin.file_purpose");
+        assert!(purpose_root.is_some(), "文件用途必须存在");
+        let purpose_root = purpose_root.unwrap();
+        let work_doc_node = purpose_root.children.iter().find(|c| c.code == "builtin.work_documents");
+        assert!(work_doc_node.is_some(), "工作文档必须存在于文件用途下");
+        let work_doc_node = work_doc_node.unwrap();
+        let sec_node = work_doc_node.children.iter().find(|c| c.code == "builtin.security_level");
+        assert!(sec_node.is_some(), "安全等级必须挂载在工作文档下");
+        let sec_node = sec_node.unwrap();
+        assert_eq!(sec_node.code_path.as_deref(), Some("/builtin.file_purpose/builtin.work_documents/builtin.security_level"));
+        assert_eq!(sec_node.children.len(), 1);
+        assert_eq!(sec_node.children[0].code, "omw.01704761.a");
+        assert_eq!(sec_node.children[0].code_path.as_deref(), Some("/builtin.file_purpose/builtin.work_documents/builtin.security_level/omw.01704761.a"));
 
-        // 2. 验证语言细分独立建根
-        let lang_root = resp.root_nodes.iter().find(|n| n.code == "builtin.language_segmentation");
-        assert!(lang_root.is_some(), "语言细分必须独立建根，不得丢失");
-        let lang_root = lang_root.unwrap();
-        assert_eq!(lang_root.code_path.as_deref(), Some("/builtin.language_segmentation"));
-        assert_eq!(lang_root.name, "语言细分");
-        assert_eq!(lang_root.children.len(), 1);
-        assert_eq!(lang_root.children[0].code, "builtin.chinese");
-        assert_eq!(lang_root.children[0].code_path.as_deref(), Some("/builtin.language_segmentation/builtin.chinese"));
+        // 2. 验证语言细分自愈归位于「文件类型」->「文档」下，严禁独立建根
+        assert!(!resp.root_nodes.iter().any(|n| n.code == "builtin.language_segmentation"), "语言细分严禁独立建根");
+        let type_root = resp.root_nodes.iter().find(|n| n.code == "builtin.file_type");
+        assert!(type_root.is_some(), "文件类型必须存在");
+        let type_root = type_root.unwrap();
+        let doc_node = type_root.children.iter().find(|c| c.code == "builtin.document");
+        assert!(doc_node.is_some(), "文档必须存在于文件类型下");
+        let doc_node = doc_node.unwrap();
+        let lang_node = doc_node.children.iter().find(|c| c.code == "builtin.language_segmentation");
+        assert!(lang_node.is_some(), "语言细分必须挂载在文档下");
+        let lang_node = lang_node.unwrap();
+        assert_eq!(lang_node.code_path.as_deref(), Some("/builtin.file_type/builtin.document/builtin.language_segmentation"));
+        assert_eq!(lang_node.children.len(), 1);
+        assert_eq!(lang_node.children[0].code, "builtin.chinese");
+        assert_eq!(lang_node.children[0].code_path.as_deref(), Some("/builtin.file_type/builtin.document/builtin.language_segmentation/builtin.chinese"));
 
         // 3. 验证内容标签下仅有纯业务扩展标签，绝无安全等级或语言细分
         let content_root = resp.root_nodes.iter().find(|n| n.code == "builtin.content_tags");
