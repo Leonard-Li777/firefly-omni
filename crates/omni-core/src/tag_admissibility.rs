@@ -243,6 +243,10 @@ pub struct TagAdmissibility {
     verb_adv_pos: Vec<String>,
     /// 动词/副词禁用黑名单（R-G2-03: 默认放行，命中才拒）
     banned_lemmas: Vec<String>,
+    /// 禁用的词类域（R-G2-08: adv.all, adj.pert）
+    banned_lexfiles: Vec<String>,
+    /// 抽象空洞壳名词（R-G2-11: 习惯/情况/问题等，禁止单独成标）
+    shell_nouns: Vec<String>,
     /// 配置来源是否为内置默认（false = 命中外部资产）。供诊断/单测使用。
     builtin_default: bool,
 }
@@ -278,10 +282,32 @@ impl TagAdmissibility {
         &self.banned_lemmas
     }
 
+    /// 禁用的词类域（只读）
+    pub fn banned_lexfiles(&self) -> &[String] {
+        &self.banned_lexfiles
+    }
+
+    /// 抽象空洞壳名词（只读）
+    pub fn shell_nouns(&self) -> &[String] {
+        &self.shell_nouns
+    }
+
     /// 判定词形是否命中动词/副词禁用黑名单（R-G2-03；v/r 默认准入，命中才拒）
     pub fn is_banned_lemma(&self, tag: &str) -> bool {
         let t = tag.trim().to_lowercase();
         self.banned_lemmas.iter().any(|b| b == &t)
+    }
+
+    /// 判定词类域是否被禁止（R-G2-08）
+    pub fn is_banned_lexfile(&self, lex: &str) -> bool {
+        let l = lex.trim().to_lowercase();
+        self.banned_lexfiles.iter().any(|b| b == &l)
+    }
+
+    /// 判定词形是否命中抽象壳名词（R-G2-11；禁止作为独立标签）
+    pub fn is_shell_noun(&self, tag: &str) -> bool {
+        let t = tag.trim().to_lowercase();
+        self.shell_nouns.iter().any(|b| b == &t)
     }
 
     /// 是否为闭类或清洗词性（禁止作为文件标签标注）
@@ -322,6 +348,8 @@ impl TagAdmissibility {
             allowed_pos: vec!["n".into(), "a".into(), "s".into()],
             verb_adv_pos: vec!["v".into(), "r".into()],
             banned_lemmas: Vec::new(),
+            banned_lexfiles: vec!["adv.all".into(), "adj.pert".into()],
+            shell_nouns: Vec::new(),
             builtin_default: true,
         }
     }
@@ -490,6 +518,43 @@ impl TagAdmissibility {
                     all
                 })
                 .unwrap_or_default(),
+            banned_lexfiles: g2
+                .and_then(|g| g.get("banned_lexfiles"))
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|w| w.as_str())
+                        .map(|w| w.trim().to_lowercase())
+                        .filter(|w| !w.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| fallback.banned_lexfiles.clone()),
+            shell_nouns: g2
+                .and_then(|g| g.get("shell_nouns"))
+                .map(|s| {
+                    let mut all: Vec<String> = Vec::new();
+                    if let Some(arr) = s.as_array() {
+                        all.extend(
+                            arr.iter()
+                                .filter_map(|w| w.as_str())
+                                .map(|w| w.trim().to_lowercase())
+                                .filter(|w| !w.is_empty()),
+                        );
+                    } else {
+                        for key in ["zh", "en"] {
+                            if let Some(arr) = s.get(key).and_then(|x| x.as_array()) {
+                                all.extend(
+                                    arr.iter()
+                                        .filter_map(|w| w.as_str())
+                                        .map(|w| w.trim().to_lowercase())
+                                        .filter(|w| !w.is_empty()),
+                                );
+                            }
+                        }
+                    }
+                    all
+                })
+                .unwrap_or_default(),
             builtin_default: false,
         }
     }
@@ -503,6 +568,16 @@ pub fn is_tag_pos_rejected(pos: &str) -> bool {
 /// 判定词形是否命中动词/副词禁用黑名单（R-G2-03；v/r 默认准入，命中才拒）
 pub fn is_banned_lemma(tag: &str) -> bool {
     config().is_banned_lemma(tag)
+}
+
+/// 判定词类域是否被禁止（R-G2-08: adv.all, adj.pert）
+pub fn is_banned_lexfile(lex: &str) -> bool {
+    config().is_banned_lexfile(lex)
+}
+
+/// 判定词形是否命中抽象空洞壳名词（R-G2-11；禁止单独成标）
+pub fn is_shell_noun(tag: &str) -> bool {
+    config().is_shell_noun(tag)
 }
 
 /// 判定 jieba 分词的 POS 标注是否为非实体/非主题词（助词、连词、介词、代词、副词、语气词、叹词、纯标点、未知残渣碎片等闭类虚词）
@@ -1397,12 +1472,52 @@ mod tests {
         assert!(is_banned_lemma("希望"));
         assert!(is_banned_lemma("好像"));
         assert!(is_banned_lemma("似乎"));
+        assert!(is_banned_lemma("知道"));
+        assert!(is_banned_lemma("明白"));
+        assert!(is_banned_lemma("同意"));
+        assert!(is_banned_lemma("赞同"));
+        assert!(is_banned_lemma("反对"));
+        assert!(is_banned_lemma("回到"));
+        assert!(is_banned_lemma("还好"));
 
         // 实体动词/正常动作默认放行（零误杀）
         assert!(!is_banned_lemma("阅读"));
         assert!(!is_banned_lemma("摄影"));
         assert!(!is_banned_lemma("烹饪"));
         assert!(!is_banned_lemma("微笑"));
+        assert!(!is_banned_lemma("学习"));
+    }
+
+    #[test]
+    fn test_shell_nouns_and_banned_lexfiles() {
+        // R-G2-11 抽象空洞壳名词独立成标拦截
+        assert!(is_shell_noun("习惯"));
+        assert!(is_shell_noun("情况"));
+        assert!(is_shell_noun("问题"));
+        assert!(is_shell_noun("方式"));
+        assert!(is_shell_noun("方法"));
+        assert!(is_shell_noun("原因"));
+        assert!(is_shell_noun("结果"));
+        assert!(is_shell_noun("过程"));
+        assert!(is_shell_noun("状态"));
+        assert!(is_shell_noun("内容"));
+        assert!(is_shell_noun("意义"));
+        assert!(is_shell_noun("目的"));
+        assert!(is_shell_noun("现象"));
+        assert!(is_shell_noun("东西"));
+        assert!(is_shell_noun("事情"));
+        assert!(is_shell_noun("habit"));
+        assert!(is_shell_noun("problem"));
+
+        // 复合实体非全词匹配，不命中壳名词
+        assert!(!is_shell_noun("生活习惯"));
+        assert!(!is_shell_noun("网络问题"));
+        assert!(!is_shell_noun("处理方法"));
+
+        // R-G2-08 词类域拦截
+        assert!(is_banned_lexfile("adv.all"));
+        assert!(is_banned_lexfile("adj.pert"));
+        assert!(!is_banned_lexfile("noun.animal"));
     }
 }
 
