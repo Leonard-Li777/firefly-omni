@@ -51,26 +51,18 @@ impl ExtensionTopologyResolver {
         }
     }
 
-    /// 根据 MediaDomain 获取大类解析结果（2 级物化路径）
-    pub fn resolve_category_by_domain(domain: MediaDomain) -> Option<CategoryResolution> {
-        let cat_concept = match domain {
-            MediaDomain::Audio => Concept::音频,
-            MediaDomain::Image => Concept::图片,
-            MediaDomain::Video => Concept::视频,
-            MediaDomain::Document => Concept::文档,
-            MediaDomain::Code => Concept::源代码,
-            MediaDomain::Archive => Concept::压缩包,
-            MediaDomain::Ebook => Concept::电子书,
-            _ => return None,
-        };
-        let code_path = format!("/{}/{}", Concept::文件类型.code(), cat_concept.code());
-        let name_path = format!("/{}/{}", Concept::文件类型.zh_name(), cat_concept.zh_name());
-        Some(CategoryResolution {
-            category_concept: cat_concept,
-            code_path,
-            name_path,
-            depth: 2,
-        })
+    /// 根据 MediaDomain 获取媒体大类受控概念
+    pub fn resolve_category_by_domain(domain: MediaDomain) -> Option<Concept> {
+        match domain {
+            MediaDomain::Audio => Some(Concept::音频),
+            MediaDomain::Image => Some(Concept::图片),
+            MediaDomain::Video => Some(Concept::视频),
+            MediaDomain::Document => Some(Concept::文档),
+            MediaDomain::Code => Some(Concept::源代码),
+            MediaDomain::Archive => Some(Concept::压缩包),
+            MediaDomain::Ebook => Some(Concept::电子书),
+            _ => None,
+        }
     }
 
     /// 解析扩展名归属的扩展名维度
