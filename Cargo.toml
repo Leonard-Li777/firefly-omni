@@ -54,6 +54,8 @@ jieba-rs = "0.7"
 sherpa-onnx = { version = "1.13.8", default-features = false, features = ["shared"] }
 # 统一 ONNX Runtime 动态链接底座，解耦编译期静态绑定，彻底消除 Windows MSVC /MT vs /MD (LNK2038) 冲突
 ort = { version = "=2.0.0-rc.9", features = ["load-dynamic"] }
+pelite = "0.10"
+goblin = { version = "0.8", default-features = false, features = ["elf32", "elf64", "mach32", "mach64", "endian_fd"] }
 
 [patch.crates-io]
 mupdf-sys = { path = "crates/mupdf-sys" }

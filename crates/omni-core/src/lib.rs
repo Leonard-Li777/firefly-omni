@@ -6,6 +6,9 @@ pub mod tag_identity;
 /// AOT 受控概念强类型枚举（PRD-0050）
 pub mod concepts;
 
+/// AOT 自动生成的受控标签别名常量表（SSOT 来自 file-dimension-source.ts）
+pub mod builtin_aliases_generated;
+
 /// 纯静态扩展名与大类受控拓扑解析器 (PRD-0058 / Fact Tags Migration)
 pub mod extension_topology;
 pub use extension_topology::{ExtensionResolution, ExtensionTopologyResolver};
@@ -24,6 +27,10 @@ pub use dimension_policies_generated::*;
 pub mod ort_runtime;
 pub use ort_runtime::*;
 pub use ort;
+
+/// 本地二进制智能分析与分类引擎 (BinaryLens)
+pub mod binarylens;
+pub use binarylens::{analyze_binary, BinaryAnalysisInfo, BinaryLensError};
 
 /// 编译/运行期受控标签宏：开发时书写中文或英文直观名称，自动解析为系统标准 tag_code
 ///
@@ -272,7 +279,7 @@ impl MediaDomain {
             "image" | "picture" | "photo" | "图片" | "图像" => Self::Image,
             "archive" | "zip" | "压缩包" => Self::Archive,
             "code" | "source_code" | "源代码" | "代码" => Self::Code,
-            "document" | "doc" | "文档" => Self::Document,
+            "document" | "doc" | "文档" | "text" | "txt" | "文本" => Self::Document,
             _ => Self::General,
         }
     }
@@ -491,6 +498,12 @@ pub struct OmniPerceptionResult {
     pub phash: Option<String>,
     pub is_corrupted: bool,
     pub benchmark: Option<OmniPerceptionBenchmark>,
+    /// 创作者/作者/厂商统一顶层透出 (全媒体契约统一)
+    #[serde(default)]
+    pub author: Option<String>,
+    /// 二进制可执行文件与原生模块的结构化分析事实 (BinaryLens)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_info: Option<BinaryAnalysisInfo>,
 }
 
 /// 级联提示词候选假设项 (用于 CLIP 文本向量仲裁)
@@ -810,19 +823,16 @@ mod tests {
 /// 存在 code 分歧（GH #719），直查 `from_code` 会静默落空、展示名退化成裸 slug。
 #[inline(always)]
 pub fn get_canonical_concept_name(code: &str) -> Option<&'static str> {
-    tag_identity::concept_from_code(code).map(|item| item.zh_name())
+    tag_identity::concept_from_code(code).map(|item: concepts::Concept| item.zh_name())
 }
 
-/// 核心受控根维度强类型枚举集合
+/// 核心受控根维度强类型枚举集合（全系统 7 大 Level 1 根维度，SSOT 事实源: file-dimension-source.ts）
 pub const ROOT_DIMENSION_CONCEPTS: &[concepts::Concept] = &[
     concepts::Concept::文件类型,
     concepts::Concept::文件用途,
     concepts::Concept::文件来源,
     concepts::Concept::作者,
     concepts::Concept::文件质量,
-    concepts::Concept::安全等级,
-    concepts::Concept::语言细分,
-    concepts::Concept::处理状态,
     concepts::Concept::内容分级,
     concepts::Concept::内容标签,
 ];
@@ -833,7 +843,7 @@ pub fn is_root_dimension(code: &str) -> bool {
     code == "builtin.author"
         || code == "builtin.fileType"
         || code == "builtin.content_rating"
-        || ROOT_DIMENSION_CONCEPTS.iter().any(|item| item.code() == code)
+        || ROOT_DIMENSION_CONCEPTS.iter().any(|item: &concepts::Concept| item.code() == code)
 }
 
 pub use tag_identity::{concept_from_language_code, detect_fact_language};

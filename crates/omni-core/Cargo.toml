@@ -13,4 +13,6 @@ tracing.workspace = true
 sha2.workspace = true
 unicode-normalization.workspace = true
 ort.workspace = true
+pelite.workspace = true
+goblin.workspace = true
 

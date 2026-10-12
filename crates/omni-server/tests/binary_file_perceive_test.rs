@@ -104,3 +104,56 @@ async fn test_perceive_binary_file_no_fake_tags_or_smart_name() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_perceive_real_pe_binary_metadata_and_dual_tags() {
+    let notepad_path = std::path::Path::new(r"C:\Windows\System32\notepad.exe");
+    if !notepad_path.exists() {
+        eprintln!("notepad.exe not found on this system, skipping test");
+        return;
+    }
+
+    let app = setup_test_app();
+    let res = perceive_file(&app, notepad_path, Some("zh")).await;
+
+    // 1. binary_info 结构化事实必须透出
+    assert!(res.binary_info.is_some(), "binary_info 必须有值");
+    let bin = res.binary_info.unwrap();
+    assert_eq!(bin.format, "PE");
+
+    // 2. author 统一透出 (微软签名或公司名)
+    assert!(res.author.is_some(), "author 必须统一透出厂商或签名机构，当前为 None");
+    let author = res.author.unwrap();
+    assert!(
+        author.contains("Microsoft"),
+        "author 应包含 Microsoft，实际为: {}",
+        author
+    );
+
+    // 3. smart_name 优先取 product_name
+    assert!(res.smart_name.is_some(), "smart_name 应提取自产品名");
+    let sn = res.smart_name.unwrap();
+    assert!(
+        sn.contains("Notepad") || sn.contains("记事本") || sn.contains("Windows"),
+        "smart_name 实际为: {}",
+        sn
+    );
+
+    // 4. fused_tags 必须包含 Windows 平台标签，以及正交派生标签
+    let has_platform_win = res.fused_tags.iter().any(|t| t.code == omni_core::concepts::Concept::Windows.code());
+    assert!(has_platform_win, "fused_tags 必须包含 Windows 受控代码 (builtin.windows)");
+
+    // 5. 验证双路径（正交派生）：严格断言存在开发工具与工具应用，消除 if 条件旁路
+    let has_dev_tools = res.fused_tags.iter().any(|t| t.code == omni_core::concepts::Concept::开发工具.code());
+    assert!(has_dev_tools, "fused_tags 必须包含程序细分受控标签 (开发工具)");
+
+    let has_tools_util = res.fused_tags.iter().any(|t| t.code == omni_core::concepts::Concept::工具应用.code());
+    assert!(has_tools_util, "程序细分为开发工具时，必须正交派生文件用途中的 工具应用 标签");
+
+    let dev_tag = res.fused_tags.iter().find(|t| t.code == omni_core::concepts::Concept::开发工具.code()).unwrap();
+    assert!(
+        dev_tag.parent_codes.contains(&omni_core::concepts::Concept::工具应用.code().to_string()),
+        "开发工具的 parent_codes 必须包含 tagImplications 蕴涵的目标父级 (工具应用)"
+    );
+}
+
