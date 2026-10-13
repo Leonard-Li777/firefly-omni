@@ -609,7 +609,7 @@ pub enum Concept {
     轮奸侵犯,
     /// 概念: 论文 | 代码: hownet.000000256774.n
     论文,
-    /// 概念: 漫画 | 代码: hownet.000000195971.n
+    /// 概念: 漫画 | 代码: omw.06780678.n
     漫画,
     /// 概念: 漫画细分 | 代码: builtin.comic_segmentation
     漫画细分,
@@ -775,7 +775,7 @@ pub enum Concept {
     色偏严重,
     /// 概念: 色情 | 代码: builtin.pornography
     色情,
-    /// 概念: 色情分级 | 代码: builtin.pornography_rating
+    /// 概念: 色情分级 | 代码: builtin.erotic_scale
     色情分级,
     /// 概念: 色情细分 | 代码: builtin.pornography_subgenres
     色情细分,
@@ -931,7 +931,7 @@ pub enum Concept {
     图片,
     /// 概念: 图片扩展名 | 代码: builtin.image_extensions
     图片扩展名,
-    /// 概念: 图片细分 | 代码: builtin.image_segmentation
+    /// 概念: 图片细分 | 代码: builtin.image_subdivision
     图片细分,
     /// 概念: 图文标题 | 代码: builtin.picture_and_text_title
     图文标题,
@@ -1057,7 +1057,7 @@ pub enum Concept {
     乡村,
     /// 概念: 乡间记趣 | 代码: builtin.countryside_notes
     乡间记趣,
-    /// 概念: 小说 | 代码: omw.06367879.n
+    /// 概念: 小说 | 代码: omw.03833065.n
     小说,
     /// 概念: 小姨子 | 代码: builtin.sister_in_law
     小姨子,
@@ -1157,7 +1157,7 @@ pub enum Concept {
     艺术设计,
     /// 概念: 意大利语 | 代码: builtin.italian
     意大利语,
-    /// 概念: 音乐 | 代码: omw.01505462.a
+    /// 概念: 音乐 | 代码: omw.00543233.n
     音乐,
     /// 概念: 音乐类型 | 代码: builtin.music_type
     音乐类型,
@@ -2416,7 +2416,7 @@ impl Concept {
             Concept::伦理 => "omw.02723563.a",
             Concept::轮奸侵犯 => "builtin.gang_rape_assault",
             Concept::论文 => "hownet.000000256774.n",
-            Concept::漫画 => "hownet.000000195971.n",
+            Concept::漫画 => "omw.06780678.n",
             Concept::漫画细分 => "builtin.comic_segmentation",
             Concept::冒险 => "omw.00065791.a",
             Concept::美乳美腿 => "builtin.beautiful_breasts_and_legs",
@@ -2499,7 +2499,7 @@ impl Concept {
             Concept::嫂嫂 => "builtin.elder_brother_s_wife",
             Concept::色偏严重 => "builtin.severe_color_cast",
             Concept::色情 => "builtin.pornography",
-            Concept::色情分级 => "builtin.pornography_rating",
+            Concept::色情分级 => "builtin.erotic_scale",
             Concept::色情细分 => "builtin.pornography_subgenres",
             Concept::删减版 => "builtin.abridged_version",
             Concept::商业涉黄 => "builtin.commercial_pornography",
@@ -2577,7 +2577,7 @@ impl Concept {
             Concept::图表为主 => "builtin.chart_based",
             Concept::图片 => "omw.03234306.n",
             Concept::图片扩展名 => "builtin.image_extensions",
-            Concept::图片细分 => "builtin.image_segmentation",
+            Concept::图片细分 => "builtin.image_subdivision",
             Concept::图文标题 => "builtin.picture_and_text_title",
             Concept::图文混合 => "builtin.mixed_graphics_and_text",
             Concept::图形用户界面 => "builtin.graphical_user_interface",
@@ -2640,7 +2640,7 @@ impl Concept {
             Concept::仙侠 => "builtin.xianxia",
             Concept::乡村 => "omw.02050452.a",
             Concept::乡间记趣 => "builtin.countryside_notes",
-            Concept::小说 => "omw.06367879.n",
+            Concept::小说 => "omw.03833065.n",
             Concept::小姨子 => "builtin.sister_in_law",
             Concept::校花 => "builtin.school_beauty",
             Concept::校园 => "hownet.000000166642.n",
@@ -2690,7 +2690,7 @@ impl Concept {
             Concept::已完结 => "builtin.completed",
             Concept::艺术设计 => "builtin.art_design",
             Concept::意大利语 => "builtin.italian",
-            Concept::音乐 => "omw.01505462.a",
+            Concept::音乐 => "omw.00543233.n",
             Concept::音乐类型 => "builtin.music_type",
             Concept::音频 => "builtin.audio",
             Concept::音频扩展名 => "builtin.audio_extensions",
@@ -4613,7 +4613,7 @@ impl Concept {
             Concept::嫂嫂 => "Elder Brother's Wife",
             Concept::色偏严重 => "Severe color cast",
             Concept::色情 => "Pornography",
-            Concept::色情分级 => "Pornography Rating",
+            Concept::色情分级 => "Erotic scale",
             Concept::色情细分 => "Pornography Subgenres",
             Concept::删减版 => "Abridged Version",
             Concept::商业涉黄 => "Commercial pornography",
@@ -4691,7 +4691,7 @@ impl Concept {
             Concept::图表为主 => "Chart-based",
             Concept::图片 => "Image",
             Concept::图片扩展名 => "Image Extensions",
-            Concept::图片细分 => "Image segmentation",
+            Concept::图片细分 => "Image subdivision",
             Concept::图文标题 => "Picture and text title",
             Concept::图文混合 => "Mixed graphics and text",
             Concept::图形用户界面 => "Graphical user interface",
@@ -6643,7 +6643,7 @@ impl Concept {
             "omw.02723563.a" => Some(Concept::伦理),
             "builtin.gang_rape_assault" => Some(Concept::轮奸侵犯),
             "hownet.000000256774.n" => Some(Concept::论文),
-            "hownet.000000195971.n" => Some(Concept::漫画),
+            "omw.06780678.n" => Some(Concept::漫画),
             "builtin.comic_segmentation" => Some(Concept::漫画细分),
             "omw.00065791.a" => Some(Concept::冒险),
             "builtin.beautiful_breasts_and_legs" => Some(Concept::美乳美腿),
@@ -6726,7 +6726,7 @@ impl Concept {
             "builtin.elder_brother_s_wife" => Some(Concept::嫂嫂),
             "builtin.severe_color_cast" => Some(Concept::色偏严重),
             "builtin.pornography" => Some(Concept::色情),
-            "builtin.pornography_rating" => Some(Concept::色情分级),
+            "builtin.erotic_scale" => Some(Concept::色情分级),
             "builtin.pornography_subgenres" => Some(Concept::色情细分),
             "builtin.abridged_version" => Some(Concept::删减版),
             "builtin.commercial_pornography" => Some(Concept::商业涉黄),
@@ -6804,7 +6804,7 @@ impl Concept {
             "builtin.chart_based" => Some(Concept::图表为主),
             "omw.03234306.n" => Some(Concept::图片),
             "builtin.image_extensions" => Some(Concept::图片扩展名),
-            "builtin.image_segmentation" => Some(Concept::图片细分),
+            "builtin.image_subdivision" => Some(Concept::图片细分),
             "builtin.picture_and_text_title" => Some(Concept::图文标题),
             "builtin.mixed_graphics_and_text" => Some(Concept::图文混合),
             "builtin.graphical_user_interface" => Some(Concept::图形用户界面),
@@ -6867,7 +6867,7 @@ impl Concept {
             "builtin.xianxia" => Some(Concept::仙侠),
             "omw.02050452.a" => Some(Concept::乡村),
             "builtin.countryside_notes" => Some(Concept::乡间记趣),
-            "omw.06367879.n" => Some(Concept::小说),
+            "omw.03833065.n" => Some(Concept::小说),
             "builtin.sister_in_law" => Some(Concept::小姨子),
             "builtin.school_beauty" => Some(Concept::校花),
             "hownet.000000166642.n" => Some(Concept::校园),
@@ -6916,7 +6916,7 @@ impl Concept {
             "builtin.completed" => Some(Concept::已完成),
             "builtin.art_design" => Some(Concept::艺术设计),
             "builtin.italian" => Some(Concept::意大利语),
-            "omw.01505462.a" => Some(Concept::音乐),
+            "omw.00543233.n" => Some(Concept::音乐),
             "builtin.music_type" => Some(Concept::音乐类型),
             "builtin.audio" => Some(Concept::音频),
             "builtin.audio_extensions" => Some(Concept::音频扩展名),
@@ -7391,7 +7391,6 @@ impl Concept {
             "builtin.zig" => Some(Concept::zig),
             "builtin.zip" => Some(Concept::zip),
             "builtin.aspect_ratio" => Some(Concept::画幅),
-            "builtin.image_subdivision" => Some(Concept::图片细分),
             "builtin.author" => Some(Concept::作者),
             "builtin.background" => Some(Concept::背景),
             "builtin.perspective" => Some(Concept::视角),
@@ -7407,17 +7406,13 @@ impl Concept {
             "builtin.system_file" => Some(Concept::系统文件),
             "builtin.font" => Some(Concept::字体),
             "omw.10126177.n" => Some(Concept::作者),
-            "omw.06780678.n" => Some(Concept::漫画),
             "builtin.image_with_text" => Some(Concept::有字图),
             "builtin.horizontal_screen" => Some(Concept::横屏),
             "builtin.vertical_screen" => Some(Concept::竖屏),
             "builtin.landscape" => Some(Concept::横屏),
             "builtin.portrait" => Some(Concept::竖屏),
-            "omw.03833065.n" => Some(Concept::小说),
-            "omw.00543233.n" => Some(Concept::音乐),
             "builtin.novel" => Some(Concept::小说),
             "builtin.music" => Some(Concept::音乐),
-            "builtin.erotic_scale" => Some(Concept::色情分级),
             "builtin.mosaic_censorship_level" => Some(Concept::打码程度),
             "builtin.comic_categories" => Some(Concept::漫画细分),
             "builtin.photo_categories" => Some(Concept::摄影照片细分),
@@ -7426,6 +7421,8 @@ impl Concept {
             "builtin.shot_size" => Some(Concept::景别),
             "builtin.contracts_bills_breakdown" => Some(Concept::合同票据细分),
             "builtin.peep_wardrobe_malfunction_segmentation" => Some(Concept::窥视暴露细分),
+            "builtin.pornography_rating" => Some(Concept::色情分级),
+            "builtin.image_segmentation" => Some(Concept::图片细分),
             "builtin.square" => Some(Concept::正方形),
             _ => None,
         }
