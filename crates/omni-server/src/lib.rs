@@ -125,6 +125,8 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/perceive", post(perceive_file_handler))
             .route("/api/audio/transcribe", post(audio_transcribe_handler))
             .route("/api/audio/convert", post(audio_convert_handler))
+            .route("/api/audio/tts/chunk", post(audio_tts_chunk_handler))
+            .route("/api/audio/tts/status", get(audio_tts_status_handler))
             .route("/api/vision/tags", post(vision_tags_handler))
             .route("/api/vision/inspect", post(vision_inspect_handler))
             .route("/api/fs/ads", post(fs_ads_handler))
@@ -169,7 +171,10 @@ pub fn create_app_router(state: AppState) -> Router {
             )
             // ADR-0039 / Ticket 1: 高速未分析文件秒搜与密集向量段落对齐
             .route("/api/v1/search/fs", get(routes::fs_search::fs_search_handler))
-            .route("/api/v1/vector/match-passages", post(routes::vector::match_passages_handler));
+            .route("/api/v1/vector/match-passages", post(routes::vector::match_passages_handler))
+            // 文本分词 API (中英文结巴搜索切词与多字段高亮)
+            .route("/api/v1/text/tokenize", post(text_tokenize_handler))
+            .route("/api/text/tokenize", post(text_tokenize_handler));
     }
 
     router
@@ -2259,10 +2264,12 @@ async fn perceive_file_handler(
     let fusion_outcome = if is_pro {
         omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate(&multimodal_ctx)
     } else {
+        // 非 Pro 构建无融合引擎：fused_tags 必须留空，严禁以 visual_tags 顶替。
+        // 顶替会让视觉标签在桌面端被误判为「融合标签」组（ADR-0045 来源分组语义污染）。
         omni_pro::text::FusedPerceptionOutcome {
             smart_name: None,
             content_description: None,
-            fused_tags: structured_visual_tags.clone(),
+            fused_tags: Vec::new(),
             candidate_hypotheses: Vec::new(),
         }
     };
@@ -2320,7 +2327,12 @@ async fn perceive_file_handler(
         filtered.retain(|t| t.confidence >= EXIT_CONFIDENCE_THRESHOLD);
         filtered
     } else {
-        structured_visual_tags.clone()
+        // ADR-0045：融合引擎无产出时**不得**回退为 visual_tags 整份拷贝。
+        // 该回退会让「视觉标签」冒充「融合标签」：桌面端 `isFusedAuthoritative`
+        // 据 fused_tags 非空判真，把整份标签赋 `fused` 组，而真正的「视觉标签」组
+        // 因同名去重（fused 优先于 visual）恒空。
+        // 语义正确做法 = 无融合产出即返回空，视觉标签走自身通道 visual_tags。
+        Vec::new()
     };
 
     // 缺口2（GH #712 S7）：融合标签组补挂词性回填。
@@ -2725,6 +2737,35 @@ fn empty_text_analysis_result() -> omni_pro::text::TextAnalysisResult {
         keybert_ms: 0,
         slot_summary_ms: 0,
     }
+}
+
+/// 文本分词请求体: POST /api/v1/text/tokenize
+#[derive(Deserialize)]
+pub struct TextTokenizeRequest {
+    pub text: String,
+}
+
+/// 文本分词响应体
+#[derive(Serialize)]
+pub struct TextTokenizeResponse {
+    pub tokens: Vec<String>,
+}
+
+/// 文本分词处理器: POST /api/v1/text/tokenize
+async fn text_tokenize_handler(
+    Json(req): Json<TextTokenizeRequest>,
+) -> Json<TextTokenizeResponse> {
+    if !omni_pro::is_pro_enabled() {
+        return Json(TextTokenizeResponse { tokens: Vec::new() });
+    }
+    let text = req.text;
+    let tokens = tokio::task::spawn_blocking(move || {
+        omni_pro::text::TextTokenizer::tokenize(&text)
+    })
+    .await
+    .unwrap_or_default();
+
+    Json(TextTokenizeResponse { tokens })
 }
 
 /// 语义标签父级求解请求体: POST /api/taxonomy/resolve-parent
@@ -3146,6 +3187,76 @@ fn write_wav_s16le(path: &std::path::Path, samples: &[f32], sample_rate: u32) ->
 
     file.flush()?;
     Ok(())
+}
+
+/// TTS 分块合成请求参数
+#[derive(Debug, serde::Deserialize)]
+pub struct AudioTtsChunkRequest {
+    pub text: String,
+    pub sid: Option<i32>,
+    pub speed: Option<f32>,
+}
+
+/// TTS 引擎状态响应
+#[derive(Debug, serde::Serialize)]
+pub struct AudioTtsStatusResponse {
+    pub ready: bool,
+    pub total_speakers: i32,
+    pub sample_rate: i32,
+}
+
+/// 查询 TTS 引擎状态: GET /api/audio/tts/status
+async fn audio_tts_status_handler(
+    State(state): State<AppState>,
+) -> Json<AudioTtsStatusResponse> {
+    let (ready, total_speakers, sample_rate) = state.sherpa.tts_status();
+    Json(AudioTtsStatusResponse {
+        ready,
+        total_speakers,
+        sample_rate,
+    })
+}
+
+/// 单句离线语音合成处理: POST /api/audio/tts/chunk
+/// 经由 Semaphore(1) 限制单通道排队，并在 spawn_blocking 工作池中执行 Kokoro 神经网络推理
+async fn audio_tts_chunk_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AudioTtsChunkRequest>,
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    let clean_text = req.text.replace('\0', " ").trim().to_string();
+    if clean_text.is_empty() {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "text cannot be empty".to_string()));
+    }
+
+    let (ready, _, _) = state.sherpa.tts_status();
+    if !ready {
+        return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, "Kokoro TTS engine not ready or model missing".to_string()));
+    }
+
+    let sid = req.sid.unwrap_or(0);
+    let speed = req.speed.unwrap_or(1.0);
+    let sherpa = state.sherpa.clone();
+
+    // 经由 Semaphore(1) 控制单通道排队，防止多请求同时推理打爆 CPU
+    let permit = sherpa.tts_semaphore().acquire_owned().await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire tts lock: {}", e)))?;
+
+    let wav_bytes = tokio::task::spawn_blocking(move || {
+        let _permit = permit; // 保持锁直到推理完成
+        sherpa.synthesize_chunk(&clean_text, sid, speed)
+    })
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TTS task panicked: {}", e)))?
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let response = axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "audio/wav")
+        .header(axum::http::header::CONTENT_LENGTH, wav_bytes.len().to_string())
+        .body(axum::body::Body::from(wav_bytes))
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(response)
 }
 
 /// 单指标视觉标签处理: POST /api/vision/tags

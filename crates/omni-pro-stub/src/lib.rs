@@ -708,6 +708,9 @@ pub mod text {
         pub fn extract_candidate_keywords(_text: &str, _lang: &str) -> Vec<String> {
             Vec::new()
         }
+        pub fn tokenize(_text: &str) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     pub struct BekkoEmbedder;
