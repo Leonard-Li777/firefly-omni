@@ -2,7 +2,7 @@
 // Omni 受控标签别名表 (Builtin Aliases Generated)
 // 由 scripts/taxonomy/generate-controlled-concepts.ts 自动生成，请勿手动编辑！
 // 单一事实源: file-dimension-source.ts + curated-model-aliases.json
-// 条目总数: 2017 对
+// 条目总数: 2019 对
 // =====================================================================
 
 pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
@@ -365,6 +365,7 @@ pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("erotic martial arts", "Erotic Wuxia"),
     ("erotic physiology", "Erotic Physiology"),
     ("Erotic Physiology", "Erotic Physiology"),
+    ("Erotic scale", "Erotic scale"),
     ("erotic wuxia", "Erotic Wuxia"),
     ("Erotic Wuxia", "Erotic Wuxia"),
     ("Esports & Competitive", "Esports & Competitive"),
@@ -559,7 +560,8 @@ pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("Image", "Image"),
     ("Image Extensions", "Image Extensions"),
     ("Image quality level", "Image quality level"),
-    ("Image segmentation", "Image segmentation"),
+    ("Image segmentation", "Image subdivision"),
+    ("Image subdivision", "Image subdivision"),
     ("image with no text", "Image without Text"),
     ("image with text", "Text-in-Image"),
     ("image without text", "Image without Text"),
@@ -880,7 +882,7 @@ pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("Popular science", "Popular science"),
     ("pornography", "Pornography"),
     ("Pornography", "Pornography"),
-    ("Pornography Rating", "Pornography Rating"),
+    ("Pornography Rating", "Erotic scale"),
     ("Pornography Subgenres", "Pornography Subgenres"),
     ("Portable Version", "Green portable version"),
     ("Portrait", "Vertical Screen"),
@@ -1440,7 +1442,7 @@ pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("图标字体", "Icon Font"),
     ("图片", "Image"),
     ("图片扩展名", "Image Extensions"),
-    ("图片细分", "Image segmentation"),
+    ("图片细分", "Image subdivision"),
     ("图纸", "Blueprint"),
     ("图表为主", "Chart-based"),
     ("地图导航截图", "Screenshot of Map Navigation"),
@@ -1889,7 +1891,7 @@ pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("航空航拍", "Aerial Photography"),
     ("色偏严重", "Severe color cast"),
     ("色情", "Pornography"),
-    ("色情分级", "Pornography Rating"),
+    ("色情分级", "Erotic scale"),
     ("色情细分", "Pornography Subgenres"),
     ("艺术", "Painting"),
     ("艺术设计", "Art & Design"),
