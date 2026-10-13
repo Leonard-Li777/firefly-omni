@@ -1479,6 +1479,8 @@ mod tests {
         assert!(is_banned_lemma("反对"));
         assert!(is_banned_lemma("回到"));
         assert!(is_banned_lemma("还好"));
+        assert!(is_banned_lemma("重新"));
+        assert!(is_banned_lemma("再次"));
 
         // 实体动词/正常动作默认放行（零误杀）
         assert!(!is_banned_lemma("阅读"));
