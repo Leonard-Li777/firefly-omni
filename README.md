@@ -64,13 +64,29 @@
 
 数据集缺失时接口恒返回 HTTP 200 + `available:false`（软降级），不影响服务其余功能。
 
+### 数据集发现契约（用户裁定 2026-10-14，omni 各资源查找同构）
+
+`omni-geo/src/discover.rs`（及 `omni-hownet`、`semantic_loader` 等同构实现）按运行模式分三层查找 `build/extraResources/geo/geonames-compact.json`：
+
+| 层级 | 模式 | 路径形态 | 含义 |
+| --- | --- | --- | --- |
+| 0 | 双模式 | 环境变量 `OMNI_GEO_DATA_PATH` | 宿主 desktop 显式下发的权威路径（最高优先级） |
+| 1 | 开发 + 生产 | `build/extraResources/geo/` | 自身独立发行版本的资源目录（cargo 开发态经 `<exe>/../../build/...` 命中） |
+| 2 | 仅开发 | `apps/desktop/build/extraResources/geo/` | 宿主 desktop 工程项目的 build/extraResources（资源统一流水线的实际落点） |
+| 3 | 仅生产 | `../geo/`、`../../geo/` | 宿主 desktop 共享资源目录的兄弟项（exe 部署在 `extraResources/bin/` 或 `bin/omni/` 下） |
+
+模式判定：`cfg!(debug_assertions)` 或环境变量 `OMNI_DEV_MODE=1`（宿主 desktop spawn 时统一下发）。全部落空仅软降级（`available:false`），不阻塞服务其余功能。
+
 ### 数据集装配
 
-开发环境执行资源初始化脚本即可自动装配（本地 presetResources 优先，缺失时从 firefly-omni Release 回退下载）：
+开发环境执行资源初始化脚本即可自动装配（本地 presetResources 优先——依次探测 omni 侧与 desktop 侧 preset，缺失时从 firefly-omni Release 回退下载）：
 
 ```powershell
 node scripts/setup-extra-resources.js
 ```
+
+> 注：即便不手动执行该脚本，开发态桌面拉起 omni 时也会经发现契约层级 2 命中
+> `apps/desktop/build/extraResources/geo/`（desktop 流水线已装配的数据集）。
 
 维护者重建/发布数据集：
 
