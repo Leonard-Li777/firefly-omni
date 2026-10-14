@@ -345,6 +345,7 @@ fn setup_test_app_with_pack_and_vector() -> axum::Router {
         master_db_path: Arc::new(Mutex::new(None)),
         dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
         sherpa: Arc::new(omni_server::SherpaManager::new()),
+        moss: Arc::new(omni_server::MossTtsManager::new()),
     };
     create_app_router(state)
 }

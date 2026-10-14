@@ -28,6 +28,7 @@ fn setup_test_app() -> Router {
             omni_core::get_default_dimension_policies(),
         )),
         sherpa: Arc::new(SherpaManager::new()),
+        moss: Arc::new(omni_server::MossTtsManager::new()),
     };
     create_app_router(state)
 }
