@@ -1328,6 +1328,11 @@ pub mod omw_db {
         pub fn semantic_graph(&self) -> Option<Arc<super::semantic_graph::SemanticGraph>> {
             None
         }
+        /// 数据源能力位镜像（omni-server `/health` 与 reconnect 响应消费）：
+        /// CE 无语义包 ⇒ 恒 false
+        pub fn is_pack(&self) -> bool {
+            false
+        }
         pub fn is_available(&self) -> bool {
             false
         }

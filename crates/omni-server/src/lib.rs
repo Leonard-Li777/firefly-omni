@@ -63,7 +63,8 @@ pub struct AppState {
     pub hownet: Arc<omni_pro::hownet::OmniHowNetService>,
     /// 工业级混合检索与约束聚类服务 (支柱 5)
     pub search: Arc<omni_pro::search::OmniSearchService>,
-    /// OMW 多语言标签词库只读连接池（未传入 --db-path 时为软不可用实例）
+    /// OMW 多语言标签词库只读连接池（生产 = 启动期挂载的只读语义包 `semantic.pack`，
+    /// 见 ADR-0038；CE 存根或未挂载时为软不可用实例）
     pub omw: OmwDb,
     /// 阿里巴巴 zvec 嵌入式双槽位向量引擎 (RaBitQ + INT8 量化，适配 384d bekko-a8m 与 512d EmbeddingGemma，闭源优先 🔒)
     pub vector: Arc<VectorEngine>,
@@ -87,7 +88,11 @@ pub struct FilePreviewRequest {
     pub path: String,
 }
 
-/// OMW 词库热重连请求体: POST /api/reconnect（dbPath 为 null/空串时表示断开直连）
+/// 桌面业务主库刷新请求体: POST /api/reconnect（`dbPath` = 桌面业务主库路径）
+///
+/// ⚠️ 语义已于 2026-10-14 收敛：本端点**不再**改变 OmwDb 数据源（历史行为 `omw.connect(dbPath)`
+/// 会把语义包替换成业务主库，是 M8 事故根因）；`dbPath` 仅用于刷新主库路径与维度执行策略。
+/// `dbPath` 为 null/空串 ⇒ 仅 no-op（不再触发断开直连）。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReconnectRequest {
@@ -252,10 +257,16 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         false
     };
     // OMW 词库可用性：实际执行一次 SELECT 1 探测只读连接（与 is_pro 无关，直连会话独立）
+    //
+    // 能力位（2026-10-14 新增）：`omwAvailable` 仅证明"连接能跑 SELECT 1"（业务主库同样满足），
+    // 不足以反映**数据源正确性** —— 必须额外暴露 `omwSource` 与 `graphReady`，否则
+    // "语义包被换成业务主库"这类错源完全不可观测（M8 事故因此静默近一个月）。
     let omw = state.omw.clone();
     let omw_available = tokio::task::spawn_blocking(move || omw.validate())
         .await
         .unwrap_or(false);
+    let omw_source_label = omw_source(&state.omw);
+    let graph_ready = state.omw.semantic_graph().is_some();
     Json(serde_json::json!({
         "status": "ok",
         "server": "firefly-omni",
@@ -265,8 +276,25 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "hownetAvailable": hownet_available,
         "searchAvailable": search_available,
         "cleanupAvailable": is_pro,
-        "omwAvailable": omw_available
+        "omwAvailable": omw_available,
+        "omwSource": omw_source_label,
+        "graphReady": graph_ready
     }))
+}
+
+/// OmwDb 数据源能力位：`pack`（内存只读语义包，生产唯一合法源）/ `db`（普通只读库，
+/// 仅测试与离线核查注入）/ `none`（未挂载）。
+///
+/// 存在的意义：`/health` 的 `omwAvailable` 与 reconnect 响应此前只回传
+/// `is_available()`/`validate()`，业务主库也能让它们为真 ⇒ 错源不可观测。
+fn omw_source(omw: &OmwDb) -> &'static str {
+    if omw.is_pack() {
+        "pack"
+    } else if omw.is_available() {
+        "db"
+    } else {
+        "none"
+    }
 }
 
 /// 离线反向地理编码: POST /api/geo/reverse（数据缺失或开源模式返回 200 + available:false 软失败）
@@ -331,15 +359,25 @@ async fn hownet_describe_handler(
     Json(outcome)
 }
 
-/// OMW 词库热重连: POST /api/reconnect
+/// OMW 热重连: POST /api/reconnect
 ///
-/// 支撑桌面端多语言切换：接收 `{ "dbPath": "..." }` 原子替换只读连接池，无需重启服务进程；
-/// dbPath 为 null/空串时断开直连恢复初始不可用态。失败时保持原连接不变（软失败 200 回传）。
+/// **契约收敛（2026-10-14，修 M8）**：本端点只刷新「桌面业务主库路径 + 维度执行策略」，
+/// **绝不触碰 OmwDb 数据源**。语义包挂载是启动期一次性行为（ADR-0038），且 pack 内含全语言
+/// `tag_aliases_{lang}` 分表（挂载时一次全量热载），语言切换只需查询期 `locale` 参数 ⇒
+/// 换库在架构上根本不需要。
+///
+/// 历史行为 `state.omw.connect(dbPath)` 会把内存语义包整体替换成业务主库
+/// （主库无 `file_tags`/`omw_*` 表）⇒ 语义图卸载、分类树退化为空树、量词缓存清空，
+/// 且响应 `omwAvailable` 仍为 true，桌面侧完全无感。该行为已删除。
+///
+/// 零降级：Pro 构建下若 OmwDb 当前无可用数据源，直接 panic 崩溃而非静默继续 ——
+/// 数据源缺失属启动期错误（启动链已保证 Pro 必挂载 pack），不应在此降级兜底。
 async fn reconnect_omw_handler(
     State(state): State<AppState>,
     Json(req): Json<ReconnectRequest>,
 ) -> Json<serde_json::Value> {
     let db_path = req.db_path.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let mut policies_reloaded = false;
     if let Some(p) = db_path {
         if let Ok(mut lock) = state.master_db_path.lock() {
             *lock = Some(std::path::PathBuf::from(p));
@@ -348,39 +386,37 @@ async fn reconnect_omw_handler(
         if let Ok(mut lock) = state.dimension_policies.write() {
             *lock = new_policies;
         }
-    }
-    let result = match db_path {
-        Some(path) => state.omw.connect(path),
-        None => {
-            state.omw.disconnect();
-            Ok(())
-        }
-    };
-
-    // 量词接线（GH #710 S9）：热重连/断开成功后刷新进程缓存——
-    // 换库取新库量词；断开或源无 classifier 列则复位为空（后续造句量词 miss），杜绝陈旧量词
-    if result.is_ok() {
-        let omw_bg = state.omw.clone();
-        tokio::task::spawn_blocking(move || refresh_classifier_map(&omw_bg))
-            .await
-            .unwrap_or_else(|err| tracing::warn!("classifier map refresh join failed: {err}"));
+        policies_reloaded = true;
     }
 
-    match result {
-        Ok(()) => Json(serde_json::json!({
-            "status": "ok",
-            "omwAvailable": state.omw.is_available(),
-            "dbPath": state.omw.db_path().map(|p| p.to_string_lossy().to_string()),
-            "reason": null
-        })),
-        Err(err) => Json(serde_json::json!({
-            "status": "error",
-            // 失败时原连接保持不变，如实反映当前真实可用性
-            "omwAvailable": state.omw.is_available(),
-            "dbPath": state.omw.db_path().map(|p| p.to_string_lossy().to_string()),
-            "reason": err.to_string()
-        })),
+    // 零降级铁律：Pro 构建下 OmwDb 必须已持有数据源（生产 = 启动期挂载的语义包）
+    if omni_pro::is_pro_enabled() && !state.omw.is_available() {
+        tracing::error!(
+            "[reconnect] OmwDb 无可用数据源（语义包未挂载），拒绝以降级状态继续服务"
+        );
+        panic!(
+            "[reconnect] OmwDb 无可用数据源：语义包未挂载。本端点不负责 OmwDb 生命周期（ADR-0038），\
+             数据源缺失属启动期错误，须修复启动链，严禁在此以降级数据源兜底。"
+        );
     }
+
+    let master_db = state
+        .master_db_path
+        .lock()
+        .ok()
+        .and_then(|p| p.clone())
+        .map(|p| p.to_string_lossy().to_string());
+
+    Json(serde_json::json!({
+        "status": "ok",
+        // 数据源能力位：本端点不再改变 OmwDb，故此处恒等于当前真实数据源
+        "omwAvailable": state.omw.is_available(),
+        "omwSource": omw_source(&state.omw),
+        "graphReady": state.omw.semantic_graph().is_some(),
+        "policiesReloaded": policies_reloaded,
+        "dbPath": master_db,
+        "reason": null
+    }))
 }
 
 /// OMW 只读查询统一软失败包装
@@ -660,27 +696,37 @@ fn save_config_to_disk(cfg: &OmniConfig) {
 /// 量词接线（GH #710 S9）：以当前词库刷新 omni-text 真实搭配量词进程缓存
 ///
 /// 成功路径由 `hydrate_from_conn` 内部「局部建表 → `replace_map` 原子 swap」完成，
-/// 灌库窗口内旧词库量词仍可读（无空窗）；失败/无源路径显式复位为空
-/// （造句量词 miss，符合设计，不回退「张」，亦杜绝换库后的陈旧量词）。
-/// 缺表/缺列与断开态属预期降级（info 级），其余异常按 warn 记录——均不阻断服务。
+/// 灌库窗口内旧词库量词仍可读（无空窗）。
+///
+/// **零降级（2026-10-14 用户裁定）**：仅"未配置数据源"（CE 存根 / 显式断开）按 info 复位；
+/// 一旦有数据源却缺 `classifier` 列、缺分表或零条有效量词，一律 **panic 崩溃** ——
+/// 那是语义包陈旧或接错库的硬信号，静默清空会让造句量词永久 miss 且无任何告警。
 fn refresh_classifier_map(omw: &OmwDb) {
     if !omw.is_available() {
-        // 断开态/未配置：无数据源 → 复位为空（主动断开是预期操作，记 info）
+        // 未配置/断开态：无数据源 → 复位为空（非错误，记 info）
         omni_pro::text::classifier_lookup::reset_classifier_map();
         info!("classifier map cleared: omw unavailable (no classifier source)");
         return;
     }
     match omw.with_conn(|conn| omni_pro::text::classifier_lookup::hydrate_from_conn(conn)) {
-        Ok(n) => info!("classifier map hydrated: {n} lemma entries"),
+        Ok(n) if n > 0 => info!("classifier map hydrated: {n} lemma entries"),
+        Ok(n) => {
+            // 零降级：分表在但零条非空 classifier ⇒ 陈旧/残缺语义包，量词功能将全失
+            tracing::error!("[classifier] 语义包 tag_aliases_zh_CN.classifier 全空（{n} 条），拒绝继续运行");
+            panic!(
+                "[classifier] 语义包 tag_aliases_zh_CN.classifier 零条有效数据 ⇒ 语义包陈旧或不完整，\
+                 拒绝以缺失量词源的状态继续运行（请重跑 build-semantic-pack 流水线）。"
+            );
+        }
         Err(err) => {
-            // 灌库失败即清空：防止换库/老库场景残留上一个词库的陈旧量词
+            // 零降级：缺列/缺表 = 接入的不是当前代语义包（陈旧包或错源），直接崩溃暴露。
+            // 历史行为是 reset 后 info/warn 静默清空，正是 M8 事故中"分类树空 + 量词全丢"的放大器。
             omni_pro::text::classifier_lookup::reset_classifier_map();
             let msg = format!("{err:#}");
-            if msg.contains("no such column") || msg.contains("no such table") {
-                info!("classifier map cleared: source has no classifier column ({msg})");
-            } else {
-                tracing::warn!("classifier map hydrate failed, cleared: {msg}");
-            }
+            tracing::error!("[classifier] 量词源装载失败，拒绝继续运行: {msg}");
+            panic!(
+                "[classifier] 语义包 tag_aliases_zh_CN 缺少 classifier 列或不可读 ⇒ 数据源不是当前代语义包：{msg}"
+            );
         }
     }
 }
@@ -724,37 +770,61 @@ pub async fn start_server(
         std::env::temp_dir().join("firefly_omni_search_index")
     };
     let search = Arc::new(omni_pro::search::OmniSearchService::new(search_dir));
-    // OMW 词库直连与只读包零磁盘内存挂载 (ADR-0038 / PRD #679: 闭源优先 🔒)
-    // 规范解耦：--pack-path 专用于只读语义包；--db-path 专用于桌面业务主库
+    // OMW 词库只读语义包零磁盘内存挂载 (ADR-0038 / PRD #679: 闭源优先 🔒)
+    // 规范解耦：--pack-path 专用于只读语义包；--db-path 专用于桌面业务主库（**永不**充当 OmwDb 数据源）
+    //
+    // 零降级铁律（2026-10-14 用户裁定）：Pro 构建下语义包是 OmwDb 的唯一合法数据源 ——
+    // 未发现包或挂载失败一律 panic 崩溃，严禁回退到 --db-path 所指的业务主库。
+    // 历史事故：此处曾在 !pack_mounted 时回退 `omw.connect(db_path)`，与 /api/reconnect 的
+    // 同类错误叠加，使语义包被业务主库静默替换（M8，见
+    // docs/issues/review-semantic-graph-slice-0-4-code-audit.md）。
     let omw = OmwDb::unavailable();
-    let mut pack_mounted = false;
     let mut omw_connected = false;
+    let is_pro_build = omni_pro::is_pro_enabled();
     let pack_to_load = pack_path.or_else(SemanticPackLoader::discover_pack_path);
-    if let Some(target_pack_path) = pack_to_load {
-        match omw.connect_pack(&target_pack_path) {
+    match pack_to_load {
+        Some(target_pack_path) => match omw.connect_pack(&target_pack_path) {
             Ok(()) => {
-                info!("semantic.pack zero-disk mounted to OmwDb from {}", target_pack_path.display());
-                pack_mounted = true;
+                info!(
+                    "semantic.pack zero-disk mounted to OmwDb from {}",
+                    target_pack_path.display()
+                );
                 omw_connected = true;
             }
-            Err(err) => tracing::warn!("Failed to mount semantic.pack: {err}"),
+            Err(err) => {
+                if is_pro_build {
+                    tracing::error!(
+                        "[OmwDb] 语义包挂载失败（{}），拒绝以降级数据源启动: {err:#}",
+                        target_pack_path.display()
+                    );
+                    panic!(
+                        "[OmwDb] 语义包挂载失败，拒绝以降级数据源启动（{}）：{err:#}",
+                        target_pack_path.display()
+                    );
+                }
+                tracing::warn!(
+                    "Failed to mount semantic.pack (open-core/stub mode, omw stays unavailable): {err}"
+                );
+            }
+        },
+        None => {
+            if is_pro_build {
+                tracing::error!(
+                    "[OmwDb] Pro 构建未发现任何 semantic.pack（--pack-path 未传且 discover 落空），拒绝以业务主库充当 OMW 数据源"
+                );
+                panic!(
+                    "[OmwDb] Pro 构建必须挂载 semantic.pack：--pack-path 未传入且自动 discover 未命中。\
+                     严禁以 --db-path 所指的桌面业务主库充当 OMW 数据源（该库不含 file_tags/omw_* 语义表）。"
+                );
+            }
+            info!("open-core/stub mode: no semantic.pack required, omw subsystem starts unavailable");
         }
     }
-
-    if !pack_mounted {
-        if let Some(path) = &db_path {
-            match omw.connect(path) {
-                Ok(()) => {
-                    info!("omw db fallback connected read-only at {}", path.display());
-                    omw_connected = true;
-                }
-                Err(err) => {
-                    tracing::warn!("omw db open failed ({}), omw subsystem starts unavailable", err)
-                }
-            }
-        }
-    } else if let Some(path) = &db_path {
-        info!("semantic.pack mounted into memory; db-path is reserved for desktop master database ({})", path.display());
+    if let Some(path) = &db_path {
+        info!(
+            "db-path is reserved for desktop master database ({})",
+            path.display()
+        );
     }
 
     // 量词接线（GH #710 S9）：词库就绪后刷新量词进程缓存
