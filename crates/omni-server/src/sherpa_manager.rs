@@ -781,6 +781,59 @@ impl SherpaManager {
         let (res_opt, events) = self.process_audio_pipeline_full(samples, sample_rate);
         (res_opt.map(|r| r.text).filter(|t| !t.is_empty()), events)
     }
+
+    /// 检查音频净化所需关键深度学习模型是否就绪（GTCRN 降噪与 Silero VAD）
+    pub fn is_purification_ready(&self) -> bool {
+        self.denoiser.is_some() && self.vad_config.is_some()
+    }
+
+    /// 纯内存多级人声提纯与干声切片抽取 (GTCRN 降噪 + Silero VAD 伴奏截断 + 3.0s 门禁 + 5.0s 黄金区间切片)
+    ///
+    /// 【契约铁律】:
+    /// 1. 显式降级治理 (AGENTS.md §2.9): 若 GTCRN 降噪模型或 Silero VAD 未初始化，严禁 Fail-Open 静默放行未降噪音频，必须返回清晰 Err；
+    /// 2. 有效真人发音 3.0s 门禁: 若有效真人发音累计样本点不足 3 秒 (48,000 @ 16kHz)，直接返回明确错误，杜绝 Prompt 过短导致自回归自注意力崩溃；
+    /// 3. 时域截断: 仅截取前 3.0s ~ 5.0s (最多 80,000 样本点 @ 16kHz)，确保下游生成的 RVQ-16 帧数严格锁定在 38 ~ 62 帧黄金区间。
+    pub fn purify_vocal_and_extract_dry_stem(
+        &self,
+        samples_16k: &[f32],
+        sample_rate: i32,
+    ) -> Result<Vec<f32>, String> {
+        if samples_16k.is_empty() {
+            return Err("输入音频数据为空".to_string());
+        }
+
+        // 1. 显式降级治理 (AGENTS.md §2.9): 严禁 Fail-Open 静默放行原音频
+        if self.denoiser.is_none() {
+            tracing::error!("[SherpaManager] GTCRN 降噪模型未就绪，严禁静默放行未降噪音频");
+            return Err("GTCRN 降噪模型未就绪".to_string());
+        }
+        if self.vad_config.is_none() {
+            tracing::error!("[SherpaManager] Silero VAD 模型未就绪，严禁静默放行未过滤伴奏");
+            return Err("Silero VAD 模型未就绪".to_string());
+        }
+
+        // 2. Stage 2: 纯内存 GTCRN 深度复数残差降噪
+        let denoised = self.denoise(samples_16k, sample_rate);
+
+        // 3. Stage 3: Silero VAD 截除伴奏前奏/间奏与静音
+        let (has_voice, voice_samples) = self.vad_filter(&denoised, sample_rate);
+
+        // 4. 有效真人发音 3.0s 门禁 (消除自回归注意力数学断裂)
+        let min_voice_samples = (sample_rate as usize) * 3;
+        if !has_voice || voice_samples.len() < min_voice_samples {
+            return Err("真人有效语音时长不足（伴奏过长或有效发音不足 3 秒）".to_string());
+        }
+
+        // 5. 黄金发音区间截取 (前 3.0s ~ 5.0s，最多 80,000 样本点 @ 16kHz)
+        let max_voice_samples = (sample_rate as usize) * 5;
+        let final_stem = if voice_samples.len() > max_voice_samples {
+            voice_samples[..max_voice_samples].to_vec()
+        } else {
+            voice_samples
+        };
+
+        Ok(final_stem)
+    }
 }
 
 impl Default for SherpaManager {
@@ -911,6 +964,73 @@ pub fn decode_audio_to_48k_stereo(
     }
 
     let raw_bytes = output.stdout;
+    let samples: Vec<f32> = raw_bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+
+    Some(samples)
+}
+
+/// 纯内存带通音频解码纯函数：专用于音色克隆与人声提纯前置预处理
+///
+/// 契约要求：
+/// 1. 强制走常驻 FFmpeg 管道，注入带通滤波与单声道合规下混：
+///    `-vn -af "highpass=f=80,lowpass=f=8000" -ar 16000 -ac 1 -f f32le pipe:1`
+/// 2. 截除非人声超低频伴奏（低音鼓、贝斯、环境低频风噪）与超高频乐器泛音（金属镲片、高频杂音）；
+/// 3. 原生 `-ac 1` 下混严格遵循 ITU-R BS.775 权重，保护 5.1/7.1 Center 通道人声对话不丢失；
+/// 4. 音频处理全程纯内存管道流转，零临时文件落地。
+pub fn decode_audio_to_16k_mono_bandpass(
+    file_path: &Path,
+    duration_seconds: Option<u32>,
+) -> Option<Vec<f32>> {
+    if !file_path.exists() {
+        return None;
+    }
+
+    let ffmpeg = resolve_ffmpeg_binary()?;
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.arg("-i").arg(file_path);
+
+    if let Some(dur) = duration_seconds {
+        cmd.arg("-t").arg(dur.to_string());
+    }
+
+    cmd.args([
+        "-vn",
+        "-af",
+        "highpass=f=80,lowpass=f=8000",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-f",
+        "f32le",
+        "pipe:1",
+    ]);
+
+    let output = match cmd.output() {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!("[decode_audio_to_16k_mono_bandpass] FFmpeg 管道执行失败: {:?}", e);
+            return None;
+        }
+    };
+
+    if !output.status.success() {
+        tracing::warn!(
+            "[decode_audio_to_16k_mono_bandpass] FFmpeg 转码退出状态码非 0: status={:?}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return None;
+    }
+
+    let raw_bytes = output.stdout;
+    if raw_bytes.is_empty() {
+        return Some(Vec::new());
+    }
+
     let samples: Vec<f32> = raw_bytes
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))

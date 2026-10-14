@@ -544,6 +544,7 @@ pub struct MossTtsEngine {
     decode_session: Mutex<Session>,
     local_fixed_session: Mutex<Session>,
     codec_decode_session: Mutex<Session>,
+    codec_encode_session: Mutex<Session>,
     tokenizer: Tokenizer,
 }
 
@@ -556,12 +557,14 @@ impl MossTtsEngine {
         let decode_path = model_dir.join("moss_tts_decode_step.onnx");
         let local_fixed_path = model_dir.join("moss_tts_local_fixed_sampled_frame.onnx");
         let codec_decode_path = model_dir.join("moss_audio_tokenizer_decode_full.onnx");
+        let codec_encode_path = model_dir.join("moss_audio_tokenizer_encode.onnx");
         let tokenizer_path = model_dir.join("tokenizer.json");
 
         if !prefill_path.exists()
             || !decode_path.exists()
             || !local_fixed_path.exists()
             || !codec_decode_path.exists()
+            || !codec_encode_path.exists()
             || !tokenizer_path.exists()
         {
             return Err(format!(
@@ -578,12 +581,14 @@ impl MossTtsEngine {
             .map_err(|e| format!("加载 moss_tts_local_fixed 失败: {}", e))?;
         let codec_decode_session = OmniOrtRuntime::build_session(&codec_decode_path, ModelTier::Tier2)
             .map_err(|e| format!("加载 moss_audio_tokenizer_decode_full 失败: {}", e))?;
+        let codec_encode_session = OmniOrtRuntime::build_session(&codec_encode_path, ModelTier::Tier2)
+            .map_err(|e| format!("加载 moss_audio_tokenizer_encode 失败: {}", e))?;
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| format!("加载 tokenizer.json 失败: {}", e))?;
 
         tracing::info!(
-            "[MossTtsEngine] 成功加载 MOSS-TTS-Nano 4个核心 ONNX 模型与分词器: {:?}",
+            "[MossTtsEngine] 成功加载 MOSS-TTS-Nano 5个核心 ONNX 模型与分词器: {:?}",
             model_dir
         );
 
@@ -592,6 +597,7 @@ impl MossTtsEngine {
             decode_session: Mutex::new(decode_session),
             local_fixed_session: Mutex::new(local_fixed_session),
             codec_decode_session: Mutex::new(codec_decode_session),
+            codec_encode_session: Mutex::new(codec_encode_session),
             tokenizer,
         })
     }
@@ -975,6 +981,137 @@ impl MossTtsEngine {
         let wav_bytes = encode_stereo_f32_to_wav(&left_final, &right_final, 48000);
         Ok(wav_bytes)
     }
+
+    /// 将 16kHz 单声道样本重采样为 48kHz Planar 双声道张量 [1, 2, num_samples_48k]
+    /// 采用 Catmull-Rom 三次样条插值，避免阶跃并平滑抑制高频失真
+    pub fn resample_16k_mono_to_48k_stereo_planar(samples_16k: &[f32]) -> Result<Array3<f32>, String> {
+        if samples_16k.is_empty() {
+            return Err("Input samples are empty".to_string());
+        }
+
+        let n_in = samples_16k.len();
+        let n_out = n_in * 3;
+        let mut mono_48k = Vec::with_capacity(n_out);
+
+        for i in 0..n_out {
+            let t = i as f32 / 3.0;
+            let idx = t.floor() as usize;
+            let tau = t - (idx as f32);
+
+            let p0 = if idx == 0 { samples_16k[0] } else { samples_16k[idx - 1] };
+            let p1 = samples_16k[idx.min(n_in - 1)];
+            let p2 = samples_16k[(idx + 1).min(n_in - 1)];
+            let p3 = samples_16k[(idx + 2).min(n_in - 1)];
+
+            // Catmull-Rom 插值多项式系数
+            let a0 = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
+            let a1 = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
+            let a2 = -0.5 * p0 + 0.5 * p2;
+            let a3 = p1;
+
+            let val = ((a0 * tau + a1) * tau + a2) * tau + a3;
+            mono_48k.push(val.clamp(-1.0, 1.0));
+        }
+
+        // 构造 Planar 格式 [1, 2, n_out]
+        // 内存排布：Channel 0 全部连续在前，Channel 1 全部连续在后
+        let mut planar_data = Vec::with_capacity(2 * n_out);
+        planar_data.extend_from_slice(&mono_48k); // Channel 0 (left)
+        planar_data.extend_from_slice(&mono_48k); // Channel 1 (right)
+
+        Array3::from_shape_vec((1, 2, n_out), planar_data)
+            .map_err(|e| format!("Failed to create planar Array3: {}", e))
+    }
+
+    /// 执行 48kHz Codec 编码推理，从 16kHz 干声提取 RVQ-16 离散特征码
+    pub fn extract_codes(&self, samples_16k: &[f32]) -> Result<Vec<Vec<i16>>, String> {
+        if samples_16k.is_empty() {
+            return Err("Input vocal stem is empty".to_string());
+        }
+
+        let planar_waveform = Self::resample_16k_mono_to_48k_stereo_planar(samples_16k)?;
+        let num_samples_48k = samples_16k.len() * 3;
+        let input_lengths = Array1::from_vec(vec![num_samples_48k as i32]);
+
+        let encode_sess = self
+            .codec_encode_session
+            .lock()
+            .map_err(|e| format!("Lock codec_encode_session failed: {}", e))?;
+
+        let encode_inputs = ort::inputs![
+            "waveform" => planar_waveform,
+            "input_lengths" => input_lengths,
+        ]
+        .map_err(|e| format!("Codec encode inputs error: {}", e))?;
+
+        let encode_outputs = encode_sess
+            .run(encode_inputs)
+            .map_err(|e| format!("Codec encode run error: {}", e))?;
+
+        let mut valid_len: usize = 0;
+        let mut raw_codes_tensor: Option<(Vec<i32>, Vec<usize>)> = None;
+
+        for (name, val) in encode_outputs.into_iter() {
+            if name == "audio_code_lengths" {
+                if let Ok(t) = val.try_extract_tensor::<i32>() {
+                    if let Some(&l) = t.as_slice().unwrap_or(&[]).first() {
+                        valid_len = l.max(0) as usize;
+                    }
+                }
+            } else if name == "audio_codes" {
+                if let Ok(t) = val.try_extract_tensor::<i32>() {
+                    let shape = t.shape().to_vec();
+                    let slice = t.as_slice().unwrap_or(&[]).to_vec();
+                    raw_codes_tensor = Some((slice, shape));
+                }
+            }
+        }
+
+        let (slice, shape) = raw_codes_tensor
+            .ok_or_else(|| "Codec encode output 'audio_codes' missing".to_string())?;
+
+        if shape.len() != 3 || shape[2] != 16 {
+            return Err(format!("Unexpected audio_codes shape: {:?}", shape));
+        }
+
+        let total_frames = shape[1];
+        if slice.len() < total_frames * 16 {
+            return Err(format!(
+                "Codec encode output tensor data buffer mismatch: expected at least {} elements, got {}",
+                total_frames * 16,
+                slice.len()
+            ));
+        }
+
+        let effective_frames = if valid_len > 0 && valid_len <= total_frames {
+            valid_len
+        } else {
+            total_frames
+        };
+
+        if effective_frames == 0 {
+            return Err("Codec encode extracted 0 frames".to_string());
+        }
+
+        let mut result_codes = Vec::with_capacity(effective_frames);
+        for frame_idx in 0..effective_frames {
+            let offset = frame_idx * 16;
+            let mut row = Vec::with_capacity(16);
+            for cb in 0..16 {
+                let val = slice[offset + cb];
+                row.push(val as i16);
+            }
+            result_codes.push(row);
+        }
+
+        tracing::info!(
+            "[MossTtsEngine] 成功提取 RVQ-16 声学特征码: 总帧数={}, 有效帧数={}",
+            total_frames,
+            effective_frames
+        );
+
+        Ok(result_codes)
+    }
 }
 
 /// 全局常驻 MOSS-TTS 音色与状态管理器
@@ -1199,6 +1336,16 @@ impl MossTtsManager {
     pub fn semaphore(&self) -> Arc<tokio::sync::Semaphore> {
         self.semaphore.clone()
     }
+
+    /// 从 16kHz 干声中提取 48kHz RVQ-16 离散声学特征码
+    pub fn extract_voice_codes(&self, samples_16k: &[f32]) -> Result<Vec<Vec<i16>>, String> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| "MOSS-TTS 原生 ONNX 引擎未就绪或模型文件缺失".to_string())?;
+
+        engine.extract_codes(samples_16k)
+    }
 }
 
 impl Default for MossTtsManager {
@@ -1365,5 +1512,33 @@ mod tests {
         let scaled_075_bytes = scale_wav_speed(&wav_1x, 0.75).expect("0.75x scaling should succeed");
         assert!(scaled_075_bytes.len() > wav_1x.len(), "0.75x WAV 字节数应多于 1.0x WAV");
     }
+
+    #[test]
+    fn test_resample_16k_mono_to_48k_stereo_planar() {
+        let n_16k = 16000; // 1秒 16kHz
+        let mut samples_16k = Vec::with_capacity(n_16k);
+        for i in 0..n_16k {
+            let t = i as f32 / 16000.0;
+            samples_16k.push((2.0 * std::f32::consts::PI * 440.0 * t).sin());
+        }
+
+        let planar = MossTtsEngine::resample_16k_mono_to_48k_stereo_planar(&samples_16k)
+            .expect("重采样应成功");
+
+        let shape = planar.shape();
+        assert_eq!(shape, &[1, 2, 48000], "输出张量形状必须是 [1, 2, 48000]");
+
+        // 验证 Planar 数据连续性与左右声道一致性
+        let slice = planar.as_slice().unwrap();
+        assert_eq!(slice.len(), 96000);
+        let left = &slice[0..48000];
+        let right = &slice[48000..96000];
+        assert_eq!(left, right, "双声道 Planar 左右声道应完全相同");
+        for &s in left {
+            assert!(s >= -1.0 && s <= 1.0, "样本点幅度应被安全钳位在 [-1.0, 1.0]");
+            assert!(!s.is_nan());
+        }
+    }
 }
+
 
