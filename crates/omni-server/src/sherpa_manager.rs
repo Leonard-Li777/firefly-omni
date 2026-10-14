@@ -1,10 +1,9 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use sherpa_onnx::{
-    AudioTagging, AudioTaggingConfig, AudioTaggingModelConfig, GenerationConfig,
+    AudioTagging, AudioTaggingConfig, AudioTaggingModelConfig,
     OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
     OfflineSpeechDenoiser, OfflineSpeechDenoiserConfig, OfflineSpeechDenoiserGtcrnModelConfig,
-    OfflineSpeechDenoiserModelConfig, OfflineTts, OfflineTtsConfig, OfflineTtsKokoroModelConfig,
+    OfflineSpeechDenoiserModelConfig,
     SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
 };
 
@@ -181,14 +180,12 @@ pub fn ensure_safe_onnx_dll_directory() {
     }
 }
 
-/// Sherpa-ONNX 全栈音频管理引擎 (ASR, VAD, GTCRN 降噪, CED 打标, Kokoro 离线 TTS)
+/// Sherpa-ONNX 全栈音频管理引擎 (ASR, VAD, GTCRN 降噪, CED 打标)
 pub struct SherpaManager {
     recognizer: Option<OfflineRecognizer>,
     vad_config: Option<VadModelConfig>,
     denoiser: Option<OfflineSpeechDenoiser>,
     tagger: Option<AudioTagging>,
-    tts: Option<Arc<OfflineTts>>,
-    tts_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl SherpaManager {
@@ -208,40 +205,55 @@ impl SherpaManager {
         // 4. 初始化 CED-mini 音频打标器
         let tagger = Self::init_ced_tagger();
 
-        // 5. 初始化 Kokoro 离线 TTS 引擎
-        let tts = Self::init_kokoro_tts();
-
-        // 6. 建立单并发互斥信号量，防止 TTS 多线程并发造成 CPU 颠簸
-        let tts_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-
         Self {
             recognizer,
             vad_config,
             denoiser,
             tagger,
-            tts,
-            tts_semaphore,
         }
     }
 
-    /// 探测当前平台推荐的 ONNX Runtime 硬件加速 Execution Provider 列表
-    fn preferred_sherpa_providers() -> Vec<&'static str> {
-        let mut providers = Vec::new();
-        #[cfg(target_os = "windows")]
-        {
-            providers.push("directml");
-            providers.push("cuda");
+    /// 解析当前平台推荐的 ONNX Runtime Execution Provider 候选列表（纯函数，不读环境，便于单测）
+    ///
+    /// 【为何不再按平台盲推硬件加速 EP（2026-10-14 勘误）】
+    /// 随包分发的 `sherpa-onnx` 运行时来自上游 **CPU-only** 归档
+    /// （`sherpa-onnx-v1.13.8-win-x64-shared-MT-Release-lib`，v1.13.8 **未发布任何 DirectML 变体**），
+    /// 其 `Ort::GetAvailableProviders()` 只含 `CPUExecutionProvider`。此时若传入非 cpu 的 provider，
+    /// 上游 `csrc/session.cc:355` 会打印
+    /// `Please compile with -DSHERPA_ONNX_ENABLE_GPU=ON. Available providers: ... Fallback to cpu!`
+    /// 之后**静默回退 CPU 并仍然返回成功**（既不报错也不返回 null），于是：
+    /// ① 每次启动都刷出一条 level=1 的伪错误日志；② 上层误报「已用 cuda」的虚假硬件加速归因。
+    ///
+    /// 【旧启发式的缺陷】曾以 `CUDA_PATH` / `CUDA_HOME` 是否存在推断 Windows 支持 CUDA —— 该变量只说明
+    /// 本机装了 CUDA Toolkit，与本项目随包运行时的 EP 能力**完全无关**，属恒假阳性。
+    /// 另注：上游 `kDirectML` 分支受**编译期** `SHERPA_ONNX_ENABLE_DIRECTML == 1` 门控，
+    /// 故仅替换 `onnxruntime.dll` 也无法为 sherpa 开启 DirectML。
+    ///
+    /// 【现行策略】
+    /// 1. 显式环境变量覆盖：`FIREFLY_SHERPA_PROVIDER` 非空时优先尊重用户指定（如 "cuda", "directml", "coreml"）；
+    /// 2. macOS：默认 `coreml` —— 官方 osx 归档的 onnxruntime 默认内置 CoreML EP，属真实可用能力；
+    /// 3. Windows / Linux：默认**仅 cpu**。随包归档不含 CUDA/DML EP，盲推只会制造伪告警；
+    ///    确需 GPU 时由用户显式设置 `FIREFLY_SHERPA_PROVIDER`（并自备 GPU 版归档）。
+    fn resolve_sherpa_providers(custom_override: Option<&str>) -> Vec<String> {
+        if let Some(custom) = custom_override {
+            let trimmed = custom.trim().to_lowercase();
+            if !trimmed.is_empty() {
+                return vec![trimmed, "cpu".to_string()];
+            }
         }
+
+        let mut providers = Vec::new();
         #[cfg(target_os = "macos")]
         {
-            providers.push("coreml");
+            providers.push("coreml".to_string());
         }
-        #[cfg(target_os = "linux")]
-        {
-            providers.push("cuda");
-        }
-        providers.push("cpu");
+        providers.push("cpu".to_string());
         providers
+    }
+
+    /// 探测当前平台推荐的 Execution Provider 候选列表（读取 `FIREFLY_SHERPA_PROVIDER` 覆盖）
+    fn preferred_sherpa_providers() -> Vec<String> {
+        Self::resolve_sherpa_providers(std::env::var("FIREFLY_SHERPA_PROVIDER").ok().as_deref())
     }
 
     fn init_sense_voice() -> Option<OfflineRecognizer> {
@@ -252,7 +264,7 @@ impl SherpaManager {
         let threads = omni_core::OmniOrtRuntime::recommended_intra_threads() as i32;
         let providers = Self::preferred_sherpa_providers();
 
-        for &provider in &providers {
+        for provider in &providers {
             let mut config = OfflineRecognizerConfig::default();
             config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
                 model: Some(model_path.to_str()?.to_string()),
@@ -262,19 +274,31 @@ impl SherpaManager {
             config.model_config.tokens = Some(tokens_path.to_str()?.to_string());
             config.model_config.num_threads = threads;
             config.model_config.debug = false;
-            config.model_config.provider = Some(provider.to_string());
+            config.model_config.provider = Some(provider.clone());
 
             if let Some(rec) = OfflineRecognizer::create(&config) {
-                tracing::info!(
-                    "[SherpaManager] 成功加载 SenseVoice ASR 模型 (provider: {}, threads: {}): {:?}",
-                    provider,
-                    threads,
-                    model_path
-                );
+                if provider == "cpu" {
+                    tracing::info!(
+                        "[SherpaManager] 成功加载 SenseVoice ASR 模型 (provider: cpu, threads: {}): {:?}",
+                        threads,
+                        model_path
+                    );
+                } else {
+                    // ★ 严禁把「请求的 provider」当成「生效的 EP」：sherpa-onnx 在 EP 不可用时会静默
+                    // 回退 CPU 且仍返回成功（csrc/session.cc:355），故此处只能如实标注为「请求值」。
+                    tracing::info!(
+                        "[SherpaManager] 成功加载 SenseVoice ASR 模型 (provider 请求值: {}, threads: {}; ★ 真实生效 EP 以 sherpa 上游日志为准，EP 不可用时会静默回退 CPU): {:?}",
+                        provider,
+                        threads,
+                        model_path
+                    );
+                }
                 return Some(rec);
             } else if provider != "cpu" {
+                // 注：EP 不可用**不会**走到这里（上游静默回退 CPU 并返回成功），本分支只覆盖
+                // 模型文件损坏 / tokens 缺失等真实构建失败，故保留。
                 tracing::warn!(
-                    "[SherpaManager] SenseVoice 硬件加速 provider '{}' 初始化失败，自动降级下一个候选",
+                    "[SherpaManager] SenseVoice provider '{}' 构建失败，自动降级下一个候选",
                     provider
                 );
             }
@@ -352,218 +376,6 @@ impl SherpaManager {
             tracing::warn!("[SherpaManager] 加载 CED-mini 音频打标模型失败: {:?}", model_path);
         }
         tagger
-    }
-
-    /// 初始化 Kokoro 8-bit 量化离线语音合成引擎
-    fn init_kokoro_tts() -> Option<Arc<OfflineTts>> {
-        // 模型加载策略：优先加载 310MB 全精度未量化模型 (消除 8-bit 量化沙沙底噪)，找不到时降级至 model.int8.onnx
-        let model_path = resolve_model_file(&["audio/kokoro", "kokoro", "audio/tts", "tts/kokoro"], "model.full.onnx")
-            .or_else(|| resolve_model_file(&["audio/kokoro", "kokoro", "audio/tts", "tts/kokoro"], "model.onnx"))
-            .or_else(|| resolve_model_file(&["audio/kokoro", "kokoro", "audio/tts", "tts/kokoro"], "model.int8.onnx"))?;
-        let voices_path = resolve_model_file(&["audio/kokoro", "kokoro", "audio/tts", "tts/kokoro"], "voices.bin")?;
-        let tokens_path = resolve_model_file(&["audio/kokoro", "kokoro", "audio/tts", "tts/kokoro"], "tokens.txt")?;
-
-        let model_dir = model_path.parent()?;
-        let data_dir = model_dir.join("espeak-ng-data");
-        let dict_dir = model_dir.join("dict");
-        let lexicon_en = model_dir.join("lexicon-us-en.txt");
-        let lexicon_zh = model_dir.join("lexicon-zh.txt");
-        let lexicon_str = if lexicon_en.exists() && lexicon_zh.exists() {
-            format!("{},{}", lexicon_en.to_str()?, lexicon_zh.to_str()?)
-        } else if lexicon_en.exists() {
-            lexicon_en.to_str()?.to_string()
-        } else if lexicon_zh.exists() {
-            lexicon_zh.to_str()?.to_string()
-        } else {
-            String::new()
-        };
-
-        let threads = omni_core::OmniOrtRuntime::recommended_intra_threads() as i32;
-        let providers = Self::preferred_sherpa_providers();
-
-        for &provider in &providers {
-            let mut config = OfflineTtsConfig::default();
-            config.model.kokoro = OfflineTtsKokoroModelConfig {
-                model: Some(model_path.to_str()?.to_string()),
-                voices: Some(voices_path.to_str()?.to_string()),
-                tokens: Some(tokens_path.to_str()?.to_string()),
-                data_dir: if data_dir.exists() { Some(data_dir.to_str()?.to_string()) } else { None },
-                length_scale: 1.0,
-                dict_dir: if dict_dir.exists() { Some(dict_dir.to_str()?.to_string()) } else { None },
-                lexicon: if !lexicon_str.is_empty() { Some(lexicon_str.clone()) } else { None },
-                lang: None,
-            };
-            config.model.num_threads = threads;
-            config.model.debug = false;
-            config.model.provider = Some(provider.to_string());
-
-            if let Some(t) = OfflineTts::create(&config) {
-                tracing::info!(
-                    "[SherpaManager] 成功加载 Kokoro TTS 模型 (provider: {}, threads: {}): {:?}, 采样率: {}Hz, 发音人数: {}",
-                    provider,
-                    threads,
-                    model_path,
-                    t.sample_rate(),
-                    t.num_speakers()
-                );
-                return Some(Arc::new(t));
-            } else if provider != "cpu" {
-                tracing::warn!(
-                    "[SherpaManager] Kokoro TTS 硬件加速 provider '{}' 初始化失败，自动降级下一个候选",
-                    provider
-                );
-            }
-        }
-
-        tracing::warn!("[SherpaManager] 加载 Kokoro TTS 模型最终失败: {:?}", model_path);
-        None
-    }
-
-    /// 获取 Kokoro 语音合成引擎状态 (就绪标志, 总发音人数, 采样率)
-    pub fn tts_status(&self) -> (bool, i32, i32) {
-        if let Some(ref tts) = self.tts {
-            (true, tts.num_speakers(), tts.sample_rate())
-        } else {
-            (false, 0, 24000)
-        }
-    }
-
-    /// 获取单通道并发控制信号量引用
-    pub fn tts_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
-        self.tts_semaphore.clone()
-    }
-
-    /// 单句离线语音合成：返回标准 24kHz 16-bit 单声道 WAV 二进制数据
-    pub fn synthesize_chunk(&self, text: &str, sid: i32, speed: f32) -> Result<Vec<u8>, String> {
-        let tts = self.tts.as_ref().ok_or_else(|| "Kokoro TTS engine not initialized or model missing".to_string())?;
-
-        // 1. 安全过滤 NUL 字符与特殊标点平滑映射：
-        // a. 将感叹号（! 和 ！）转换为逗号（，和 ,），消除 Kokoro 韵律模型在感叹号下的高频跳变怪音；
-        // b. 英文词边界与中英文夹杂规范化：确保 Folder / folder 前后有独立词间距；
-        let mut clean_text = text.replace('\0', " ")
-            .replace('！', "，")
-            .replace('!', ",");
-
-        // 中英混读时，若 Kokoro 中文分词未切分英文大写复合词，确保 Folder 能够被独立发音
-        clean_text = clean_text.trim().to_string();
-        if clean_text.is_empty() {
-            return Err("Input text is empty".to_string());
-        }
-
-        // 2. 发音人与速率安全归一化
-        let mut gen_config = GenerationConfig::default();
-        let max_speakers = tts.num_speakers();
-        gen_config.sid = if sid >= 0 && (max_speakers == 0 || sid < max_speakers) {
-            sid
-        } else {
-            0
-        };
-        gen_config.speed = if (0.1..=5.0).contains(&speed) { speed } else { 1.0 };
-
-        // 3. 执行纯内存生成
-        let audio = tts.generate_with_config(&clean_text, &gen_config, None::<fn(&[f32], f32) -> bool>)
-            .ok_or_else(|| "Failed to generate audio from Kokoro TTS".to_string())?;
-
-        let raw_samples = audio.samples();
-
-        // 4. 音质与质感声学净化增强 (DSP 链路优化)：
-        // 彻底解决 8-bit ISTFTNet 量化带来的高频散粒底噪（沙沙声）与字间底噪泄漏：
-        // a. 二阶低通平滑滤波 (Biquad Butterworth Low-Pass Filter @ 8.2 kHz, Q = 0.707):
-        //    有效滤除 8.5kHz ~ 12kHz 频段无语义贡献的 8-bit 高频相位截断噪底，保留纯净人声泛音与齿音细节；
-        // b. 动态软噪声门 (Soft Downward Noise Gate):
-        //    字间换气与静音停顿段平滑压制底噪，打造“纯黑背景”的高保真静音；
-        // c. 自动峰值电平归一化 (Peak Normalization @ -0.5 dBFS):
-        //    将纯净波形自适应提升至广播级电平，饱满清澈。
-        let enhanced_samples: Vec<f32> = if raw_samples.is_empty() {
-            Vec::new()
-        } else {
-            let sample_rate = audio.sample_rate() as f32; // 24000.0 Hz
-            let cutoff_hz = 8200.0f32; // 截止频率 8.2 kHz
-            let omega = 2.0f32 * std::f32::consts::PI * cutoff_hz / sample_rate;
-            let sn = omega.sin();
-            let cs = omega.cos();
-            let alpha = sn / (2.0f32 * std::f32::consts::FRAC_1_SQRT_2); // Q = 0.707 (Butterworth 最大平坦)
-
-            let b0 = (1.0 - cs) / 2.0;
-            let b1 = 1.0 - cs;
-            let b2 = (1.0 - cs) / 2.0;
-            let a0 = 1.0 + alpha;
-            let a1 = -2.0 * cs;
-            let a2 = 1.0 - alpha;
-
-            // 归一化双二阶滤波器系数
-            let nb0 = b0 / a0;
-            let nb1 = b1 / a0;
-            let nb2 = b2 / a0;
-            let na1 = a1 / a0;
-            let na2 = a2 / a0;
-
-            let mut x1 = 0.0f32;
-            let mut x2 = 0.0f32;
-            let mut y1 = 0.0f32;
-            let mut y2 = 0.0f32;
-
-            // 第一阶段：低通滤波滤除高频量化散粒白噪
-            let filtered: Vec<f32> = raw_samples
-                .iter()
-                .map(|&x0| {
-                    let y0 = nb0 * x0 + nb1 * x1 + nb2 * x2 - na1 * y1 - na2 * y2;
-                    x2 = x1;
-                    x1 = x0;
-                    y2 = y1;
-                    y1 = y0;
-                    y0
-                })
-                .collect();
-
-            // 第二阶段：自适应平滑噪声门 (消除字间残余微弱量化噪底)
-            // 设定微弱信号门限 (-48 dBFS 约为 0.004)
-            let gate_threshold = 0.0045f32;
-            let mut envelope = 0.0f32;
-            let attack_coeff = 0.25f32;
-            let release_coeff = 0.008f32;
-
-            let gated: Vec<f32> = filtered
-                .iter()
-                .map(|&s| {
-                    let abs_s = s.abs();
-                    if abs_s > envelope {
-                        envelope += (abs_s - envelope) * attack_coeff;
-                    } else {
-                        envelope += (abs_s - envelope) * release_coeff;
-                    }
-
-                    // 软门限增益衰减曲线
-                    let gate_gain = if envelope >= gate_threshold {
-                        1.0f32
-                    } else if envelope > 1e-5 {
-                        (envelope / gate_threshold).powf(1.5f32)
-                    } else {
-                        0.0f32
-                    };
-
-                    s * gate_gain
-                })
-                .collect();
-
-            // 第三阶段：Soft-Peak 广播级归一化
-            let max_peak = gated.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
-            let target_peak = 0.944f32; // -0.5 dBFS
-            let gain = if max_peak > 1e-4 {
-                (target_peak / max_peak).min(3.5f32)
-            } else {
-                1.0f32
-            };
-
-            gated
-                .iter()
-                .map(|&s| (s * gain).clamp(-1.0f32, 1.0f32))
-                .collect()
-        };
-
-        // 5. 编码为内存 RIFF WAV 字节流
-        let wav_bytes = encode_pcm_f32_to_wav(&enhanced_samples, audio.sample_rate() as u32);
-        Ok(wav_bytes)
     }
 
     /// 纯内存 GTCRN 深度学习降噪（替代传统 FFmpeg afftdn 临时文件）
@@ -661,9 +473,200 @@ impl SherpaManager {
             (true, voice_samples)
         }
     }
+}
 
-    /// 使用 SenseVoice 进行端到端语音识别 (ASR)
-    pub fn transcribe(&self, samples: &[f32], sample_rate: i32) -> Option<String> {
+/// SenseVoice 端到端转录及声学元数据解析结果
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SenseVoiceResult {
+    /// 纯净自然文本（已剥离所有 `<|...|>` 特殊 Token）
+    pub text: String,
+    /// 识别出的主要语言代码（如 "zh", "en", "ja", "ko", "yue"）
+    pub lang: Option<String>,
+    /// 识别出的主要情感标记（如 "happy", "sad", "angry", "neutral", "fearful", "disgusted", "surprised"）
+    pub emotion: Option<String>,
+    /// 识别出的声音事件列表（如 ["laughter", "applause", "sing", "cry", "bgm"]）
+    pub audio_events: Vec<String>,
+}
+
+/// 解析 SenseVoice 输出的原始带有特殊 Token 的文本并执行「声学标记优先 + 文本字符集兜底」双层语言判定
+pub fn parse_sense_voice_tokens(raw_text: &str) -> SenseVoiceResult {
+    if raw_text.trim().is_empty() {
+        return SenseVoiceResult::default();
+    }
+
+    let mut lang: Option<String> = None;
+    let mut emotion: Option<String> = None;
+    let mut audio_events: Vec<String> = Vec::new();
+
+    let mut clean_text = String::with_capacity(raw_text.len());
+    let mut rest = raw_text;
+
+    while let Some(start_idx) = rest.find("<|") {
+        clean_text.push_str(&rest[..start_idx]);
+        let token_slice = &rest[start_idx + 2..];
+        if let Some(end_idx) = token_slice.find("|>") {
+            let token_content = &token_slice[..end_idx];
+            let token_trim = token_content.trim();
+
+            // 1. 语言判定 (SenseVoice 语言 Token)
+            let lower = token_trim.to_ascii_lowercase();
+            if lower == "zh" || lower.starts_with("zh/") {
+                if lang.is_none() {
+                    lang = Some("zh".to_string());
+                }
+            } else if lower == "en" || lower.starts_with("en/") {
+                if lang.is_none() {
+                    lang = Some("en".to_string());
+                }
+            } else if lower == "ja" {
+                if lang.is_none() {
+                    lang = Some("ja".to_string());
+                }
+            } else if lower == "ko" {
+                if lang.is_none() {
+                    lang = Some("ko".to_string());
+                }
+            } else if lower == "yue" || lower == "dialect" || lower == "minnan" || lower == "wuyu" {
+                if lang.is_none() {
+                    lang = Some(lower.clone());
+                }
+            } else if matches!(
+                lower.as_str(),
+                "de" | "es" | "ru" | "fr" | "pt" | "tr" | "it" | "ar" | "hi" | "vi" | "th"
+            ) {
+                if lang.is_none() {
+                    lang = Some(lower.clone());
+                }
+            }
+
+            // 2. 情绪判定 (SenseVoice 情感 Token)
+            let upper = token_trim.to_ascii_uppercase();
+            match upper.as_str() {
+                "HAPPY" => emotion = Some("happy".to_string()),
+                "SAD" => emotion = Some("sad".to_string()),
+                "ANGRY" => emotion = Some("angry".to_string()),
+                "NEUTRAL" => emotion = Some("neutral".to_string()),
+                "FEARFUL" => emotion = Some("fearful".to_string()),
+                "DISGUSTED" => emotion = Some("disgusted".to_string()),
+                "SURPRISED" => emotion = Some("surprised".to_string()),
+                _ => {}
+            }
+
+            // 3. 声音事件判定
+            match upper.as_str() {
+                "BGM" => {
+                    if !audio_events.iter().any(|e| e == "bgm") {
+                        audio_events.push("bgm".to_string());
+                    }
+                }
+                "LAUGHTER" => {
+                    if !audio_events.iter().any(|e| e == "laughter") {
+                        audio_events.push("laughter".to_string());
+                    }
+                }
+                "APPLAUSE" => {
+                    if !audio_events.iter().any(|e| e == "applause") {
+                        audio_events.push("applause".to_string());
+                    }
+                }
+                "CRY" => {
+                    if !audio_events.iter().any(|e| e == "cry") {
+                        audio_events.push("cry".to_string());
+                    }
+                }
+                "SNEEZE" => {
+                    if !audio_events.iter().any(|e| e == "sneeze") {
+                        audio_events.push("sneeze".to_string());
+                    }
+                }
+                "BREATH" => {
+                    if !audio_events.iter().any(|e| e == "breath") {
+                        audio_events.push("breath".to_string());
+                    }
+                }
+                "COUGH" => {
+                    if !audio_events.iter().any(|e| e == "cough") {
+                        audio_events.push("cough".to_string());
+                    }
+                }
+                "SING" => {
+                    if !audio_events.iter().any(|e| e == "sing") {
+                        audio_events.push("sing".to_string());
+                    }
+                }
+                "SPEECH_NOISE" => {
+                    if !audio_events.iter().any(|e| e == "speech_noise") {
+                        audio_events.push("speech_noise".to_string());
+                    }
+                }
+                _ => {}
+            }
+
+            rest = &token_slice[end_idx + 2..];
+        } else {
+            clean_text.push_str("<|");
+            rest = token_slice;
+        }
+    }
+    clean_text.push_str(rest);
+
+    let text = clean_text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+
+    // 4. 双层语言判定：若声学标记缺失或未知，以转录文本 Unicode 字符集比例兜底
+    let final_lang = if lang.is_some() {
+        lang
+    } else if !text.is_empty() {
+        detect_language_from_text(&text)
+    } else {
+        None
+    };
+
+    SenseVoiceResult {
+        text,
+        lang: final_lang,
+        emotion,
+        audio_events,
+    }
+}
+
+/// 基于 Unicode 字符分布的次级兜底语言检测
+fn detect_language_from_text(text: &str) -> Option<String> {
+    let mut cjk_count = 0usize;
+    let mut kana_count = 0usize;
+    let mut hangul_count = 0usize;
+    let mut latin_count = 0usize;
+
+    for ch in text.chars() {
+        match ch {
+            '\u{4e00}'..='\u{9fa5}' => cjk_count += 1,
+            '\u{3040}'..='\u{30ff}' => kana_count += 1,
+            '\u{ac00}'..='\u{d7af}' => hangul_count += 1,
+            'a'..='z' | 'A'..='Z' => latin_count += 1,
+            _ => {}
+        }
+    }
+
+    if kana_count > 0 {
+        Some("ja".to_string())
+    } else if hangul_count > 0 {
+        Some("ko".to_string())
+    } else if cjk_count > 0 && cjk_count * 2 >= latin_count {
+        Some("zh".to_string())
+    } else if latin_count > 0 {
+        Some("en".to_string())
+    } else {
+        None
+    }
+}
+
+impl SherpaManager {
+    /// 使用 SenseVoice 进行端到端语音识别与声学元数据解析 (ASR + 语言 + 情感 + 声音事件)
+    pub fn transcribe_full(&self, samples: &[f32], sample_rate: i32) -> Option<SenseVoiceResult> {
         let recognizer = self.recognizer.as_ref()?;
 
         // 防空张量守卫
@@ -677,12 +680,24 @@ impl SherpaManager {
         recognizer.decode(&stream);
 
         let result = stream.get_result()?;
-        let text = result.text.trim().to_string();
-        if text.is_empty() {
+        let raw_text = result.text.trim();
+        if raw_text.is_empty() {
+            return None;
+        }
+
+        let parsed = parse_sense_voice_tokens(raw_text);
+        if parsed.text.is_empty() && parsed.emotion.is_none() && parsed.lang.is_none() {
             None
         } else {
-            Some(text)
+            Some(parsed)
         }
+    }
+
+    /// 使用 SenseVoice 进行端到端语音识别 (ASR，兼容纯文本接口)
+    pub fn transcribe(&self, samples: &[f32], sample_rate: i32) -> Option<String> {
+        self.transcribe_full(samples, sample_rate)
+            .map(|r| r.text)
+            .filter(|t| !t.is_empty())
     }
 
     /// 使用 CED-mini 对音频进行声学事件打标，并归一化为受控本体标签 (audio_events)
@@ -718,18 +733,18 @@ impl SherpaManager {
         res
     }
 
-    /// 端到端纯内存音频处理流水线：降噪 -> VAD -> ASR + 声学打标
-    pub fn process_audio_pipeline(
+    /// 端到端纯内存音频处理全量流水线：降噪 -> VAD -> ASR + 语言/情绪解析 + 声学打标
+    pub fn process_audio_pipeline_full(
         &self,
         samples: &[f32],
         sample_rate: i32,
-    ) -> (Option<String>, Vec<String>) {
+    ) -> (Option<SenseVoiceResult>, Vec<String>) {
         if samples.is_empty() {
             return (None, Vec::new());
         }
 
         // 1. 声学打标在原始或微降噪波形上提取事件 (CED-mini)
-        let audio_events = self.tag_audio(samples, sample_rate, 5);
+        let mut audio_events = self.tag_audio(samples, sample_rate, 5);
 
         // 2. 纯内存 GTCRN 降噪
         let denoised = self.denoise(samples, sample_rate);
@@ -737,14 +752,34 @@ impl SherpaManager {
         // 3. Silero VAD 防御性语音检测与截断
         let (has_voice, voice_samples) = self.vad_filter(&denoised, sample_rate);
 
-        // 4. 若有有效语音，执行 SenseVoice ASR
-        let transcript = if has_voice {
-            self.transcribe(&voice_samples, sample_rate)
+        // 4. 若有有效语音，执行 SenseVoice ASR 完整解析
+        let sense_voice_result = if has_voice {
+            self.transcribe_full(&voice_samples, sample_rate)
         } else {
             None
         };
 
-        (transcript, audio_events)
+        // 5. 合并 SenseVoice 识别出的声音事件到 audio_events 列表
+        if let Some(ref sv) = sense_voice_result {
+            for ev in &sv.audio_events {
+                let norm = normalize_ced_audio_event(ev);
+                if !norm.is_empty() && !audio_events.contains(&norm) {
+                    audio_events.push(norm);
+                }
+            }
+        }
+
+        (sense_voice_result, audio_events)
+    }
+
+    /// 端到端纯内存音频处理流水线：降噪 -> VAD -> ASR + 声学打标 (向后兼容)
+    pub fn process_audio_pipeline(
+        &self,
+        samples: &[f32],
+        sample_rate: i32,
+    ) -> (Option<String>, Vec<String>) {
+        let (res_opt, events) = self.process_audio_pipeline_full(samples, sample_rate);
+        (res_opt.map(|r| r.text).filter(|t| !t.is_empty()), events)
     }
 }
 
@@ -831,6 +866,51 @@ pub fn decode_audio_to_16k_mono(
     }
 
     // 将 f32le (每个 float 4 字节) 解析为 Vec<f32>
+    let samples: Vec<f32> = raw_bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+
+    Some(samples)
+}
+
+/// 纯内存音频解码纯函数：将媒体转码解码为 48kHz 双声道交织 f32 样本 [L0, R0, L1, R1, ...]
+pub fn decode_audio_to_48k_stereo(
+    file_path: &Path,
+    duration_seconds: Option<u32>,
+) -> Option<Vec<f32>> {
+    if !file_path.exists() {
+        return None;
+    }
+
+    let ffmpeg = resolve_ffmpeg_binary()?;
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.arg("-i").arg(file_path);
+
+    if let Some(dur) = duration_seconds {
+        cmd.arg("-t").arg(dur.to_string());
+    }
+
+    // 强制输出 48000Hz 2 通道，f32le 原生 PCM，输出到标准管道
+    cmd.args(["-vn", "-ar", "48000", "-ac", "2", "-f", "f32le", "pipe:1"]);
+
+    let output = match cmd.output() {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!("[decode_audio_to_48k_stereo] FFmpeg 管道执行失败: {:?}", e);
+            return None;
+        }
+    };
+
+    if !output.status.success() || output.stdout.is_empty() {
+        tracing::warn!(
+            "[decode_audio_to_48k_stereo] FFmpeg 转码非零退出或输出为空: status={:?}",
+            output.status
+        );
+        return None;
+    }
+
+    let raw_bytes = output.stdout;
     let samples: Vec<f32> = raw_bytes
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
@@ -931,6 +1011,47 @@ pub fn encode_pcm_f32_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 mod tests {
     use super::*;
     use omni_core::concepts::Concept;
+
+    /// ★ 守卫：随包 sherpa / onnxruntime 为 CPU-only 归档，Windows / Linux 上必须默认只给 cpu。
+    /// 严禁再依据 `CUDA_PATH` / `CUDA_HOME` 等「本机装了 CUDA Toolkit」的信号盲推 cuda ——
+    /// 那会触发上游 `session.cc:355` 的伪告警（`-DSHERPA_ONNX_ENABLE_GPU`）与虚假硬件加速归因。
+    #[test]
+    fn test_resolve_sherpa_providers_defaults_to_cpu_without_override() {
+        let providers = SherpaManager::resolve_sherpa_providers(None);
+        #[cfg(target_os = "macos")]
+        assert_eq!(providers, vec!["coreml".to_string(), "cpu".to_string()]);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(providers, vec!["cpu".to_string()]);
+    }
+
+    /// 显式覆盖（含大小写与首尾空白）必须被规整后置于首位，cpu 兜底恒在末位；
+    /// 纯空白覆盖视为未设置，回落平台默认列表。
+    #[test]
+    fn test_resolve_sherpa_providers_explicit_override_wins() {
+        assert_eq!(
+            SherpaManager::resolve_sherpa_providers(Some("  CUDA  ")),
+            vec!["cuda".to_string(), "cpu".to_string()]
+        );
+        assert_eq!(
+            SherpaManager::resolve_sherpa_providers(Some("directml")),
+            vec!["directml".to_string(), "cpu".to_string()]
+        );
+        assert_eq!(
+            SherpaManager::resolve_sherpa_providers(Some("   ")),
+            SherpaManager::resolve_sherpa_providers(None)
+        );
+    }
+
+    /// `preferred_sherpa_providers()` 仅负责把 `FIREFLY_SHERPA_PROVIDER` 透传给纯函数，
+    /// 且任何路径下末位都必须有 cpu 兜底，杜绝「无可用 EP 且无兜底」的构造失败。
+    #[test]
+    fn test_preferred_sherpa_providers_reads_env_override_with_cpu_fallback() {
+        let expected = SherpaManager::resolve_sherpa_providers(
+            std::env::var("FIREFLY_SHERPA_PROVIDER").ok().as_deref(),
+        );
+        assert_eq!(SherpaManager::preferred_sherpa_providers(), expected);
+        assert_eq!(expected.last().map(String::as_str), Some("cpu"));
+    }
 
     #[test]
     fn test_encode_pcm_f32_to_wav_header() {
@@ -1154,28 +1275,46 @@ mod tests {
     }
 
     #[test]
-    fn test_kokoro_tts_lifecycle_and_synthesis() {
-        let manager = SherpaManager::new();
-        let (ready, num_speakers, sample_rate) = manager.tts_status();
-        println!("Kokoro TTS status: ready={}, speakers={}, rate={}Hz", ready, num_speakers, sample_rate);
+    fn test_parse_sense_voice_tokens_and_fallbacks() {
+        // 1. 中文带情感和事件
+        let raw1 = "<|zh|><|HAPPY|><|Speech|><|woitn|><|Laughter|>你好世界，很高兴见到大家！<|/Laughter|>";
+        let res1 = parse_sense_voice_tokens(raw1);
+        assert_eq!(res1.lang.as_deref(), Some("zh"));
+        assert_eq!(res1.emotion.as_deref(), Some("happy"));
+        assert!(res1.audio_events.contains(&"laughter".to_string()));
+        assert_eq!(res1.text, "你好世界，很高兴见到大家！");
 
-        assert!(ready, "Kokoro TTS engine should be initialized when models exist in extraResources");
-        assert_eq!(num_speakers, 103, "Kokoro multi-lang v1.1 should have 103 speakers");
-        assert_eq!(sample_rate, 24000, "Kokoro TTS standard sample rate is 24000Hz");
+        // 2. 英文带悲伤情绪与 BGM
+        let raw2 = "<|en|><|SAD|><|BGM|>I am very sorry for the delay.<|/BGM|>";
+        let res2 = parse_sense_voice_tokens(raw2);
+        assert_eq!(res2.lang.as_deref(), Some("en"));
+        assert_eq!(res2.emotion.as_deref(), Some("sad"));
+        assert!(res2.audio_events.contains(&"bgm".to_string()));
+        assert_eq!(res2.text, "I am very sorry for the delay.");
 
-        // 测试中英文合成（包含 Folder、感叹号与逗号）
-        let wav1 = manager
-            .synthesize_chunk("Hello Folder! Welcome to Firefly AI Folder.", 0, 1.0)
-            .expect("Synthesize en Folder should succeed");
-        println!("Synthesized en Folder wav bytes: {}", wav1.len());
+        // 3. 次级兜底轨：无声学语言标记，纯文本字符集判定中文
+        let raw3 = "<|NEUTRAL|>今天天气真不错";
+        let res3 = parse_sense_voice_tokens(raw3);
+        assert_eq!(res3.lang.as_deref(), Some("zh"));
+        assert_eq!(res3.emotion.as_deref(), Some("neutral"));
+        assert_eq!(res3.text, "今天天气真不错");
 
-        let wav2 = manager
-            .synthesize_chunk("你好！欢迎使用 Firefly AI Folder 驱动的下一代文件管理", 44, 1.0)
-            .expect("Synthesize zh Folder should succeed");
-        println!("Synthesized zh Folder wav bytes: {}", wav2.len());
+        // 4. 次级兜底轨：纯英文无标记
+        let raw4 = "Hello world from Rust tests";
+        let res4 = parse_sense_voice_tokens(raw4);
+        assert_eq!(res4.lang.as_deref(), Some("en"));
+        assert!(res4.emotion.is_none());
+        assert_eq!(res4.text, "Hello world from Rust tests");
 
-        assert!(wav1.len() > 44, "WAV output must be longer than 44-byte header");
-        assert_eq!(&wav1[0..4], b"RIFF", "Header magic should be RIFF");
-        assert_eq!(&wav1[8..12], b"WAVE", "Header format should be WAVE");
+        // 5. 日文假名判定
+        let raw5 = "こんにちは世界";
+        let res5 = parse_sense_voice_tokens(raw5);
+        assert_eq!(res5.lang.as_deref(), Some("ja"));
+
+        // 6. 空白输入
+        let raw6 = "   <|nospeech|>   ";
+        let res6 = parse_sense_voice_tokens(raw6);
+        assert!(res6.text.is_empty());
+        assert!(res6.lang.is_none());
     }
 }

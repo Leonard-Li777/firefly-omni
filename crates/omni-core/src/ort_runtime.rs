@@ -182,6 +182,52 @@ impl OmniOrtRuntime {
             .unwrap_or(4)
     }
 
+    /// 获取当前平台优先推荐的硬件加速 Execution Provider 候选列表（按优先级排序）
+    pub fn preferred_hardware_eps() -> Vec<ort::execution_providers::ExecutionProviderDispatch> {
+        use ort::execution_providers::ExecutionProvider;
+
+        let mut eps = Vec::new();
+
+        #[cfg(target_os = "windows")]
+        {
+            // 优先检查当前加载的 ONNX Runtime 二进制是否编译了 CUDA (需 onnxruntime-gpu 构建)
+            let cuda_ep = ort::execution_providers::CUDAExecutionProvider::default();
+            if cuda_ep.is_available().unwrap_or(false) {
+                tracing::info!("OmniOrtRuntime: 探测到当前 ONNX Runtime 包含 CUDA 硬件加速支持");
+                eps.push(cuda_ep.build());
+            }
+
+            // 检查 DirectML 支持 (当前随包分发的 onnxruntime-directml 构建，覆盖全系 GPU/NPU)
+            let dml_ep = ort::execution_providers::DirectMLExecutionProvider::default();
+            if dml_ep.is_available().unwrap_or(true) {
+                eps.push(dml_ep.build());
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let coreml_ep = ort::execution_providers::CoreMLExecutionProvider::default();
+            if coreml_ep.is_available().unwrap_or(true) {
+                eps.push(coreml_ep.build());
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let cuda_ep = ort::execution_providers::CUDAExecutionProvider::default();
+            if cuda_ep.is_available().unwrap_or(false) {
+                eps.push(cuda_ep.build());
+            }
+        }
+
+        eps
+    }
+
+    /// 获取首选硬件加速 Execution Provider (向后兼容)
+    pub fn preferred_hardware_ep() -> Option<ort::execution_providers::ExecutionProviderDispatch> {
+        Self::preferred_hardware_eps().into_iter().next()
+    }
+
     /// 执行提供商 (EP) 两阶段降级路由工厂
     pub fn build_session<P: AsRef<Path>>(
         model_path: P,
@@ -190,26 +236,8 @@ impl OmniOrtRuntime {
         Self::ensure_initialized();
         let path = model_path.as_ref();
         let intra_threads = Self::recommended_intra_threads();
-        let ep = Self::preferred_hardware_ep();
-        Self::build_session_with_ep_internal(path, tier, ep, intra_threads)
-    }
-
-    /// 获取当前平台优先推荐的硬件加速 Execution Provider
-    pub fn preferred_hardware_ep() -> Option<ort::execution_providers::ExecutionProviderDispatch> {
-        #[cfg(target_os = "windows")]
-        {
-            // Windows 优先注入 DirectMLExecutionProvider
-            Some(ort::execution_providers::DirectMLExecutionProvider::default().build())
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // macOS 优先注入 CoreMLExecutionProvider
-            Some(ort::execution_providers::CoreMLExecutionProvider::default().build())
-        }
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        {
-            None
-        }
+        let eps = Self::preferred_hardware_eps();
+        Self::build_session_with_eps_internal(path, tier, eps, intra_threads)
     }
 
     /// 统一两阶段执行提供商路由逻辑
@@ -252,33 +280,65 @@ impl OmniOrtRuntime {
         Ok(cpu_session)
     }
 
-    /// 内部两阶段构建逻辑，支持测试中模拟 EP 注入与失败
-    pub fn build_session_with_ep_internal(
+    /// 内部多阶段构建逻辑：按优先级依次尝试硬件加速 EP，最终优雅回退到多线程优化 CPU Session
+    pub fn build_session_with_eps_internal(
         path: &Path,
         _tier: ModelTier,
-        ep: Option<ort::execution_providers::ExecutionProviderDispatch>,
+        eps: Vec<ort::execution_providers::ExecutionProviderDispatch>,
         intra_threads: usize,
     ) -> Result<ort::session::Session, ort::Error> {
-        let has_ep = ep.is_some();
         let path_str = path.display().to_string();
-        Self::execute_two_stage_fallback(
-            &path_str,
-            has_ep,
-            || {
-                let hardware_ep = ep.as_ref().unwrap();
+
+        for (idx, ep) in eps.into_iter().enumerate() {
+            let res = (|| {
                 let mut b = ort::session::Session::builder()?
                     .with_intra_threads(intra_threads)?
                     .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?;
-                b = b.with_execution_providers([hardware_ep.clone()])?;
+                b = b.with_execution_providers([ep])?;
                 b.commit_from_file(path)
-            },
-            || {
-                ort::session::Session::builder()?
-                    .with_intra_threads(intra_threads)?
-                    .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-                    .commit_from_file(path)
-            },
-        )
+            })();
+
+            match res {
+                Ok(session) => {
+                    tracing::info!(
+                        "OmniOrtRuntime: 成功构建硬件加速 Session (model={}, ep_candidate={})",
+                        path_str,
+                        idx
+                    );
+                    return Ok(session);
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        "OmniOrtRuntime: 硬件加速候选 EP[{}] 初始化未命中或不支持，继续尝试下一个候选: {:?}",
+                        idx,
+                        err
+                    );
+                }
+            }
+        }
+
+        // 最终兜底：纯 CPU Session
+        let cpu_session = ort::session::Session::builder()?
+            .with_intra_threads(intra_threads)?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+            .commit_from_file(path)?;
+
+        tracing::info!(
+            "OmniOrtRuntime: 成功构建纯 CPU Session (model={})",
+            path_str
+        );
+        Ok(cpu_session)
+    }
+
+    /// 内部两阶段构建逻辑，支持测试中模拟 EP 注入与失败 (兼容现有测试)
+    pub fn build_session_with_ep_internal(
+        path: &Path,
+        tier: ModelTier,
+        ep: Option<ort::execution_providers::ExecutionProviderDispatch>,
+        intra_threads: usize,
+    ) -> Result<ort::session::Session, ort::Error> {
+        let eps = ep.into_iter().collect();
+        Self::build_session_with_eps_internal(path, tier, eps, intra_threads)
     }
 }
 

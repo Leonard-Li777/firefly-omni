@@ -69,10 +69,11 @@ impl OmniFactTagExtractor {
         // 0. 原生扩展名与媒体大类事实确定性抽取 (PRD-0058 / Fact Tags Migration)
         Self::extract_extension_and_category_facts(ctx, &mut tags);
 
-        // 1. 元数据实体维度抽取 (音频 / 视觉器材 / 文档)
+        // 1. 元数据实体维度抽取 (音频 / 视觉器材 / 文档 / 情绪)
         Self::extract_audio_dimensions(ctx.metadata, &mut tags);
         Self::extract_visual_equipment_dimensions(ctx.metadata, &mut tags);
         Self::extract_document_dimensions(ctx.metadata, &mut tags);
+        Self::extract_emotion_dimensions(ctx.metadata, &mut tags);
 
         // 2. 下沉既有物理事实 (桌面端 Node.js 预检管线既有确诊维度)
         Self::push_fact(&mut tags, "文件来源", ctx.file_source.as_deref(), "builtin.file_source", CONF_FACT);
@@ -197,6 +198,41 @@ impl OmniFactTagExtractor {
                 if let Some(val) = Self::get_str(scope, key) {
                     let code = Self::resolve_or_derive_code(&val);
                     Self::push_tag(out, "音乐流派", code, &val, CONF_FACT, Some(key), &val, Some("builtin.music_type"));
+                }
+            }
+        }
+    }
+
+    /// 情绪标签抽取 (dim 121: builtin.emotion_tags)
+    fn extract_emotion_dimensions(metadata: &Value, out: &mut Vec<TagChainItem>) {
+        for scope in Self::metadata_scopes(metadata) {
+            for key in ["emotion", "Emotion", "mood", "Mood"] {
+                if let Some(val) = Self::get_str(scope, key) {
+                    let lower = val.trim().to_ascii_lowercase();
+                    // 映射 SenseVoice 情绪为受控 Concept (权威 OMW 优先)
+                    let concept_opt = match lower.as_str() {
+                        "happy" | "喜悦" | "欢乐" => Some(Concept::欢乐),
+                        "sad" | "悲伤" => Some(Concept::悲伤),
+                        "angry" | "愤怒" | "生气" => Some(Concept::紧张),
+                        "fearful" | "害怕" | "恐惧" => Some(Concept::紧张),
+                        "surprised" | "惊讶" | "惊奇" => Some(Concept::兴奋),
+                        "neutral" | "平静" | "中立" => Some(Concept::轻松),
+                        _ => None,
+                    };
+
+                    if let Some(concept_val) = concept_opt {
+                        Self::push_tag(
+                            out,
+                            "情绪标签",
+                            concept_val.code().to_string(),
+                            concept_val.zh_name(),
+                            CONF_FACT,
+                            Some(key),
+                            &val,
+                            Some(Concept::情绪标签.code()),
+                        );
+                        return;
+                    }
                 }
             }
         }
@@ -703,5 +739,30 @@ mod tests {
             Some("builtin.content_tags"),
             "专辑不得误挂在 builtin.audio_segmentation，必须归入 builtin.content_tags"
         );
+    }
+
+    /// 情绪标签事实抽取验证 (SenseVoice 情感分析回填落库)
+    #[test]
+    fn test_emotion_tag_extraction() {
+        // 1. 快乐/喜悦 -> Concept::欢乐 (omw.07529377.n)
+        let meta_happy = json!({ "emotion": "happy" });
+        let tags_happy = extract_fact_tags(&meta_happy);
+        let tag = tags_happy.iter().find(|t| t.name == "欢乐").expect("应提取出情绪标签: 欢乐");
+        assert_eq!(tag.code, "omw.07529377.n");
+        assert_eq!(tag.via_parent_code.as_deref(), Some("builtin.emotion_tags"));
+
+        // 2. 悲伤 -> Concept::悲伤 (omw.01364008.a)
+        let meta_sad = json!({ "audio": { "emotion": "sad" } });
+        let tags_sad = extract_fact_tags(&meta_sad);
+        let tag_sad = tags_sad.iter().find(|t| t.name == "悲伤").expect("应提取出情绪标签: 悲伤");
+        assert_eq!(tag_sad.code, "omw.01364008.a");
+        assert_eq!(tag_sad.via_parent_code.as_deref(), Some("builtin.emotion_tags"));
+
+        // 3. 平静/中立 -> Concept::轻松 (omw.01064148.n)
+        let meta_neutral = json!({ "emotion": "neutral" });
+        let tags_neutral = extract_fact_tags(&meta_neutral);
+        let tag_neutral = tags_neutral.iter().find(|t| t.name == "轻松").expect("应提取出情绪标签: 轻松");
+        assert_eq!(tag_neutral.code, "omw.01064148.n");
+        assert_eq!(tag_neutral.via_parent_code.as_deref(), Some("builtin.emotion_tags"));
     }
 }
