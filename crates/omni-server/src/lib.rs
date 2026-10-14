@@ -46,7 +46,7 @@ pub mod sherpa_manager;
 pub mod text_chunker;
 
 pub use moss_tts::MossTtsManager;
-pub use sherpa_manager::{decode_audio_to_16k_mono, normalize_ced_audio_event, SherpaManager};
+pub use sherpa_manager::{decode_audio_to_16k_mono, decode_audio_to_16k_mono_bandpass, normalize_ced_audio_event, SherpaManager};
 
 /// CLIP 互斥组标准名称定义
 const GROUP_COLOR_MODE: &str = "色彩模式";
@@ -3550,7 +3550,7 @@ pub struct AudioAnalyzeVoiceRequest {
     pub file_path: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioAnalyzeVoiceResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3563,48 +3563,98 @@ pub struct AudioAnalyzeVoiceResponse {
 }
 
 /// 音频特征分析与提取: POST /api/audio/analyze-voice
-/// 前置 -t 10 纯内存转码，利用 SenseVoice 双层判定识别语言与情感，并提取特征
+///
+/// 契约说明 (PRD-0058 / Spec §2.4 & §3.1.2):
+/// 1. 显式降级治理 (AGENTS.md §2.9): 若 GTCRN 降噪模型、Silero VAD 或 MOSS-TTS 原生 ONNX 引擎未就绪，
+///    严禁静默放行未提纯音频或空特征码，显式记录错误并返回 HTTP 503 SERVICE_UNAVAILABLE；
+/// 2. 多级人声净化流水线:
+///    - Stage 1: FFmpeg 频带通 (80-8000Hz) 与单声道合规下混 (-t 15 截取)；
+///    - Stage 2: 纯内存 GTCRN 深度复数残差降噪；
+///    - Stage 3: Silero VAD 伴奏截断 + 0.15s 平滑拼接；
+///    - 门禁: 3.0s 有效真人发音把关，不足 3s 返回 HTTP 400 BAD_REQUEST；
+///    - 截片: 前 3.0s ~ 5.0s 纯干声 (最多 80,000 点 @ 16kHz)；
+/// 3. SenseVoice 三层语言确定性决策 + 情绪自动识别；
+/// 4. MOSS-TTS Codec Encode 提取 48kHz RVQ-16 离散声学特征码 (frames 落在 38~62 帧)。
 async fn audio_analyze_voice_handler(
     State(state): State<AppState>,
     Json(req): Json<AudioAnalyzeVoiceRequest>,
-) -> Json<AudioAnalyzeVoiceResponse> {
+) -> (StatusCode, Json<AudioAnalyzeVoiceResponse>) {
     let file_path = req.file_path.trim().to_string();
     if file_path.is_empty() {
-        return Json(AudioAnalyzeVoiceResponse {
-            success: false,
-            error: Some("file_path cannot be empty".to_string()),
-            lang: "zh".to_string(),
-            emotion: "neutral".to_string(),
-            text: String::new(),
-            frames: 0,
-            codes: Vec::new(),
-        });
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AudioAnalyzeVoiceResponse {
+                success: false,
+                error: Some("file_path cannot be empty".to_string()),
+                lang: "zh".to_string(),
+                emotion: "neutral".to_string(),
+                text: String::new(),
+                frames: 0,
+                codes: Vec::new(),
+            }),
+        );
     }
 
     let path = std::path::PathBuf::from(&file_path);
     if !path.exists() {
-        return Json(AudioAnalyzeVoiceResponse {
-            success: false,
-            error: Some(format!("Audio file not found: {}", file_path)),
-            lang: "zh".to_string(),
-            emotion: "neutral".to_string(),
-            text: String::new(),
-            frames: 0,
-            codes: Vec::new(),
-        });
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AudioAnalyzeVoiceResponse {
+                success: false,
+                error: Some(format!("Audio file not found: {}", file_path)),
+                lang: "zh".to_string(),
+                emotion: "neutral".to_string(),
+                text: String::new(),
+                frames: 0,
+                codes: Vec::new(),
+            }),
+        );
+    }
+
+    // 1. 检查人声净化与声学特征提取模型是否就绪（AGENTS.md §2.9 禁止静默降级铁律）
+    if !state.sherpa.is_purification_ready() || !state.moss.is_ready() {
+        tracing::error!(
+            "[audio_analyze_voice_handler] 人声净化或声学特征提取模型未就绪 (purification_ready={}, moss_ready={})",
+            state.sherpa.is_purification_ready(),
+            state.moss.is_ready()
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AudioAnalyzeVoiceResponse {
+                success: false,
+                error: Some("人声净化或声学特征提取模型未就绪".to_string()),
+                lang: "zh".to_string(),
+                emotion: "neutral".to_string(),
+                text: String::new(),
+                frames: 0,
+                codes: Vec::new(),
+            }),
+        );
     }
 
     let sherpa = state.sherpa.clone();
+    let moss = state.moss.clone();
+
     let res = tokio::task::spawn_blocking(move || {
-        // 1. 解码前 10 秒 16kHz 单声道（供 SenseVoice 分析）
-        let samples_16k = match decode_audio_to_16k_mono(&path, Some(10)) {
+        // Stage 1: FFmpeg 频带通 (80-8000Hz) 与单声道合规下混 (前 15 秒)
+        let raw_16k = match decode_audio_to_16k_mono_bandpass(&path, Some(15)) {
             Some(s) if !s.is_empty() => s,
-            _ => return Err("Failed to decode audio to 16kHz mono".to_string()),
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "音频文件转码失败或时长为空".to_string(),
+                ))
+            }
         };
 
-        // 2. SenseVoice 识别
-        let (sv_opt, _) = sherpa.process_audio_pipeline_full(&samples_16k, 16000);
+        // Stage 2 & 3: 纯内存 GTCRN 降噪 + Silero VAD 伴奏截断 + 3.0s 发音门禁 + 5.0s 黄金区间截取
+        let dry_vocal_stem = match sherpa.purify_vocal_and_extract_dry_stem(&raw_16k, 16000) {
+            Ok(stem) => stem,
+            Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
+        };
 
+        // Stage 4: SenseVoice ASR 文本转录、语言与情感分析
+        let sv_opt = sherpa.transcribe_full(&dry_vocal_stem, 16000);
         let (text, lang, emotion) = if let Some(sv) = sv_opt {
             let l = sv.lang.unwrap_or_else(|| "zh".to_string());
             let e = sv.emotion.unwrap_or_else(|| "neutral".to_string());
@@ -3613,41 +3663,60 @@ async fn audio_analyze_voice_handler(
             (String::new(), "zh".to_string(), "neutral".to_string())
         };
 
-        let codes: Vec<Vec<i16>> = Vec::new();
-        let frames = codes.len();
+        // Stage 5: MOSS-TTS Codec Encode 提取 48kHz RVQ-16 离散声学特征码
+        let codes = match moss.extract_voice_codes(&dry_vocal_stem) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("[audio_analyze_voice_handler] Codec 特征码提取失败: {}", e);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Codec 特征码提取失败: {}", e),
+                ));
+            }
+        };
 
+        let frames = codes.len();
         Ok((text, lang, emotion, frames, codes))
     })
     .await;
 
     match res {
-        Ok(Ok((text, lang, emotion, frames, codes))) => Json(AudioAnalyzeVoiceResponse {
-            success: true,
-            error: None,
-            lang,
-            emotion,
-            text,
-            frames,
-            codes,
-        }),
-        Ok(Err(err)) => Json(AudioAnalyzeVoiceResponse {
-            success: false,
-            error: Some(err),
-            lang: "zh".to_string(),
-            emotion: "neutral".to_string(),
-            text: String::new(),
-            frames: 0,
-            codes: Vec::new(),
-        }),
-        Err(e) => Json(AudioAnalyzeVoiceResponse {
-            success: false,
-            error: Some(format!("Analyze voice task panicked: {}", e)),
-            lang: "zh".to_string(),
-            emotion: "neutral".to_string(),
-            text: String::new(),
-            frames: 0,
-            codes: Vec::new(),
-        }),
+        Ok(Ok((text, lang, emotion, frames, codes))) => (
+            StatusCode::OK,
+            Json(AudioAnalyzeVoiceResponse {
+                success: true,
+                error: None,
+                lang,
+                emotion,
+                text,
+                frames,
+                codes,
+            }),
+        ),
+        Ok(Err((status, err))) => (
+            status,
+            Json(AudioAnalyzeVoiceResponse {
+                success: false,
+                error: Some(err),
+                lang: "zh".to_string(),
+                emotion: "neutral".to_string(),
+                text: String::new(),
+                frames: 0,
+                codes: Vec::new(),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AudioAnalyzeVoiceResponse {
+                success: false,
+                error: Some(format!("Analyze voice task panicked: {}", e)),
+                lang: "zh".to_string(),
+                emotion: "neutral".to_string(),
+                text: String::new(),
+                frames: 0,
+                codes: Vec::new(),
+            }),
+        ),
     }
 }
 
