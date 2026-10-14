@@ -29,6 +29,8 @@ sherpa-onnx = { workspace = true }
 ort = { workspace = true }
 ndarray = "0.16"
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+jieba-rs = { workspace = true }
+unicode-segmentation = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

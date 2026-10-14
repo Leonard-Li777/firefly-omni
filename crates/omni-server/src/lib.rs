@@ -43,6 +43,7 @@ use omni_pro::{
 pub mod moss_tts;
 pub mod routes;
 pub mod sherpa_manager;
+pub mod text_chunker;
 
 pub use moss_tts::MossTtsManager;
 pub use sherpa_manager::{decode_audio_to_16k_mono, normalize_ced_audio_event, SherpaManager};
@@ -139,6 +140,7 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/audio/tts/status", get(audio_tts_status_handler))
             .route("/api/audio/tts/register-voice", post(audio_tts_register_voice_handler))
             .route("/api/audio/tts/scale", post(audio_tts_scale_handler))
+            .route("/api/audio/tts/split-chunks", post(audio_tts_split_chunks_handler))
             .route("/api/vision/tags", post(vision_tags_handler))
             .route("/api/vision/inspect", post(vision_inspect_handler))
             .route("/api/fs/ads", post(fs_ads_handler))
@@ -3481,6 +3483,67 @@ async fn audio_tts_scale_handler(
     Ok(response)
 }
 
+/// 智能分句切片请求体: POST /api/audio/tts/split-chunks
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTtsSplitChunksRequest {
+    pub text: String,
+    #[serde(default, alias = "max_chunk_chars", alias = "max_length", alias = "maxLength")]
+    pub max_chunk_chars: Option<usize>,
+    #[serde(default, alias = "min_chunk_chars", alias = "min_length", alias = "minLength")]
+    pub min_chunk_chars: Option<usize>,
+    #[serde(default, alias = "target_chunk_chars", alias = "target_length", alias = "targetLength")]
+    pub target_chunk_chars: Option<usize>,
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+/// 智能分句切片响应体
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTtsSplitChunksResponse {
+    pub chunks: Vec<String>,
+    pub total_chunks: usize,
+    pub total_chars: usize,
+}
+
+/// 智能分句切片处理: POST /api/audio/tts/split-chunks
+async fn audio_tts_split_chunks_handler(
+    Json(req): Json<AudioTtsSplitChunksRequest>,
+) -> Result<Json<AudioTtsSplitChunksResponse>, (StatusCode, String)> {
+    let text = req.text;
+    let char_count = text.chars().count();
+    if char_count > 50_000 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Text length of {} characters exceeds 50000 limit", char_count),
+        ));
+    }
+
+    if text.trim().is_empty() {
+        return Ok(Json(AudioTtsSplitChunksResponse {
+            chunks: Vec::new(),
+            total_chunks: 0,
+            total_chars: 0,
+        }));
+    }
+
+    let chunks = text_chunker::split_text_chunks(
+        &text,
+        req.target_chunk_chars,
+        req.min_chunk_chars,
+        req.max_chunk_chars,
+        req.language.as_deref(),
+    );
+    let total_chunks = chunks.len();
+    let total_chars = chunks.iter().map(|c| c.chars().count()).sum();
+
+    Ok(Json(AudioTtsSplitChunksResponse {
+        chunks,
+        total_chunks,
+        total_chars,
+    }))
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AudioAnalyzeVoiceRequest {
