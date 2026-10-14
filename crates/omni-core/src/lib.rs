@@ -585,6 +585,8 @@ pub struct AudioTranscribeResponse {
     pub transcript: Option<String>,
     pub events: Vec<String>,
     pub language: Option<String>,
+    #[serde(default)]
+    pub emotion: Option<String>,
     pub duration_ms: u64,
 }
 

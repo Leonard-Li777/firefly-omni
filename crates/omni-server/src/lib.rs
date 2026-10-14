@@ -133,6 +133,7 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/audio/tts/chunk", post(audio_tts_chunk_handler))
             .route("/api/audio/tts/status", get(audio_tts_status_handler))
             .route("/api/audio/tts/register-voice", post(audio_tts_register_voice_handler))
+            .route("/api/audio/tts/scale", post(audio_tts_scale_handler))
             .route("/api/vision/tags", post(vision_tags_handler))
             .route("/api/vision/inspect", post(vision_inspect_handler))
             .route("/api/fs/ads", post(fs_ads_handler))
@@ -3371,6 +3372,45 @@ async fn audio_tts_chunk_handler(
 
     Ok(response)
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioTtsScaleParams {
+    pub speed: Option<f32>,
+}
+
+/// 极速音频保音调倍速转换: POST /api/audio/tts/scale?speed=1.25
+/// 纯 Rust WSOLA 内存算法，< 30ms 毫秒级重采样与内嵌 meta chunk 增量更新，免除重复运行神经网络
+async fn audio_tts_scale_handler(
+    Query(params): Query<AudioTtsScaleParams>,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    let speed = params.speed.unwrap_or(1.0);
+    if speed <= 0.1 || speed > 5.0 {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid speed parameter: must be between 0.1 and 5.0".to_string(),
+        ));
+    }
+    if body.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "Audio WAV body cannot be empty".to_string(),
+        ));
+    }
+
+    let wav_bytes = moss_tts::scale_wav_speed(&body, speed)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("WAV scaling failed: {}", e)))?;
+
+    let response = axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "audio/wav")
+        .header(axum::http::header::CONTENT_LENGTH, wav_bytes.len().to_string())
+        .body(axum::body::Body::from(wav_bytes))
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(response)
+}
+
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AudioAnalyzeVoiceRequest {
