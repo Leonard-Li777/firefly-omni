@@ -117,6 +117,39 @@ function resolveGeoRepo() {
 }
 
 /**
+ * 本地候选分发包（阶段一）：omni 自身 preset 优先，其次 monorepo 内 desktop 侧 preset。
+ * 背景：资源统一装配流水线（consume-preset-resources.js）按 firefly-resources 标准把
+ * geo-<版本>.tar.gz 下载到 apps/desktop/build/presetResources/geo/，apps/omni 自身
+ * presetResources/ 历史上从未被写入 geo 目录 —— 只认 omni 自己目录时阶段一恒落空、
+ * 阶段二 Release（Leonard-Li777/firefly-omni tag: geo-data）又早已 404，
+ * 于是开发态地理子系统永远软不可用（2026-10-14 定位）。
+ */
+function resolveLocalGeoArchives(omniRoot) {
+  const presetDirs = [
+    path.join(omniRoot, 'build', 'presetResources', 'geo'),
+    path.resolve(omniRoot, '..', '..', 'apps', 'desktop', 'build', 'presetResources', 'geo')
+  ]
+  const archives = []
+  for (const dir of presetDirs) {
+    if (!fs.existsSync(dir)) continue
+    for (const f of fs.readdirSync(dir)) {
+      // 兼容 geonames-resources.tar.gz（历史命名）与 geo-<版本>.tar.gz（firefly-resources 标准命名）
+      if (f.endsWith('.tar.gz') || f.endsWith('.zip')) {
+        archives.push(path.join(dir, f))
+      }
+    }
+  }
+  // 优先历史命名（语义更明确），其余按版本号新→旧
+  archives.sort((a, b) => {
+    const aHist = path.basename(a).startsWith('geonames-resources')
+    const bHist = path.basename(b).startsWith('geonames-resources')
+    if (aHist !== bHist) return aHist ? -1 : 1
+    return path.basename(b).localeCompare(path.basename(a))
+  })
+  return archives
+}
+
+/**
  * omni-geo 地理数据集装配（两级）：
  * 阶段一：build/presetResources/geo/geonames-resources.tar.gz 本地解压；
  * 阶段二：本地缺失时从 firefly-omni GitHub Release (tag: geo-data) 回退下载。
@@ -134,21 +167,26 @@ async function setupOmniGeoDataset() {
   }
 
   ensureDir(geoTargetDir)
-  let tarPath = path.join(omniRoot, 'build', 'presetResources', 'geo', 'geonames-resources.tar.gz')
+  const localArchives = resolveLocalGeoArchives(omniRoot)
 
-  // 阶段一：本地分发包存在则直接使用
-  if (!fs.existsSync(tarPath)) {
+  // 阶段一：本地分发包存在则直接使用（omni preset 或 desktop preset）
+  let tarPath = localArchives[0]
+  if (!tarPath) {
     // 阶段二：网络回退下载（firefly-omni 滚动 Release: geo-data）
     const repo = resolveGeoRepo()
     const tag = process.env.OMNI_GEO_RELEASE_TAG || 'geo-data'
     const url = `https://github.com/${repo}/releases/download/${tag}/geonames-resources.tar.gz`
     console.log(`⬇️ [omni-setup] 本地无地理数据包，开始下载: ${url}`)
+    tarPath = path.join(omniRoot, 'build', 'presetResources', 'geo', 'geonames-resources.tar.gz')
+    ensureDir(path.dirname(tarPath))
     try {
       await downloadToFile(url, tarPath)
     } catch (err) {
       console.warn(`⚠️ [omni-setup] 地理数据集下载失败（服务将以不可用状态软降级）: ${err.message}`)
       return
     }
+  } else {
+    console.log(`📦 [omni-setup] 使用本地地理数据包: ${tarPath}`)
   }
 
   try {
