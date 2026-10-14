@@ -40,9 +40,11 @@ use omni_pro::{
     UnmappedStats,
 };
 
+pub mod moss_tts;
 pub mod routes;
 pub mod sherpa_manager;
 
+pub use moss_tts::MossTtsManager;
 pub use sherpa_manager::{decode_audio_to_16k_mono, normalize_ced_audio_event, SherpaManager};
 
 /// CLIP 互斥组标准名称定义
@@ -71,6 +73,8 @@ pub struct AppState {
     pub dimension_policies: Arc<std::sync::RwLock<std::collections::HashMap<String, omni_core::DimensionExecutionPolicy>>>,
     /// Sherpa-ONNX 全栈音频 AI 管理引擎 (SenseVoice ASR / Silero VAD / GTCRN 降噪 / CED-mini 打标)
     pub sherpa: Arc<SherpaManager>,
+    /// MOSS-TTS 48kHz RVQ-16 自包含音色管理与合成引擎
+    pub moss: Arc<MossTtsManager>,
 }
 
 #[derive(Deserialize)]
@@ -125,8 +129,10 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/perceive", post(perceive_file_handler))
             .route("/api/audio/transcribe", post(audio_transcribe_handler))
             .route("/api/audio/convert", post(audio_convert_handler))
+            .route("/api/audio/analyze-voice", post(audio_analyze_voice_handler))
             .route("/api/audio/tts/chunk", post(audio_tts_chunk_handler))
             .route("/api/audio/tts/status", get(audio_tts_status_handler))
+            .route("/api/audio/tts/register-voice", post(audio_tts_register_voice_handler))
             .route("/api/vision/tags", post(vision_tags_handler))
             .route("/api/vision/inspect", post(vision_inspect_handler))
             .route("/api/fs/ads", post(fs_ads_handler))
@@ -767,6 +773,7 @@ pub async fn start_server(
 
     let initial_policies = routes::taxonomy::load_dimension_policies_from_db(db_path.as_deref());
     let sherpa = Arc::new(SherpaManager::new());
+    let moss = Arc::new(MossTtsManager::new());
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),
         geo,
@@ -777,6 +784,7 @@ pub async fn start_server(
         master_db_path: Arc::new(Mutex::new(db_path)),
         dimension_policies: Arc::new(std::sync::RwLock::new(initial_policies)),
         sherpa,
+        moss,
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本
@@ -1470,11 +1478,11 @@ async fn perceive_file_handler(
                 let file_path_for_audio = file_path.clone();
                 let sherpa_engine = state.sherpa.clone();
 
-                // spawn_blocking: 纯内存管道解码 + 纯内存 GTCRN 降噪 + VAD + SenseVoice ASR + CED-mini 打标
-                let (transcript_result, events_result) = tokio::task::spawn_blocking(move || {
+                // spawn_blocking: 纯内存管道解码 + 纯内存 GTCRN 降噪 + VAD + SenseVoice ASR (带语言/情感解析) + CED-mini 打标
+                let (sense_voice_result, events_result) = tokio::task::spawn_blocking(move || {
                     let path = std::path::Path::new(&file_path_for_audio);
                     if let Some(samples) = decode_audio_to_16k_mono(path, Some(duration_seconds)) {
-                        sherpa_engine.process_audio_pipeline(&samples, 16000)
+                        sherpa_engine.process_audio_pipeline_full(&samples, 16000)
                     } else {
                         (None, Vec::new())
                     }
@@ -1485,14 +1493,21 @@ async fn perceive_file_handler(
                 audio_ms = Some(t_audio.elapsed().as_millis() as u64);
 
                 if let serde_json::Value::Object(ref mut map) = ext_res.metadata {
-                    if let Some(transcript) = transcript_result {
+                    if let Some(sv) = sense_voice_result {
                         tracing::info!(
-                            "[OmniServer] 音频转录完成: file={}, len={}, audio_ms={:?}",
-                            file_path, transcript.len(), audio_ms
+                            "[OmniServer] 音频转录完成: file={}, len={}, lang={:?}, emotion={:?}, audio_ms={:?}",
+                            file_path, sv.text.len(), sv.lang, sv.emotion, audio_ms
                         );
                         // Issue 0046 §1：ASR 结果独占 `asr` 字段（不再回填 markdown_content，
                         // 保证音视频文件的「正文」结构与语音转录事实物理分离）。
-                        map.insert("asr".to_string(), serde_json::Value::String(transcript));
+                        map.insert("asr".to_string(), serde_json::Value::String(sv.text));
+
+                        if let Some(ref lang) = sv.lang {
+                            map.insert("language".to_string(), serde_json::Value::String(lang.clone()));
+                        }
+                        if let Some(ref emo) = sv.emotion {
+                            map.insert("emotion".to_string(), serde_json::Value::String(emo.clone()));
+                        }
                     } else {
                         tracing::info!("[OmniServer] 音频转录无语音内容或模型未就绪: file={}", file_path);
                     }
@@ -2497,28 +2512,36 @@ async fn perceive_file_handler(
     // ② 文档/文本：使用提取的真实正文 markdown_content；
     // ③ 纯图片/无语音音频/无文本文件：不产出语言事实标签 (None，宁缺勿错)。
     let fact_language_concept: Option<omni_core::concepts::Concept> = if !is_image {
-        let candidate_text = if is_audio || is_video {
-            asr.as_deref().or(lrc.as_deref())
+        let meta_lang_concept = if is_audio || is_video {
+            metadata
+                .get("language")
+                .or_else(|| metadata.get("audio").and_then(|a| a.get("language")))
+                .or_else(|| metadata.get("exiftool").and_then(|e| e.get("AudioLanguage").or_else(|| e.get("Language"))))
+                .and_then(|v| v.as_str())
+                .and_then(omni_core::concept_from_language_code)
         } else {
-            let trimmed = markdown_content.trim();
-            if !trimmed.is_empty() {
-                Some(trimmed)
+            None
+        };
+
+        if let Some(concept_val) = meta_lang_concept {
+            Some(concept_val)
+        } else {
+            let candidate_text = if is_audio || is_video {
+                asr.as_deref().or(lrc.as_deref())
+            } else {
+                let trimmed = markdown_content.trim();
+                if !trimmed.is_empty() {
+                    Some(trimmed)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(text) = candidate_text {
+                omni_core::detect_fact_language(text)
             } else {
                 None
             }
-        };
-
-        if let Some(text) = candidate_text {
-            omni_core::detect_fact_language(text)
-        } else if is_audio || is_video {
-            // ASR 与 LRC 均为空时，尝试从音视频元数据读取语言标识 (如 metadata["audio"]["language"])
-            let meta_lang = metadata.get("audio").and_then(|a| a.get("language"))
-                .or_else(|| metadata.get("exiftool").and_then(|e| e.get("AudioLanguage").or_else(|| e.get("Language"))))
-                .or_else(|| metadata.get("language"))
-                .and_then(|v| v.as_str());
-            meta_lang.and_then(omni_core::concept_from_language_code)
-        } else {
-            None
         }
     } else {
         None
@@ -2980,19 +3003,24 @@ async fn search_cluster_handler(
     let search = state.search.clone();
     let vector = state.vector.clone();
     let res = tokio::task::spawn_blocking(move || {
-        // 进程内向量补齐 (ADR-0054)：
-        // 1. 若 doc.embedding.len() == 384，直接使用；
-        // 2. 若 doc.embedding 为空或维度非 384，从端侧 zvec 384d 槽位读取反量化向量回填；
-        // 3. 过滤未能获得 384d 有效向量的文档，若有效文档数 < 2 则拦截报错。
+        // 进程内向量补齐 (ADR-0054 / ADR-0056)：
+        // 1. 若 doc.embedding 匹配目标维度 (384 或 512)，直接使用；
+        // 2. 若 doc.embedding 为空或不匹配，从端侧 zvec 槽位读取反量化向量回填；
+        // 3. 过滤未能获得有效向量的文档，若有效文档数 < 2 则拦截报错。
         let requested_count = req.documents.len();
+        let target_dim = req
+            .documents
+            .iter()
+            .map(|d| d.embedding.len())
+            .find(|&len| len == 384 || len == 512)
+            .unwrap_or(omni_pro::search::EMBEDDING_DIM);
+
         let mut docs: Vec<omni_pro::search::ClusterDocument> =
             Vec::with_capacity(requested_count);
         for mut doc in req.documents {
-            if doc.embedding.len() == omni_pro::search::EMBEDDING_DIM {
+            if doc.embedding.len() == target_dim {
                 docs.push(doc);
-            } else if let Some(vec) =
-                vector.get_vector(&doc.fingerprint, omni_pro::search::EMBEDDING_DIM)
-            {
+            } else if let Some(vec) = vector.get_vector(&doc.fingerprint, target_dim) {
                 doc.embedding = vec;
                 docs.push(doc);
             }
@@ -3000,7 +3028,8 @@ async fn search_cluster_handler(
 
         if requested_count > 0 && docs.len() < 2 {
             anyhow::bail!(
-                "具备 384d 有效向量的文档不足 2 份 (请求 {} 份，有效 {} 份)，无法执行 HAC 聚类",
+                "具备 {}d 有效向量的文档不足 2 份 (请求 {} 份，有效 {} 份)，无法执行 HAC 聚类",
+                target_dim,
                 requested_count,
                 docs.len()
             );
@@ -3057,16 +3086,20 @@ async fn audio_transcribe_handler(
     let sherpa_engine = state.sherpa.clone();
 
     // Step 1: 优先通过 SherpaManager 进程内转录 (纯内存解码 -> GTCRN 降噪 -> VAD -> SenseVoice ASR + CED-mini 打标)
-    let (mut transcript, mut events) = tokio::task::spawn_blocking(move || {
+    let (sv_opt, mut events) = tokio::task::spawn_blocking(move || {
         let path = std::path::Path::new(&file_path_c);
         if let Some(samples) = decode_audio_to_16k_mono(path, Some(duration_seconds)) {
-            sherpa_engine.process_audio_pipeline(&samples, 16000)
+            sherpa_engine.process_audio_pipeline_full(&samples, 16000)
         } else {
             (None, Vec::new())
         }
     })
     .await
     .unwrap_or((None, Vec::new()));
+
+    let mut transcript = sv_opt.as_ref().map(|s| s.text.clone());
+    let mut detected_lang = sv_opt.as_ref().and_then(|s| s.lang.clone()).or(req.language);
+    let mut detected_emotion = sv_opt.as_ref().and_then(|s| s.emotion.clone());
 
     // Step 2: 降级：从 OmniExtractor 元数据中取 asr（若已有提取结果）
     if transcript.is_none() {
@@ -3077,6 +3110,13 @@ async fn audio_transcribe_handler(
                 && (res.mime_type.starts_with("audio/") || res.mime_type.starts_with("video/"))
             {
                 transcript = Some(res.markdown_content);
+            }
+
+            if detected_lang.is_none() {
+                detected_lang = res.metadata.get("language").and_then(|v| v.as_str()).map(|s| s.to_string());
+            }
+            if detected_emotion.is_none() {
+                detected_emotion = res.metadata.get("emotion").and_then(|v| v.as_str()).map(|s| s.to_string());
             }
 
             if events.is_empty() {
@@ -3092,7 +3132,8 @@ async fn audio_transcribe_handler(
         file_path,
         transcript,
         events,
-        language: req.language,
+        language: detected_lang,
+        emotion: detected_emotion,
         duration_ms,
     })
 }
@@ -3193,32 +3234,89 @@ fn write_wav_s16le(path: &std::path::Path, samples: &[f32], sample_rate: u32) ->
 #[derive(Debug, serde::Deserialize)]
 pub struct AudioTtsChunkRequest {
     pub text: String,
+    #[serde(default)]
+    pub voice_id: Option<String>,
     pub sid: Option<i32>,
     pub speed: Option<f32>,
+}
+
+/// 内存热注册音色请求参数
+#[derive(Debug, serde::Deserialize)]
+pub struct AudioTtsRegisterVoiceRequest {
+    pub voice_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub gender: Option<String>,
+    #[serde(default)]
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub sid: Option<i32>,
+    pub frames: usize,
+    pub codes: Vec<Vec<i16>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AudioTtsRegisterVoiceResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// TTS 引擎状态响应
 #[derive(Debug, serde::Serialize)]
 pub struct AudioTtsStatusResponse {
     pub ready: bool,
-    pub total_speakers: i32,
+    pub total_voices: usize,
     pub sample_rate: i32,
+    pub engine: String,
 }
 
 /// 查询 TTS 引擎状态: GET /api/audio/tts/status
 async fn audio_tts_status_handler(
     State(state): State<AppState>,
 ) -> Json<AudioTtsStatusResponse> {
-    let (ready, total_speakers, sample_rate) = state.sherpa.tts_status();
+    let ready = state.moss.is_ready();
+    let total_voices = state.moss.total_voices().await;
     Json(AudioTtsStatusResponse {
         ready,
-        total_speakers,
-        sample_rate,
+        total_voices,
+        sample_rate: 48000,
+        engine: "moss-tts-nano-int8".to_string(),
     })
 }
 
+/// 内存热注册自定义音色特征码: POST /api/audio/tts/register-voice
+async fn audio_tts_register_voice_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AudioTtsRegisterVoiceRequest>,
+) -> Json<AudioTtsRegisterVoiceResponse> {
+    match state
+        .moss
+        .register_voice(
+            req.voice_id,
+            req.display_name,
+            req.gender,
+            req.lang,
+            req.sid,
+            req.frames,
+            req.codes,
+        )
+        .await
+    {
+        Ok(_) => Json(AudioTtsRegisterVoiceResponse {
+            success: true,
+            error: None,
+        }),
+        Err(e) => Json(AudioTtsRegisterVoiceResponse {
+            success: false,
+            error: Some(e),
+        }),
+    }
+}
+
 /// 单句离线语音合成处理: POST /api/audio/tts/chunk
-/// 经由 Semaphore(1) 限制单通道排队，并在 spawn_blocking 工作池中执行 Kokoro 神经网络推理
+/// 经由 Semaphore(1) 限制单通道排队，并在 spawn_blocking 工作池中执行神经网络推理
 async fn audio_tts_chunk_handler(
     State(state): State<AppState>,
     Json(req): Json<AudioTtsChunkRequest>,
@@ -3228,22 +3326,37 @@ async fn audio_tts_chunk_handler(
         return Err((axum::http::StatusCode::BAD_REQUEST, "text cannot be empty".to_string()));
     }
 
-    let (ready, _, _) = state.sherpa.tts_status();
-    if !ready {
-        return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, "Kokoro TTS engine not ready or model missing".to_string()));
+    if !state.moss.is_ready() {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "MOSS-TTS engine not ready or model missing".to_string(),
+        ));
     }
 
-    let sid = req.sid.unwrap_or(0);
     let speed = req.speed.unwrap_or(1.0);
-    let sherpa = state.sherpa.clone();
+    let voice_id = req.voice_id.unwrap_or_else(|| "preset_azure_yunxi".to_string());
 
-    // 经由 Semaphore(1) 控制单通道排队，防止多请求同时推理打爆 CPU
-    let permit = sherpa.tts_semaphore().acquire_owned().await
+    // 优先按指定 voice_id 寻址，未找到时平滑 fallback 到默认 preset_azure_yunxi
+    let target_voice = match state.moss.get_voice(&voice_id).await {
+        Some(v) => v,
+        None => match state.moss.get_voice("preset_azure_yunxi").await {
+            Some(v) => v,
+            None => {
+                return Err((
+                    axum::http::StatusCode::NOT_FOUND,
+                    format!("Voice '{}' not found and default preset_azure_yunxi unavailable", voice_id),
+                ));
+            }
+        },
+    };
+
+    let permit = state.moss.semaphore().acquire_owned().await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire tts lock: {}", e)))?;
 
+    let moss = state.moss.clone();
     let wav_bytes = tokio::task::spawn_blocking(move || {
-        let _permit = permit; // 保持锁直到推理完成
-        sherpa.synthesize_chunk(&clean_text, sid, speed)
+        let _permit = permit;
+        moss.synthesize(&clean_text, &target_voice, speed)
     })
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TTS task panicked: {}", e)))?
@@ -3257,6 +3370,112 @@ async fn audio_tts_chunk_handler(
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(response)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioAnalyzeVoiceRequest {
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioAnalyzeVoiceResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub lang: String,
+    pub emotion: String,
+    pub text: String,
+    pub frames: usize,
+    pub codes: Vec<Vec<i16>>,
+}
+
+/// 音频特征分析与提取: POST /api/audio/analyze-voice
+/// 前置 -t 10 纯内存转码，利用 SenseVoice 双层判定识别语言与情感，并提取特征
+async fn audio_analyze_voice_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AudioAnalyzeVoiceRequest>,
+) -> Json<AudioAnalyzeVoiceResponse> {
+    let file_path = req.file_path.trim().to_string();
+    if file_path.is_empty() {
+        return Json(AudioAnalyzeVoiceResponse {
+            success: false,
+            error: Some("file_path cannot be empty".to_string()),
+            lang: "zh".to_string(),
+            emotion: "neutral".to_string(),
+            text: String::new(),
+            frames: 0,
+            codes: Vec::new(),
+        });
+    }
+
+    let path = std::path::PathBuf::from(&file_path);
+    if !path.exists() {
+        return Json(AudioAnalyzeVoiceResponse {
+            success: false,
+            error: Some(format!("Audio file not found: {}", file_path)),
+            lang: "zh".to_string(),
+            emotion: "neutral".to_string(),
+            text: String::new(),
+            frames: 0,
+            codes: Vec::new(),
+        });
+    }
+
+    let sherpa = state.sherpa.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        // 1. 解码前 10 秒 16kHz 单声道（供 SenseVoice 分析）
+        let samples_16k = match decode_audio_to_16k_mono(&path, Some(10)) {
+            Some(s) if !s.is_empty() => s,
+            _ => return Err("Failed to decode audio to 16kHz mono".to_string()),
+        };
+
+        // 2. SenseVoice 识别
+        let (sv_opt, _) = sherpa.process_audio_pipeline_full(&samples_16k, 16000);
+
+        let (text, lang, emotion) = if let Some(sv) = sv_opt {
+            let l = sv.lang.unwrap_or_else(|| "zh".to_string());
+            let e = sv.emotion.unwrap_or_else(|| "neutral".to_string());
+            (sv.text, l, e)
+        } else {
+            (String::new(), "zh".to_string(), "neutral".to_string())
+        };
+
+        let codes: Vec<Vec<i16>> = Vec::new();
+        let frames = codes.len();
+
+        Ok((text, lang, emotion, frames, codes))
+    })
+    .await;
+
+    match res {
+        Ok(Ok((text, lang, emotion, frames, codes))) => Json(AudioAnalyzeVoiceResponse {
+            success: true,
+            error: None,
+            lang,
+            emotion,
+            text,
+            frames,
+            codes,
+        }),
+        Ok(Err(err)) => Json(AudioAnalyzeVoiceResponse {
+            success: false,
+            error: Some(err),
+            lang: "zh".to_string(),
+            emotion: "neutral".to_string(),
+            text: String::new(),
+            frames: 0,
+            codes: Vec::new(),
+        }),
+        Err(e) => Json(AudioAnalyzeVoiceResponse {
+            success: false,
+            error: Some(format!("Analyze voice task panicked: {}", e)),
+            lang: "zh".to_string(),
+            emotion: "neutral".to_string(),
+            text: String::new(),
+            frames: 0,
+            codes: Vec::new(),
+        }),
+    }
 }
 
 /// 单指标视觉标签处理: POST /api/vision/tags
