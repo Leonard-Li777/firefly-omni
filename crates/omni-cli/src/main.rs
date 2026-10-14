@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 
 /// Omni 日志时间格式：仅输出「分:秒」，避免完整时间戳刷屏
@@ -49,9 +50,14 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,anydoc=error,lopdf=error,czkawka_core=off,little_exif=off,symphonia=off,symphonia_bundle_mp3=off,symphonia_core=off,symphonia_bundle_flac=off,symphonia_format_isomp4=off,symphonia_format_riff=off"));
+    // ANSI 颜色仅在 stdout 为交互式终端时启用。桌面端（Electron）以管道方式捕获
+    // stdout，若强制输出 \x1b[2m 等转义序列，会随日志透传至渲染进程浏览器控制台与
+    // 日志文件，表现为时间戳/级别前缀乱码（PRD 无关修复，见 omni-service 同步剥离）。
+    let enable_ansi = std::io::stdout().is_terminal();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_timer(MinuteSecondTimer)
+        .with_ansi(enable_ansi)
         .init();
     let cli = Cli::parse();
 
