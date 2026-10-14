@@ -1788,6 +1788,13 @@ pub async fn fast_recognize_handler(
 }
 
 /// 从 SQLite 桌面主库只读加载 DIMENSION_POLICIES 策略配置（DEC-03 / DEC-04）
+///
+/// **零降级（2026-10-14 用户裁定）**：主库路径已显式给出时，「打开失败 / 无 `system_config`
+/// 表 / JSON 解析失败 / 读取报错」一律属"数据库错"，直接 panic 崩溃 —— 静默回退物化默认策略
+/// 会让云端下发的策略（当前 95 条）与运行时实际生效策略静默失真。
+///
+/// 仅两条软路径被允许，且都必须显式上报：① 路径尚不存在（首次启动建库前的合法瞬态）；
+/// ② `system_config` 存在但尚无 `DIMENSION_POLICIES` 行（云端配置尚未落库）。
 pub fn load_dimension_policies_from_db(
     master_db_path: Option<&std::path::Path>,
 ) -> HashMap<String, omni_core::DimensionExecutionPolicy> {
@@ -1796,12 +1803,21 @@ pub fn load_dimension_policies_from_db(
         return policies;
     };
     if !path.exists() {
+        tracing::warn!(
+            "[load_dimension_policies_from_db] 主库路径尚不存在（{}），暂用物化默认策略；建库后 reconnect 会重载",
+            path.display()
+        );
         return policies;
     }
 
-    let Ok(conn) = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-        return policies;
-    };
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap_or_else(|err| {
+            tracing::error!("[load_dimension_policies_from_db] 主库打开失败（{}）: {err:#}", path.display());
+            panic!(
+                "[load_dimension_policies_from_db] 主库只读打开失败，拒绝以默认策略降级运行（{}）：{err:#}",
+                path.display()
+            )
+        });
 
     let has_table: bool = conn
         .query_row(
@@ -1812,7 +1828,11 @@ pub fn load_dimension_policies_from_db(
         .unwrap_or(false);
 
     if !has_table {
-        return policies;
+        tracing::error!("[load_dimension_policies_from_db] 主库缺少 system_config 表（{}）", path.display());
+        panic!(
+            "[load_dimension_policies_from_db] 库 {} 缺少 system_config 表 ⇒ 不是桌面业务主库，拒绝以降级默认策略继续运行",
+            path.display()
+        );
     }
 
     let val_str: Result<String, _> = conn.query_row(
@@ -1821,8 +1841,16 @@ pub fn load_dimension_policies_from_db(
         |row| row.get(0),
     );
 
-    if let Ok(raw) = val_str {
-        if let Ok(db_policies) = serde_json::from_str::<HashMap<String, omni_core::DimensionExecutionPolicy>>(&raw) {
+    match val_str {
+        Ok(raw) => {
+            let db_policies = serde_json::from_str::<HashMap<String, omni_core::DimensionExecutionPolicy>>(&raw)
+                .unwrap_or_else(|err| {
+                    tracing::error!("[load_dimension_policies_from_db] DIMENSION_POLICIES JSON 解析失败: {err}");
+                    panic!(
+                        "[load_dimension_policies_from_db] system_config.DIMENSION_POLICIES JSON 解析失败（{}），拒绝以默认策略降级运行：{err}",
+                        path.display()
+                    )
+                });
             let count = db_policies.len();
             for (code, policy) in db_policies {
                 policies.insert(code, policy);
@@ -1831,8 +1859,18 @@ pub fn load_dimension_policies_from_db(
                 "[load_dimension_policies_from_db] 成功从主库 system_config 读取并覆盖 {} 条维度策略",
                 count
             );
-        } else {
-            tracing::warn!("[load_dimension_policies_from_db] system_config.DIMENSION_POLICIES JSON 解析失败，回退物化默认策略");
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            tracing::warn!(
+                "[load_dimension_policies_from_db] 主库 system_config 尚无 DIMENSION_POLICIES 行（云端配置未落库），暂用物化默认策略"
+            );
+        }
+        Err(err) => {
+            tracing::error!("[load_dimension_policies_from_db] 读取 DIMENSION_POLICIES 失败: {err:#}");
+            panic!(
+                "[load_dimension_policies_from_db] 读取主库 {} 的 DIMENSION_POLICIES 失败，拒绝以降级默认策略继续运行：{err:#}",
+                path.display()
+            );
         }
     }
 
