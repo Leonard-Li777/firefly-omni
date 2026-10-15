@@ -4394,6 +4394,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "windows-sys 0.59.0",
  "zip 2.4.2",
 ]
 

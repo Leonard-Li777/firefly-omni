@@ -897,6 +897,7 @@ pub async fn start_server(
             }
         })
         .await?;
+    omni_extract::shutdown_exiftool_daemon();
     Ok(())
 }
 

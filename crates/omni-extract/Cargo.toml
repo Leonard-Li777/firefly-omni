@@ -25,4 +25,12 @@ lopdf = "0.42"
 zip = "2.1"
 quick-xml = "0.36"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
+
 
