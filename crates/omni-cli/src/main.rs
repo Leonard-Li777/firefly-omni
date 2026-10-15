@@ -66,7 +66,9 @@ async fn main() -> anyhow::Result<()> {
             let socket_addr: SocketAddr = addr.parse()?;
             let db_path = db_path.as_deref().map(std::path::PathBuf::from);
             let pack_path = pack_path.as_deref().map(std::path::PathBuf::from);
-            omni_server::start_server(socket_addr, db_path, pack_path, embedding_profile.clone(), *mrl_dimension).await?;
+            let res = omni_server::start_server(socket_addr, db_path, pack_path, embedding_profile.clone(), *mrl_dimension).await;
+            omni_extract::shutdown_exiftool_daemon();
+            res?;
         }
         Some(Commands::Extract { file }) => {
             let config = omni_core::OmniConfig::default();

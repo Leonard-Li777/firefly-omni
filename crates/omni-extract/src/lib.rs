@@ -701,11 +701,78 @@ fn extract_pdf_metadata_native(p: &Path) -> Option<serde_json::Map<String, serde
     }
 }
 
+#[cfg(windows)]
+struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for JobHandle {}
+#[cfg(windows)]
+unsafe impl Sync for JobHandle {}
+
+#[cfg(windows)]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn bind_to_kill_on_close_job(child: &std::process::Child) -> Option<JobHandle> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            tracing::warn!("[ExifToolDaemon] 无法创建 Windows Job Object");
+            return None;
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        let set_res = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+
+        if set_res == 0 {
+            tracing::warn!("[ExifToolDaemon] 设置 Windows Job Object 限制信息失败");
+            CloseHandle(job);
+            return None;
+        }
+
+        let child_handle = child.as_raw_handle() as HANDLE;
+        let assign_res = AssignProcessToJobObject(job, child_handle);
+        if assign_res == 0 {
+            tracing::warn!("[ExifToolDaemon] 将 ExifTool 进程分配到 Windows Job Object 失败");
+            CloseHandle(job);
+            return None;
+        }
+
+        tracing::info!("[ExifToolDaemon] ExifTool 守护进程已成功关联 Windows Job Object (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)");
+        Some(JobHandle(job))
+    }
+}
+
 /// ExifTool -stay_open 守护进程句柄（单进程常驻内存，延迟初始化，原子同步管道通信）
 struct ExifToolDaemon {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
     stdout_reader: std::io::BufReader<std::process::ChildStdout>,
+    #[cfg(windows)]
+    _job: Option<JobHandle>,
 }
 
 impl ExifToolDaemon {
@@ -726,6 +793,8 @@ impl ExifToolDaemon {
             .stderr(Stdio::null());
 
         let mut child = cmd.spawn().ok()?;
+        #[cfg(windows)]
+        let _job = bind_to_kill_on_close_job(&child);
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
         let stdout_reader = std::io::BufReader::new(stdout);
@@ -734,6 +803,8 @@ impl ExifToolDaemon {
             child,
             stdin,
             stdout_reader,
+            #[cfg(windows)]
+            _job,
         })
     }
 
