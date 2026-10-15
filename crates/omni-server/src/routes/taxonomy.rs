@@ -410,12 +410,19 @@ pub fn query_taxonomy_tree_fast(
             code_segs[0] = "builtin.file_type".to_string();
         }
 
-        // 历史存量数据自愈：若前缀误被包装为 /builtin.content_tags/<subdim>/... 或 /builtin.content_tags/<root_dim>/...，剥除顶层伪 content_tags 前缀
+        // 历史存量数据自愈：若前缀误被包装为 /builtin.content_tags/<subdim>/... 或 /builtin.content_tags/<root_dim>/...，
+        // 门禁：只要第二段为受控维度代码（如摄影照片细分、文字密度、语言细分等）或一级根维度代码，绝对严禁作为 content_tags 的子节点，直接剥除伪 content_tags 前缀！
         if code_segs.len() > 1 && code_segs[0] == "builtin.content_tags" {
-            let is_subdim_to_heal = code_segs[1] == "builtin.language_segmentation"
+            let is_subdim_or_root = omni_core::is_root_dimension(&code_segs[1])
+                || omni_core::get_dimension_policy(&code_segs[1]).is_some()
+                || omni_core::tag_identity::concept_from_code(&code_segs[1])
+                    .map_or(false, |c_concept| omni_core::get_dimension_policy(c_concept.code()).is_some())
+                || code_segs[1] == "builtin.language_segmentation"
                 || code_segs[1] == "builtin.security_level"
-                || code_segs[1] == "builtin.processing_status";
-            if is_subdim_to_heal || omni_core::is_root_dimension(&code_segs[1]) {
+                || code_segs[1] == "builtin.processing_status"
+                || code_segs[1] == "builtin.photography_categories"
+                || code_segs[1] == "builtin.text_density";
+            if is_subdim_or_root {
                 code_segs.remove(0);
                 if !name_segs.is_empty() {
                     name_segs.remove(0);
@@ -442,10 +449,25 @@ pub fn query_taxonomy_tree_fast(
             }
         }
 
-        // 受控根维度封闭性：若顶层非受控根维度，强制前置挂载到 builtin.content_tags 下
+        // 受控根维度封闭性与排他门禁 (Spec v2.0 不变式 1 & 不变式 2)
         if !omni_core::is_root_dimension(&code_segs[0]) && code_segs[0] != "builtin.content_tags" {
-            code_segs.insert(0, "builtin.content_tags".to_string());
-            name_segs.insert(0, "内容标签".to_string());
+            let is_subdim = omni_core::get_dimension_policy(&code_segs[0]).is_some()
+                || omni_core::tag_identity::concept_from_code(&code_segs[0])
+                    .map_or(false, |c_concept| omni_core::get_dimension_policy(c_concept.code()).is_some())
+                || code_segs[0] == "builtin.photography_categories"
+                || code_segs[0] == "builtin.text_density";
+            if is_subdim {
+                // 已归入受控细分体系，排他门禁生效：严禁强插内容标签！
+                // 前置补齐所属文件类型一级根
+                let root_code = omni_core::concepts::Concept::文件类型.code().to_string();
+                let root_name = "文件类型".to_string();
+                code_segs.insert(0, root_code);
+                name_segs.insert(0, root_name);
+            } else {
+                // 仅对非受控的开放自由标签或未声明父级的受控泛标签，收敛兜底至内容标签
+                code_segs.insert(0, "builtin.content_tags".to_string());
+                name_segs.insert(0, "内容标签".to_string());
+            }
         }
 
         // 自顶向下装配路径节点
@@ -2420,7 +2442,67 @@ mod tests {
         assert_eq!(file_type_root.children.len(), 1);
         assert_eq!(file_type_root.children[0].sort_order, 0);
     }
+
+    /// 历史存量数据自愈测试：若受控子维度被错误包裹在 /builtin.content_tags 下，倒排 Trie 树必须剥除伪前缀并自愈至文件类型根
+    #[test]
+    fn test_inverted_trie_healing_pseudo_content_tags() {
+        let pack_conn = Connection::open_in_memory().unwrap();
+        let master_conn = Connection::open_in_memory().unwrap();
+        master_conn
+            .execute_batch(
+                "CREATE TABLE workspace_files (
+                file_fingerprint TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                workspace_id INTEGER NOT NULL DEFAULT 1,
+                status INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE file_tag_relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_fingerprint TEXT NOT NULL,
+                tag_code TEXT NOT NULL,
+                code_path TEXT,
+                name_path TEXT
+            );
+            INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
+                ('fp_cam', 'D:\\\\files\\\\cam.jpg', 1, 1),
+                ('fp_txt', 'D:\\\\files\\\\txt.png', 1, 1);
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_cam', '_ext.camera_canon', '/builtin.content_tags/builtin.photography_categories/_ext.camera_canon', '/内容标签/摄影照片细分/Canon EOS 5D Mark II'),
+                ('fp_txt', 'builtin.tiny_text', '/builtin.content_tags/builtin.text_density/builtin.tiny_text', '/内容标签/文字密度/微量文本');",
+            )
+            .unwrap();
+
+        let resp = query_taxonomy_tree_fast(
+            &pack_conn,
+            "zh-CN",
+            None,
+            &master_conn,
+            false,
+            Some(1),
+            None,
+        )
+        .expect("query_taxonomy_tree_fast failed");
+
+        // 1. 内容标签根节点下绝不能包含摄影照片细分或文字密度
+        if let Some(content_root) = resp.root_nodes.iter().find(|n| n.code == "builtin.content_tags") {
+            assert!(!content_root.children.iter().any(|c| c.code == "builtin.photography_categories"));
+            assert!(!content_root.children.iter().any(|c| c.code == "builtin.text_density"));
+        }
+
+        // 2. 文件类型根节点下必须存在自愈后的摄影照片细分或文字密度
+        let file_type_root = resp
+            .root_nodes
+            .iter()
+            .find(|n| n.code == "builtin.file_type")
+            .expect("missing builtin.file_type");
+
+        let has_healed_subdim = file_type_root.children.iter().any(|c| {
+            c.code == "builtin.photography_categories" || c.code == "builtin.text_density"
+        });
+        assert!(has_healed_subdim, "摄影照片细分或文字密度必须成功自愈至文件类型根节点下");
+    }
 }
+
 
 
 

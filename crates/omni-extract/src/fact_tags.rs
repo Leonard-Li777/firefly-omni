@@ -76,11 +76,11 @@ impl OmniFactTagExtractor {
         Self::extract_emotion_dimensions(ctx.metadata, &mut tags);
 
         // 2. 下沉既有物理事实 (桌面端 Node.js 预检管线既有确诊维度)
-        Self::push_fact(&mut tags, "文件来源", ctx.file_source.as_deref(), "builtin.file_source", CONF_FACT);
-        Self::push_fact(&mut tags, "处理状态", ctx.workflow_state.as_deref(), "builtin.processing_status", CONF_FACT);
-        Self::push_fact(&mut tags, "安全等级", ctx.security_level.as_deref(), "builtin.security_level", CONF_FACT);
+        Self::push_fact(&mut tags, "文件来源", ctx.file_source.as_deref(), Concept::文件来源.code(), CONF_FACT);
+        Self::push_fact(&mut tags, "处理状态", ctx.workflow_state.as_deref(), Concept::处理状态.code(), CONF_FACT);
+        Self::push_fact(&mut tags, "安全等级", ctx.security_level.as_deref(), Concept::安全等级.code(), CONF_FACT);
         Self::push_quality_grade(&mut tags, ctx.quality_score);
-        Self::push_fact(&mut tags, "语言", ctx.language_label.as_deref(), "builtin.language_segmentation", CONF_FACT);
+        Self::push_fact(&mut tags, "语言", ctx.language_label.as_deref(), Concept::语言细分.code(), CONF_FACT);
 
         // 出口一致性保障：fact_tags 为确定性物理事实，仍统一校验置信度不低于出口门限
         tags.retain(|t| t.confidence >= EXIT_CONFIDENCE_THRESHOLD);
@@ -174,7 +174,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
-                        Some("builtin.author"),
+                        Some(Concept::作者.code()),
                     );
                 }
             }
@@ -189,7 +189,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
-                        Some("builtin.content_tags"),
+                        Some(Concept::内容标签.code()),
                     );
                 }
             }
@@ -197,7 +197,7 @@ impl OmniFactTagExtractor {
             for key in ["Genre", "genre"] {
                 if let Some(val) = Self::get_str(scope, key) {
                     let code = Self::resolve_or_derive_code(&val);
-                    Self::push_tag(out, "音乐流派", code, &val, CONF_FACT, Some(key), &val, Some("builtin.music_type"));
+                    Self::push_tag(out, "音乐流派", code, &val, CONF_FACT, Some(key), &val, Some(Concept::音乐类型.code()));
                 }
             }
         }
@@ -252,7 +252,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
-                        Some("builtin.photography_categories"),
+                        Some(Concept::摄影照片细分.code()),
                     );
                 }
             }
@@ -270,7 +270,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
-                        Some("builtin.photography_categories"),
+                        Some(Concept::摄影照片细分.code()),
                     );
                 }
             }
