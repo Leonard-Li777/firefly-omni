@@ -90,6 +90,42 @@ fn asr_length_counts_unicode_scalars() {
     assert_eq!(value["asr_length"], json!(5));
 }
 
+/// 契约 2c：纯标点或无意义 ASR 文本（如 "."、"..."、" 。 "）经过 is_meaningful_asr_text 过滤后，
+/// 感知契约强制归一为 `asr: None`、`has_asr: false`、`asr_length: 0`，不泄漏给下游与客户端。
+#[test]
+fn meaningless_asr_punctuation_is_normalized_to_none() {
+    use omni_core::is_meaningful_asr_text;
+
+    for junk in [".", "...", " . ", "。", "……", "，。？！", "---", "", "   \t\n"] {
+        assert!(
+            !is_meaningful_asr_text(junk),
+            "标点/空白噪声 '{junk}' 必须被判定为无实质意义"
+        );
+
+        // 模拟感知接口层组装规则：
+        let asr = Some(junk.to_string()).filter(|s| is_meaningful_asr_text(s));
+        let has_asr = asr.is_some();
+        let asr_length = asr.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+
+        assert!(asr.is_none());
+        assert!(!has_asr);
+        assert_eq!(asr_length, 0);
+
+        let result = OmniPerceptionResult {
+            file_path: "/tmp/noise.mp3".to_string(),
+            mime_type: "audio/mpeg".to_string(),
+            asr,
+            has_asr,
+            asr_length,
+            ..Default::default()
+        };
+        let value: Value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["asr"], Value::Null);
+        assert_eq!(value["has_asr"], json!(false));
+        assert_eq!(value["asr_length"], json!(0));
+    }
+}
+
 /// 契约 3：纯图片路径下 OCR 文本与 ASR 相互隔离——OCR 文本落在 `ocr_text`，
 /// 不写入 ASR 字段；`asr` 保持 None、`has_asr` 为 false。
 #[test]

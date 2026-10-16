@@ -87,6 +87,8 @@ pub struct ExtractRequest {
 #[derive(Deserialize)]
 pub struct FilePreviewRequest {
     pub path: String,
+    #[serde(default, alias = "skipIfExists")]
+    pub skip_if_exists: Option<bool>,
 }
 
 /// 桌面业务主库刷新请求体: POST /api/reconnect（`dbPath` = 桌面业务主库路径）
@@ -613,6 +615,10 @@ async fn cover_handler(
     State(state): State<AppState>,
     Query(req): Query<FilePreviewRequest>,
 ) -> Response {
+    if req.skip_if_exists.unwrap_or(false) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
     if !omni_pro::is_pro_enabled() {
         return (
             StatusCode::FORBIDDEN,
@@ -1568,19 +1574,26 @@ async fn perceive_file_handler(
 
                 if let serde_json::Value::Object(ref mut map) = ext_res.metadata {
                     if let Some(sv) = sense_voice_result {
-                        tracing::info!(
-                            "[OmniServer] 音频转录完成: file={}, len={}, lang={:?}, emotion={:?}, audio_ms={:?}",
-                            file_path, sv.text.len(), sv.lang, sv.emotion, audio_ms
-                        );
-                        // Issue 0046 §1：ASR 结果独占 `asr` 字段（不再回填 markdown_content，
-                        // 保证音视频文件的「正文」结构与语音转录事实物理分离）。
-                        map.insert("asr".to_string(), serde_json::Value::String(sv.text));
+                        if omni_core::is_meaningful_asr_text(&sv.text) {
+                            tracing::info!(
+                                "[OmniServer] 音频转录完成: file={}, len={}, lang={:?}, emotion={:?}, audio_ms={:?}",
+                                file_path, sv.text.len(), sv.lang, sv.emotion, audio_ms
+                            );
+                            // Issue 0046 §1：ASR 结果独占 `asr` 字段（不再回填 markdown_content，
+                            // 保证音视频文件的「正文」结构与语音转录事实物理分离）。
+                            map.insert("asr".to_string(), serde_json::Value::String(sv.text));
 
-                        if let Some(ref lang) = sv.lang {
-                            map.insert("language".to_string(), serde_json::Value::String(lang.clone()));
-                        }
-                        if let Some(ref emo) = sv.emotion {
-                            map.insert("emotion".to_string(), serde_json::Value::String(emo.clone()));
+                            if let Some(ref lang) = sv.lang {
+                                map.insert("language".to_string(), serde_json::Value::String(lang.clone()));
+                            }
+                            if let Some(ref emo) = sv.emotion {
+                                map.insert("emotion".to_string(), serde_json::Value::String(emo.clone()));
+                            }
+                        } else {
+                            tracing::info!(
+                                "[OmniServer] 音频转录结果为无实质语义文本或标点噪声，已过滤: file={}, raw_text={:?}",
+                                file_path, sv.text
+                            );
                         }
                     } else {
                         tracing::info!("[OmniServer] 音频转录无语音内容或模型未就绪: file={}", file_path);
@@ -1649,7 +1662,7 @@ async fn perceive_file_handler(
         .get("asr")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .filter(|s| !s.trim().is_empty());
+        .filter(|s| omni_core::is_meaningful_asr_text(s));
     let has_asr = asr.is_some();
     let asr_length = asr.as_deref().map(|s| s.chars().count()).unwrap_or(0);
 
@@ -1703,6 +1716,15 @@ async fn perceive_file_handler(
     let mut photo_type = vision_res.photo_type;
     let quality_issues = vision_res.quality_issues;
     let mut morphology_tags = vision_res.morphology_tags;
+    // ★ ADR-0045「物理事实绝对覆盖律」溯源基线（2026-10-16 定性修复）：
+    //   derive_morphology_tags（客观文字检测 has_text → 有字图/无字图、黑白像素检测 is_bw → 黑白/全彩）
+    //   与 DEC-05 物理算子（画幅 143 / 背景 139 / 主色调·色系 149 / 画质等级 122）产出的形态标签
+    //   是**确定性物理事实**。此处必须在 CLIP 互斥组合并（下方 `let mut morphology_tags = if ...`）
+    //   **之前**捕获该基线：合并后的集合混入了互斥组独有胜出项（摄影题材细分等语义标签），
+    //   不可再作为「物理事实」判据。该基线供下方互斥组注册循环保护 physical 来源标签
+    //   不被冗余语义投票覆盖（详见该处注释）。
+    let physical_fact_tags: std::collections::HashSet<String> =
+        morphology_tags.iter().cloned().collect();
     let mut clip_tags = vision_res.clip_tags;
     // (WP2b) CLIP 标定分快照（名 → 分），供 engine map 与 6.2 confidence 贯通
     let clip_tag_confs = vision_res.clip_tag_confs;
@@ -1895,6 +1917,19 @@ async fn perceive_file_handler(
             }
         }
         for (tag, conf, _group) in &clip_mutual_tags {
+            // ★ ADR-0045「物理事实绝对覆盖律」（2026-10-16 定性修复）：
+            //   已登记为 physical 的**规则推导物理事实**（见上方 physical_fact_tags 基线注释：
+            //   客观文字检测 has_text → 有字图/无字图、DEC-05 算子 → 画幅/背景/主色调/画质等级）
+            //   不得被 CLIP 互斥组的语义投票覆盖来源标签。互斥组（如「文字存在性」组命中无字图）
+            //   即便与客观检测同向，也只是对确定性事实的冗余确认——一旦覆盖为 mutual_group，
+            //   桌面端 `resolveProvenanceGroup(engine, 'visual')` 会把「无字图」这类客观物理事实
+            //   误归 visual 组而非 fact 组（真实事故：has_text=false 时无字图同时命中规则推导与
+            //   CLIP 文字存在性互斥组，prio 5 > 4 被覆盖，属性面板把物理事实显示在视觉标签分组）。
+            //   仅拦截基线集合内的物理事实；互斥组独有胜出项（摄影题材细分等语义标签）
+            //   保持 mutual_group 语义不变（模型推理不得伪装成物理事实）。
+            if physical_fact_tags.contains(tag) {
+                continue;
+            }
             // 互斥组胜出项：组内点积经同一标定函数换算
             register(
                 tag,
@@ -3171,26 +3206,43 @@ async fn audio_transcribe_handler(
     .await
     .unwrap_or((None, Vec::new()));
 
-    let mut transcript = sv_opt.as_ref().map(|s| s.text.clone());
-    let mut detected_lang = sv_opt.as_ref().and_then(|s| s.lang.clone()).or(req.language);
-    let mut detected_emotion = sv_opt.as_ref().and_then(|s| s.emotion.clone());
+    let mut transcript = sv_opt
+        .as_ref()
+        .map(|s| s.text.clone())
+        .filter(|s| omni_core::is_meaningful_asr_text(s));
+    let mut detected_lang = if transcript.is_some() {
+        sv_opt.as_ref().and_then(|s| s.lang.clone()).or(req.language)
+    } else {
+        None
+    };
+    let mut detected_emotion = if transcript.is_some() {
+        sv_opt.as_ref().and_then(|s| s.emotion.clone())
+    } else {
+        None
+    };
 
     // Step 2: 降级：从 OmniExtractor 元数据中取 asr（若已有提取结果）
     if transcript.is_none() {
         if let Ok(res) = OmniExtractor::extract(&file_path, &cfg).await {
             if let Some(t) = res.metadata.get("asr").and_then(|v| v.as_str()) {
-                transcript = Some(t.to_string());
+                if omni_core::is_meaningful_asr_text(t) {
+                    transcript = Some(t.to_string());
+                }
             } else if !res.markdown_content.is_empty()
                 && (res.mime_type.starts_with("audio/") || res.mime_type.starts_with("video/"))
             {
-                transcript = Some(res.markdown_content);
+                if omni_core::is_meaningful_asr_text(&res.markdown_content) {
+                    transcript = Some(res.markdown_content);
+                }
             }
 
-            if detected_lang.is_none() {
-                detected_lang = res.metadata.get("language").and_then(|v| v.as_str()).map(|s| s.to_string());
-            }
-            if detected_emotion.is_none() {
-                detected_emotion = res.metadata.get("emotion").and_then(|v| v.as_str()).map(|s| s.to_string());
+            if transcript.is_some() {
+                if detected_lang.is_none() {
+                    detected_lang = res.metadata.get("language").and_then(|v| v.as_str()).map(|s| s.to_string());
+                }
+                if detected_emotion.is_none() {
+                    detected_emotion = res.metadata.get("emotion").and_then(|v| v.as_str()).map(|s| s.to_string());
+                }
             }
 
             if events.is_empty() {
@@ -3654,12 +3706,15 @@ async fn audio_analyze_voice_handler(
             Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
         };
 
-        // Stage 4: SenseVoice ASR 文本转录、语言与情感分析
         let sv_opt = sherpa.transcribe_full(&dry_vocal_stem, 16000);
         let (text, lang, emotion) = if let Some(sv) = sv_opt {
-            let l = sv.lang.unwrap_or_else(|| "zh".to_string());
-            let e = sv.emotion.unwrap_or_else(|| "neutral".to_string());
-            (sv.text, l, e)
+            if omni_core::is_meaningful_asr_text(&sv.text) {
+                let l = sv.lang.unwrap_or_else(|| "zh".to_string());
+                let e = sv.emotion.unwrap_or_else(|| "neutral".to_string());
+                (sv.text, l, e)
+            } else {
+                (String::new(), "zh".to_string(), "neutral".to_string())
+            }
         } else {
             (String::new(), "zh".to_string(), "neutral".to_string())
         };

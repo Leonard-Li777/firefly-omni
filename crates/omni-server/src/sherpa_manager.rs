@@ -617,19 +617,34 @@ pub fn parse_sense_voice_tokens(raw_text: &str) -> SenseVoiceResult {
         .trim()
         .to_string();
 
-    // 4. 双层语言判定：若声学标记缺失或未知，以转录文本 Unicode 字符集比例兜底
-    let final_lang = if lang.is_some() {
-        lang
-    } else if !text.is_empty() {
-        detect_language_from_text(&text)
+    // 彻底滤除无意义文本（如仅有单个标点 "."、"..."、"。" 或纯符号空白）
+    let is_meaningful = omni_core::is_meaningful_asr_text(&text);
+    let text = if is_meaningful {
+        text
     } else {
+        String::new()
+    };
+
+    // 4. 双层语言判定：若声学标记缺失或未知，以转录文本 Unicode 字符集比例兜底
+    // 注意：若文本无意义或为空，声学语言与情绪标记失去依托（噪音频段随机输出），置为 None
+    let final_lang = if text.is_empty() {
         None
+    } else if lang.is_some() {
+        lang
+    } else {
+        detect_language_from_text(&text)
+    };
+
+    let final_emotion = if text.is_empty() {
+        None
+    } else {
+        emotion
     };
 
     SenseVoiceResult {
         text,
         lang: final_lang,
-        emotion,
+        emotion: final_emotion,
         audio_events,
     }
 }
@@ -686,7 +701,7 @@ impl SherpaManager {
         }
 
         let parsed = parse_sense_voice_tokens(raw_text);
-        if parsed.text.is_empty() && parsed.emotion.is_none() && parsed.lang.is_none() {
+        if parsed.text.is_empty() && parsed.audio_events.is_empty() {
             None
         } else {
             Some(parsed)
@@ -697,7 +712,7 @@ impl SherpaManager {
     pub fn transcribe(&self, samples: &[f32], sample_rate: i32) -> Option<String> {
         self.transcribe_full(samples, sample_rate)
             .map(|r| r.text)
-            .filter(|t| !t.is_empty())
+            .filter(|t| omni_core::is_meaningful_asr_text(t))
     }
 
     /// 使用 CED-mini 对音频进行声学事件打标，并归一化为受控本体标签 (audio_events)
@@ -707,7 +722,9 @@ impl SherpaManager {
             None => return Vec::new(),
         };
 
-        if samples.is_empty() {
+        // 防空张量与超短音频守卫（CED-mini patch_embed 卷积要求至少 0.1s 时域宽度，否则报 Invalid input shape）
+        let min_samples = (sample_rate as f32 * 0.1) as usize;
+        if samples.len() < min_samples {
             return Vec::new();
         }
 
@@ -779,7 +796,12 @@ impl SherpaManager {
         sample_rate: i32,
     ) -> (Option<String>, Vec<String>) {
         let (res_opt, events) = self.process_audio_pipeline_full(samples, sample_rate);
-        (res_opt.map(|r| r.text).filter(|t| !t.is_empty()), events)
+        (
+            res_opt
+                .map(|r| r.text)
+                .filter(|t| omni_core::is_meaningful_asr_text(t)),
+            events,
+        )
     }
 
     /// 检查音频净化所需关键深度学习模型是否就绪（GTCRN 降噪与 Silero VAD）
@@ -1305,6 +1327,32 @@ mod tests {
         let (transcript, events) = manager.process_audio_pipeline(&[], 16000);
         assert!(transcript.is_none());
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_parse_sense_voice_tokens_filters_meaningless_text() {
+        // 1. 单个点号 "."
+        let res = parse_sense_voice_tokens("<|zh|><|NEUTRAL|><|Speech|>.");
+        assert_eq!(res.text, "");
+        assert!(res.lang.is_none());
+        assert!(res.emotion.is_none());
+
+        // 2. 连续省略号与空白组合 "..."
+        let res = parse_sense_voice_tokens("<|en|><|HAPPY|><|Speech|>   ...  ");
+        assert_eq!(res.text, "");
+        assert!(res.lang.is_none());
+        assert!(res.emotion.is_none());
+
+        // 3. 中文全角标点 "。"
+        let res = parse_sense_voice_tokens("<|zh|><|Speech|>。");
+        assert_eq!(res.text, "");
+        assert!(res.lang.is_none());
+
+        // 4. 正常有效语音转录放行
+        let res = parse_sense_voice_tokens("<|zh|><|NEUTRAL|><|Speech|>今天开会讨论了三季度预算。");
+        assert_eq!(res.text, "今天开会讨论了三季度预算。");
+        assert_eq!(res.lang.as_deref(), Some("zh"));
+        assert_eq!(res.emotion.as_deref(), Some("neutral"));
     }
 
     /// 辅助：生成标准的 16kHz 单声道 16-bit PCM WAV 字节
