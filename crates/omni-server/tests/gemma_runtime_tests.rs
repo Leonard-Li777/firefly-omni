@@ -451,3 +451,74 @@ fn test_ac3_7_late_fusion_and_silence_equivalence() {
         assert!(!x.is_nan(), "全零向量切片严禁产生 NaN");
     }
 }
+
+#[test]
+fn test_video_chunks_overlapping_and_boundary_guards() {
+    use omni_pro::vision::gemma::split_video_chunks_overlapping;
+
+    // 1. 28 秒短视频切片 (T <= W): 切片数严格断言为 1，区间为 [0.0, 28.0]
+    let chunks_28 = split_video_chunks_overlapping(28.0, 30.0, 25.0);
+    assert_eq!(chunks_28.len(), 1, "28s 短视频必须仅生成 1 个切片");
+    assert_eq!(chunks_28[0], (0, 0.0, 28.0));
+
+    // 2. 30 秒边界视频 (T = W): 切片数严格断言为 1，区间为 [0.0, 30.0]
+    let chunks_30 = split_video_chunks_overlapping(30.0, 30.0, 25.0);
+    assert_eq!(chunks_30.len(), 1, "30s 边界视频必须仅生成 1 个切片");
+    assert_eq!(chunks_30[0], (0, 0.0, 30.0));
+
+    // 3. 35 秒短延展视频 (T = 35.0s, W = 30.0s, S = 25.0s): 切片 0: [0, 30], 切片 1: [25, 35]
+    let chunks_35 = split_video_chunks_overlapping(35.0, 30.0, 25.0);
+    assert_eq!(chunks_35.len(), 2, "35s 延展视频必须生成 2 个切片");
+    assert_eq!(chunks_35[0], (0, 0.0, 30.0));
+    assert_eq!(chunks_35[1], (1, 25.0, 35.0));
+
+    // 4. 61 秒常规视频 (5 秒重叠)
+    let chunks_61 = split_video_chunks_overlapping(61.0, 30.0, 25.0);
+    assert_eq!(chunks_61.len(), 3, "61s 视频必须生成 3 个重叠切片");
+    assert_eq!(chunks_61[0], (0, 0.0, 30.0));
+    assert_eq!(chunks_61[1], (1, 25.0, 55.0));
+    assert_eq!(chunks_61[2], (2, 50.0, 61.0));
+
+    // 5. 步长越界防御 (S > W): 传入 step_sec = 50.0, chunk_len = 30.0 自动夹紧，切片区间单调递增，绝无 start > end
+    let chunks_overstep = split_video_chunks_overlapping(35.0, 30.0, 50.0);
+    for (_idx, start, end) in &chunks_overstep {
+        assert!(start < end, "切片区间必须严格单调递增 (start < end)，绝不允许倒挂");
+    }
+
+    // 6. 非法参数 DoS 防御: 传入 step_sec = 0.0 或 NaN 不死循环，自动安全夹紧兜底
+    let chunks_zero_step = split_video_chunks_overlapping(10.0, 30.0, 0.0);
+    assert!(!chunks_zero_step.is_empty(), "0.0 步长必须自动安全兜底");
+
+    let chunks_nan_step = split_video_chunks_overlapping(10.0, 30.0, f32::NAN);
+    assert!(!chunks_nan_step.is_empty(), "NaN 步长必须自动安全兜底");
+
+    let chunks_invalid_duration = split_video_chunks_overlapping(-5.0, 30.0, 25.0);
+    assert!(chunks_invalid_duration.is_empty(), "非法负时长返回空数组");
+}
+
+#[tokio::test]
+async fn test_vision_watchdog_evict_and_recover() {
+    use omni_pro::vision::gemma::{EmbeddingGemmaEngine, EmbeddingProfile};
+
+    let engine = EmbeddingGemmaEngine::new(EmbeddingProfile::GemmaUnified);
+
+    // 显式触发卸载
+    engine.unload_vision();
+    assert!(!engine.is_vision_loaded(), "调用 unload_vision 后必须未处于已加载状态");
+
+    // 推理时应能够正常调用并自愈 (即便离线无权重也能平滑兜底)
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(100, 100));
+    let vec = engine.encode_image(&img);
+    assert!(vec.is_ok(), "卸载后调用 encode_image 必须自愈成功");
+
+    // 测试 evict API
+    let app = setup_test_app("gemma_unified");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/engine/vision/evict")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

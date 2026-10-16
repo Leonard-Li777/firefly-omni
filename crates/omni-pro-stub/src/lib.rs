@@ -218,6 +218,14 @@ pub mod perceive {
     pub fn detect_video_dynamic_watermark(_video_path: &Path) -> (u8, &'static str) {
         (0, "none")
     }
+
+    pub fn process_video_time_chunks(
+        _video_path: &Path,
+        _sampling_interval_seconds: f32,
+        _asr_text: Option<&str>,
+    ) -> Vec<omni_core::OmniVideoChunk> {
+        Vec::new()
+    }
 }
 
 pub mod vision {
@@ -365,8 +373,28 @@ pub mod vision {
             Vec::new()
         }
 
+        pub fn set_gemma_mrl_dimension(_dim: usize) {}
+
+        pub fn gemma_mrl_dimension() -> usize {
+            512
+        }
+
+        pub fn encode_gemma_text(_text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+
+        pub fn encode_gemma_image(_img: &image::DynamicImage) -> anyhow::Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+
         pub fn gemma_vision_status() -> String {
             "uninitialized".to_string()
+        }
+
+        pub fn evict_gemma_vision() {}
+
+        pub fn is_gemma_vision_resident() -> bool {
+            false
         }
 
         pub fn extract_clip_visual_tags_from_image_with_hint(
