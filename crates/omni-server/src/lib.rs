@@ -190,7 +190,9 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/v1/vector/match-passages", post(routes::vector::match_passages_handler))
             // 文本分词 API (中英文结巴搜索切词与多字段高亮)
             .route("/api/v1/text/tokenize", post(text_tokenize_handler))
-            .route("/api/text/tokenize", post(text_tokenize_handler));
+            .route("/api/text/tokenize", post(text_tokenize_handler))
+            // 多模态视觉塔显存驱逐 API (spec §4.3)
+            .route("/api/v1/engine/vision/evict", post(engine_vision_evict_handler));
     }
 
     router
@@ -220,13 +222,31 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
     } else {
         "uninitialized".to_string()
     };
+    let vision_resident = if is_pro {
+        omni_pro::OmniVisionEngine::is_gemma_vision_resident()
+    } else {
+        false
+    };
     Json(serde_json::json!({
         "status": "ok",
         "profile": profile,
         "mrlDimension": mrl_dim,
         "visionStatus": vision_status,
+        "visionSessionResident": vision_resident,
+        "idleTimeoutSeconds": 300,
         "isPro": is_pro,
         "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// 显式驱逐视觉显存/内存: POST /api/v1/engine/vision/evict (spec §4.3)
+async fn engine_vision_evict_handler() -> Json<serde_json::Value> {
+    if omni_pro::is_pro_enabled() {
+        omni_pro::OmniVisionEngine::evict_gemma_vision();
+    }
+    Json(serde_json::json!({
+        "status": "ok",
+        "evicted": true,
     }))
 }
 
@@ -753,6 +773,9 @@ pub async fn start_server(
     if let Some(mrl) = mrl_dimension {
         initial_config.mrl_dimension = mrl;
     }
+    if omni_pro::is_pro_enabled() {
+        omni_pro::OmniVisionEngine::set_gemma_mrl_dimension(initial_config.mrl_dimension);
+    }
     // 地理数据集发现链：环境变量 → exe 相对目录 → cwd 候选；落空或开源存根时软不可用
     let geo = match omni_pro::geo::discover_dataset_path() {
         Some(path) => {
@@ -918,6 +941,9 @@ async fn update_config(
     State(state): State<AppState>,
     Json(new_config): Json<OmniConfig>,
 ) -> Json<OmniConfig> {
+    if omni_pro::is_pro_enabled() {
+        omni_pro::OmniVisionEngine::set_gemma_mrl_dimension(new_config.mrl_dimension);
+    }
     let mut cfg = state.config.lock().unwrap();
     *cfg = new_config.clone();
     save_config_to_disk(&new_config);
@@ -1013,6 +1039,7 @@ fn run_vision_pipeline(
     exif_orient: Option<&str>,
     enable_visual_tags: bool,
     lang: Option<&str>,
+    embedding_profile: &str,
 ) -> VisionComputed {
     let t_vision = std::time::Instant::now();
     let mut out = VisionComputed::default();
@@ -1043,15 +1070,22 @@ fn run_vision_pipeline(
                     omni_pro::OmniVisionEngine::fast_detect_has_text(&inspect_img)
                 });
 
-                // 2. 视觉语义标签 (Chinese-CLIP / Mobile-CLIP)
+                // 2. 视觉语义标签 (Chinese-CLIP / Mobile-CLIP / EmbeddingGemma)
                 // (WP2b) 带分提取：分数在提取层保留，贯通至 TagChainItem.confidence，杜绝 0.92 硬编码灌水
                 let h_clip = omni_core::timed_spawn!(s, {
                     if enable_visual_tags {
-                        omni_pro::OmniVisionEngine::extract_clip_visual_tags_scored_from_image(
-                            &inspect_img,
-                            lang,
-                            10,
-                        )
+                        if embedding_profile == "gemma_unified" {
+                            omni_pro::OmniVisionEngine::extract_gemma_visual_tags_scored_from_image(
+                                &inspect_img,
+                                10,
+                            )
+                        } else {
+                            omni_pro::OmniVisionEngine::extract_clip_visual_tags_scored_from_image(
+                                &inspect_img,
+                                lang,
+                                10,
+                            )
+                        }
                     } else {
                         Vec::new()
                     }
@@ -1091,9 +1125,13 @@ fn run_vision_pipeline(
                     }
                 });
 
-                // 9. CLIP 图像嵌入向量提取 (用于级联假设 CLIP 仲裁)，统一走 timed_spawn! 计时宏
+                // 9. 图像嵌入向量提取 (用于级联假设仲裁与多模态稠密检索)，统一走 timed_spawn! 计时宏
                 let h_embed = omni_core::timed_spawn!(s, {
-                    omni_pro::OmniVisionEngine::extract_clip_image_embedding(&inspect_img, lang)
+                    if embedding_profile == "gemma_unified" {
+                        omni_pro::OmniVisionEngine::encode_gemma_image(&inspect_img).ok()
+                    } else {
+                        omni_pro::OmniVisionEngine::extract_clip_image_embedding(&inspect_img, lang)
+                    }
                 });
 
                 // 汇聚并行子任务: panic 时回退默认值并记录日志，避免零耗时误导瓶颈判定
@@ -1138,15 +1176,17 @@ fn run_vision_pipeline(
                 out.ram_tags = ram_res;
                 out.ram_ms = ram_ms;
                 out.image_embedding = img_embed;
-                // CLIP 互斥分类：利用图像嵌入向量对内容形态/色彩/文字等互斥组分类
+                // CLIP 互斥分类：利用图像嵌入向量对内容形态/色彩/文字等互斥组分类（仅 Classic Light 模式使用）
                 let mut mutual_ms = 0u64;
                 if let Some(ref emb) = out.image_embedding {
-                    let t_mutual = std::time::Instant::now();
-                    out.clip_mutual_tags = omni_pro::OmniVisionEngine::classify_mutual_exclusive_groups(
-                        emb.as_slice(),
-                        lang,
-                    );
-                    mutual_ms = t_mutual.elapsed().as_millis() as u64;
+                    if embedding_profile != "gemma_unified" {
+                        let t_mutual = std::time::Instant::now();
+                        out.clip_mutual_tags = omni_pro::OmniVisionEngine::classify_mutual_exclusive_groups(
+                            emb.as_slice(),
+                            lang,
+                        );
+                        mutual_ms = t_mutual.elapsed().as_millis() as u64;
+                    }
                 }
                 // 标签分支挂钟 = 并行段长尾 (CLIP/NSFW/RAM/Embed 取 Max) + 串行尾巴 (互斥分类)
                 // 图像嵌入提取在 scope 内并行执行，互斥分类在 scope 外部消费嵌入向量顺序执行
@@ -1384,7 +1424,7 @@ async fn perceive_file_handler(
         }
     };
 
-    let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text)) = if is_image {
+    let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, video_chunks)) = if is_image {
         let f_img = async {
             // 步骤 A1: 前置 ExifTool 全量元数据提取 (画质姿态/方向依赖 exiftool 提取的元数据)
             let t_meta = std::time::Instant::now();
@@ -1401,9 +1441,10 @@ async fn perceive_file_handler(
             let lang = req.language.clone();
             let fp = file_path.clone();
             let eo = exif_orient.clone();
+            let profile = cfg.embedding_profile.clone();
             let vision_res = if is_pro {
                 tokio::task::spawn_blocking(move || {
-                    run_vision_pipeline(&fp, eo.as_deref(), enable_visual_tags, lang.as_deref())
+                    run_vision_pipeline(&fp, eo.as_deref(), enable_visual_tags, lang.as_deref(), &profile)
                 })
                 .await
                 .unwrap_or_default()
@@ -1511,7 +1552,7 @@ async fn perceive_file_handler(
         benchmark.record_opt("text_ms", text_ms);
         benchmark.extract_ms = Some(vision_res.duration_ms.max(metadata_ms).max(ocr_ms.unwrap_or(0)));
 
-        (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text))
+        (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, Vec::new()))
     } else {
         let f_non_img = async {
             let t_extract = std::time::Instant::now();
@@ -1534,11 +1575,24 @@ async fn perceive_file_handler(
             let extract_ms = t_extract.elapsed().as_millis() as u64;
 
             let mut v = VisionComputed::default();
+            let mut video_chunks: Vec<omni_core::OmniVideoChunk> = Vec::new();
             if is_video && is_pro {
                 let (v_wm_lvl, v_wm_status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(&file_path));
                 v.watermark_level = Some(v_wm_lvl);
                 v.has_watermark = Some(v_wm_lvl > 0);
                 v.watermark_status = Some(v_wm_status.to_string());
+
+                let file_path_for_video = file_path.clone();
+                let video_interval = req.video_frame_interval_seconds.unwrap_or(5.0);
+                video_chunks = tokio::task::spawn_blocking(move || {
+                    omni_pro::perceive::process_video_time_chunks(
+                        std::path::Path::new(&file_path_for_video),
+                        video_interval,
+                        None,
+                    )
+                })
+                .await
+                .unwrap_or_default();
             }
 
             // 音频/视频文件: 纯内存解码 (16kHz 单声道) → GTCRN 降噪 + Silero VAD + SenseVoice 转录 + CED-mini 声学打标
@@ -1613,9 +1667,9 @@ async fn perceive_file_handler(
                 }
             }
 
-            (extract_ms, ext_res, v, audio_ms)
+            (extract_ms, ext_res, v, audio_ms, video_chunks)
         };
-        let (ads_res, (extract_ms, ext_res, v, audio_ms)) = tokio::join!(f_ads, f_non_img);
+        let (ads_res, (extract_ms, ext_res, v, audio_ms, video_chunks)) = tokio::join!(f_ads, f_non_img);
 
         benchmark.extract_ms = Some(extract_ms);
         benchmark.audio_ms = audio_ms;
@@ -1628,7 +1682,7 @@ async fn perceive_file_handler(
             }
         }
 
-        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, None))
+        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, None, video_chunks))
     };
 
     benchmark.ads_ms = ads_ms;
@@ -2317,8 +2371,15 @@ async fn perceive_file_handler(
         let text = effective_text.clone();
         let fname = file_name.clone();
         let hownet = state.hownet.clone();
+        let profile = cfg.embedding_profile.clone();
         let res = tokio::task::spawn_blocking(move || {
-            omni_pro::text::OmniTextEngine::analyze(&text, &fname, mtime, Some(&*hownet))
+            let mut r = omni_pro::text::OmniTextEngine::analyze(&text, &fname, mtime, Some(&*hownet));
+            if profile == "gemma_unified" {
+                if let Ok(vec) = omni_pro::OmniVisionEngine::encode_gemma_text(&text) {
+                    r.embedding_dense = vec;
+                }
+            }
+            r
         })
         .await;
         let text_duration = t_text.elapsed().as_millis() as u64;
@@ -2793,10 +2854,11 @@ async fn perceive_file_handler(
         structured_summary: text_summary,
         one_sentence_desc: text_one_desc,
         name_slots: text_slots,
-        embedding_dense: text_emb.clone(),
+        embedding_dense: text_emb.clone().or(image_embedding),
         benchmark: Some(benchmark),
         author,
         binary_info: binary_analysis_info,
+        video_chunks,
     });
 
     // 跨支柱自动索引 (Pillar 4 -> Pillar 5): 若感知产出了稠密特征向量且有文本，自动异步入库双轨混合索引
@@ -2837,8 +2899,15 @@ async fn text_analyze_handler(
     let hownet = state.hownet.clone();
     let text = req.text;
     let mtime = req.mtime;
+    let profile = state.config.lock().unwrap().embedding_profile.clone();
     let res = tokio::task::spawn_blocking(move || {
-        omni_pro::text::OmniTextEngine::analyze(&text, &file_name, mtime, Some(&*hownet))
+        let mut r = omni_pro::text::OmniTextEngine::analyze(&text, &file_name, mtime, Some(&*hownet));
+        if profile == "gemma_unified" {
+            if let Ok(vec) = omni_pro::OmniVisionEngine::encode_gemma_text(&text) {
+                r.embedding_dense = vec;
+            }
+        }
+        r
     })
     .await;
     Json(match res {
