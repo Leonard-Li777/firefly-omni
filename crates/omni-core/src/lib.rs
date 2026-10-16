@@ -178,6 +178,9 @@ pub struct OmniPerceptionRequest {
     /// 自定义音频截取时长（秒，缺省时读取 OmniConfig.audio_analysis_duration）
     #[serde(default)]
     pub audio_analysis_duration: Option<u32>,
+    /// 是否需要生成缩略图/封面（若已有则传 false，不要求生成）
+    #[serde(default)]
+    pub generate_thumbnail: Option<bool>,
 }
 
 /// 原生多模态感知细分耗时
@@ -547,6 +550,52 @@ pub struct MultimodalContext {
     pub dimension_policies: Option<std::collections::HashMap<String, DimensionExecutionPolicy>>,
 }
 
+/// 检查 ASR 语音识别文本是否包含实质语义内容
+///
+/// 过滤规则（彻底根除 SenseVoice 等 ASR 模型在杂音/静音/呼吸时输出的纯标点符号，如 "."、"..."、"。"）：
+/// 1. 空白字符或纯空串直接判定为无意义；
+/// 2. 剥离所有 ASCII 标点、Unicode 常见标点符号、控制符及全角/半角修饰符号；
+/// 3. 若剩余有效字符数为 0（即不含任何字母、数字、CJK 表意汉字、假名、谚文等语言学语素），判定为无意义文本。
+pub fn is_meaningful_asr_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.chars().any(|ch| {
+        if ch.is_whitespace() || ch.is_ascii_punctuation() || ch.is_control() {
+            return false;
+        }
+        // 排除常见 Unicode 标点与符号区间
+        match ch as u32 {
+            // General Punctuation (包括 … — “ ” ‘ ’ 等)
+            0x2000..=0x206F
+            // Superscripts and Subscripts
+            | 0x2070..=0x209F
+            // Currency Symbols & Combining Diacritical Marks for Symbols
+            | 0x20A0..=0x20CF
+            // Arrows, Math Operators, Misc Technical, Box Drawing, Block Elements, Geometric Shapes
+            | 0x2190..=0x27FF
+            // Supplemental Punctuation
+            | 0x2E00..=0x2E7F
+            // CJK Symbols and Punctuation (、。〈〉《》「」『』【】〔〕等)
+            | 0x3000..=0x303F
+            // Fullwidth ASCII variants (！＂＃＄％＆＇（）＊＋，－．／等)
+            | 0xFF00..=0xFF0F
+            // Fullwidth (：；＜＝＞？＠)
+            | 0xFF1A..=0xFF20
+            // Fullwidth (［＼］＾＿｀)
+            | 0xFF3B..=0xFF40
+            // Fullwidth (｛｜｝～｟｠｡｢｣､･)
+            | 0xFF5B..=0xFF65
+            // Fullwidth currency & symbols
+            | 0xFFE0..=0xFFEE
+            // CJK Compatibility Forms & Small Form Variants & Vertical forms
+            | 0xFE10..=0xFE1F | 0xFE30..=0xFE4F | 0xFE50..=0xFE6F => false,
+            _ => ch.is_alphanumeric(),
+        }
+    })
+}
+
 /// 解析「可参与事实推导的文本正文」（Issue 0046 §1）。
 ///
 /// 优先级：复合文档正文（markdown_content）> 纯图片 OCR 文本 > 音视频 ASR 转录。
@@ -565,7 +614,9 @@ pub fn resolve_effective_text(
     if let Some(ocr) = ocr_text.filter(|s| !s.trim().is_empty()) {
         return ocr.to_string();
     }
-    asr.unwrap_or_default().to_string()
+    asr.filter(|s| is_meaningful_asr_text(s))
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// 单指标音频转录请求: POST /api/audio/transcribe
@@ -816,6 +867,44 @@ mod tests {
         let deserialized: TagChainItem = serde_json::from_str(&json_str).expect("反序列化失败");
         assert_eq!(deserialized.via_parent_code, Some("builtin.image.mammal".to_string()));
         assert_eq!(deserialized.parent_codes, vec!["builtin.image.animal".to_string()]);
+    }
+
+    #[test]
+    fn test_is_meaningful_asr_text() {
+        // 1. 无意义标点与噪声文本 -> false
+        assert!(!is_meaningful_asr_text("."));
+        assert!(!is_meaningful_asr_text("..."));
+        assert!(!is_meaningful_asr_text(" . "));
+        assert!(!is_meaningful_asr_text("。"));
+        assert!(!is_meaningful_asr_text("……"));
+        assert!(!is_meaningful_asr_text("，。？！"));
+        assert!(!is_meaningful_asr_text("---"));
+        assert!(!is_meaningful_asr_text(""));
+        assert!(!is_meaningful_asr_text("   \n\t  "));
+        assert!(!is_meaningful_asr_text("【】（）"));
+
+        // 2. 有效实质语义文本 -> true
+        assert!(is_meaningful_asr_text("你好"));
+        assert!(is_meaningful_asr_text("hello"));
+        assert!(is_meaningful_asr_text("OK."));
+        assert!(is_meaningful_asr_text("今天天气真好。"));
+        assert!(is_meaningful_asr_text("123"));
+        assert!(is_meaningful_asr_text("はい"));
+        assert!(is_meaningful_asr_text("네"));
+    }
+
+    #[test]
+    fn test_resolve_effective_text_asr_guard() {
+        // ASR 仅为标点 "." 时，有效文本必须回落为空，杜绝无意义标点进入下游融合
+        assert_eq!(resolve_effective_text("", None, Some(".")), "");
+        assert_eq!(resolve_effective_text("", None, Some("...")), "");
+        assert_eq!(resolve_effective_text("", None, Some(" 。 ")), "");
+
+        // 正常 ASR 文本正常放行
+        assert_eq!(
+            resolve_effective_text("", None, Some("会议录音")),
+            "会议录音"
+        );
     }
 }
 
