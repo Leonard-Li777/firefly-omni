@@ -152,7 +152,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": true,
         "isRequiresAI": true,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -173,7 +173,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.image_segmentation": {
+  "builtin.image_subdivision": {
     "id": 6,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -187,7 +187,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -205,7 +205,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -260,7 +260,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -376,7 +376,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -394,7 +394,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -412,7 +412,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -431,7 +431,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": true,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -472,7 +472,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -490,7 +490,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -528,7 +528,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -547,7 +547,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -587,7 +587,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -627,7 +627,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -707,7 +707,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -793,7 +793,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1018,7 +1018,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1039,7 +1039,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1106,7 +1106,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.pornography_rating": {
+  "builtin.erotic_scale": {
     "id": 123,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1181,7 +1181,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1200,7 +1200,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1220,7 +1220,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1262,7 +1262,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1284,7 +1284,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1306,7 +1306,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1328,7 +1328,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1350,7 +1350,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1369,7 +1369,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1486,7 +1486,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1599,7 +1599,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
     ],
     "metadata": {
       "flag": {
-        "isPanDimension": true,
+        "isPanDimension": false,
         "isRequiresAI": false,
         "isMultiSelect": true
       }
@@ -1662,7 +1662,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1684,11 +1684,11 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
-  "builtin.campus_teachers_and_students_breakdown": {
+  "builtin.teacher_student_erotica_breakdown": {
     "id": 152,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1698,19 +1698,19 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "archive"
     ],
     "contextHints": [
-      "师生叙事",
-      "校园青春",
-      "同窗题材"
+      "师生情欲",
+      "校园性爱",
+      "同窗情色"
     ],
     "metadata": {
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
-  "builtin.workplace_social_segmentation": {
+  "builtin.workplace_erotica_breakdown": {
     "id": 153,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1720,15 +1720,15 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "archive"
     ],
     "contextHints": [
-      "职场叙事",
-      "邻里生活",
-      "社交关系"
+      "职场情欲",
+      "邻里情色",
+      "社交情欲"
     ],
     "metadata": {
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1742,15 +1742,15 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "archive"
     ],
     "contextHints": [
-      "多主体互动",
-      "群体互动",
-      "聚会场景"
+      "多主体色情互动",
+      "群体色情互动",
+      "性爱聚会场景"
     ],
     "metadata": {
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1772,7 +1772,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1794,11 +1794,11 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
-  "builtin.professional_uniform_segmentation": {
+  "builtin.uniform_seduction_breakdown": {
     "id": 157,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1816,11 +1816,11 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
-  "builtin.literary_subject_breakdown": {
+  "builtin.erotic_literature_subcategories": {
     "id": 158,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1830,7 +1830,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "archive"
     ],
     "contextHints": [
-      "文学题材",
+      "情色文学",
       "背景设定",
       "文学流派"
     ],
@@ -1838,7 +1838,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1860,7 +1860,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
@@ -1882,11 +1882,11 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
-  "builtin.multiple_orientation_segmentation": {
+  "builtin.diverse_sexual_orientation_subcategories": {
     "id": 161,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1896,7 +1896,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "archive"
     ],
     "contextHints": [
-      "多元取向",
+      "多元性取向",
       "同性题材",
       "性向分类"
     ],
@@ -1904,7 +1904,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       "flag": {
         "isPanDimension": false,
         "isRequiresAI": false,
-        "isMultiSelect": false
+        "isMultiSelect": true
       }
     }
   },
