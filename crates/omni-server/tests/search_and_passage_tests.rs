@@ -334,3 +334,61 @@ async fn test_vector_match_passages_cache_hit_is_fast() {
         cold.duration_ms
     );
 }
+
+#[tokio::test]
+async fn test_batch_embed_text_dual_profiles() {
+    let app = setup_test_app();
+
+    // 1. 测试 classic_light (Bekko 384d)
+    let bekko_req = Request::builder()
+        .uri("/api/v1/vector/batch-embed-text")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({
+            "texts": [
+                "2026年第一季度财务报销发票清单",
+                "UI设计高保真切图资源"
+            ],
+            "profile": "classic_light",
+            "dim": 384
+        }).to_string()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(bekko_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let res: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(res["count"], 2);
+    assert_eq!(res["dim"], 384);
+    assert_eq!(res["profile"], "classic_light");
+    let vecs = res["vectors"].as_array().unwrap();
+    assert_eq!(vecs.len(), 2);
+    assert_eq!(vecs[0].as_array().unwrap().len(), 384);
+    assert_eq!(vecs[1].as_array().unwrap().len(), 384);
+
+    // 2. 测试 gemma_unified (Gemma 512d)
+    let gemma_req = Request::builder()
+        .uri("/api/v1/vector/batch-embed-text")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({
+            "texts": [
+                "深度学习模型训练日志"
+            ],
+            "profile": "gemma_unified",
+            "dim": 512
+        }).to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(gemma_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let res: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(res["count"], 1);
+    assert_eq!(res["dim"], 512);
+    assert_eq!(res["profile"], "gemma_unified");
+    let vecs = res["vectors"].as_array().unwrap();
+    assert_eq!(vecs.len(), 1);
+    assert_eq!(vecs[0].as_array().unwrap().len(), 512);
+}
+

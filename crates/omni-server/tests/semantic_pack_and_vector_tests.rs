@@ -31,7 +31,48 @@ fn create_test_sqlite_bytes() -> Vec<u8> {
             name TEXT NOT NULL,
             parent_codes TEXT NOT NULL DEFAULT '[]',
             source TEXT,
-            sort_order INTEGER DEFAULT 0
+            role TEXT,
+            slot_role TEXT,
+            sort_order INTEGER DEFAULT 0,
+            pos TEXT,
+            lexfile TEXT,
+            dc_identifier TEXT,
+            depth INTEGER DEFAULT 1,
+            is_instance INTEGER NOT NULL DEFAULT 0,
+            valency_type INTEGER
+        );
+        CREATE TABLE omw_synsets (
+            id TEXT PRIMARY KEY,
+            pos TEXT,
+            lexfile TEXT,
+            meta TEXT
+        );
+        CREATE TABLE omw_lexical_entries (
+            id TEXT PRIMARY KEY,
+            synset_id TEXT,
+            language TEXT,
+            lemma TEXT,
+            pos TEXT
+        );
+        CREATE TABLE omw_relations (
+            source_code TEXT NOT NULL,
+            target_code TEXT NOT NULL,
+            rel_type TEXT NOT NULL,
+            PRIMARY KEY (source_code, target_code, rel_type)
+        );
+        CREATE TABLE omw_sense_relations (
+            source_entry_id TEXT,
+            target_entry_id TEXT,
+            rel_type TEXT
+        );
+        CREATE TABLE antonym_pairs (
+            word_a TEXT,
+            word_b TEXT
+        );
+        CREATE TABLE holo_part_relations (
+            source_code TEXT,
+            target_code TEXT,
+            rel_type TEXT
         );
         CREATE TABLE tag_aliases_zh_CN (
             tag_code TEXT NOT NULL,
@@ -39,6 +80,7 @@ fn create_test_sqlite_bytes() -> Vec<u8> {
             is_canonical INTEGER NOT NULL DEFAULT 0,
             n INTEGER NOT NULL DEFAULT 1,
             count INTEGER NOT NULL DEFAULT 0,
+            classifier TEXT,
             PRIMARY KEY (tag_code, lemma)
         ) WITHOUT ROWID;
 
@@ -48,15 +90,9 @@ fn create_test_sqlite_bytes() -> Vec<u8> {
             is_canonical INTEGER NOT NULL DEFAULT 0,
             n INTEGER NOT NULL DEFAULT 1,
             count INTEGER NOT NULL DEFAULT 0,
+            classifier TEXT,
             PRIMARY KEY (tag_code, lemma)
         ) WITHOUT ROWID;
-
-        CREATE TABLE omw_relations (
-            source_code TEXT NOT NULL,
-            target_code TEXT NOT NULL,
-            rel_type TEXT NOT NULL,
-            PRIMARY KEY (source_code, target_code, rel_type)
-        );
 
         INSERT INTO file_tags (code, name, parent_codes, source, sort_order) VALUES
             ('builtin.file_type', '文件类型', '[]', 'dimension', 1),
@@ -643,4 +679,6 @@ fn test_two_stage_resolution_on_real_pack() {
         println!("✅ 真实语义包两阶段反查成功: '{w}' -> code: '{code}', 中文规范展示名: '{name}'");
     }
 }
+
+
 
