@@ -948,8 +948,7 @@ pub const ROOT_DIMENSION_CONCEPTS: &[concepts::Concept] = &[
 /// 判定指定 code 是否为受控根维度 (严格基于受控概念枚举)
 #[inline]
 pub fn is_root_dimension(code: &str) -> bool {
-    code == "builtin.fileType"
-        || code == "builtin.content_rating"
+    code == "builtin.fileType" // locale-invariant-ok: 历史驼峰兼容
         || ROOT_DIMENSION_CONCEPTS.iter().any(|item: &concepts::Concept| item.code() == code)
 }
 

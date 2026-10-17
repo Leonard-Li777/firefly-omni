@@ -2,7 +2,7 @@
 // Omni 受控标签别名表 (Builtin Aliases Generated)
 // 由 scripts/taxonomy/generate-controlled-concepts.ts 自动生成，请勿手动编辑！
 // 单一事实源: file-dimension-source.ts + curated-model-aliases.json
-// 条目总数: 2039 对
+// 条目总数: 2042 对
 // =====================================================================
 
 pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
@@ -545,6 +545,8 @@ pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("hpp", "hpp"),
     ("hrl", "hrl"),
     ("hs", "hs"),
+    ("htm", "htm"),
+    ("html", "html"),
     ("Humanistic activities", "Humanistic activities"),
     ("Humanities", "Humanities"),
     ("icns", "icns"),
@@ -947,6 +949,7 @@ pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("raw", "raw"),
     ("rb", "rb"),
     ("rdf", "rdf"),
+    ("rdp", "rdp"),
     ("real shot", "Real Shot"),
     ("Real shot", "Real Shot"),
     ("Real Shot", "Real Shot"),

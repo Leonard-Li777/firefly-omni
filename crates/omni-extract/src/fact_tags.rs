@@ -300,7 +300,16 @@ impl OmniFactTagExtractor {
                         continue;
                     }
                     let code = Self::resolve_or_derive_code(&name);
-                    Self::push_tag(out, "创作软件", code, &name, CONF_FACT, Some(key), &val, Some("builtin.content_tags"));
+                    Self::push_tag(
+                        out,
+                        "创作软件",
+                        code,
+                        &name,
+                        CONF_FACT,
+                        Some(key),
+                        &val,
+                        Some(omni_core::concepts::Concept::内容标签.code()),
+                    );
                 }
             }
         }
@@ -323,7 +332,7 @@ impl OmniFactTagExtractor {
                         CONF_FACT,
                         Some(key),
                         &val,
-                        Some("builtin.content_tags"),
+                        Some(omni_core::concepts::Concept::内容标签.code()),
                     );
                 }
             }
@@ -349,7 +358,7 @@ impl OmniFactTagExtractor {
             CONF_FACT,
             Some("quality_score"),
             &score.to_string(),
-            Some("builtin.document_quality"),
+            Some(omni_core::concepts::Concept::文件质量.code()),
         );
     }
 
