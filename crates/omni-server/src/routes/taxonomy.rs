@@ -685,12 +685,18 @@ pub fn query_taxonomy_tree_fast(
         let code_proc_status = omni_core::concepts::Concept::处理状态.code();
         let code_photo_cat = omni_core::concepts::Concept::摄影照片细分.code();
         let code_text_density = omni_core::concepts::Concept::文字密度.code();
+        let code_geo_location = omni_core::concepts::Concept::地理位置.code();
+
+        let name_content_tags = omni_core::concepts::Concept::内容标签.zh_name();
+        let name_geo_location = omni_core::concepts::Concept::地理位置.zh_name();
+        let name_file_type = omni_core::concepts::Concept::文件类型.zh_name();
+        let name_document = omni_core::concepts::Concept::文档.zh_name();
 
         // 悲观数据兜底 (M-3)：若 code_path 为空，回退虚拟挂载至 /{code_content_tags}/{tag_code}
         let (eff_code_path, eff_name_path) = if raw_code_path.trim().is_empty() {
             (
                 format!("/{}/{}", code_content_tags, tag_code),
-                format!("/内容标签/{}", tag_code),
+                format!("/{}/{}", name_content_tags, tag_code),
             )
         } else {
             (raw_code_path, raw_name_path)
@@ -711,7 +717,7 @@ pub fn query_taxonomy_tree_fast(
         if code_segs.is_empty() {
             code_segs.push(code_content_tags.to_string());
             code_segs.push(tag_code.clone());
-            name_segs.push("内容标签".to_string());
+            name_segs.push(name_content_tags.to_string());
             name_segs.push(tag_code.clone());
         }
 
@@ -740,14 +746,27 @@ pub fn query_taxonomy_tree_fast(
             }
         }
 
+        // 历史错误拓扑自愈：地理位置为一级独立根维度，若历史脏数据中被误挂在其他维度（如文件类型->图片->地理位置），
+        // 自动切除前缀，将地理位置提升为根节点
+        if let Some(pos) = code_segs.iter().position(|s| s == code_geo_location) {
+            if pos > 0 {
+                code_segs.drain(0..pos);
+                if let Some(name_pos) = name_segs.iter().position(|s| s == name_geo_location) {
+                    name_segs.drain(0..name_pos);
+                } else if name_segs.len() > pos {
+                    name_segs.drain(0..pos);
+                }
+            }
+        }
+
         // 历史截断短路径自愈：子维度若缺失顶层祖先，自动根据本体拓扑补齐真实父级路径
         if code_segs[0] == code_lang_seg {
             // 语言细分属于 文件类型 -> 文档
             code_segs.insert(0, omni_core::concepts::Concept::文档.code().to_string());
             code_segs.insert(0, code_file_type.to_string());
             if !name_segs.is_empty() {
-                name_segs.insert(0, "文档".to_string());
-                name_segs.insert(0, "文件类型".to_string());
+                name_segs.insert(0, name_document.to_string());
+                name_segs.insert(0, name_file_type.to_string());
             }
         } else if code_segs[0] == code_sec_level || code_segs[0] == code_proc_status {
             // 安全等级 / 处理状态属于 文件用途 -> 工作文档
