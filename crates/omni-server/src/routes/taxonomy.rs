@@ -201,6 +201,308 @@ pub async fn taxonomy_aliases_handler(
     }
 }
 
+/// 单项待鉴别标签请求
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectTagItem {
+    pub tag_name: String,
+    pub target_parent_code: String,
+}
+
+/// 批量鉴别请求载荷: POST /api/v1/taxonomy/inspect-tag
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectTagBatchRequest {
+    pub items: Vec<InspectTagItem>,
+    pub language: Option<String>,
+}
+
+/// 单项鉴别输出结果
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectTagItemResult {
+    pub tag_name: String,
+    pub is_controlled: bool,
+    pub matched_parent: bool,
+    pub code: Option<String>,
+    pub canonical_name: Option<String>,
+    pub parent_codes: Vec<String>,
+    pub ancestry_matched_code: Option<String>,
+}
+
+/// 批量鉴别响应载荷
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectTagBatchResponse {
+    pub success: bool,
+    pub results: Vec<InspectTagItemResult>,
+}
+
+/// 受控标签鉴别与祖先闭包判定端点: POST /api/v1/taxonomy/inspect-tag
+pub async fn taxonomy_inspect_tag_handler(
+    State(state): State<AppState>,
+    Json(req): Json<InspectTagBatchRequest>,
+) -> Json<InspectTagBatchResponse> {
+    let locale = req
+        .language
+        .or_else(|| state.config.lock().ok().and_then(|c| c.language.clone()))
+        .unwrap_or_else(|| "zh-CN".to_string());
+    let items = req.items;
+
+    let res = state.omw.with_conn(move |conn| {
+        inspect_tags_batch(conn, &items, &locale)
+    });
+
+    match res {
+        Ok(results) => Json(InspectTagBatchResponse {
+            success: true,
+            results,
+        }),
+        Err(err) => {
+            tracing::warn!("[taxonomy_inspect_tag_handler] 鉴别标签异常: {err}");
+            Json(InspectTagBatchResponse {
+                success: false,
+                results: Vec::new(),
+            })
+        }
+    }
+}
+
+/// 对单项标签在只读语义包 (semantic.pack) 中进行受控性与祖先继承链匹配检验
+pub fn inspect_single_tag(
+    conn: &Connection,
+    tag_name: &str,
+    target_parent_code: &str,
+    locale: &str,
+) -> InspectTagItemResult {
+    let target_table = omni_pro::resolve_tag_aliases_table(locale);
+    let has_alias_table = table_exists(conn, target_table);
+    let has_file_tags = table_exists(conn, "file_tags");
+    inspect_single_tag_internal(conn, tag_name, target_parent_code, target_table, has_alias_table, has_file_tags)
+}
+
+fn inspect_single_tag_internal(
+    conn: &Connection,
+    tag_name: &str,
+    target_parent_code: &str,
+    target_table: &str,
+    has_alias_table: bool,
+    has_file_tags: bool,
+) -> InspectTagItemResult {
+    let clean_name = tag_name.trim();
+    let clean_parent = target_parent_code.trim();
+
+    if clean_name.is_empty() {
+        return InspectTagItemResult {
+            tag_name: tag_name.to_string(),
+            is_controlled: false,
+            matched_parent: false,
+            code: None,
+            canonical_name: None,
+            parent_codes: Vec::new(),
+            ancestry_matched_code: None,
+        };
+    }
+
+    if !has_file_tags {
+        return InspectTagItemResult {
+            tag_name: tag_name.to_string(),
+            is_controlled: false,
+            matched_parent: false,
+            code: None,
+            canonical_name: None,
+            parent_codes: Vec::new(),
+            ancestry_matched_code: None,
+        };
+    }
+
+    // 1. 寻找候选受控 tag_code
+    struct Candidate {
+        code: String,
+        canonical_name: String,
+    }
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+
+    // 1.1 从别名表中精确匹配 lemma（严格遵循 omw > hownet > builtin 权威优先级排序）
+    if has_alias_table {
+        let sql = format!(
+            "SELECT a.tag_code, a.lemma, \
+             (SELECT a2.lemma FROM {target_table} a2 WHERE a2.tag_code = a.tag_code AND a2.is_canonical = 1 LIMIT 1) as canonical_lemma \
+             FROM {target_table} a \
+             WHERE a.lemma = ?1 COLLATE NOCASE \
+             ORDER BY \
+               CASE \
+                 WHEN a.tag_code LIKE 'omw.%' THEN 3 \
+                 WHEN a.tag_code LIKE 'hownet.%' THEN 2 \
+                 WHEN a.tag_code LIKE 'builtin.%' THEN 1 \
+                 ELSE 0 \
+               END DESC, \
+               a.is_canonical DESC, a.count DESC"
+        );
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map([clean_name], |row| {
+                let code: String = row.get(0)?;
+                let lemma: String = row.get(1)?;
+                let canonical_lemma: Option<String> = row.get(2)?;
+                Ok(Candidate {
+                    code,
+                    canonical_name: canonical_lemma.unwrap_or(lemma),
+                })
+            }) {
+                for c in rows.flatten() {
+                    candidates.push(c);
+                }
+            }
+        }
+    }
+
+    // 1.2 若别名表未命中，尝试直接以 code 精确匹配
+    if candidates.is_empty() {
+        let sql = "SELECT code FROM file_tags WHERE code = ?1";
+        if let Ok(code) = conn.query_row(sql, [clean_name], |row| row.get::<_, String>(0)) {
+            candidates.push(Candidate {
+                code,
+                canonical_name: clean_name.to_string(),
+            });
+        }
+    }
+
+    if candidates.is_empty() {
+        return InspectTagItemResult {
+            tag_name: tag_name.to_string(),
+            is_controlled: false,
+            matched_parent: false,
+            code: None,
+            canonical_name: None,
+            parent_codes: Vec::new(),
+            ancestry_matched_code: None,
+        };
+    }
+
+    // 2. 针对候选条目拉取直接 parent_codes 并运行祖先闭包检测
+    let fetch_parent_codes = |c: &str| -> Vec<String> {
+        let sql = "SELECT parent_codes FROM file_tags WHERE code = ?1";
+        if let Ok(raw) = conn.query_row(sql, [c], |row| row.get::<_, Option<String>>(0)) {
+            if let Some(json_str) = raw {
+                if let Ok(parsed) = serde_json::from_str::<Vec<String>>(&json_str) {
+                    return parsed;
+                }
+            }
+        }
+        Vec::new()
+    };
+
+    // 祖先传递闭包算法 (Transitive Ancestor Closure Check)
+    let check_ancestry = |start_code: &str, target: &str| -> Option<String> {
+        if target.is_empty() {
+            return None;
+        }
+        let mut queue: std::collections::VecDeque<(String, usize)> = std::collections::VecDeque::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let initial_parents = fetch_parent_codes(start_code);
+        for p in initial_parents {
+            if p == target {
+                return Some(target.to_string());
+            }
+            queue.push_back((p.clone(), 1));
+            visited.insert(p);
+        }
+
+        // BFS 向上追溯，最大深度限制 5 级防环
+        while let Some((curr, depth)) = queue.pop_front() {
+            if curr == target {
+                return Some(target.to_string());
+            }
+            if depth >= 5 {
+                continue;
+            }
+            let parents = fetch_parent_codes(&curr);
+            for p in parents {
+                if p == target {
+                    return Some(target.to_string());
+                }
+                if visited.insert(p.clone()) {
+                    queue.push_back((p, depth + 1));
+                }
+            }
+        }
+        None
+    };
+
+    // 优先选择祖先匹配成功的候选概念
+    let mut matched_candidate: Option<(Candidate, Vec<String>, String)> = None;
+    let mut fallback_candidate: Option<(Candidate, Vec<String>)> = None;
+
+    for cand in candidates {
+        let parents = fetch_parent_codes(&cand.code);
+        if let Some(ancestry_hit) = check_ancestry(&cand.code, clean_parent) {
+            matched_candidate = Some((cand, parents, ancestry_hit));
+            break;
+        } else if fallback_candidate.is_none() {
+            fallback_candidate = Some((cand, parents));
+        }
+    }
+
+    if let Some((cand, parents, ancestry_code)) = matched_candidate {
+        InspectTagItemResult {
+            tag_name: tag_name.to_string(),
+            is_controlled: true,
+            matched_parent: true,
+            code: Some(cand.code),
+            canonical_name: Some(cand.canonical_name),
+            parent_codes: parents,
+            ancestry_matched_code: Some(ancestry_code),
+        }
+    } else if let Some((cand, parents)) = fallback_candidate {
+        InspectTagItemResult {
+            tag_name: tag_name.to_string(),
+            is_controlled: true,
+            matched_parent: false,
+            code: Some(cand.code),
+            canonical_name: Some(cand.canonical_name),
+            parent_codes: parents,
+            ancestry_matched_code: None,
+        }
+    } else {
+        InspectTagItemResult {
+            tag_name: tag_name.to_string(),
+            is_controlled: false,
+            matched_parent: false,
+            code: None,
+            canonical_name: None,
+            parent_codes: Vec::new(),
+            ancestry_matched_code: None,
+        }
+    }
+}
+
+/// 批量鉴别受控标签（批次层单次检测系统表，杜绝 N+1 次 table_exists 查询）
+pub fn inspect_tags_batch(
+    conn: &Connection,
+    items: &[InspectTagItem],
+    locale: &str,
+) -> anyhow::Result<Vec<InspectTagItemResult>> {
+    let target_table = omni_pro::resolve_tag_aliases_table(locale);
+    let has_alias_table = table_exists(conn, target_table);
+    let has_file_tags = table_exists(conn, "file_tags");
+
+    Ok(items
+        .iter()
+        .map(|item| {
+            inspect_single_tag_internal(
+                conn,
+                &item.tag_name,
+                &item.target_parent_code,
+                target_table,
+                has_alias_table,
+                has_file_tags,
+            )
+        })
+        .collect())
+}
+
 /// 从语义包 `file_tags` 按需读取指定受控 codes 的 `sort_order > 0` 映射（受控域排序值唯一事实源）。
 ///
 /// - 利用 `PRIMARY KEY (code)` B-Tree 索引批量点查，单批次 <= 200 个，耗时仅 ~0.05ms，彻底杜绝 40,000+ 行全表扫描；
@@ -376,10 +678,18 @@ pub fn query_taxonomy_tree_fast(
             continue;
         }
 
-        // 悲观数据兜底 (M-3)：若 code_path 为空，回退虚拟挂载至 /builtin.content_tags/{tag_code}
+        let code_content_tags = omni_core::concepts::Concept::内容标签.code();
+        let code_file_type = omni_core::concepts::Concept::文件类型.code();
+        let code_lang_seg = omni_core::concepts::Concept::语言细分.code();
+        let code_sec_level = omni_core::concepts::Concept::安全等级.code();
+        let code_proc_status = omni_core::concepts::Concept::处理状态.code();
+        let code_photo_cat = omni_core::concepts::Concept::摄影照片细分.code();
+        let code_text_density = omni_core::concepts::Concept::文字密度.code();
+
+        // 悲观数据兜底 (M-3)：若 code_path 为空，回退虚拟挂载至 /{code_content_tags}/{tag_code}
         let (eff_code_path, eff_name_path) = if raw_code_path.trim().is_empty() {
             (
-                format!("/builtin.content_tags/{}", tag_code),
+                format!("/{}/{}", code_content_tags, tag_code),
                 format!("/内容标签/{}", tag_code),
             )
         } else {
@@ -399,7 +709,7 @@ pub fn query_taxonomy_tree_fast(
             .collect();
 
         if code_segs.is_empty() {
-            code_segs.push("builtin.content_tags".to_string());
+            code_segs.push(code_content_tags.to_string());
             code_segs.push(tag_code.clone());
             name_segs.push("内容标签".to_string());
             name_segs.push(tag_code.clone());
@@ -407,21 +717,21 @@ pub fn query_taxonomy_tree_fast(
 
         // 历史驼峰归一化兼容
         if code_segs[0] == "builtin.fileType" {
-            code_segs[0] = "builtin.file_type".to_string();
+            code_segs[0] = code_file_type.to_string();
         }
 
-        // 历史存量数据自愈：若前缀误被包装为 /builtin.content_tags/<subdim>/... 或 /builtin.content_tags/<root_dim>/...，
+        // 历史存量数据自愈：若前缀误被包装为 /{code_content_tags}/<subdim>/... 或 /{code_content_tags}/<root_dim>/...，
         // 门禁：只要第二段为受控维度代码（如摄影照片细分、文字密度、语言细分等）或一级根维度代码，绝对严禁作为 content_tags 的子节点，直接剥除伪 content_tags 前缀！
-        if code_segs.len() > 1 && code_segs[0] == "builtin.content_tags" {
+        if code_segs.len() > 1 && code_segs[0] == code_content_tags {
             let is_subdim_or_root = omni_core::is_root_dimension(&code_segs[1])
                 || omni_core::get_dimension_policy(&code_segs[1]).is_some()
                 || omni_core::tag_identity::concept_from_code(&code_segs[1])
                     .map_or(false, |c_concept| omni_core::get_dimension_policy(c_concept.code()).is_some())
-                || code_segs[1] == "builtin.language_segmentation"
-                || code_segs[1] == "builtin.security_level"
-                || code_segs[1] == "builtin.processing_status"
-                || code_segs[1] == "builtin.photography_categories"
-                || code_segs[1] == "builtin.text_density";
+                || code_segs[1] == code_lang_seg
+                || code_segs[1] == code_sec_level
+                || code_segs[1] == code_proc_status
+                || code_segs[1] == code_photo_cat
+                || code_segs[1] == code_text_density;
             if is_subdim_or_root {
                 code_segs.remove(0);
                 if !name_segs.is_empty() {
@@ -431,18 +741,18 @@ pub fn query_taxonomy_tree_fast(
         }
 
         // 历史截断短路径自愈：子维度若缺失顶层祖先，自动根据本体拓扑补齐真实父级路径
-        if code_segs[0] == "builtin.language_segmentation" {
-            // 语言细分属于 文件类型 -> 文档/文本
-            code_segs.insert(0, "builtin.document".to_string());
-            code_segs.insert(0, "builtin.file_type".to_string());
+        if code_segs[0] == code_lang_seg {
+            // 语言细分属于 文件类型 -> 文档
+            code_segs.insert(0, omni_core::concepts::Concept::文档.code().to_string());
+            code_segs.insert(0, code_file_type.to_string());
             if !name_segs.is_empty() {
                 name_segs.insert(0, "文档".to_string());
                 name_segs.insert(0, "文件类型".to_string());
             }
-        } else if code_segs[0] == "builtin.security_level" || code_segs[0] == "builtin.processing_status" {
+        } else if code_segs[0] == code_sec_level || code_segs[0] == code_proc_status {
             // 安全等级 / 处理状态属于 文件用途 -> 工作文档
-            code_segs.insert(0, "builtin.work_documents".to_string());
-            code_segs.insert(0, "builtin.file_purpose".to_string());
+            code_segs.insert(0, omni_core::concepts::Concept::工作文档.code().to_string());
+            code_segs.insert(0, omni_core::concepts::Concept::文件用途.code().to_string());
             if !name_segs.is_empty() {
                 name_segs.insert(0, "工作文档".to_string());
                 name_segs.insert(0, "文件用途".to_string());
@@ -450,22 +760,22 @@ pub fn query_taxonomy_tree_fast(
         }
 
         // 受控根维度封闭性与排他门禁 (Spec v2.0 不变式 1 & 不变式 2)
-        if !omni_core::is_root_dimension(&code_segs[0]) && code_segs[0] != "builtin.content_tags" {
+        if !omni_core::is_root_dimension(&code_segs[0]) && code_segs[0] != code_content_tags {
             let is_subdim = omni_core::get_dimension_policy(&code_segs[0]).is_some()
                 || omni_core::tag_identity::concept_from_code(&code_segs[0])
                     .map_or(false, |c_concept| omni_core::get_dimension_policy(c_concept.code()).is_some())
-                || code_segs[0] == "builtin.photography_categories"
-                || code_segs[0] == "builtin.text_density";
+                || code_segs[0] == code_photo_cat
+                || code_segs[0] == code_text_density;
             if is_subdim {
                 // 已归入受控细分体系，排他门禁生效：严禁强插内容标签！
                 // 前置补齐所属文件类型一级根
-                let root_code = omni_core::concepts::Concept::文件类型.code().to_string();
+                let root_code = code_file_type.to_string();
                 let root_name = "文件类型".to_string();
                 code_segs.insert(0, root_code);
                 name_segs.insert(0, root_name);
             } else {
                 // 仅对非受控的开放自由标签或未声明父级的受控泛标签，收敛兜底至内容标签
-                code_segs.insert(0, "builtin.content_tags".to_string());
+                code_segs.insert(0, code_content_tags.to_string());
                 name_segs.insert(0, "内容标签".to_string());
             }
         }
@@ -501,9 +811,9 @@ pub fn query_taxonomy_tree_fast(
                 "user".to_string()
             };
 
-            let sort_order = if seg_code == "builtin.content_tags" {
+            let sort_order = if seg_code == omni_core::concepts::Concept::内容标签.code() {
                 9999
-            } else if seg_code == "builtin.file_type" {
+            } else if seg_code == omni_core::concepts::Concept::文件类型.code() {
                 1
             } else {
                 0
@@ -570,7 +880,7 @@ pub fn query_taxonomy_tree_fast(
     let pack_sort_orders = load_pack_sort_orders_for_codes(conn, &all_codes);
     if !pack_sort_orders.is_empty() {
         for node in node_map.values_mut() {
-            if node.code == "builtin.content_tags" {
+            if node.code == omni_core::concepts::Concept::内容标签.code() {
                 continue;
             }
             if let Some(&sort_order) = pack_sort_orders.get(&node.code) {
@@ -961,7 +1271,7 @@ pub fn query_taxonomy_tree(
             .cloned()
             .or_else(|| raw.parent_codes.first().cloned());
         // 特例：builtin.content_tags 恒定垫底，与 fast path 的 9999 硬编码口径一致（pack 值 28 不参与根级排序）
-        let sort_order = if raw.code == "builtin.content_tags" {
+        let sort_order = if raw.code == omni_core::concepts::Concept::内容标签.code() {
             9999
         } else {
             raw.sort_order
@@ -989,7 +1299,7 @@ pub fn query_taxonomy_tree(
     let mut parent_to_children: HashMap<String, Vec<String>> = HashMap::new();
     let mut root_candidates: Vec<String> = Vec::new();
 
-    // 5.1 确保 6 大受控根维度节点完整存在于 node_map，并具备准确的当前母语规范展示名
+    // 5.1 确保 7 大受控根维度节点完整存在于 node_map，并具备准确的当前母语规范展示名
     let lang = locale.split('-').next().unwrap_or("zh");
     for root_concept in omni_core::ROOT_DIMENSION_CONCEPTS {
         let code = root_concept.code().to_string();
@@ -1012,7 +1322,7 @@ pub fn query_taxonomy_tree(
                     parent_code: None,
                     parent_codes: Vec::new(),
                     source: "builtin".to_string(),
-                    sort_order: if code == "builtin.content_tags" { 9999 } else { 0 },
+                    sort_order: if code == omni_core::concepts::Concept::内容标签.code() { 9999 } else { 0 },
                     file_count: 0,
                     files: Vec::new(),
                     children: Vec::new(),
@@ -1148,7 +1458,7 @@ pub fn query_taxonomy_tree(
                                         name_chain
                                             .split('/')
                                             .map(|s| s.trim().to_string())
-                                            .filter(|s| !s.is_empty() && s != "内容标签" && s != "builtin.content_tags")
+                                            .filter(|s| !s.is_empty() && s != "内容标签" && s != omni_core::concepts::Concept::内容标签.code())
                                             .collect()
                                     } else {
                                         Vec::new()
@@ -1157,7 +1467,7 @@ pub fn query_taxonomy_tree(
                                         code_chain
                                             .split('/')
                                             .map(|s| s.trim().to_string())
-                                            .filter(|s| !s.is_empty() && s != "内容标签" && s != "builtin.content_tags")
+                                            .filter(|s| !s.is_empty() && s != "内容标签" && s != omni_core::concepts::Concept::内容标签.code())
                                             .collect()
                                     } else {
                                         Vec::new()
@@ -1175,17 +1485,17 @@ pub fn query_taxonomy_tree(
 
                                         // 归一化兼容历史驼峰 builtin.fileType
                                         if first_seg_code == "builtin.fileType" {
-                                            first_seg_code = "builtin.file_type".to_string();
+                                            first_seg_code = omni_core::concepts::Concept::文件类型.code().to_string();
                                         }
 
-                                        // 原则 2：只有 6 大受控根维度允许作为独立顶层树根
+                                        // 原则 2：只有 7 大受控根维度允许作为独立顶层树根
                                         let is_root_dim = omni_core::is_root_dimension(&first_seg_code);
 
                                         let (mut prev_code, start_idx) = if is_root_dim {
                                             (first_seg_code, 1)
                                         } else {
-                                            // 原则 1：非 6 大根维度链路，统一安全收敛挂入 builtin.content_tags
-                                            ("builtin.content_tags".to_string(), 0)
+                                            // 原则 1：非 7 大根维度链路，统一安全收敛挂入 builtin.content_tags
+                                            (omni_core::concepts::Concept::内容标签.code().to_string(), 0)
                                         };
 
                                         for i in start_idx..num_segs {
@@ -1288,11 +1598,12 @@ pub fn query_taxonomy_tree(
                 let is_root = omni_core::is_root_dimension(code)
                     || (pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false)
                         && node.parent_codes.is_empty());
+                let code_content_tags = omni_core::concepts::Concept::内容标签.code();
                 if is_root && !root_candidates.contains(code) {
                     root_candidates.push(code.clone());
-                } else if !is_root && code != "builtin.content_tags" {
-                    // 原则 1：未挂在已知父级且非 6 大根维度的节点，统一收拢归入 builtin.content_tags
-                    let children = parent_to_children.entry("builtin.content_tags".to_string()).or_default();
+                } else if !is_root && code != code_content_tags {
+                    // 原则 1：未挂在已知父级且非 7 大根维度的节点，统一收拢归入 builtin.content_tags
+                    let children = parent_to_children.entry(code_content_tags.to_string()).or_default();
                     if !children.contains(code) {
                         children.push(code.clone());
                     }
@@ -1303,11 +1614,12 @@ pub fn query_taxonomy_tree(
             let is_root = omni_core::is_root_dimension(code)
                 || (pack_source_map.get(code).map(|s| s == "dimension").unwrap_or(false)
                     && node.parent_codes.is_empty());
+            let code_content_tags = omni_core::concepts::Concept::内容标签.code();
             if is_root && !root_candidates.contains(code) {
                 root_candidates.push(code.clone());
-            } else if !is_root && code != "builtin.content_tags" {
-                // 原则 1：未挂在已知父级且非 6 大根维度的节点，统一收拢归入 builtin.content_tags
-                let children = parent_to_children.entry("builtin.content_tags".to_string()).or_default();
+            } else if !is_root && code != code_content_tags {
+                // 原则 1：未挂在已知父级且非 7 大根维度的节点，统一收拢归入 builtin.content_tags
+                let children = parent_to_children.entry(code_content_tags.to_string()).or_default();
                 if !children.contains(code) {
                     children.push(code.clone());
                 }
@@ -2500,6 +2812,95 @@ mod tests {
             c.code == "builtin.photography_categories" || c.code == "builtin.text_density"
         });
         assert!(has_healed_subdim, "摄影照片细分或文字密度必须成功自愈至文件类型根节点下");
+    }
+
+    #[test]
+    fn test_inspect_controlled_tag_and_transitive_ancestor_closure() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE tag_aliases_zh_CN (
+                tag_code TEXT NOT NULL,
+                lemma TEXT NOT NULL,
+                is_canonical INTEGER NOT NULL DEFAULT 1,
+                source TEXT NOT NULL DEFAULT 'builtin',
+                count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE file_tags (
+                code TEXT PRIMARY KEY,
+                parent_codes TEXT,
+                source TEXT NOT NULL DEFAULT 'builtin'
+            );
+
+            -- 1. 安全等级与公开 (直接匹配)
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical) VALUES
+                ('builtin.security_level', '安全等级', 1),
+                ('omw.01704761.a', '公开', 1);
+            INSERT INTO file_tags (code, parent_codes, source) VALUES
+                ('builtin.security_level', '["builtin.domain"]', 'dimension'),
+                ('omw.01704761.a', '["builtin.security_level"]', 'tag');
+
+            -- 2. 发票 -> 财务票据 -> 文件用途 (多级祖先闭包)
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical) VALUES
+                ('builtin.file_purpose', '文件用途', 1),
+                ('builtin.financial_type', '财务票据', 1),
+                ('builtin.invoice', '发票', 1);
+            INSERT INTO file_tags (code, parent_codes, source) VALUES
+                ('builtin.file_purpose', '["builtin.domain"]', 'dimension'),
+                ('builtin.financial_type', '["builtin.file_purpose"]', 'dimension'),
+                ('builtin.invoice', '["builtin.financial_type"]', 'tag');
+
+            -- 3. 塔防 -> 游戏类型
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical) VALUES
+                ('builtin.game_genre', '游戏类型', 1),
+                ('builtin.tower_defense', '塔防', 1);
+            INSERT INTO file_tags (code, parent_codes, source) VALUES
+                ('builtin.game_genre', '["builtin.domain"]', 'dimension'),
+                ('builtin.tower_defense', '["builtin.game_genre"]', 'tag');
+            "#,
+        ).unwrap();
+
+        // Case 1: 直接受控匹配 (公开在安全等级下)
+        let res_public = inspect_single_tag(&conn, "公开", "builtin.security_level", "zh-CN");
+        assert!(res_public.is_controlled);
+        assert!(res_public.matched_parent);
+        assert_eq!(res_public.code.as_deref(), Some("omw.01704761.a"));
+        assert_eq!(res_public.ancestry_matched_code.as_deref(), Some("builtin.security_level"));
+
+        // Case 2: 祖先闭包多级匹配 (发票挂在顶层文件用途下)
+        let res_invoice = inspect_single_tag(&conn, "发票", "builtin.file_purpose", "zh-CN");
+        assert!(res_invoice.is_controlled);
+        assert!(res_invoice.matched_parent);
+        assert_eq!(res_invoice.code.as_deref(), Some("builtin.invoice"));
+        assert_eq!(res_invoice.ancestry_matched_code.as_deref(), Some("builtin.file_purpose"));
+
+        // Case 3: 受控但父级不匹配 (塔防挂在作者下)
+        let res_td = inspect_single_tag(&conn, "塔防", "builtin.author", "zh-CN");
+        assert!(res_td.is_controlled);
+        assert!(!res_td.matched_parent);
+        assert_eq!(res_td.code.as_deref(), Some("builtin.tower_defense"));
+        assert!(res_td.ancestry_matched_code.is_none());
+
+        // Case 4: 完全未收录的自定义标签 (张三)
+        let res_custom = inspect_single_tag(&conn, "张三", "builtin.author", "zh-CN");
+        assert!(!res_custom.is_controlled);
+        assert!(!res_custom.matched_parent);
+        assert!(res_custom.code.is_none());
+        assert!(res_custom.ancestry_matched_code.is_none());
+
+        // Case 5: 批量批处理检验
+        let batch_items = vec![
+            InspectTagItem { tag_name: "公开".to_string(), target_parent_code: "builtin.security_level".to_string() },
+            InspectTagItem { tag_name: "发票".to_string(), target_parent_code: "builtin.file_purpose".to_string() },
+            InspectTagItem { tag_name: "塔防".to_string(), target_parent_code: "builtin.author".to_string() },
+            InspectTagItem { tag_name: "张三".to_string(), target_parent_code: "builtin.author".to_string() },
+        ];
+        let batch_res = inspect_tags_batch(&conn, &batch_items, "zh-CN").unwrap();
+        assert_eq!(batch_res.len(), 4);
+        assert!(batch_res[0].matched_parent);
+        assert!(batch_res[1].matched_parent);
+        assert!(!batch_res[2].matched_parent);
+        assert!(!batch_res[3].is_controlled);
     }
 }
 

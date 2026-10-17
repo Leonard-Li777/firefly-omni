@@ -173,6 +173,7 @@ pub fn create_app_router(state: AppState) -> Router {
             // ADR-0038 / PRD #679: 只读语义包与向量引擎专用服务化出口 (Pro 独占 🔒)
             .route("/api/v1/taxonomy/tree", get(routes::taxonomy::taxonomy_tree_handler))
             .route("/api/v1/taxonomy/aliases", get(routes::taxonomy::taxonomy_aliases_handler))
+            .route("/api/v1/taxonomy/inspect-tag", post(routes::taxonomy::taxonomy_inspect_tag_handler))
             .route("/api/taxonomy/fast-recognize", post(routes::taxonomy::fast_recognize_handler))
             .route("/api/v1/taxonomy/fast-recognize", post(routes::taxonomy::fast_recognize_handler))
             .route("/api/taxonomy/reload-policies", post(routes::taxonomy::reload_policies_handler))
@@ -939,15 +940,32 @@ async fn get_config(
 
 async fn update_config(
     State(state): State<AppState>,
-    Json(new_config): Json<OmniConfig>,
+    Json(payload): Json<serde_json::Value>,
 ) -> Json<OmniConfig> {
-    if omni_pro::is_pro_enabled() {
-        omni_pro::OmniVisionEngine::set_gemma_mrl_dimension(new_config.mrl_dimension);
-    }
     let mut cfg = state.config.lock().unwrap();
-    *cfg = new_config.clone();
-    save_config_to_disk(&new_config);
-    Json(new_config)
+    if let Ok(new_cfg) = serde_json::from_value::<OmniConfig>(payload.clone()) {
+        let prev_profile = cfg.embedding_profile.clone();
+        let prev_mrl = cfg.mrl_dimension;
+
+        *cfg = new_cfg;
+
+        // 若传入 payload 未显式指定 embedding_profile，保留当前激活档位，杜绝被 serde default 降级覆盖
+        if payload.get("embedding_profile").is_none() {
+            cfg.embedding_profile = prev_profile;
+        }
+        // 若传入 payload 未显式指定 mrl_dimension，保留当前 MRL 维度
+        if payload.get("mrl_dimension").is_none() {
+            cfg.mrl_dimension = prev_mrl;
+        }
+
+        if omni_pro::is_pro_enabled() {
+            omni_pro::OmniVisionEngine::set_gemma_mrl_dimension(cfg.mrl_dimension);
+        }
+        save_config_to_disk(&*cfg);
+        Json(cfg.clone())
+    } else {
+        Json(cfg.clone())
+    }
 }
 
 /// 处理本地 JSON 文件路径提取请求: POST /api/extract { "file_path": "/path/to/file" }
