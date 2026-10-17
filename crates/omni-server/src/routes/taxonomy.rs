@@ -2306,7 +2306,7 @@ mod tests {
                 );
                 INSERT INTO file_tags (code, sort_order) VALUES
                     ('builtin.file_type', 1),
-                    ('builtin.author', 4),
+                    ('hownet.000000043396.n', 4),
                     ('builtin.content_tags', 28),
                     ('builtin.novel', 1),
                     ('builtin.image', 5),
@@ -2341,7 +2341,7 @@ mod tests {
                 ('fp_1', 'builtin.image', '/builtin.file_type/builtin.image', '/文件类型/图片'),
                 ('fp_2', 'builtin.novel', '/builtin.file_type/builtin.novel', '/文件类型/小说'),
                 ('fp_3', 'builtin.article', '/builtin.file_type/builtin.article', '/文件类型/文章'),
-                ('fp_4', 'builtin.zhangsan', '/builtin.author/builtin.zhangsan', '/作者/张三'),
+                ('fp_4', 'builtin.zhangsan', '/hownet.000000043396.n/builtin.zhangsan', '/作者/张三'),
                 ('fp_5', 'builtin.foo', '/builtin.content_tags/builtin.foo', '/内容标签/未知');",
             )
             .unwrap();
@@ -2359,7 +2359,7 @@ mod tests {
 
         // 1. 根数组按 sort_order (>0) 升序：file_type(1) -> author(4) -> content_tags(9999)
         let root_codes: Vec<&str> = resp.root_nodes.iter().map(|n| n.code.as_str()).collect();
-        assert_eq!(root_codes, vec!["builtin.file_type", "builtin.author", "builtin.content_tags"]);
+        assert_eq!(root_codes, vec!["builtin.file_type", "hownet.000000043396.n", "builtin.content_tags"]);
 
         // 2. 根节点 sort_order 取自 pack；content_tags 特例仍为 9999（pack 值 28 不参与）
         assert_eq!(resp.root_nodes[0].sort_order, 1);
