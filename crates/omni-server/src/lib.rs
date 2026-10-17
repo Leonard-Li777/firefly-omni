@@ -929,13 +929,18 @@ pub async fn start_server(
     };
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            // 当由 Electron / Node.js 宿主拉起时，stdin 管道随宿主退出而关闭 (EOF)
-            // 监听 stdin EOF 或终止信号，确保宿主崩溃或强制关闭时 omni-server 立即退出不残留
-            use tokio::io::AsyncReadExt;
-            let mut stdin = tokio::io::stdin();
-            let mut buf = [0u8; 1];
+            // 当由 Electron / Node.js 宿主显式配置 OMNI_WATCH_STDIN=1 拉起时，监听 stdin EOF
+            // 默认情况下（独立运行、后台守护、CLI）仅响应 Ctrl+C 信号，杜绝无终端环境下直接读到 EOF 导致的误退出
+            let watch_stdin = std::env::var("OMNI_WATCH_STDIN").map(|v| v == "1").unwrap_or(false);
             tokio::select! {
                 _ = async {
+                    if !watch_stdin {
+                        std::future::pending::<()>().await;
+                        return;
+                    }
+                    use tokio::io::AsyncReadExt;
+                    let mut stdin = tokio::io::stdin();
+                    let mut buf = [0u8; 1];
                     loop {
                         match stdin.read(&mut buf).await {
                             Ok(0) => break, // 真正读到 EOF (宿主进程已销毁)
