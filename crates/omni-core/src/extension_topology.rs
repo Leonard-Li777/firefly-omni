@@ -217,6 +217,7 @@ impl ExtensionTopologyResolver {
             "hpp" => Some(Concept::源代码扩展名),
             "hrl" => Some(Concept::源代码扩展名),
             "hs" => Some(Concept::源代码扩展名),
+            "htm" | "html" => Some(Concept::文本扩展名),
             "icns" => Some(Concept::图片扩展名),
             "ico" => Some(Concept::图片扩展名),
             "ics" => Some(Concept::应用数据扩展名),
@@ -338,6 +339,7 @@ impl ExtensionTopologyResolver {
             },
             "rb" => Some(Concept::源代码扩展名),
             "rdf" => Some(Concept::文本扩展名),
+            "rdp" => Some(Concept::应用数据扩展名),
             "reg" => Some(Concept::应用数据扩展名),
             "rm" => Some(Concept::视频扩展名),
             "rmvb" => Some(Concept::视频扩展名),
@@ -452,11 +454,35 @@ impl ExtensionTopologyResolver {
             category_concept: category,
         })
     }
+
+    /// 求解扩展名确定性细分受控概念与细分维度 (例如 .lnk / .url 确定性映射为 快捷方式 ➔ 应用数据细分)
+    pub fn resolve_subdivision(ext: &str) -> Option<(Concept, Concept)> {
+        let clean = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+        match clean.as_str() {
+            "lnk" | "url" => Some((Concept::快捷方式, Concept::应用数据细分)),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_lnk_shortcut_subdivision() {
+        let sub = ExtensionTopologyResolver::resolve_subdivision("lnk").expect("lnk should resolve subdivision");
+        assert_eq!(sub.0, Concept::快捷方式);
+        assert_eq!(sub.1, Concept::应用数据细分);
+
+        let sub_dot = ExtensionTopologyResolver::resolve_subdivision(".lnk").expect(".lnk should resolve subdivision");
+        assert_eq!(sub_dot.0, Concept::快捷方式);
+
+        let sub_url = ExtensionTopologyResolver::resolve_subdivision("url").expect("url should resolve subdivision");
+        assert_eq!(sub_url.0, Concept::快捷方式);
+
+        assert!(ExtensionTopologyResolver::resolve_subdivision("mp3").is_none());
+    }
 
     #[test]
     fn test_resolve_mp3_concept() {
@@ -482,6 +508,19 @@ mod tests {
         let res = ExtensionTopologyResolver::resolve("jpg", None).unwrap();
         assert_eq!(res.category_concept, Concept::图片);
         assert_eq!(res.ext_dim_concept, Concept::图片扩展名);
+    }
+
+    #[test]
+    fn test_resolve_html_and_rdp() {
+        let res_html = ExtensionTopologyResolver::resolve("html", None).unwrap();
+        assert_eq!(res_html.tag_code, "builtin.html");
+        assert_eq!(res_html.ext_dim_concept, Concept::文本扩展名);
+        assert_eq!(res_html.category_concept, Concept::文本);
+
+        let res_rdp = ExtensionTopologyResolver::resolve("rdp", None).unwrap();
+        assert_eq!(res_rdp.tag_code, "builtin.rdp");
+        assert_eq!(res_rdp.ext_dim_concept, Concept::应用数据扩展名);
+        assert_eq!(res_rdp.category_concept, Concept::应用数据);
     }
 
     #[test]

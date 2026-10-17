@@ -178,6 +178,9 @@ pub struct OmniPerceptionRequest {
     /// 自定义音频截取时长（秒，缺省时读取 OmniConfig.audio_analysis_duration）
     #[serde(default)]
     pub audio_analysis_duration: Option<u32>,
+    /// 自定义视频抽帧采样间隔（秒，缺省时读取全局配置或默认 5.0 秒）
+    #[serde(default)]
+    pub video_frame_interval_seconds: Option<f32>,
     /// 是否需要生成缩略图/封面（若已有则传 false，不要求生成）
     #[serde(default)]
     pub generate_thumbnail: Option<bool>,
@@ -507,6 +510,20 @@ pub struct OmniPerceptionResult {
     /// 二进制可执行文件与原生模块的结构化分析事实 (BinaryLens)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_info: Option<BinaryAnalysisInfo>,
+    /// 视频时序切片集合（30 秒切片，包含 512 维向量、起止时间及可选切片 ASR）
+    #[serde(default)]
+    pub video_chunks: Vec<OmniVideoChunk>,
+}
+
+/// 视频时序切片实体（30 秒窗口切片）
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct OmniVideoChunk {
+    pub chunk_index: usize,
+    pub start_sec: f32,
+    pub end_sec: f32,
+    pub vector: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asr_text: Option<String>,
 }
 
 /// 级联提示词候选假设项 (用于 CLIP 文本向量仲裁)
@@ -928,11 +945,10 @@ pub const ROOT_DIMENSION_CONCEPTS: &[concepts::Concept] = &[
     concepts::Concept::内容标签,
 ];
 
-/// 判定指定 code 是否为受控根维度 (内置 builtin.author / builtin.fileType / builtin.content_rating 别名收敛)
+/// 判定指定 code 是否为受控根维度 (严格基于受控概念枚举)
 #[inline]
 pub fn is_root_dimension(code: &str) -> bool {
-    code == "builtin.author"
-        || code == "builtin.fileType"
+    code == "builtin.fileType"
         || code == "builtin.content_rating"
         || ROOT_DIMENSION_CONCEPTS.iter().any(|item: &concepts::Concept| item.code() == code)
 }

@@ -130,6 +130,23 @@ impl OmniFactTagExtractor {
                     source: Some("metadata".to_string()),
                     ..Default::default()
                 });
+
+                // 3. 细分事实（例如 .lnk / .url 确定性直出「快捷方式」事实标签，归属「应用数据细分」）
+                if let Some((sub_tag, sub_dim)) = omni_core::ExtensionTopologyResolver::resolve_subdivision(ext) {
+                    out.push(TagChainItem {
+                        code: sub_tag.code().to_string(),
+                        name: sub_tag.zh_name().to_string(),
+                        confidence: CONF_FACT,
+                        parent_codes: vec![sub_dim.code().to_string()],
+                        via_parent_code: Some(sub_dim.code().to_string()),
+                        code_path: None,
+                        name_path: None,
+                        depth: None,
+                        engine: Some(ENGINE_METADATA.to_string()),
+                        source: Some("metadata".to_string()),
+                        ..Default::default()
+                    });
+                }
             }
         } else if let Some(domain) = ctx.media_domain {
             // 若无扩展名但已知 media_domain，直出媒体大类事实
@@ -730,7 +747,7 @@ mod tests {
         let tags = extract_fact_tags(&metadata);
         let artist_tag = tags.iter().find(|t| t.name == "沐可儿").expect("应提取作者沐可儿");
         assert_eq!(artist_tag.code, "_ext.c252094c", "纯中文作者名不得出现双重 hash 或 creator 前缀");
-        assert_eq!(artist_tag.via_parent_code.as_deref(), Some("builtin.author"));
+        assert_eq!(artist_tag.via_parent_code.as_deref(), Some(Concept::作者.code()));
 
         let album_tag = tags.iter().find(|t| t.name == "21").expect("应提取专辑21");
         assert_eq!(album_tag.code, "_ext.21.6f4b6612", "非受控专辑名不得拼接 album 前缀");
@@ -764,5 +781,24 @@ mod tests {
         let tag_neutral = tags_neutral.iter().find(|t| t.name == "轻松").expect("应提取出情绪标签: 轻松");
         assert_eq!(tag_neutral.code, "omw.01064148.n");
         assert_eq!(tag_neutral.via_parent_code.as_deref(), Some("builtin.emotion_tags"));
+    }
+
+    /// .lnk 扩展名文件主动直出「快捷方式」事实标签 (置信度 0.90, engine: metadata, group: fact)
+    #[test]
+    fn test_extract_lnk_shortcut_fact_tag() {
+        let meta = json!({});
+        let ctx = FactTagContext {
+            metadata: &meta,
+            file_path: Some(r"C:\Users\lilun\Desktop\test.lnk"),
+            extension: Some("lnk"),
+            ..Default::default()
+        };
+        let tags = OmniFactTagExtractor::extract(&ctx);
+        let shortcut_tag = tags.iter().find(|t| t.name == "快捷方式").expect(".lnk 必须主动打上「快捷方式」标签");
+        assert_eq!(shortcut_tag.code, "builtin.shortcut");
+        assert_eq!(shortcut_tag.via_parent_code.as_deref(), Some("builtin.application_data_segmentation"));
+        assert_eq!(shortcut_tag.parent_codes, vec!["builtin.application_data_segmentation"]);
+        assert_eq!(shortcut_tag.confidence, 0.90);
+        assert_eq!(shortcut_tag.engine.as_deref(), Some("metadata"));
     }
 }
