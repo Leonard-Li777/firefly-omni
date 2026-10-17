@@ -828,35 +828,35 @@ pub fn concept_from_language_code(code_str: &str) -> Option<crate::concepts::Con
         return None;
     }
 
-    if clean.starts_with("zh") || clean.starts_with("chi") || clean.starts_with("zho") || clean.starts_with("cmn") || clean == "chinese" || clean == "中文" {
+    if clean.starts_with("zh") || clean.starts_with("chi") || clean.starts_with("zho") || clean.starts_with("cmn") || clean == "chinese" || clean == crate::concepts::Concept::中文.zh_name() {
         Some(crate::concepts::Concept::中文)
-    } else if clean.starts_with("en") || clean.starts_with("eng") || clean == "english" || clean == "英文" {
+    } else if clean.starts_with("en") || clean.starts_with("eng") || clean == "english" || clean == crate::concepts::Concept::英文.zh_name() {
         Some(crate::concepts::Concept::英文)
-    } else if clean.starts_with("ja") || clean.starts_with("jpn") || clean == "japanese" || clean == "日语" {
+    } else if clean.starts_with("ja") || clean.starts_with("jpn") || clean == "japanese" || clean == crate::concepts::Concept::日语.zh_name() {
         Some(crate::concepts::Concept::日语)
-    } else if clean.starts_with("ko") || clean.starts_with("kor") || clean == "korean" || clean == "韩语" {
+    } else if clean.starts_with("ko") || clean.starts_with("kor") || clean == "korean" || clean == crate::concepts::Concept::韩语.zh_name() {
         Some(crate::concepts::Concept::韩语)
-    } else if clean.starts_with("fr") || clean.starts_with("fre") || clean.starts_with("fra") || clean == "french" || clean == "法语" {
+    } else if clean.starts_with("fr") || clean.starts_with("fre") || clean.starts_with("fra") || clean == "french" || clean == crate::concepts::Concept::法语.zh_name() {
         Some(crate::concepts::Concept::法语)
-    } else if clean.starts_with("de") || clean.starts_with("ger") || clean.starts_with("deu") || clean == "german" || clean == "德语" {
+    } else if clean.starts_with("de") || clean.starts_with("ger") || clean.starts_with("deu") || clean == "german" || clean == crate::concepts::Concept::德语.zh_name() {
         Some(crate::concepts::Concept::德语)
-    } else if clean.starts_with("es") || clean.starts_with("spa") || clean == "spanish" || clean == "西班牙语" {
+    } else if clean.starts_with("es") || clean.starts_with("spa") || clean == "spanish" || clean == crate::concepts::Concept::西班牙语.zh_name() {
         Some(crate::concepts::Concept::西班牙语)
-    } else if clean.starts_with("ru") || clean.starts_with("rus") || clean == "russian" || clean == "俄语" {
+    } else if clean.starts_with("ru") || clean.starts_with("rus") || clean == "russian" || clean == crate::concepts::Concept::俄语.zh_name() {
         Some(crate::concepts::Concept::俄语)
-    } else if clean.starts_with("ar") || clean.starts_with("ara") || clean == "arabic" || clean == "阿拉伯语" {
+    } else if clean.starts_with("ar") || clean.starts_with("ara") || clean == "arabic" || clean == crate::concepts::Concept::阿拉伯语.zh_name() {
         Some(crate::concepts::Concept::阿拉伯语)
-    } else if clean.starts_with("pt") || clean.starts_with("por") || clean == "portuguese" || clean == "葡萄牙语" {
+    } else if clean.starts_with("pt") || clean.starts_with("por") || clean == "portuguese" || clean == crate::concepts::Concept::葡萄牙语.zh_name() {
         Some(crate::concepts::Concept::葡萄牙语)
-    } else if clean.starts_with("it") || clean.starts_with("ita") || clean == "italian" || clean == "意大利语" {
+    } else if clean.starts_with("it") || clean.starts_with("ita") || clean == "italian" || clean == crate::concepts::Concept::意大利语.zh_name() {
         Some(crate::concepts::Concept::意大利语)
-    } else if clean.starts_with("nl") || clean.starts_with("dut") || clean.starts_with("nld") || clean == "dutch" || clean == "荷兰语" {
+    } else if clean.starts_with("nl") || clean.starts_with("dut") || clean.starts_with("nld") || clean == "dutch" || clean == crate::concepts::Concept::荷兰语.zh_name() {
         Some(crate::concepts::Concept::荷兰语)
-    } else if clean.starts_with("th") || clean.starts_with("tha") || clean == "thai" || clean == "泰语" {
+    } else if clean.starts_with("th") || clean.starts_with("tha") || clean == "thai" || clean == crate::concepts::Concept::泰语.zh_name() {
         Some(crate::concepts::Concept::泰语)
-    } else if clean.starts_with("vi") || clean.starts_with("vie") || clean == "vietnamese" || clean == "越南语" {
+    } else if clean.starts_with("vi") || clean.starts_with("vie") || clean == "vietnamese" || clean == crate::concepts::Concept::越南语.zh_name() {
         Some(crate::concepts::Concept::越南语)
-    } else if clean.starts_with("hi") || clean.starts_with("hin") || clean == "hindi" || clean == "印地语" {
+    } else if clean.starts_with("hi") || clean.starts_with("hin") || clean == "hindi" || clean == crate::concepts::Concept::印地语.zh_name() {
         Some(crate::concepts::Concept::印地语)
     } else {
         None

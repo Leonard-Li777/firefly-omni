@@ -909,7 +909,24 @@ pub async fn start_server(
     let app = create_app_router(state);
 
     info!("firefly-omni Axum HTTP server v{} starting on {}", env!("CARGO_PKG_VERSION"), addr);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let mut retry_count = 0;
+    let listener = loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => break l,
+            Err(e) if retry_count < 10 => {
+                retry_count += 1;
+                tracing::warn!(
+                    "firefly-omni failed to bind to {} ({}), retrying in 1s (attempt {}/10)...",
+                    addr, e, retry_count
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(e) => {
+                tracing::error!("firefly-omni failed to bind to {} after {} attempts: {}", addr, retry_count, e);
+                return Err(e.into());
+            }
+        }
+    };
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             // 当由 Electron / Node.js 宿主拉起时，stdin 管道随宿主退出而关闭 (EOF)
@@ -918,7 +935,15 @@ pub async fn start_server(
             let mut stdin = tokio::io::stdin();
             let mut buf = [0u8; 1];
             tokio::select! {
-                _ = stdin.read(&mut buf) => {
+                _ = async {
+                    loop {
+                        match stdin.read(&mut buf).await {
+                            Ok(0) => break, // 真正读到 EOF (宿主进程已销毁)
+                            Ok(_) => continue, // 宿主写入了心跳或数据，继续等待
+                            Err(_) => break, // 管道断开
+                        }
+                    }
+                } => {
                     tracing::info!("firefly-omni stdin closed (host terminated), shutting down gracefully.");
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -2771,8 +2796,9 @@ async fn perceive_file_handler(
     // 注：源头门控需在 `omni-extract` 的 `FactTagContext` 补 file_group 后实施，此处先行兜底。
     if !is_image {
         fact_tags.retain(|t| {
-            let under_photography = t.via_parent_code.as_deref() == Some("builtin.photography_categories")
-                || t.parent_codes.iter().any(|c| c == "builtin.photography_categories");
+            let photo_code = Concept::摄影照片细分.code();
+            let under_photography = t.via_parent_code.as_deref() == Some(photo_code)
+                || t.parent_codes.iter().any(|c| c == photo_code);
             !under_photography
         });
     }

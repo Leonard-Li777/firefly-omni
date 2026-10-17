@@ -1458,7 +1458,7 @@ pub fn query_taxonomy_tree(
                                         name_chain
                                             .split('/')
                                             .map(|s| s.trim().to_string())
-                                            .filter(|s| !s.is_empty() && s != "内容标签" && s != omni_core::concepts::Concept::内容标签.code())
+                                            .filter(|s| !s.is_empty() && s != omni_core::concepts::Concept::内容标签.zh_name() && s != omni_core::concepts::Concept::内容标签.code())
                                             .collect()
                                     } else {
                                         Vec::new()
@@ -1467,7 +1467,7 @@ pub fn query_taxonomy_tree(
                                         code_chain
                                             .split('/')
                                             .map(|s| s.trim().to_string())
-                                            .filter(|s| !s.is_empty() && s != "内容标签" && s != omni_core::concepts::Concept::内容标签.code())
+                                            .filter(|s| !s.is_empty() && s != omni_core::concepts::Concept::内容标签.zh_name() && s != omni_core::concepts::Concept::内容标签.code())
                                             .collect()
                                     } else {
                                         Vec::new()
