@@ -189,6 +189,8 @@ pub fn create_app_router(state: AppState) -> Router {
             // ADR-0039 / Ticket 1: 高速未分析文件秒搜与密集向量段落对齐
             .route("/api/v1/search/fs", get(routes::fs_search::fs_search_handler))
             .route("/api/v1/vector/match-passages", post(routes::vector::match_passages_handler))
+            // 批量整理双底座文本特征向量批量抽取 (batch-organize-hybrid-vector-classification-spec.md)
+            .route("/api/v1/vector/batch-embed-text", post(routes::vector::batch_embed_text_handler))
             // 文本分词 API (中英文结巴搜索切词与多字段高亮)
             .route("/api/v1/text/tokenize", post(text_tokenize_handler))
             .route("/api/text/tokenize", post(text_tokenize_handler))

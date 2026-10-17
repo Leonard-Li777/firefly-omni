@@ -525,3 +525,158 @@ pub async fn match_passages_handler(
         )),
     }
 }
+
+/// 批量文本向量编码请求体: POST /api/v1/vector/batch-embed-text
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchEmbedTextRequest {
+    pub texts: Vec<String>,
+    #[serde(default)]
+    pub profile: Option<String>, // "classic_light" (bekko) | "gemma_unified"
+    #[serde(default)]
+    pub dim: Option<usize>,      // 缺省时：bekko 为 384，gemma 为当前 mrl_dimension (256/512/1024)
+}
+
+/// 批量文本向量编码响应体: POST /api/v1/vector/batch-embed-text
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchEmbedTextResponse {
+    pub vectors: Vec<Vec<f32>>,
+    pub count: usize,
+    pub dim: usize,
+    pub profile: String,
+    pub duration_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 批量文本向量化处理器: POST /api/v1/vector/batch-embed-text
+///
+/// 依据 batch-organize-hybrid-vector-classification-spec.md 规格契约：
+/// 1. 支持根据当前系统 Profile 与用户自选维度动态自适应分派；
+/// 2. 当 profile == "classic_light" 或未传且 dim == Some(384) 时：路由至 BekkoEmbedder (384d)；
+/// 3. 当 profile == "gemma_unified" 或 dim 为 256/512/1024 时：路由至 OmniVisionEngine::encode_gemma_text，执行 MRL 截断与强制 L2 归一化；
+/// 4. 杜绝阻塞事件循环，使用 tokio::task::spawn_blocking 并在批量 > 1000 时进行硬安全截断。
+pub async fn batch_embed_text_handler(
+    Json(req): Json<BatchEmbedTextRequest>,
+) -> Result<Json<BatchEmbedTextResponse>, (StatusCode, Json<BatchEmbedTextResponse>)> {
+    let start = Instant::now();
+
+    // 硬上限截断 1000 条，防止超大请求拖垮内存与推理池
+    let mut texts = req.texts;
+    if texts.len() > 1000 {
+        texts.truncate(1000);
+    }
+
+    let profile = req.profile.clone().unwrap_or_default();
+    let is_gemma = profile == "gemma_unified"
+        || req.dim == Some(256)
+        || req.dim == Some(512)
+        || req.dim == Some(1024);
+
+    let active_profile = if is_gemma {
+        "gemma_unified".to_string()
+    } else {
+        "classic_light".to_string()
+    };
+
+    let target_dim = if is_gemma {
+        req.dim.unwrap_or(512)
+    } else {
+        384
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<Vec<f32>>, usize)> {
+        if texts.is_empty() {
+            return Ok((Vec::new(), target_dim));
+        }
+
+        if !is_gemma {
+            let embedder = omni_pro::text::BekkoEmbedder::new();
+            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+            let mut vectors = embedder.batch_embed(&text_refs)?;
+            // 确保每个向量维度为 384 并执行 L2 归一化兜底
+            for v in &mut vectors {
+                if v.len() != 384 {
+                    v.resize(384, 0.0);
+                }
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 1e-6 {
+                    for x in v.iter_mut() {
+                        *x /= norm;
+                    }
+                }
+            }
+            Ok((vectors, 384))
+        } else {
+            let mut vectors = Vec::with_capacity(texts.len());
+            for text in texts {
+                let mut v = match omni_pro::OmniVisionEngine::encode_gemma_text(&text) {
+                    Ok(vec) => vec,
+                    Err(e) => {
+                        tracing::warn!("Gemma text embedding failed for text snippet: {e}");
+                        Vec::new()
+                    }
+                };
+
+                // MRL 截断与对齐
+                if v.len() >= target_dim {
+                    v.truncate(target_dim);
+                } else {
+                    v.resize(target_dim, 0.0);
+                }
+
+                // 强制 L2 归一化
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 1e-6 {
+                    for x in v.iter_mut() {
+                        *x /= norm;
+                    }
+                }
+
+                vectors.push(v);
+            }
+            Ok((vectors, target_dim))
+        }
+    })
+    .await;
+
+    let duration_ms = start.elapsed().as_millis();
+
+    match result {
+        Ok(Ok((vectors, actual_dim))) => {
+            let count = vectors.len();
+            Ok(Json(BatchEmbedTextResponse {
+                vectors,
+                count,
+                dim: actual_dim,
+                profile: active_profile,
+                duration_ms,
+                error: None,
+            }))
+        }
+        Ok(Err(err)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(BatchEmbedTextResponse {
+                vectors: Vec::new(),
+                count: 0,
+                dim: target_dim,
+                profile: active_profile,
+                duration_ms,
+                error: Some(err.to_string()),
+            }),
+        )),
+        Err(join_err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(BatchEmbedTextResponse {
+                vectors: Vec::new(),
+                count: 0,
+                dim: target_dim,
+                profile: active_profile,
+                duration_ms,
+                error: Some(format!("Task execution panic: {join_err}")),
+            }),
+        )),
+    }
+}
+
