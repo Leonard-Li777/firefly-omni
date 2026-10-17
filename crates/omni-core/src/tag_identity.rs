@@ -84,7 +84,7 @@ pub fn is_controlled_code(code: &str) -> bool {
 }
 
 /// 未知标签兜底代码
-pub const UNKNOWN_TAG_CODE: &str = "builtin.unknown";
+pub const UNKNOWN_TAG_CODE: &str = "builtin.unknown"; // locale-invariant-ok: 未知兜底代码
 
 /// AOT 自动生成的受控标签别名常量切片（单一事实源自 file-dimension-source.ts + curated-model-aliases.json）
 pub use crate::builtin_aliases_generated::BUILTIN_ALIASES;
@@ -919,38 +919,46 @@ pub fn tag_matches_concept(tag: &str, canonical_zh_or_en: &str) -> bool {
 /// 历史词表中**不在别名表**的近义/口语词，一律以其**受控近似概念**的 code 替换
 /// （见每条行尾「← 原词」注，及 [`LOOSE_GATE_ALIASES`]），从而彻底消除自然语言词面匹配。
 pub const GATE_CODES: &[&str] = &[
-    // ── 敏感内容 / 安全（维度「敏感内容」id 130）──────────────────────────────
-    "builtin.safe",             // 安全（← 合规）
-    "builtin.all_ages",         // 全年龄
-    "builtin.violation",        // 违规
-    // 维度级 code（非叶子别名）：仅经「已是受控 code」分支可达，词面分支永不命中。
-    "builtin.sensitive_content", // 敏感内容维度
-    // ── 内容尺度 / 评级（维度「内容尺度」id 123）──────────────────────────────
-    "builtin.content_scale",    // 内容尺度维度（同上，维度级 code）
-    "builtin.r_15",             // R-15
-    "builtin.r_18",             // R-18
-    "builtin.explicit",         // 露骨
+    // ── 敏感内容 / 安全等级（真实枚举变体）──────────────────────────────
+    crate::concepts::Concept::安全等级.code(),
+    crate::concepts::Concept::全年龄.code(),
+    crate::concepts::Concept::违规.code(),
+    crate::concepts::Concept::敏感内容.code(),
+    "builtin.safe", // locale-invariant-ok: 别名表 Safe 兼容
+    // ── 内容尺度 / 评级（维度「内容尺度」与「内容分级」）─────────────────────
+    crate::concepts::Concept::色情分级.code(),
+    crate::concepts::Concept::内容分级.code(),
+    crate::concepts::Concept::R_15.code(),
+    crate::concepts::Concept::R_18.code(),
+    crate::concepts::Concept::露骨性行为.code(),
+    "builtin.explicit", // locale-invariant-ok: 别名表 Explicit 兼容
+    "builtin.content_scale", // locale-invariant-ok: 内容尺度维度兼容
     // ── 打码程度（维度「打码程度」id 124）────────────────────────────────────
-    "builtin.uncensored",       // 无码（← 无修）
-    "builtin.censored",         // 有码
+    crate::concepts::Concept::无码.code(),
+    crate::concepts::Concept::薄码.code(),
+    crate::concepts::Concept::有码.code(),
     // ── 文件质量（维度「文件质量」id 27）─────────────────────────────────────
-    "builtin.high_quality",     // 高质量（← 画质高）
-    "builtin.medium_quality",   // 中等质量（← 画质中）
-    "builtin.low_quality",      // 低质量（← 画质低）
+    crate::concepts::Concept::高质量.code(),
+    crate::concepts::Concept::中等质量.code(),
+    crate::concepts::Concept::低质量.code(),
     // ── 水印程度（维度「水印程度」id 125）────────────────────────────────────
-    "builtin.no_watermark",     // 无水印（← 去水印）
-    "builtin.watermarked",             // 有水印（← 带水印）
+    crate::concepts::Concept::无水印.code(),
+    crate::concepts::Concept::有水印.code(),
     // ── 照片质量 / 曝光（维度「照片质量」id 127）──────────────────────────────
-    "builtin.normal_exposure",     // 曝光正常
-    "builtin.good_exposure",    // 曝光良好
-    "builtin.underexposed_in_low_light",      // 暗光欠曝（← 曝光不足）
-    "builtin.blown_highlights_in_backlight",        // 逆光死白（← 曝光过度）
+    crate::concepts::Concept::曝光正常.code(),
+    crate::concepts::Concept::暗光欠曝.code(),
+    crate::concepts::Concept::逆光死白.code(),
+    crate::concepts::Concept::优质精选.code(),
+    crate::concepts::Concept::高ISO噪点.code(),
+    crate::concepts::Concept::模糊废片.code(),
+    crate::concepts::Concept::虚焦.code(),
+    "builtin.good_exposure", // locale-invariant-ok: 别名表 Good Exposure 兼容
     // ── 文字密度 / 版面（维度「文字密度」id 146 /「版面」id 141）───────────────
-    "builtin.text_only",          // 纯文字
-    "builtin.plain_text",         // 纯文本 / 旧版纯文字兼容
-    "builtin.microtext",          // 微量文本
-    "builtin.text_in_image",    // 有字图（D12 泄漏修复：en 侧 `Image With Text` 曾漏判）
-    "builtin.image_without_text", // 无字图
+    crate::concepts::Concept::纯文字.code(),
+    crate::concepts::Concept::纯文本.code(),
+    crate::concepts::Concept::微量文本.code(),
+    crate::concepts::Concept::有字图.code(),
+    crate::concepts::Concept::无字图.code(),
 ];
 
 /// 门控维度的**口语 / 近义词 → 受控规范词**桥接表（**目标词必须已在 [`BUILTIN_ALIASES`] 内**）。
