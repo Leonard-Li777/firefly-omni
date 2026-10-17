@@ -934,22 +934,14 @@ pub fn get_canonical_concept_name(code: &str) -> Option<&'static str> {
     tag_identity::concept_from_code(code).map(|item: concepts::Concept| item.zh_name())
 }
 
-/// 核心受控根维度强类型枚举集合（全系统 7 大 Level 1 根维度，SSOT 事实源: file-dimension-source.ts）
-pub const ROOT_DIMENSION_CONCEPTS: &[concepts::Concept] = &[
-    concepts::Concept::文件类型,
-    concepts::Concept::文件用途,
-    concepts::Concept::文件来源,
-    concepts::Concept::作者,
-    concepts::Concept::文件质量,
-    concepts::Concept::内容分级,
-    concepts::Concept::内容标签,
-];
+/// 核心受控根维度强类型枚举集合（全系统顶级受控根维度，SSOT 事实源: file-dimension-source.ts / concepts.rs 自动派生）
+pub use concepts::TOP_ROOT_CONCEPTS as ROOT_DIMENSION_CONCEPTS;
 
 /// 判定指定 code 是否为受控根维度 (严格基于受控概念枚举)
 #[inline]
 pub fn is_root_dimension(code: &str) -> bool {
     code == "builtin.fileType" // locale-invariant-ok: 历史驼峰兼容
-        || ROOT_DIMENSION_CONCEPTS.iter().any(|item: &concepts::Concept| item.code() == code)
+        || concepts::Concept::from_code(code).map(|concept_item| concept_item.is_top_root()).unwrap_or(false)
 }
 
 pub use tag_identity::{concept_from_language_code, detect_fact_language};
