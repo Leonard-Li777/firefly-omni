@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// 受控标签跨语言身份（别名 → code）
 pub mod tag_identity;
+pub use tag_identity::is_controlled_code;
 
 /// AOT 受控概念强类型枚举（PRD-0050）
 pub mod concepts;
