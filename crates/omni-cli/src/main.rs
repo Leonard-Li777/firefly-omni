@@ -38,6 +38,9 @@ enum Commands {
         /// MRL 弹性降维维度（256、512 或 768，缺省 512）
         #[arg(long)]
         mrl_dimension: Option<usize>,
+        /// 向量存储目录 vectors/ 路径（缺省时自动对齐 --db-path 父目录下的 vectors/）
+        #[arg(long)]
+        vectors_path: Option<String>,
     },
     /// 提取指定文件的信息与 Markdown 文本
     Extract {
@@ -62,11 +65,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Serve { addr, db_path, pack_path, embedding_profile, mrl_dimension }) => {
+        Some(Commands::Serve { addr, db_path, pack_path, embedding_profile, mrl_dimension, vectors_path }) => {
             let socket_addr: SocketAddr = addr.parse()?;
             let db_path = db_path.as_deref().map(std::path::PathBuf::from);
             let pack_path = pack_path.as_deref().map(std::path::PathBuf::from);
-            let res = omni_server::start_server(socket_addr, db_path, pack_path, embedding_profile.clone(), *mrl_dimension).await;
+            let vectors_path = vectors_path.as_deref().map(std::path::PathBuf::from);
+            let res = omni_server::start_server(socket_addr, db_path, pack_path, embedding_profile.clone(), *mrl_dimension, vectors_path).await;
             omni_extract::shutdown_exiftool_daemon();
             res?;
         }
