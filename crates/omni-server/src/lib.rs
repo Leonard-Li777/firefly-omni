@@ -768,6 +768,7 @@ pub async fn start_server(
     pack_path: Option<PathBuf>,
     embedding_profile: Option<String>,
     mrl_dimension: Option<usize>,
+    vectors_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let mut initial_config = load_config_from_disk();
     if let Some(profile) = embedding_profile {
@@ -792,17 +793,24 @@ pub async fn start_server(
     };
     // HowNet 独立数据库已废弃，能力已完全合流至 semantic.pack；保持软不可用存根服务
     let hownet = Arc::new(omni_pro::hownet::OmniHowNetService::unavailable());
-    // 索引目录发现链：优先持久化用户数据目录（APPDATA → LOCALAPPDATA → USERPROFILE），
+    // 索引目录发现链：优先绑定 db_path 同级 search_index 目录（确保多 Worktree 数据物理隔离），
+    // 缺失 db_path 时才尝试全局用户目录（APPDATA → LOCALAPPDATA → USERPROFILE），
     // 全部缺失时才降级到系统临时目录（临时目录存在被系统清理导致索引重建的风险，仅作兜底）
-    let search_dir = if let Ok(appdata) = std::env::var("APPDATA") {
-        PathBuf::from(appdata).join("firefly-ai-folder").join("search_index")
-    } else if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
-        PathBuf::from(local_appdata).join("firefly-ai-folder").join("search_index")
-    } else if let Ok(home) = std::env::var("USERPROFILE") {
-        PathBuf::from(home).join(".firefly-ai-folder").join("search_index")
-    } else {
-        std::env::temp_dir().join("firefly_omni_search_index")
-    };
+    let search_dir = db_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("search_index"))
+        .unwrap_or_else(|| {
+            if let Ok(appdata) = std::env::var("APPDATA") {
+                PathBuf::from(appdata).join("firefly-ai-folder").join("search_index")
+            } else if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+                PathBuf::from(local_appdata).join("firefly-ai-folder").join("search_index")
+            } else if let Ok(home) = std::env::var("USERPROFILE") {
+                PathBuf::from(home).join(".firefly-ai-folder").join("search_index")
+            } else {
+                std::env::temp_dir().join("firefly_omni_search_index")
+            }
+        });
     let search = Arc::new(omni_pro::search::OmniSearchService::new(search_dir));
     // OMW 词库只读语义包零磁盘内存挂载 (ADR-0038 / PRD #679: 闭源优先 🔒)
     // 规范解耦：--pack-path 专用于只读语义包；--db-path 专用于桌面业务主库（**永不**充当 OmwDb 数据源）
@@ -871,10 +879,23 @@ pub async fn start_server(
     }
 
     // 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 384d bekko-a8m 与 512d EmbeddingGemma)
-    let vector = Arc::new(VectorEngine::open_default().unwrap_or_else(|err| {
-        tracing::warn!("Failed to open default vector engine ({err}), falling back to memory");
-        VectorEngine::in_memory()
-    }));
+    // 优先绑定 vectors_path，其次绑定 db_path 父级 vectors/ 目录（多 Worktree 物理隔离），最后 fallback
+    let target_vectors_dir = vectors_path
+        .or_else(|| db_path.as_ref().and_then(|p| p.parent()).map(|p| p.join("vectors")));
+
+    let vector = Arc::new(match target_vectors_dir {
+        Some(dir) => {
+            tracing::info!("[OmniServer] 向量引擎成功对齐目标路径: {}", dir.display());
+            VectorEngine::open(dir).unwrap_or_else(|err| {
+                tracing::warn!("Failed to open vector engine at target path ({err}), falling back to memory");
+                VectorEngine::in_memory()
+            })
+        }
+        None => VectorEngine::open_default().unwrap_or_else(|err| {
+            tracing::warn!("Failed to open default vector engine ({err}), falling back to memory");
+            VectorEngine::in_memory()
+        }),
+    });
 
     let initial_policies = routes::taxonomy::load_dimension_policies_from_db(db_path.as_deref());
     let sherpa = Arc::new(SherpaManager::new());
@@ -3252,6 +3273,31 @@ async fn search_cluster_handler(
             } else if let Some(vec) = vector.get_vector(&doc.fingerprint, target_dim) {
                 doc.embedding = vec;
                 docs.push(doc);
+            } else {
+                // JIT 即时向量补全自愈 (ADR-0056):
+                // 若文档未携带有效向量且本地槽位未命中（冷启动/未预先分析/缓存丢失），
+                // 自动利用文件主题关键词（或指纹/名称兜底）即时计算稠密向量并写回槽位，杜绝聚类中断
+                let text_to_embed = if !doc.keywords.is_empty() {
+                    doc.keywords.join(" ")
+                } else {
+                    doc.fingerprint.clone()
+                };
+
+                let computed_opt = if target_dim == 512 {
+                    omni_pro::OmniVisionEngine::encode_gemma_text(&text_to_embed)
+                        .ok()
+                        .or_else(|| omni_pro::text::BekkoEmbedder::new().embed(&text_to_embed).ok())
+                } else {
+                    omni_pro::text::BekkoEmbedder::new().embed(&text_to_embed).ok()
+                };
+
+                if let Some(vec) = computed_opt {
+                    if vec.len() == target_dim {
+                        let _ = vector.upsert(&doc.fingerprint, &vec);
+                        doc.embedding = vec;
+                        docs.push(doc);
+                    }
+                }
             }
         }
 
