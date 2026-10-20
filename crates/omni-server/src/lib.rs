@@ -3230,7 +3230,7 @@ pub struct SearchClusterRequest {
 }
 
 fn default_distance_threshold() -> f32 {
-    0.4
+    0.80
 }
 
 fn default_max_leaf_size() -> usize {
