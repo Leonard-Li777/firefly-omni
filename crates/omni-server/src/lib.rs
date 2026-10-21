@@ -24,9 +24,10 @@ use omni_core::{
 };
 use omni_extract::OmniExtractor;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::info;
 
 pub use omni_pro::{
@@ -2865,7 +2866,7 @@ async fn perceive_file_handler(
         fact_tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
     );
 
-    let result = Json(OmniPerceptionResult {
+    let mut result = Json(OmniPerceptionResult {
         file_path: file_path.clone(),
         mime_type,
         file_size,
@@ -2931,7 +2932,69 @@ async fn perceive_file_handler(
         author,
         binary_info: binary_analysis_info,
         video_chunks,
+        vector_saved: None,
     });
+
+    // 统一就地单次原子批量落盘 (Zero-Boomerang IPC)
+    if let Some(ref fp) = req.file_fingerprint {
+        let mut batch_items = Vec::with_capacity(result.video_chunks.len() + 1);
+
+        // 1. 主向量一并打包 (优先取稠密嵌入)
+        if let Some(ref main_vec) = result.embedding_dense {
+            batch_items.push(omni_pro::vector_engine::VectorUpsertItem {
+                file_fingerprint: fp.clone(),
+                vector: main_vec.clone(),
+            });
+        }
+
+        // 2. 切片向量打包
+        for c in result.video_chunks.iter() {
+            batch_items.push(omni_pro::vector_engine::VectorUpsertItem {
+                file_fingerprint: format!("{}:c{}", fp, c.chunk_index),
+                vector: c.vector.clone(),
+            });
+        }
+
+        // 3. 内部就地单次原子批量持久化
+        if !batch_items.is_empty() {
+            let t_zvec_start = std::time::Instant::now();
+            let saved = match state.vector.batch_upsert(&batch_items) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!("向量内部批量写入失败: {:?}", e);
+                    false
+                }
+            };
+            let t_zvec = t_zvec_start.elapsed();
+            result.vector_saved = Some(saved);
+
+            // 4. 关键：无论写盘成功与否均彻底剥离浮点数组，将网络响应体积压缩至 < 2KB (避免失败时依然向 IPC 传输大 payload)
+            for c in result.video_chunks.iter_mut() {
+                c.vector.clear();
+            }
+
+            // 5. 5 段全链路耗时监控埋点
+            let total_chunks = result.video_chunks.len();
+            if total_chunks > 0 {
+                let bench = result.benchmark.as_ref();
+                let ffmpeg_ms = bench.and_then(|b| b.subtasks.get("ffmpeg_ms").copied()).unwrap_or(0);
+                let decode_ms = bench.and_then(|b| b.subtasks.get("decode_resize_ms").copied()).unwrap_or(0);
+                let vision_ms = bench.and_then(|b| b.vision_ms).unwrap_or(0);
+                let text_ms = bench.and_then(|b| b.extract_ms).unwrap_or(0);
+                tracing::info!(
+                    "[PERF_PROFILE] 视频分析完成 | 文件: {} | 切片数: {} | 总耗时: {}ms [抽帧落盘: {}ms | 读图解码缩放: {}ms | 视觉塔前向: {}ms | 文本塔前向: {}ms | 向量批量写盘: {}ms]",
+                    req.file_path,
+                    total_chunks,
+                    t_start.elapsed().as_millis(),
+                    ffmpeg_ms,
+                    decode_ms,
+                    vision_ms,
+                    text_ms,
+                    t_zvec.as_millis()
+                );
+            }
+        }
+    }
 
     // 跨支柱自动索引 (Pillar 4 -> Pillar 5): 若感知产出了稠密特征向量且有文本，自动异步入库双轨混合索引
     if let (Some(ref emb), false) = (&text_emb, effective_text.trim().is_empty()) {
@@ -3223,6 +3286,12 @@ pub struct SearchClusterRequest {
     pub documents: Vec<omni_pro::search::ClusterDocument>,
     pub prompt: Option<String>,
     pub prompt_embedding: Option<Vec<f32>>,
+    /// 当前嵌入档位：classic_light (bekko 384d) | gemma_unified (MRL 256/512/768d)
+    #[serde(default)]
+    pub embedding_profile: Option<String>,
+    /// 当前目标向量维度；缺省时按 embedding_profile 与服务器配置自适应
+    #[serde(default)]
+    pub embedding_dim: Option<usize>,
     #[serde(default = "default_distance_threshold")]
     pub distance_threshold: f32,
     #[serde(default = "default_max_leaf_size")]
@@ -3230,11 +3299,104 @@ pub struct SearchClusterRequest {
 }
 
 fn default_distance_threshold() -> f32 {
-    0.80
+    // 与 V4 规格 §4.3 的 IPC 契约默认值保持一致
+    0.40
 }
 
 fn default_max_leaf_size() -> usize {
     50
+}
+
+/// JIT 向量缓存上限：超出后整体清空，避免长驻进程无界增长
+const JIT_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// 进程内 JIT 向量缓存 (profile + 维度 + 富文本 → 最终向量)。
+///
+/// 聚类每次换提示词都会重新请求，若每轮都重跑 EmbeddingGemma（46 条约 3s），
+/// 端侧交互会明显变慢；缓存仅在进程生命周期内有效，不落盘。
+static JIT_EMBEDDING_CACHE: OnceLock<Mutex<HashMap<String, Vec<f32>>>> = OnceLock::new();
+
+/// 按当前嵌入档位 JIT 编码文本并裁剪到目标维度，命中缓存时直接复用。
+fn jit_embedding(
+    text: &str,
+    is_gemma: bool,
+    target_dim: usize,
+    bekko: Option<&omni_pro::text::BekkoEmbedder>,
+) -> Option<Vec<f32>> {
+    let profile = if is_gemma { "gemma_unified" } else { "classic_light" };
+    let cache_key = format!("{profile}|{target_dim}|{text}");
+    let cache = JIT_EMBEDDING_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(vector) = guard.get(&cache_key) {
+            return Some(vector.clone());
+        }
+    }
+
+    let encoded = if is_gemma {
+        omni_pro::OmniVisionEngine::encode_gemma_text(text)
+    } else {
+        bekko?.embed(text)
+    };
+    let vector = encoded.ok().and_then(|v| fit_embedding_to_dim(v, target_dim))?;
+
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= JIT_CACHE_MAX_ENTRIES {
+            guard.clear();
+        }
+        guard.insert(cache_key, vector.clone());
+    }
+    Some(vector)
+}
+
+/// 将编码结果裁剪/校验为目标维度。
+///
+/// EmbeddingGemma 使用 MRL 训练，截断前缀并重新 L2 归一化仍是合法语义向量，
+/// 因此当编码维度大于目标维度时允许前缀截断；小于目标维度则无法补齐。
+fn fit_embedding_to_dim(mut vector: Vec<f32>, target_dim: usize) -> Option<Vec<f32>> {
+    if vector.len() == target_dim {
+        return Some(vector);
+    }
+    if vector.len() < target_dim || target_dim == 0 {
+        return None;
+    }
+    vector.truncate(target_dim);
+    let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm <= 1e-6 {
+        return None;
+    }
+    for x in vector.iter_mut() {
+        *x /= norm;
+    }
+    Some(vector)
+}
+
+fn normalize_embedding_dim(profile: &str, requested: Option<usize>, configured_mrl: usize) -> usize {
+    let is_gemma = profile.contains("gemma");
+    if !is_gemma {
+        if let Some(dim) = requested {
+            if dim != 384 {
+                tracing::warn!(
+                    "[HAC] 请求维度 {} 与 classic_light 档位不匹配，已回退至 384d",
+                    dim
+                );
+            }
+        }
+        return 384;
+    }
+    if let Some(dim) = requested.filter(|d| matches!(d, 256 | 512 | 768)) {
+        return dim;
+    }
+    if requested.is_some() {
+        tracing::warn!(
+            "[HAC] 请求维度 {:?} 不是 EmbeddingGemma MRL 支持的 256/512/768，回退至配置维度 {}",
+            requested,
+            configured_mrl
+        );
+    }
+    match configured_mrl {
+        256 | 768 => configured_mrl,
+        _ => 512,
+    }
 }
 
 #[derive(Serialize)]
@@ -3252,51 +3414,126 @@ async fn search_cluster_handler(
 ) -> Json<SearchClusterResponse> {
     let search = state.search.clone();
     let vector = state.vector.clone();
+    // 服务器配置作为请求缺省值：AI_EMBEDDING_PROFILE / EMBEDDING_MRL_DIMENSION 变更时 Omni 会重启并同步配置
+    let (configured_profile, configured_mrl) = {
+        let cfg = state.config.lock().unwrap();
+        (cfg.embedding_profile.clone(), cfg.mrl_dimension)
+    };
     let res = tokio::task::spawn_blocking(move || {
         // 进程内向量补齐 (ADR-0054 / ADR-0056)：
-        // 1. 若 doc.embedding 匹配目标维度 (384 或 512)，直接使用；
-        // 2. 若 doc.embedding 为空或不匹配，从端侧 zvec 槽位读取反量化向量回填；
-        // 3. 过滤未能获得有效向量的文档，若有效文档数 < 2 则拦截报错。
+        // 1. 先按当前嵌入档位解析目标维度 (classic_light=384d / gemma_unified=256|512|768d)；
+        // 2. 若 doc.embedding 匹配目标维度，直接使用；
+        // 3. 否则从端侧 zvec 对应维度槽位读取反量化向量回填；
+        // 4. 仍未命中时按当前档位 JIT 即时编码并写回槽位；
+        // 5. 过滤未能获得有效向量的文档，若有效文档数 < 2 则拦截报错。
         let requested_count = req.documents.len();
-        let target_dim = req
-            .documents
-            .iter()
-            .map(|d| d.embedding.len())
-            .find(|&len| len == 384 || len == 512)
-            .unwrap_or(omni_pro::search::EMBEDDING_DIM);
+        let active_profile = req
+            .embedding_profile
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or(configured_profile);
+        let target_dim = normalize_embedding_dim(&active_profile, req.embedding_dim, configured_mrl);
+        let is_gemma = active_profile.contains("gemma");
+
+        tracing::info!(
+            "[HAC] 聚类向量档位: profile={}, dim={}, documents={}",
+            active_profile,
+            target_dim,
+            requested_count
+        );
 
         let mut docs: Vec<omni_pro::search::ClusterDocument> =
             Vec::with_capacity(requested_count);
+        // bekko 模型按需加载：全部命中原有向量时不触发模型初始化
+        let mut bekko_embedder: Option<omni_pro::text::BekkoEmbedder> = None;
+        let prefer_count = req
+            .documents
+            .iter()
+            .filter(|d| {
+                d.prefer_embedding_text
+                    && d.embedding_text
+                        .as_deref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+            })
+            .count();
+        if prefer_count > 0 {
+            tracing::info!(
+                "[HAC] {} 份文档无可见语义文本，本次聚类改用文件名/主题词富文本编码（已有槽位不覆盖）",
+                prefer_count
+            );
+        }
         for mut doc in req.documents {
-            if doc.embedding.len() == target_dim {
-                docs.push(doc);
-            } else if let Some(vec) = vector.get_vector(&doc.fingerprint, target_dim) {
-                doc.embedding = vec;
-                docs.push(doc);
+            let embedding_text = doc
+                .embedding_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            // 正文/OCR/ASR 均无可见语义文本时，聚类改用富文本证据
+            let prefer_text = doc.prefer_embedding_text && embedding_text.is_some();
+            let mut should_upsert = true;
+
+            if !prefer_text {
+                if doc.embedding.len() == target_dim {
+                    docs.push(doc);
+                    continue;
+                }
+                if let Some(vec) = vector.get_vector(&doc.fingerprint, target_dim) {
+                    doc.embedding = vec;
+                    docs.push(doc);
+                    continue;
+                }
             } else {
-                // JIT 即时向量补全自愈 (ADR-0056):
-                // 若文档未携带有效向量且本地槽位未命中（冷启动/未预先分析/缓存丢失），
-                // 自动利用文件主题关键词（或指纹/名称兜底）即时计算稠密向量并写回槽位，杜绝聚类中断
-                let text_to_embed = if !doc.keywords.is_empty() {
-                    doc.keywords.join(" ")
-                } else {
-                    doc.fingerprint.clone()
-                };
+                // 已有槽位可能是 OCR/视觉向量或历史垃圾向量：本次聚类只借用富文本向量，
+                // 不覆盖已有语义向量；仅在槽位缺失时回填，避免破坏混合检索
+                should_upsert = vector.get_vector(&doc.fingerprint, target_dim).is_none();
+            }
 
-                let computed_opt = if target_dim == 512 {
-                    omni_pro::OmniVisionEngine::encode_gemma_text(&text_to_embed)
-                        .ok()
-                        .or_else(|| omni_pro::text::BekkoEmbedder::new().embed(&text_to_embed).ok())
-                } else {
-                    omni_pro::text::BekkoEmbedder::new().embed(&text_to_embed).ok()
-                };
+            // JIT 即时向量补全自愈 (ADR-0056):
+            // 若文档未携带有效向量且本地槽位未命中（冷启动/未预先分析/缓存丢失），
+            // 优先用富文本（文件名/智能命名 + 主题词），其次主题词，最后指纹兜底
+            let fallback_text;
+            let text_to_embed = if let Some(text) = embedding_text {
+                text
+            } else if !doc.keywords.is_empty() {
+                fallback_text = doc.keywords.join(" ");
+                fallback_text.as_str()
+            } else {
+                doc.fingerprint.as_str()
+            };
 
-                if let Some(vec) = computed_opt {
-                    if vec.len() == target_dim {
-                        let _ = vector.upsert(&doc.fingerprint, &vec);
-                        doc.embedding = vec;
-                        docs.push(doc);
+            let bekko_ref = if is_gemma {
+                None
+            } else {
+                if bekko_embedder.is_none() {
+                    bekko_embedder = Some(omni_pro::text::BekkoEmbedder::new());
+                }
+                bekko_embedder.as_ref()
+            };
+
+            match jit_embedding(text_to_embed, is_gemma, target_dim, bekko_ref) {
+                Some(vec) => {
+                    if should_upsert {
+                        if let Err(err) = vector.upsert(&doc.fingerprint, &vec) {
+                            // 回写失败不影响本次聚类，但必须显式上报，便于发现槽位损坏/磁盘问题
+                            tracing::warn!(
+                                "[HAC] 文件 {} 的 {}d JIT 向量回写失败: {}",
+                                doc.fingerprint,
+                                target_dim,
+                                err
+                            );
+                        }
                     }
+                    doc.embedding = vec;
+                    docs.push(doc);
+                }
+                None => {
+                    // 禁止静默降级：JIT 失败必须显式暴露，不得让文件无声消失
+                    tracing::warn!(
+                        "[HAC] 文件 {} 缺少 {}d 向量且 JIT 补全失败，已从本次聚类中剔除",
+                        doc.fingerprint,
+                        target_dim
+                    );
                 }
             }
         }
@@ -3310,11 +3547,39 @@ async fn search_cluster_handler(
             );
         }
 
-        // 跨支柱补缝：若未显式提供 prompt_embedding，但提供了自然语言 prompt，自动通过 BekkoEmbedder 计算聚类引导向量
+        // 跨支柱补缝：若未显式提供 prompt_embedding，但提供了自然语言 prompt，
+        // 自动通过当前档位的嵌入引擎计算聚类引导向量，确保 v_p 与文件向量同维度
         let prompt_emb = match (req.prompt_embedding, req.prompt.as_deref()) {
-            (Some(emb), _) => Some(emb),
+            (Some(emb), _) => match fit_embedding_to_dim(emb, target_dim) {
+                Some(vec) => Some(vec),
+                None => {
+                    tracing::warn!(
+                        "[HAC] 请求携带的 prompt_embedding 无法对齐到 {}d，已忽略提示词引导",
+                        target_dim
+                    );
+                    None
+                }
+            },
             (None, Some(p)) if !p.trim().is_empty() => {
-                omni_pro::text::BekkoEmbedder::new().embed(p).ok()
+                let encoded = if is_gemma {
+                    omni_pro::OmniVisionEngine::encode_gemma_text(p)
+                } else {
+                    omni_pro::text::BekkoEmbedder::new().embed(p)
+                };
+                match encoded
+                    .ok()
+                    .and_then(|vec| fit_embedding_to_dim(vec, target_dim))
+                {
+                    Some(vec) => Some(vec),
+                    None => {
+                        // 禁止静默降级：提示词向量失败会让命名退化为纯词频，必须上报
+                        tracing::warn!(
+                            "[HAC] 提示词向量编码失败或维度无法对齐到 {}d，本次聚类将仅按词频命名",
+                            target_dim
+                        );
+                        None
+                    }
+                }
             }
             _ => None,
         };

@@ -162,6 +162,9 @@ pub struct OmniExtractionResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OmniPerceptionRequest {
     pub file_path: String,
+    /// 文件唯一指纹 (若传入且感知生成了向量，直接由 Omni 内部就地批量落盘并阻断二次回传)
+    #[serde(default)]
+    pub file_fingerprint: Option<String>,
     #[serde(default)]
     pub language: Option<String>,
     #[serde(default)]
@@ -514,6 +517,9 @@ pub struct OmniPerceptionResult {
     /// 视频时序切片集合（30 秒切片，包含 512 维向量、起止时间及可选切片 ASR）
     #[serde(default)]
     pub video_chunks: Vec<OmniVideoChunk>,
+    /// 向量是否由 Omni 内部就地持久化落盘
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_saved: Option<bool>,
 }
 
 /// 视频时序切片实体（30 秒窗口切片）
@@ -614,6 +620,15 @@ pub fn is_meaningful_asr_text(text: &str) -> bool {
     })
 }
 
+/// 判定文本是否含可参与语义处理的可见字符。
+///
+/// NUL、控制字符、Unicode 替换符与纯空白都不构成有效正文。`trim()` 不会移除 NUL，
+/// 占位内容（如仅含 `\0` 的正文）曾因此被当作有效文本送入文本分析与嵌入模型。
+pub fn has_visible_text(text: &str) -> bool {
+    text.chars()
+        .any(|ch| ch != '\u{FFFD}' && !ch.is_whitespace() && !ch.is_control())
+}
+
 /// 解析「可参与事实推导的文本正文」（Issue 0046 §1）。
 ///
 /// 优先级：复合文档正文（markdown_content）> 纯图片 OCR 文本 > 音视频 ASR 转录。
@@ -626,10 +641,10 @@ pub fn resolve_effective_text(
     ocr_text: Option<&str>,
     asr: Option<&str>,
 ) -> String {
-    if !markdown_content.trim().is_empty() {
+    if has_visible_text(markdown_content) {
         return markdown_content.to_string();
     }
-    if let Some(ocr) = ocr_text.filter(|s| !s.trim().is_empty()) {
+    if let Some(ocr) = ocr_text.filter(|s| has_visible_text(s)) {
         return ocr.to_string();
     }
     asr.filter(|s| is_meaningful_asr_text(s))
@@ -922,6 +937,29 @@ mod tests {
         assert_eq!(
             resolve_effective_text("", None, Some("会议录音")),
             "会议录音"
+        );
+    }
+
+    #[test]
+    fn test_resolve_effective_text_skips_control_only_body() {
+        // NUL 占位正文（.lnk 等无文本文件）不得被当作有效正文
+        assert_eq!(resolve_effective_text("\0", None, None), "");
+        assert_eq!(resolve_effective_text(" \0\u{1} ", None, None), "");
+
+        // 无效正文必须回落到 OCR / ASR
+        assert_eq!(
+            resolve_effective_text("\0", Some("发票代码 12345678"), None),
+            "发票代码 12345678"
+        );
+        assert_eq!(
+            resolve_effective_text("\0", None, Some("会议录音")),
+            "会议录音"
+        );
+
+        // 正常正文优先于 OCR 与 ASR
+        assert_eq!(
+            resolve_effective_text("# 合同\n条款正文", Some("封面文字"), Some("旁白")),
+            "# 合同\n条款正文"
         );
     }
 }

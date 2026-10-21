@@ -1115,6 +1115,12 @@ pub mod search {
         pub fingerprint: String,
         pub embedding: Vec<f32>,
         pub keywords: Vec<String>,
+        /// 送嵌入引擎的富文本 (与 pro 实现保持同一 IPC 契约)
+        #[serde(default)]
+        pub embedding_text: Option<String>,
+        /// 正文无可见语义文本时强制按富文本重编码 (与 pro 实现保持同一 IPC 契约)
+        #[serde(default)]
+        pub prefer_embedding_text: bool,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1243,6 +1249,7 @@ pub mod vector_engine {
     #[derive(Debug, Clone, Deserialize, Serialize)]
     #[serde(rename_all = "camelCase")]
     pub struct VectorUpsertItem {
+        #[serde(alias = "file_fingerprint")]
         pub file_fingerprint: String,
         pub vector: Vec<f32>,
     }
@@ -1292,6 +1299,12 @@ pub mod vector_engine {
         }
         pub fn upsert(&self, _fingerprint: &str, _vec: &[f32]) -> anyhow::Result<()> {
             anyhow::bail!("Open-core mode: vector engine requires omni-pro");
+        }
+        pub fn batch_upsert(&self, _items: &[VectorUpsertItem]) -> anyhow::Result<usize> {
+            anyhow::bail!("Open-core mode: vector engine requires omni-pro");
+        }
+        pub fn save_count_by_dim(&self, _dim: usize) -> usize {
+            0
         }
         pub fn search(
             &self,
