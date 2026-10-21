@@ -223,14 +223,16 @@ pub async fn vector_upsert_handler(
 
     let vector_engine = state.vector.clone();
 
-    // 在 spawn_blocking 中执行批量量化与落盘，避免阻塞异步运行时
+    // 在 spawn_blocking 中执行批量量化与单次原子落盘，消除磁盘写放大
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-        let mut processed = 0;
-        for item in items {
-            vector_engine.upsert(&item.file_fingerprint, &item.vector)?;
-            processed += 1;
-        }
-        Ok(processed)
+        let batch_items: Vec<omni_pro::vector_engine::VectorUpsertItem> = items
+            .into_iter()
+            .map(|it| omni_pro::vector_engine::VectorUpsertItem {
+                file_fingerprint: it.file_fingerprint,
+                vector: it.vector,
+            })
+            .collect();
+        vector_engine.batch_upsert(&batch_items)
     })
     .await;
 
