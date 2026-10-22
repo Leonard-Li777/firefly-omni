@@ -158,6 +158,7 @@ impl OmniOrtRuntime {
                 match ort::init_from(dll_path).commit() {
                     Ok(_) => {
                         tracing::info!("OmniOrtRuntime: 成功动态加载 ONNX Runtime ({})", dll_path);
+                        Self::log_execution_provider_capability();
                         Ok(())
                     }
                     Err(e) => {
@@ -175,11 +176,77 @@ impl OmniOrtRuntime {
         let _ = Self::init();
     }
 
-    /// 限制 CPU 线程池：统一配置 intra_threads = min(物理核心数, 4)，杜绝抢占 CPU 造成系统无响应
+    /// ORT CPU 会话 intra-op 线程配额下限：即使单核机器也至少给 2 线程，避免前向完全串行化
+    pub const MIN_INTRA_THREADS: usize = 2;
+
+    /// ORT CPU 会话 intra-op 线程配额上限：可用并行度 ≥ 8 的机器放开至 8 线程，吃满多核算力
+    /// （旧实现为 `available_parallelism().min(4)`，即逻辑处理器口径上限 4；逻辑核 ≥ 8 的机器
+    /// 至少有半数算力闲置）
+    ///
+    /// 注：该上限只约束**单个 Session**，不是进程级线程总预算。视觉塔与文本塔各持一个常驻
+    /// Session（`omni-pro/crates/omni-vision/src/gemma.rs` 的视觉/文本构建点），双通道并发
+    /// 分析时两池线程数相加会超过物理核数；这是 SPEC §4.5 明确采纳的取舍，进程级配额需另行立项。
+    pub const MAX_INTRA_THREADS: usize = 8;
+
+    /// 按可用并行度映射 intra_threads 配额：`clamp(2, 8)`
+    ///
+    /// 抽成纯函数以便单测直接断言「8 核 ⇒ 8 线程」的映射关系，不依赖跑测机器的真实核数。
+    /// 入参取 `std::thread::available_parallelism()`，其上限为**逻辑处理器数**（含 SMT），
+    /// 故 4 核 8 线程的机器通常分配到 8 线程；受 cgroup CPU 配额、亲和性掩码或 Windows
+    /// Job Object 限核时该值可能更小，届时按实际可用并行度如实分配。
+    pub fn intra_threads_for_cores(cores: usize) -> usize {
+        cores.clamp(Self::MIN_INTRA_THREADS, Self::MAX_INTRA_THREADS)
+    }
+
+    /// CPU 线程池：统一配置 intra_threads = clamp(可用并行度, 2, 8)
+    ///
+    /// 保留下限 2 防止单核机器被压成串行；上限 8 控制单 Session 的线程占用。
     pub fn recommended_intra_threads() -> usize {
+        Self::intra_threads_for_cores(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+        )
+    }
+
+    /// ASR (sherpa-onnx) 线程配额：沿用历史 `available_parallelism().min(4)` 上限
+    ///
+    /// 与 ORT 视觉/文本塔的 8 线程配额刻意分离：ASR 与视觉塔可能在同一视频任务内交替运行，
+    /// 两路各占 8 线程会造成线程超额争抢，故 ASR 侧维持原有 4 线程上限。
+    pub fn recommended_asr_threads() -> usize {
         std::thread::available_parallelism()
             .map(|n| n.get().min(4))
             .unwrap_or(4)
+    }
+
+    /// 启动时显式盘点当前 DLL 的 EP 能力落点，杜绝「Session 构建成功但实跑 CPU」的静默回退不可观测
+    pub fn log_execution_provider_capability() {
+        use ort::execution_providers::ExecutionProvider;
+
+        #[cfg(target_os = "windows")]
+        {
+            let cuda = ort::execution_providers::CUDAExecutionProvider::default()
+                .is_available()
+                .unwrap_or(false);
+            let dml = ort::execution_providers::DirectMLExecutionProvider::default()
+                .is_available()
+                .unwrap_or(false);
+            tracing::info!(
+                "OmniOrtRuntime: EP 能力盘点 CUDA={}, DirectML={}",
+                cuda,
+                dml
+            );
+            if !cuda && !dml {
+                tracing::warn!(
+                    "OmniOrtRuntime: 当前 onnxruntime DLL 为纯 CPU 构建（无 CUDA/DirectML EP），全部推理将运行在 CPU 上"
+                );
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            tracing::info!("OmniOrtRuntime: 非 Windows 平台，EP 能力盘点见 preferred_hardware_eps 探测日志");
+        }
     }
 
     /// 获取当前平台优先推荐的硬件加速 Execution Provider 候选列表（按优先级排序）
@@ -198,8 +265,10 @@ impl OmniOrtRuntime {
             }
 
             // 检查 DirectML 支持 (当前随包分发的 onnxruntime-directml 构建，覆盖全系 GPU/NPU)
+            // 门控收紧：is_available 必须明确为 true 才入列，杜绝纯 CPU DLL 被误判为具备 DML 能力
             let dml_ep = ort::execution_providers::DirectMLExecutionProvider::default();
-            if dml_ep.is_available().unwrap_or(true) {
+            if dml_ep.is_available().unwrap_or(false) {
+                tracing::info!("OmniOrtRuntime: 探测到当前 ONNX Runtime 包含 DirectML 硬件加速支持");
                 eps.push(dml_ep.build());
             }
         }
@@ -218,6 +287,13 @@ impl OmniOrtRuntime {
             if cuda_ep.is_available().unwrap_or(false) {
                 eps.push(cuda_ep.build());
             }
+        }
+
+        // 显式上报硬件加速缺席：严禁静默回退 CPU 后在日志中不可见
+        if eps.is_empty() {
+            tracing::warn!(
+                "OmniOrtRuntime: 未探测到任何硬件加速 EP 候选，本平台全部 Session 将回退为纯 CPU 推理"
+            );
         }
 
         eps
@@ -308,7 +384,7 @@ impl OmniOrtRuntime {
                     return Ok(session);
                 }
                 Err(err) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         "OmniOrtRuntime: 硬件加速候选 EP[{}] 初始化未命中或不支持，继续尝试下一个候选: {:?}",
                         idx,
                         err
@@ -519,7 +595,30 @@ mod tests {
     #[test]
     fn test_recommended_intra_threads() {
         let threads = OmniOrtRuntime::recommended_intra_threads();
-        assert!(threads >= 1 && threads <= 4);
+        assert!(
+            threads >= OmniOrtRuntime::MIN_INTRA_THREADS
+                && threads <= OmniOrtRuntime::MAX_INTRA_THREADS,
+            "intra_threads 必须落在 [{}, {}] 配额区间内，实际 {}",
+            OmniOrtRuntime::MIN_INTRA_THREADS,
+            OmniOrtRuntime::MAX_INTRA_THREADS,
+            threads
+        );
+    }
+
+    #[test]
+    fn test_intra_threads_quota_scales_to_eight_cores() {
+        // 8 核及以上机器必须吃满 8 线程配额（旧 clamp(1, 4) 会把这里锁死在 4）
+        assert_eq!(OmniOrtRuntime::intra_threads_for_cores(8), 8);
+        assert_eq!(OmniOrtRuntime::intra_threads_for_cores(16), 8);
+        assert_eq!(OmniOrtRuntime::intra_threads_for_cores(64), 8);
+        // 中间核数如实映射，不被上界一口吃平
+        assert_eq!(OmniOrtRuntime::intra_threads_for_cores(6), 6);
+        assert_eq!(OmniOrtRuntime::intra_threads_for_cores(4), 4);
+        // 下限 2：单核/双核机器不退化到串行
+        assert_eq!(OmniOrtRuntime::intra_threads_for_cores(2), 2);
+        assert_eq!(OmniOrtRuntime::intra_threads_for_cores(1), 2);
+        // ASR 侧维持历史 4 线程上限，不被 ORT 解绑波及
+        assert!(OmniOrtRuntime::recommended_asr_threads() <= 4);
     }
 
     #[test]
@@ -630,5 +729,286 @@ mod tests {
 
         // 验证后台线程已自动释放内存
         assert!(!watchdog.is_loaded(), "空闲超时后后台巡检线程应自动将实例释放为 None");
+    }
+
+    /// 真实硬件 EP 可用性探针（诊断专用，--nocapture 运行）
+    ///
+    /// 背景：随包 onnxruntime.dll（1.28.2，17,799,168 B）实为**纯 CPU 构建**
+    /// （资源包 `onnxruntime-directml` 的 packageUrl 误指向 sherpa-onnx CPU 包），
+    /// 生产日志只见「成功构建纯 CPU Session」，EP 候选失败原因被 debug 级日志吞掉。
+    /// 本探针在真实 DLL + 真实 Gemma 视觉模型上逐个 EP 构建会话，把每个 EP 的
+    /// 可用性判定与真实构建错误完整打印出来，用于定位 GPU 静默回退 CPU 的根因。
+    ///
+    /// 实测补充结论（2026-10-21）：回退根因是 DLL 无 GPU EP，**不是**版本错配；
+    /// 且视觉塔含 `GatherBlockQuantized`，ORT 1.20.0 无法加载该模型，
+    /// 故不可为对齐 ort 期望版本而降级 DLL。
+    #[test]
+    fn test_probe_real_execution_provider_availability() {
+        // 1. 定位随包 DLL（复用运行时发现链，落空时从测试进程位置向上探测桌面构建目录）
+        let dll = OmniOrtRuntime::discover_onnx_dll().or_else(|| {
+            let mut cur = std::env::current_dir().ok()?;
+            for _ in 0..8 {
+                let cand = cur.join("apps/desktop/build/extraResources/bin/omni/onnxruntime.dll");
+                if cand.exists() {
+                    return Some(cand);
+                }
+                cur = cur.parent()?.to_path_buf();
+            }
+            None
+        });
+        let Some(dll) = dll else {
+            println!("[EP-PROBE] 未找到 onnxruntime.dll，跳过探针");
+            return;
+        };
+        println!("[EP-PROBE] DLL: {}", dll.display());
+
+        // 2. 定位真实 Gemma 视觉塔模型
+        let mut model = None;
+        let mut cur = std::env::current_dir().ok();
+        let mut hops = 0;
+        while let Some(dir) = cur {
+            let cand = dir.join("apps/desktop/build/extraResources/models/gemma/vision_encoder_q4.onnx");
+            if cand.exists() {
+                model = Some(cand);
+                break;
+            }
+            if hops > 8 {
+                break;
+            }
+            cur = dir.parent().map(|p| p.to_path_buf());
+            hops += 1;
+        }
+        let Some(model) = model else {
+            println!("[EP-PROBE] 未找到 gemma vision_encoder_q4.onnx，跳过探针");
+            return;
+        };
+        println!("[EP-PROBE] 模型: {}", model.display());
+
+        // 3. 初始化动态库
+        let init = OmniOrtRuntime::init_with_dll(dll.to_str().unwrap_or("onnxruntime.dll"));
+        println!("[EP-PROBE] init: {:?}", init);
+
+        // 4. 逐个 EP 探测可用性并真实构建会话
+        use ort::execution_providers::ExecutionProvider;
+
+        let cuda = ort::execution_providers::CUDAExecutionProvider::default();
+        println!(
+            "[EP-PROBE] CUDA is_available: {:?}",
+            cuda.is_available()
+        );
+        let dml = ort::execution_providers::DirectMLExecutionProvider::default();
+        println!(
+            "[EP-PROBE] DirectML is_available: {:?}",
+            dml.is_available()
+        );
+
+        let build_one = |name: &str, ep: ort::execution_providers::ExecutionProviderDispatch| {
+            let attempt = (|| {
+                let mut b = ort::session::Session::builder()?
+                    .with_intra_threads(4)?
+                    .with_optimization_level(
+                        ort::session::builder::GraphOptimizationLevel::Level3,
+                    )?;
+                b = b.with_execution_providers([ep])?;
+                b.commit_from_file(&model)
+            })();
+            match attempt {
+                Ok(_) => println!("[EP-PROBE] {name}: 真实构建成功 ✓"),
+                Err(e) => println!("[EP-PROBE] {name}: 构建失败 ✗ -> {e}"),
+            }
+        };
+
+        build_one("CUDA", cuda.build());
+        build_one("DirectML", dml.build());
+        build_one("CPU(基线)", ort::execution_providers::CPUExecutionProvider::default().build());
+
+        // 5. 走完整生产链路确认最终落点
+        match OmniOrtRuntime::build_session(&model, ModelTier::Tier2) {
+            Ok(_) => println!("[EP-PROBE] 生产 build_session 链路: 构建成功（EP 落点见上方逐项结果）"),
+            Err(e) => println!("[EP-PROBE] 生产 build_session 链路: 失败 -> {e}"),
+        }
+    }
+
+    /// 真实吞吐基准（默认跳过，需显式设置 `OMNI_EP_BENCH=1`）
+    ///
+    /// 为什么不能只看探针：Gemma 视觉塔含 `com.microsoft` 自定义量化算子
+    /// （实测 `GatherBlockQuantized` 存在），DirectML 不支持的算子会被 ORT 按节点切分
+    /// 回落到 CPU，因此「EP 可用 + Session 构建成功」并不等于推理真跑在 GPU 上。
+    /// 本基准用同一真实模型、同一输入形状分别在 CPU 与 DirectML 会话上重复前向，
+    /// 用吞吐差值给出可证伪的结论。
+    #[test]
+    fn test_bench_vision_encoder_ep_throughput() {
+        if std::env::var("OMNI_EP_BENCH").is_err() {
+            println!("[EP-BENCH] 未设置 OMNI_EP_BENCH=1，跳过真实吞吐基准");
+            return;
+        }
+        use ort::execution_providers::ExecutionProvider;
+        use std::time::Instant;
+
+        let dll = match OmniOrtRuntime::discover_onnx_dll() {
+            Some(d) => d,
+            None => {
+                println!("[EP-BENCH] 未找到 onnxruntime.dll，跳过");
+                return;
+            }
+        };
+        println!("[EP-BENCH] DLL: {}", dll.display());
+        let _ = OmniOrtRuntime::init_with_dll(dll.to_str().unwrap_or("onnxruntime.dll"));
+
+        // 允许用 OMNI_BENCH_VISION 切换被测视觉模型（如未量化的 vision_model.onnx），
+        // 用于区分「DML 不支持 Q4 量化算子」与「DML/驱动本身不可用」两种失败
+        let vision_file = std::env::var("OMNI_BENCH_VISION")
+            .unwrap_or_else(|_| "vision_encoder_q4.onnx".to_string());
+        let model = match locate_gemma_sibling(&vision_file) {
+            Some(m) => m,
+            None => {
+                println!("[EP-BENCH] 未找到 gemma {vision_file}，跳过");
+                return;
+            }
+        };
+        println!("[EP-BENCH] 模型: {}", model.display());
+
+        // 真实形状：pixel_values [1, 140, 768] f32 + pixel_position_ids [1, 140, 2] i64
+        // 140 = 官方 video_processor.max_soft_tokens
+        const SEQ: usize = 140;
+        const FEAT: usize = 768;
+        const ITERS: u32 = 15;
+
+        /// 构建会话：`ep=None` 走纯 CPU 基线
+        fn build(
+            path: &std::path::Path,
+            ep: Option<ort::execution_providers::ExecutionProviderDispatch>,
+        ) -> Result<ort::session::Session, ort::Error> {
+            let mut b = ort::session::Session::builder()?
+                .with_intra_threads(OmniOrtRuntime::recommended_intra_threads())?
+                .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?;
+            if let Some(ep) = ep {
+                b = b.with_execution_providers([ep])?;
+            }
+            b.commit_from_file(path)
+        }
+
+        /// 预热后计时 ITERS 次前向，输出单次耗时与 107 帧外推
+        fn bench<F>(label: &str, session: &mut ort::session::Session, feed: &F)
+        where
+            F: Fn(&mut ort::session::Session) -> Result<(), ort::Error>,
+        {
+            for _ in 0..3 {
+                if let Err(e) = feed(session) {
+                    println!("[EP-BENCH] {label}: 前向失败 -> {e}");
+                    return;
+                }
+            }
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                if let Err(e) = feed(session) {
+                    println!("[EP-BENCH] {label}: 计时循环中失败 -> {e}");
+                    return;
+                }
+            }
+            let per = t0.elapsed() / ITERS;
+            println!(
+                "[EP-BENCH] {label}: 单次前向 {:?}，107 帧外推 ≈ {:?}",
+                per,
+                per * 107
+            );
+        }
+
+        let feed_vision = |session: &mut ort::session::Session| -> Result<(), ort::Error> {
+            let pv = ort::value::Tensor::from_array((
+                vec![1usize, SEQ, FEAT],
+                vec![0.01f32; SEQ * FEAT],
+            ))?;
+            let pid = ort::value::Tensor::from_array((
+                vec![1usize, SEQ, 2usize],
+                vec![0i64; SEQ * 2],
+            ))?;
+            let inputs: [ort::session::SessionInputValue<'static>; 2] = [pv.into(), pid.into()];
+            session.run(inputs).map(|_| ())
+        };
+
+        match build(&model, None) {
+            Ok(mut s) => {
+                bench("视觉塔 CPU 基线", &mut s, &feed_vision);
+            }
+            Err(e) => println!("[EP-BENCH] 视觉塔 CPU 会话构建失败 -> {e}"),
+        }
+
+        // 注：`build(self)` 会消费 provider 实例，故可用性先行判定、每个分支各自新建实例
+        let dml_available = ort::execution_providers::DirectMLExecutionProvider::default()
+            .is_available()
+            .unwrap_or(false);
+        let dml_dispatch =
+            || ort::execution_providers::DirectMLExecutionProvider::default().build();
+        if dml_available {
+            match build(&model, Some(dml_dispatch())) {
+                Ok(mut s) => {
+                    bench("视觉塔 DirectML", &mut s, &feed_vision);
+                }
+                Err(e) => println!("[EP-BENCH] 视觉塔 DirectML 会话构建失败 -> {e}"),
+            }
+        } else {
+            println!("[EP-BENCH] DirectML 不可用，跳过（当前 DLL 无 DML EP）");
+        }
+
+        // 文本塔：生产链路里每帧除视觉前向还要过一次文本塔，
+        // 实测 6:30/107 帧 ≈ 3.6s/帧 远大于视觉塔耗时，故必须单独测它才能定位真正大头。
+        let Some(text_model) = locate_gemma_sibling("model_q4.onnx") else {
+            println!("[EP-BENCH] 未找到 gemma model_q4.onnx，跳过文本塔基准");
+            return;
+        };
+        // 生产 ids: [bos, soft_token_marker, soft×n, eoi, eos] → n=140 时 seq=143
+        const TEXT_SEQ: usize = 143;
+        let feed_text = |session: &mut ort::session::Session| -> Result<(), ort::Error> {
+            let ids = ort::value::Tensor::from_array((
+                vec![1usize, TEXT_SEQ],
+                vec![2i64; TEXT_SEQ],
+            ))?;
+            let mask = ort::value::Tensor::from_array((
+                vec![1usize, TEXT_SEQ],
+                vec![1i64; TEXT_SEQ],
+            ))?;
+            let img = ort::value::Tensor::from_array((
+                vec![SEQ, 512usize],
+                vec![0.01f32; SEQ * 512],
+            ))?;
+            // 注：ORT 不允许 0 维张量（"all dimensions must be >= 1"），
+            // 故未使用的模态各给 1 个 token，量级可忽略
+            let vid = ort::value::Tensor::from_array((vec![1usize, 512usize], vec![0.0f32; 512]))?;
+            let aud = ort::value::Tensor::from_array((vec![1usize, 512usize], vec![0.0f32; 512]))?;
+            let inputs: [ort::session::SessionInputValue<'static>; 5] =
+                [ids.into(), mask.into(), img.into(), vid.into(), aud.into()];
+            session.run(inputs).map(|_| ())
+        };
+
+        match build(&text_model, None) {
+            Ok(mut s) => {
+                bench("文本塔 CPU 基线", &mut s, &feed_text);
+            }
+            Err(e) => println!("[EP-BENCH] 文本塔 CPU 会话构建失败 -> {e}"),
+        }
+        if dml_available {
+            match build(&text_model, Some(dml_dispatch())) {
+                Ok(mut s) => {
+                    bench("文本塔 DirectML", &mut s, &feed_text);
+                }
+                Err(e) => println!("[EP-BENCH] 文本塔 DirectML 会话构建失败 -> {e}"),
+            }
+        }
+    }
+
+    /// 向上定位 Gemma 目录下的指定模型文件（探针与基准共用）
+    fn locate_gemma_sibling(file: &str) -> Option<std::path::PathBuf> {
+        let mut cur = std::env::current_dir().ok()?;
+        for _ in 0..8 {
+            let cand = cur
+                .join("apps/desktop/build/extraResources/models/gemma")
+                .join(file);
+            if cand.exists() {
+                return Some(cand);
+            }
+            cur = cur.parent()?.to_path_buf();
+        }
+        None
     }
 }

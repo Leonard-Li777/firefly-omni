@@ -43,9 +43,20 @@ fn blank_fields_fall_through_to_asr() {
     assert_eq!(resolve_effective_text("", Some(""), Some(asr)), asr);
 }
 
+/// NUL/控制字符占位正文不构成有效正文，必须回落到 OCR/ASR。
+#[test]
+fn control_only_body_falls_through_to_asr() {
+    let asr = "语音事实";
+    assert_eq!(resolve_effective_text("\0", None, Some(asr)), asr);
+    assert_eq!(
+        resolve_effective_text("\0\u{1}", Some("图片 OCR 文本"), Some(asr)),
+        "图片 OCR 文本"
+    );
+}
+
 /// 三者皆空 → 空字符串（不 panic，不返回占位内容）。
 ///
-/// 注：正文与 OCR 会做 trim 判定；ASR 沿用原语义原样透传（生产链路中 `asr` 已在
+/// 注：正文与 OCR 会做可见字符判定；ASR 沿用原语义原样透传（生产链路中 `asr` 已在
 /// 提取阶段做过空白过滤，故不会传入纯空白串）。
 #[test]
 fn all_empty_yields_empty_string() {

@@ -182,10 +182,13 @@ async fn test_ac3_2_and_3_3_gold_landscape_image_inference() {
         );
     }
 
-    // AC 3.2 耗时验证：总接口耗时在合理范围内 (Debug 模式放宽至 8000ms)
+    // AC 3.2 耗时验证：总接口耗时在合理范围内。
+    // 官方 Gemma4 单图 280 软 token 预算（224×224 会上采样到 768×768、2304 个 teacher patch）在
+    // Debug 模式下冷启动（含视觉塔 ONNX 会话装载）实测约 30s，Release 模式显著更快，
+    // 故此处仅作 Debug 冷启动冒烟上限，避免以旧 224/196-patch 管线的 8s 指标误判。
     println!("Total landscape inference elapsed: {:?}", total_elapsed);
     assert!(
-        total_elapsed.as_millis() <= 8000,
+        total_elapsed.as_millis() <= 45_000,
         "端到端打标耗时应在合理响应范围内"
     );
 
@@ -354,50 +357,69 @@ async fn test_ac3_5_video_aligned_chunking_and_storage() {
 }
 
 #[test]
-fn test_ac3_6_adaptive_aspect_ratio_crops_and_l2_norm() {
+fn test_ac3_6_official_aspect_ratio_preserving_patches_and_l2_norm() {
     use image::DynamicImage;
     use omni_pro::vision::gemma::{EmbeddingGemmaEngine, EmbeddingProfile};
 
-    // 1. 4:3 图像 (1024x768): 方正单片居中裁切 -> [1, 3, 224, 224]
-    let img_4_3 = DynamicImage::ImageRgb8(image::RgbImage::new(1024, 768));
-    let tensor_4_3 = EmbeddingGemmaEngine::preprocess_image(&img_4_3);
-    assert_eq!(
-        tensor_4_3.shape(),
-        &[1, 3, 224, 224],
-        "4:3 图片预处理后输出张量形状严格为 [1, 3, 224, 224] (单片居中裁切)"
-    );
+    // 官方 Gemma4 Unified 契约：长宽比保持缩放到 48 的整数倍、最多 2520 个 16px teacher patch，
+    // 尾部零 patch + (-1,-1) 坐标补齐，坐标顺序严格为 (x, y)
+    let cases: [(u32, u32, (u32, u32), usize); 4] = [
+        (1024, 768, (912, 672), 2394),   // 4:3 -> 266 个软 token
+        (1920, 1080, (1056, 576), 2376), // 16:9 -> 264 个软 token
+        (1080, 1920, (576, 1056), 2376), // 9:16 -> 264 个软 token
+        (2400, 800, (1344, 432), 2268),  // 3:1 -> 252 个软 token
+    ];
 
-    // 2. 16:9 图像 (1920x1080): 横向宽幅双片重叠裁剪 -> [2, 3, 224, 224]
-    let img_16_9 = DynamicImage::ImageRgb8(image::RgbImage::new(1920, 1080));
-    let tensor_16_9 = EmbeddingGemmaEngine::preprocess_image(&img_16_9);
-    assert_eq!(
-        tensor_16_9.shape(),
-        &[2, 3, 224, 224],
-        "16:9 图片预处理后输出张量形状严格为 [2, 3, 224, 224] (双片重叠裁剪)"
-    );
+    for (w, h, expected_size, expected_patches) in cases {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::new(w, h));
+        let patches = EmbeddingGemmaEngine::preprocess_image(&img);
+        assert_eq!(
+            patches.target_size, expected_size,
+            "{w}x{h} 必须按官方画幅保持策略缩放到 48 的整数倍"
+        );
+        assert_eq!(
+            patches.pixel_values.shape(),
+            &[1, 2520, 768],
+            "teacher patch 张量必须补齐到 [1, 2520, 768]"
+        );
+        assert_eq!(
+            patches.position_ids.shape(),
+            &[1, 2520, 2],
+            "teacher patch 坐标张量必须补齐到 [1, 2520, 2]"
+        );
+        assert_eq!(
+            patches.valid_patches, expected_patches,
+            "有效 teacher patch 数不符"
+        );
+        assert_eq!(expected_patches % 9, 0, "有效图块必须能被 3×3 合并整除");
 
-    // 3. 9:16 图像 (1080x1920): 纵向竖屏双片重叠裁剪 -> [2, 3, 224, 224]
-    let img_9_16 = DynamicImage::ImageRgb8(image::RgbImage::new(1080, 1920));
-    let tensor_9_16 = EmbeddingGemmaEngine::preprocess_image(&img_9_16);
-    assert_eq!(
-        tensor_9_16.shape(),
-        &[2, 3, 224, 224],
-        "9:16 图片预处理后输出张量形状严格为 [2, 3, 224, 224] (双片重叠裁剪)"
-    );
+        // 尾部 padding 坐标必须为 -1，最后一个有效 patch 的 x 坐标必须位于网格最右列
+        let pos = patches.position_ids.as_slice().unwrap();
+        assert_eq!(pos[expected_patches * 2], -1, "padding 坐标必须为 -1");
+        assert_eq!(
+            pos[expected_patches * 2 - 2],
+            (expected_size.0 / 16 - 1) as i64,
+            "最后一个有效 patch 的 x 坐标必须为 patch 网格最右列"
+        );
+    }
 
-    // 4. 极端画幅 (2400x800, AR = 3.0): 最长边 224 等比缩放 + 黑边 padding 兜底 -> [1, 3, 224, 224]
-    let img_extreme = DynamicImage::ImageRgb8(image::RgbImage::new(2400, 800));
-    let tensor_extreme = EmbeddingGemmaEngine::preprocess_image(&img_extreme);
+    // 视频帧官方 video_processor 预算 140：448×252 -> 720×384，1080 个有效 teacher patch / 120 软 token
+    let frame = DynamicImage::ImageRgb8(image::RgbImage::new(448, 252));
+    let video_patches = EmbeddingGemmaEngine::preprocess_image_with_soft_budget(&frame, 140);
+    assert_eq!(video_patches.target_size, (720, 384), "视频帧 140 预算目标尺寸不符");
     assert_eq!(
-        tensor_extreme.shape(),
-        &[1, 3, 224, 224],
-        "极端画幅预处理必须单片 padding 输出 [1, 3, 224, 224]"
+        video_patches.pixel_values.shape(),
+        &[1, 140 * 9, 768],
+        "视频帧 teacher patch 张量必须补齐到 [1, 1260, 768]"
     );
+    assert_eq!(video_patches.valid_patches, 1080, "视频帧有效 teacher patch 数不符");
 
-    // 5. 验证输出向量的 L2 模长严格满足 |norm - 1.0| <= 1e-5
+    // 单图单次前向输出 512 维 MRL 向量，L2 模长严格满足 |norm - 1.0| <= 1e-5
     let engine = EmbeddingGemmaEngine::new(EmbeddingProfile::GemmaUnified);
-    for img in [&img_4_3, &img_16_9, &img_9_16, &img_extreme] {
-        let vec = engine.encode_image(img).expect("编码图像失败");
+    let mut vectors = Vec::new();
+    for (w, h, _, _) in cases {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::new(w, h));
+        let vec = engine.encode_image(&img).expect("编码图像失败");
         assert_eq!(vec.len(), 512);
         let l2_norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(
@@ -405,7 +427,19 @@ fn test_ac3_6_adaptive_aspect_ratio_crops_and_l2_norm() {
             "输出向量的 L2 范数 ({}) 严格满足 ||v||_2 - 1.0 <= 1e-5",
             l2_norm
         );
+        vectors.push(vec);
     }
+
+    // 不同画幅的纯黑图必须产生不同向量：完全相同的向量说明命中了确定性 sim_vec 兜底，而非真实模型推理
+    let cos = vectors[0]
+        .iter()
+        .zip(vectors[3].iter())
+        .map(|(a, b)| a * b)
+        .sum::<f32>();
+    assert!(
+        cos < 0.999,
+        "编码结果疑似命中 sim_vec 兜底（余弦 {cos}），视觉/文本塔未真实执行"
+    );
 }
 
 #[test]
