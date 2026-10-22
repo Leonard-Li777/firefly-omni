@@ -219,12 +219,27 @@ pub mod perceive {
         (0, "none")
     }
 
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct VideoProcessTimings {
+        pub ffmpeg_ms: u64,
+        pub decode_ms: u64,
+        pub vision_ms: u64,
+    }
+
     pub fn process_video_time_chunks(
         _video_path: &Path,
         _sampling_interval_seconds: f32,
         _asr_text: Option<&str>,
     ) -> Vec<omni_core::OmniVideoChunk> {
         Vec::new()
+    }
+
+    pub fn process_video_time_chunks_with_timings(
+        _video_path: &Path,
+        _sampling_interval_seconds: f32,
+        _asr_text: Option<&str>,
+    ) -> (Vec<omni_core::OmniVideoChunk>, VideoProcessTimings) {
+        (Vec::new(), VideoProcessTimings::default())
     }
 }
 

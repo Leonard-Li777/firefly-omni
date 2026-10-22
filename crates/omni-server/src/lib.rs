@@ -1648,6 +1648,7 @@ async fn perceive_file_handler(
 
             let mut v = VisionComputed::default();
             let mut video_chunks: Vec<omni_core::OmniVideoChunk> = Vec::new();
+            let mut video_timings = omni_pro::perceive::VideoProcessTimings::default();
             if is_video && is_pro {
                 let (v_wm_lvl, v_wm_status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(&file_path));
                 v.watermark_level = Some(v_wm_lvl);
@@ -1656,8 +1657,8 @@ async fn perceive_file_handler(
 
                 let file_path_for_video = file_path.clone();
                 let video_interval = req.video_frame_interval_seconds.unwrap_or(5.0);
-                video_chunks = tokio::task::spawn_blocking(move || {
-                    omni_pro::perceive::process_video_time_chunks(
+                let (chunks, timings) = tokio::task::spawn_blocking(move || {
+                    omni_pro::perceive::process_video_time_chunks_with_timings(
                         std::path::Path::new(&file_path_for_video),
                         video_interval,
                         None,
@@ -1665,6 +1666,8 @@ async fn perceive_file_handler(
                 })
                 .await
                 .unwrap_or_default();
+                video_chunks = chunks;
+                video_timings = timings;
             }
 
             // 音频/视频文件: 纯内存解码 (16kHz 单声道) → GTCRN 降噪 + Silero VAD + SenseVoice 转录 + CED-mini 声学打标
@@ -1739,12 +1742,17 @@ async fn perceive_file_handler(
                 }
             }
 
-            (extract_ms, ext_res, v, audio_ms, video_chunks)
+            (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings)
         };
-        let (ads_res, (extract_ms, ext_res, v, audio_ms, video_chunks)) = tokio::join!(f_ads, f_non_img);
+        let (ads_res, (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings)) = tokio::join!(f_ads, f_non_img);
 
         benchmark.extract_ms = Some(extract_ms);
         benchmark.audio_ms = audio_ms;
+        if is_video {
+            benchmark.record("ffmpeg_ms", video_timings.ffmpeg_ms);
+            benchmark.record("decode_resize_ms", video_timings.decode_ms);
+            benchmark.vision_ms = Some(video_timings.vision_ms);
+        }
         if let Some(bm) = &ext_res.benchmark {
             benchmark.record_opt("metadata_ms", bm.metadata_ms);
             benchmark.record_opt("text_ms", bm.text_ms);
@@ -2982,7 +2990,7 @@ async fn perceive_file_handler(
                 let vision_ms = bench.and_then(|b| b.vision_ms).unwrap_or(0);
                 let text_ms = bench.and_then(|b| b.extract_ms).unwrap_or(0);
                 tracing::info!(
-                    "[PERF_PROFILE] 视频分析完成 | 文件: {} | 切片数: {} | 总耗时: {}ms [抽帧落盘: {}ms | 读图解码缩放: {}ms | 视觉塔前向: {}ms | 文本塔前向: {}ms | 向量批量写盘: {}ms]",
+                    "[PERF_PROFILE] 视频分析完成 | 文件: {} | 切片数: {} | 总耗时: {}ms [抽帧直连: {}ms | 读图解码缩放: {}ms | 视觉塔前向: {}ms | 文本塔前向: {}ms | 向量批量写盘: {}ms]",
                     req.file_path,
                     total_chunks,
                     t_start.elapsed().as_millis(),
