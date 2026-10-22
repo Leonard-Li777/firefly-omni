@@ -1154,11 +1154,45 @@ pub mod search {
         pub duration_ms: u64,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ClusterTreeOptions {
+        pub max_depth: usize,
+        pub max_root_directories: usize,
+        pub max_subdirectories: usize,
+        pub distance_threshold: f32,
+        pub max_leaf_size: usize,
+    }
+
+    impl Default for ClusterTreeOptions {
+        fn default() -> Self {
+            Self {
+                max_depth: 3,
+                max_root_directories: 5,
+                max_subdirectories: 5,
+                distance_threshold: 0.40,
+                max_leaf_size: 50,
+            }
+        }
+    }
+
     pub fn constrained_hac(
         _docs: &[ClusterDocument],
         _prompt_embedding: Option<&[f32]>,
         _distance_threshold: f32,
         _max_leaf_size: usize,
+    ) -> anyhow::Result<ClusterTreeResult> {
+        Ok(ClusterTreeResult {
+            clusters: Vec::new(),
+            other_files: Vec::new(),
+            duration_ms: 0,
+        })
+    }
+
+    pub fn constrained_hac_with_options(
+        _docs: &[ClusterDocument],
+        _prompt_embedding: Option<&[f32]>,
+        _options: ClusterTreeOptions,
     ) -> anyhow::Result<ClusterTreeResult> {
         Ok(ClusterTreeResult {
             clusters: Vec::new(),
@@ -1202,6 +1236,18 @@ pub mod search {
             _prompt_embedding: Option<&[f32]>,
             _distance_threshold: f32,
             _max_leaf_size: usize,
+        ) -> anyhow::Result<ClusterTreeResult> {
+            Ok(ClusterTreeResult {
+                clusters: Vec::new(),
+                other_files: Vec::new(),
+                duration_ms: 0,
+            })
+        }
+        pub fn cluster_with_options(
+            &self,
+            _docs: &[ClusterDocument],
+            _prompt_embedding: Option<&[f32]>,
+            _options: ClusterTreeOptions,
         ) -> anyhow::Result<ClusterTreeResult> {
             Ok(ClusterTreeResult {
                 clusters: Vec::new(),

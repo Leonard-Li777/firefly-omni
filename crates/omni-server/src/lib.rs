@@ -3304,6 +3304,24 @@ pub struct SearchClusterRequest {
     pub distance_threshold: f32,
     #[serde(default = "default_max_leaf_size")]
     pub max_leaf_size: usize,
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
+    #[serde(default = "default_max_root_directories")]
+    pub max_root_directories: usize,
+    #[serde(default = "default_max_subdirectories")]
+    pub max_subdirectories: usize,
+}
+
+fn default_max_depth() -> usize {
+    3
+}
+
+fn default_max_root_directories() -> usize {
+    5
+}
+
+fn default_max_subdirectories() -> usize {
+    5
 }
 
 fn default_distance_threshold() -> f32 {
@@ -3592,11 +3610,17 @@ async fn search_cluster_handler(
             _ => None,
         };
 
-        search.cluster(
+        let cluster_options = omni_pro::search::ClusterTreeOptions {
+            max_depth: req.max_depth,
+            max_root_directories: req.max_root_directories,
+            max_subdirectories: req.max_subdirectories,
+            distance_threshold: req.distance_threshold,
+            max_leaf_size: req.max_leaf_size,
+        };
+        search.cluster_with_options(
             &docs,
             prompt_emb.as_deref(),
-            req.distance_threshold,
-            req.max_leaf_size,
+            cluster_options,
         )
     })
     .await;
