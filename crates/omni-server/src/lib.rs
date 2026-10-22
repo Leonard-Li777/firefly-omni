@@ -3491,7 +3491,7 @@ async fn search_cluster_handler(
 
             // JIT 即时向量补全自愈 (ADR-0056):
             // 若文档未携带有效向量且本地槽位未命中（冷启动/未预先分析/缓存丢失），
-            // 优先用富文本（文件名/智能命名 + 主题词），其次主题词，最后指纹兜底
+            // 优先用富文本（主题词优先，缺词时为剥掉模板骨架的文件名），其次主题词，最后指纹兜底
             let fallback_text;
             let text_to_embed = if let Some(text) = embedding_text {
                 text
@@ -3593,11 +3593,28 @@ async fn search_cluster_handler(
     })
     .await;
     match res {
-        Ok(Ok(tree)) => Json(SearchClusterResponse {
-            success: true,
-            result: Some(tree),
-            error: None,
-        }),
+        Ok(Ok(tree)) => {
+            // 分区粒度可观测：巨型簇（占据过半样本）是"任意提示词都只有一个大目录"的形态指纹，
+            // 线上排障必须能直接从引擎日志看到是否又出现了这种分区
+            let sizes: Vec<usize> = tree.clusters.iter().map(|c| c.fingerprints.len()).collect();
+            let total = sizes.iter().sum::<usize>() + tree.other_files.len();
+            if let Some(largest) = sizes.iter().max() {
+                if total > 0 && *largest * 2 > total {
+                    tracing::warn!(
+                        "[HAC] 分区仍含过半巨型簇: 最大簇={}/{} 簇规模={:?} 未归类={} (下钻已收敛或该簇无纵向结构)",
+                        largest,
+                        total,
+                        sizes,
+                        tree.other_files.len()
+                    );
+                }
+            }
+            Json(SearchClusterResponse {
+                success: true,
+                result: Some(tree),
+                error: None,
+            })
+        }
         Ok(Err(e)) => Json(SearchClusterResponse {
             success: false,
             result: None,
