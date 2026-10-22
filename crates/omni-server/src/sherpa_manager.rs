@@ -261,7 +261,7 @@ impl SherpaManager {
             .or_else(|| resolve_model_file(&["sensevoice", "audio/sensevoice"], "model.onnx"))?;
         let tokens_path = resolve_model_file(&["sensevoice", "audio/sensevoice"], "tokens.txt")?;
 
-        let threads = omni_core::OmniOrtRuntime::recommended_intra_threads() as i32;
+        let threads = omni_core::OmniOrtRuntime::recommended_asr_threads() as i32;
         let providers = Self::preferred_sherpa_providers();
 
         for provider in &providers {
