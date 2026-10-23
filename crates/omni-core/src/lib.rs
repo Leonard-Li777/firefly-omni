@@ -185,6 +185,9 @@ pub struct OmniPerceptionRequest {
     /// 自定义视频抽帧采样间隔（秒，缺省时读取全局配置或默认 5.0 秒）
     #[serde(default)]
     pub video_frame_interval_seconds: Option<f32>,
+    /// 视频帧视觉软 token 预算（70=精简快速，140=标准精细；缺省按 140，越界由感知层收敛）
+    #[serde(default)]
+    pub video_soft_token_budget: Option<usize>,
     /// 是否需要生成缩略图/封面（若已有则传 false，不要求生成）
     #[serde(default)]
     pub generate_thumbnail: Option<bool>,

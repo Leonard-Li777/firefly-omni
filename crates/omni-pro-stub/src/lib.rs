@@ -226,6 +226,20 @@ pub mod perceive {
         pub vision_ms: u64,
     }
 
+    /// 视频帧视觉软 token 预算下界（开源桩镜像私有版契约，保证调用方 API 一致）
+    pub const VIDEO_SOFT_TOKEN_BUDGET_MIN: usize = 70;
+
+    /// 视频帧视觉软 token 预算上界
+    pub const VIDEO_SOFT_TOKEN_BUDGET_MAX: usize = 140;
+
+    /// 视频帧视觉软 token 预算缺省值
+    pub const VIDEO_SOFT_TOKEN_BUDGET_DEFAULT: usize = VIDEO_SOFT_TOKEN_BUDGET_MAX;
+
+    /// 将软 token 预算收敛到受支持区间（镜像私有版行为）
+    pub fn normalize_video_soft_token_budget(budget: usize) -> usize {
+        budget.clamp(VIDEO_SOFT_TOKEN_BUDGET_MIN, VIDEO_SOFT_TOKEN_BUDGET_MAX)
+    }
+
     pub fn process_video_time_chunks(
         _video_path: &Path,
         _sampling_interval_seconds: f32,
@@ -238,6 +252,7 @@ pub mod perceive {
         _video_path: &Path,
         _sampling_interval_seconds: f32,
         _asr_text: Option<&str>,
+        _soft_token_budget: usize,
     ) -> (Vec<omni_core::OmniVideoChunk>, VideoProcessTimings) {
         (Vec::new(), VideoProcessTimings::default())
     }
@@ -1136,6 +1151,9 @@ pub mod search {
         /// 正文无可见语义文本时强制按富文本重编码 (与 pro 实现保持同一 IPC 契约)
         #[serde(default)]
         pub prefer_embedding_text: bool,
+        /// 受控文件大类：'application' | 'media' | 'document' | 'other'，用于跨模态互斥门禁
+        #[serde(default)]
+        pub file_category: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
