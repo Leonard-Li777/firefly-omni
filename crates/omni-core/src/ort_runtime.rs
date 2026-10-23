@@ -109,9 +109,12 @@ pub fn directml_disable_reason() -> Option<&'static str> {
 
 /// 测试辅助：复位全局降级闸
 ///
-/// 仅供单测隔离使用（`#[cfg(test)]` 守卫，生产构建中不存在该符号，杜绝误把不可逆闸复位）。
+/// 仅供测试隔离使用。此处**刻意不加 `#[cfg(test)]` 守卫**：`cfg(test)` 只在编译 omni-core
+/// 自身的单测时生效，`omni-server` 的 `tests/*.rs` 集成测试属于独立 crate，看不到被门控的符号
+/// （会导致 E0432）。因此该符号在所有构建中存在，但调用方仅限测试代码，业务代码严禁调用
+/// （否则会错误复位不可逆的 DML 降级闸）。
 /// `OnceLock` 原因无法清空，测试只断言布尔闸；多测试并发触碰闸时须持有测试互斥锁串行化。
-#[cfg(test)]
+#[doc(hidden)]
 pub fn reset_directml_gate_for_test() {
     DIRECTML_DISABLED.store(false, Ordering::SeqCst);
 }
@@ -1735,6 +1738,29 @@ impl<T> Drop for GenericWatchdog<T> {
 
 /// 专用于 ONNX Session 的看门狗类型别名
 pub type WatchdogSession = GenericWatchdog<ort::session::Session>;
+
+/// 专用于带并发互斥保护的 ONNX Session 看门狗类型别名 (工单 05 / SPEC §3.4)
+///
+/// 核心目的：DirectML EP 在同一 Device Context 下不允许并发前向推理，
+/// 必须通过 `std::sync::Mutex<Session>` 确保在多线程环境下排队串行执行，
+/// 并支持锁中毒自动恢复 (`into_inner`)。
+pub type WatchdogSessionMutex = GenericWatchdog<std::sync::Mutex<ort::session::Session>>;
+
+// ============================================================================
+// 运行期故障注入钩子 (工单 05 §3 / 集成测试 T3 支撑)
+// ============================================================================
+
+static INJECT_FAIL_NEXT_RUN: AtomicBool = AtomicBool::new(false);
+
+/// 测试辅助：注入下一次 Session Run 失败（一次性生效后自动复位）
+pub fn inject_fail_next_run(enable: bool) {
+    INJECT_FAIL_NEXT_RUN.store(enable, Ordering::SeqCst);
+}
+
+/// 查询并消费当前是否有注入的运行期失败（原子交换为 false）
+pub fn take_injected_run_failure() -> bool {
+    INJECT_FAIL_NEXT_RUN.swap(false, Ordering::SeqCst)
+}
 
 #[cfg(test)]
 mod tests {
