@@ -1657,11 +1657,15 @@ async fn perceive_file_handler(
 
                 let file_path_for_video = file_path.clone();
                 let video_interval = req.video_frame_interval_seconds.unwrap_or(5.0);
+                let video_soft_token_budget = req
+                    .video_soft_token_budget
+                    .unwrap_or(omni_pro::perceive::VIDEO_SOFT_TOKEN_BUDGET_DEFAULT);
                 let (chunks, timings) = tokio::task::spawn_blocking(move || {
                     omni_pro::perceive::process_video_time_chunks_with_timings(
                         std::path::Path::new(&file_path_for_video),
                         video_interval,
                         None,
+                        video_soft_token_budget,
                     )
                 })
                 .await
@@ -3450,7 +3454,7 @@ async fn search_cluster_handler(
         // 1. 先按当前嵌入档位解析目标维度 (classic_light=384d / gemma_unified=256|512|768d)；
         // 2. 若 doc.embedding 匹配目标维度，直接使用；
         // 3. 否则从端侧 zvec 对应维度槽位读取反量化向量回填；
-        // 4. 仍未命中时按当前档位 JIT 即时编码并写回槽位；
+        // 4. 仍未命中时按当前档位 JIT 即时编码（仅服务本次聚类，严禁回写检索槽位）；
         // 5. 过滤未能获得有效向量的文档，若有效文档数 < 2 则拦截报错。
         let requested_count = req.documents.len();
         let active_profile = req
@@ -3497,7 +3501,6 @@ async fn search_cluster_handler(
                 .filter(|s| !s.is_empty());
             // 正文/OCR/ASR 均无可见语义文本时，聚类改用富文本证据
             let prefer_text = doc.prefer_embedding_text && embedding_text.is_some();
-            let mut should_upsert = true;
 
             if !prefer_text {
                 if doc.embedding.len() == target_dim {
@@ -3509,11 +3512,10 @@ async fn search_cluster_handler(
                     docs.push(doc);
                     continue;
                 }
-            } else {
-                // 已有槽位可能是 OCR/视觉向量或历史垃圾向量：本次聚类只借用富文本向量，
-                // 不覆盖已有语义向量；仅在槽位缺失时回填，避免破坏混合检索
-                should_upsert = vector.get_vector(&doc.fingerprint, target_dim).is_none();
             }
+            // 注意：聚类 JIT 向量（富文本、文件名或指纹兜底）只用于本次 HAC 距离矩阵，
+            // 严禁写回检索槽位。该文本与主分析链路 effective_text 口径不同，且无可见正文的
+            // 文件（如 工具.lnk）会把标题向量混入混合检索候选池，以高余弦污染语义排序。
 
             // JIT 即时向量补全自愈 (ADR-0056):
             // 若文档未携带有效向量且本地槽位未命中（冷启动/未预先分析/缓存丢失），
@@ -3539,17 +3541,6 @@ async fn search_cluster_handler(
 
             match jit_embedding(text_to_embed, is_gemma, target_dim, bekko_ref) {
                 Some(vec) => {
-                    if should_upsert {
-                        if let Err(err) = vector.upsert(&doc.fingerprint, &vec) {
-                            // 回写失败不影响本次聚类，但必须显式上报，便于发现槽位损坏/磁盘问题
-                            tracing::warn!(
-                                "[HAC] 文件 {} 的 {}d JIT 向量回写失败: {}",
-                                doc.fingerprint,
-                                target_dim,
-                                err
-                            );
-                        }
-                    }
                     doc.embedding = vec;
                     docs.push(doc);
                 }
