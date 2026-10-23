@@ -3238,17 +3238,11 @@ async fn search_index_handler(
 ) -> Json<SearchIndexResponse> {
     let search = state.search.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let mut docs = req.documents;
+        let docs = req.documents;
         let batch_len = docs.len();
-        let embedder = omni_pro::text::BekkoEmbedder::new();
-        for doc in &mut docs {
-            // 若未提供向量或维度不匹配，自动调用 BekkoEmbedder 补充 384 维向量
-            if doc.embedding.len() != omni_pro::search::EMBEDDING_DIM {
-                if let Ok(vec) = embedder.embed(&doc.searchable_text) {
-                    doc.embedding = vec;
-                }
-            }
-        }
+        // 维度契约 (vector-semantic-text-unified-scheme §3.9 P0)：缺向量或维度不符时
+        // 不再用 searchable_text 自动编码补 384 维，避免静默生成第二个向量空间；
+        // 空向量文档仅写稀疏轨 (BM25)，由 HybridIndex::upsert_batch 告警并计数。
         // 语义说明：返回本批提交/写入的文档数（而非索引存量），供调用方作为分批进度使用
         search.upsert_batch(&docs).map(|_| batch_len)
     }).await;
