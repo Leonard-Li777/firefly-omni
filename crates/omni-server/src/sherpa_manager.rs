@@ -101,7 +101,11 @@ fn resolve_model_file(sub_dirs: &[&str], file_name: &str) -> Option<PathBuf> {
     None
 }
 
-/// 确保加载安全的 ONNX Runtime 动态库（Windows 环境下免疫 System32 的老版本劫持）
+/// 确保 sherpa 音频栈加载安全的 ONNX Runtime 动态库目录（Windows 环境下免疫 System32 的老版本劫持）
+///
+/// 仅通过 `SetDllDirectoryW` 把 `bin/omni` 加入 DLL 搜索优先级，让 sherpa 自身导入表
+/// 自动加载运行时 A (`onnxruntime.dll` 1.28.2 CPU)；**绝不**初始化全局 `ort` crate 单例
+/// （拓扑解绑，见函数内注释）。
 pub fn ensure_safe_onnx_dll_directory() {
     #[cfg(target_os = "windows")]
     {
@@ -110,10 +114,12 @@ pub fn ensure_safe_onnx_dll_directory() {
 
         static ONNX_INIT: std::sync::Once = std::sync::Once::new();
         ONNX_INIT.call_once(|| {
+            // 【bin/omni 单点收敛 (工单 03)】全仓动态库部署与发现目录统一为 bin/omni，
+            // 旧 bin/onnx 目录已随资产治理 (工单 01) 废弃，严禁再回锚。
             let search_candidates = [
-                "apps/desktop/build/extraResources/bin/onnx",
-                "resources/bin/onnx",
-                "bin/onnx",
+                "apps/desktop/build/extraResources/bin/omni",
+                "resources/bin/omni",
+                "bin/omni",
                 "target/debug",
                 "target/release",
                 "apps/omni/target/debug",
@@ -160,7 +166,6 @@ pub fn ensure_safe_onnx_dll_directory() {
             }
 
             if let Some(ref dir) = found_dir {
-                let dll_path = dir.join("onnxruntime.dll");
                 let wide: Vec<u16> = dir
                     .as_os_str()
                     .encode_wide()
@@ -172,9 +177,18 @@ pub fn ensure_safe_onnx_dll_directory() {
                     }
                     SetDllDirectoryW(wide.as_ptr());
                 }
-                if let Some(dll_str) = dll_path.to_str() {
-                    let _ = omni_core::OmniOrtRuntime::init_with_dll(dll_str);
-                }
+                // 【拓扑解绑 (工单 03)】此处严禁调用 `OmniOrtRuntime::init_with_dll`：
+                // sherpa 音频栈只依赖其自身导入表自动加载 bin/omni/onnxruntime.dll（运行时 A），
+                // 若在此抢先执行 `ort::init_from`，会消耗全局 ort crate 的单例句柄，
+                // 把 sherpa 的 CPU-only 1.28.2 DLL 绑死到全局 ort 会话上，导致后续
+                // DML 运行时 B (onnxruntime_dml.dll) 的加载与 warmup 全部落空。
+                //
+                // 【跨 crate 时序契约 (盲审 M-3)】`SetDllDirectoryW` 是进程级单槽替换：
+                // 本函数必须在 SherpaManager::new() 启动期同步完成运行时 A 的加载，
+                // 且先于任何 OmniOrtRuntime 绑定（后者会以运行时 B 父目录覆盖本槽位）。
+                // 严禁将 sherpa 初始化改为惰性/延迟——否则运行时 B 目录会先占槽，
+                // 排障时自定义 OMNI_ORT_DLL / FIREFLY_ONNX_DIR 指向别处将导致
+                // 后续依赖 bin/omni 的延迟加载失配。
             }
         });
     }
