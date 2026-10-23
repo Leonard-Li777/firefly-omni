@@ -192,6 +192,11 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/v1/vector/match-passages", post(routes::vector::match_passages_handler))
             // 批量整理双底座文本特征向量批量抽取 (batch-organize-hybrid-vector-classification-spec.md)
             .route("/api/v1/vector/batch-embed-text", post(routes::vector::batch_embed_text_handler))
+            // 工单 10：Chinese-CLIP 文本塔编码（512d，encoder=2），供 desktop CLIP 第 5 路使用
+            .route(
+                "/api/v1/vector/embed-clip-text",
+                post(routes::vector::embed_clip_text_handler),
+            )
             // 文本分词 API (中英文结巴搜索切词与多字段高亮)
             .route("/api/v1/text/tokenize", post(text_tokenize_handler))
             .route("/api/text/tokenize", post(text_tokenize_handler))
@@ -256,6 +261,33 @@ async fn engine_vision_evict_handler() -> Json<serde_json::Value> {
 
 
 /// 健康检查：附 Pro 模块与地理/HowNet 子系统可用性，供前端 UI 与桌面端启动时探测
+/// 工单 10：`/health.clipText` 五字段探活。
+///
+/// - `available`：仅在三件套（模型 + 词表 + 输出可验证）齐备时为 true；
+/// - `imageEncoder`：当前激活图像塔（`chinese_clip` / `mobileclip` / `none`）；
+/// - `textModelReady` / `vocabReady`：**只查文件存在与可读，不加载模型**；
+/// - `textOutputVerified`：三态 null（未加载）/ true / false（首次编码结果）。
+fn clip_text_health() -> serde_json::Value {
+    let clip_dir = omni_pro::OmniVisionEngine::resolve_clip_model_dir();
+    let (text_model_ready, vocab_ready) = match clip_dir.as_ref() {
+        Some(dir) => (
+            omni_pro::vision::clip_text_model_ready(dir),
+            omni_pro::vision::clip_text_vocab_ready(dir),
+        ),
+        None => (false, false),
+    };
+    let text_output_verified = omni_pro::vision::clip_text_output_verified();
+    let image_encoder = omni_pro::vision::active_clip_image_encoder_label().to_string();
+    let available = text_model_ready && vocab_ready && text_output_verified != Some(false);
+    serde_json::json!({
+        "available": available,
+        "imageEncoder": image_encoder,
+        "textModelReady": text_model_ready,
+        "vocabReady": vocab_ready,
+        "textOutputVerified": text_output_verified,
+    })
+}
+
 async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let is_pro = omni_pro::is_pro_enabled();
     let geo_available = if is_pro {
@@ -306,7 +338,9 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "cleanupAvailable": is_pro,
         "omwAvailable": omw_available,
         "omwSource": omw_source_label,
-        "graphReady": graph_ready
+        "graphReady": graph_ready,
+        // 工单 10：CLIP 文本塔探活五字段（只读探测，不加载模型）
+        "clipText": clip_text_health()
     }))
 }
 
@@ -899,7 +933,19 @@ pub async fn start_server(
     });
 
     let initial_policies = routes::taxonomy::load_dimension_policies_from_db(db_path.as_deref());
+    // 注意顺序：sherpa 必须在任何 OmniOrtRuntime 绑定之前完成运行时 A 的加载
+    // （`SetDllDirectoryW` 是进程级单槽替换，见 sherpa_manager.rs 的跨 crate 时序契约），
+    // 因此下面的运行时 B 绑定显式排在 SherpaManager::new() 之后。
     let sherpa = Arc::new(SherpaManager::new());
+    // 【工单 04 / SPEC §3.8】启动期显式绑定运行时 B（先探后绑 + 全进程唯一一次 init_from）：
+    // 保证启动日志可观测到「运行时 B 路径 + FileVersion + 内存中 DirectML.dll 实际路径
+    // + EP 探测 + DML 闸状态」。绑定失败不阻断服务启动（推理请求会在 build_session 处
+    // 显式返回 Err），但必须 error 可见，严禁静默。
+    if let Err(err) = omni_core::OmniOrtRuntime::init() {
+        tracing::error!(
+            "[OmniServer] ONNX Runtime 运行时 B 绑定失败，全部 ONNX 推理将不可用: {err}"
+        );
+    }
     let moss = Arc::new(MossTtsManager::new());
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),

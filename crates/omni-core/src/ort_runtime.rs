@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 /// 模型内存驻留分级（对齐 sherpa-onnx-and-ort-unified-runtime-spec 架构规范）
@@ -67,53 +67,681 @@ pub fn set_safe_dll_directory(_sub_dir: &str) -> bool {
     true
 }
 
+// ============================================================================
+// DirectML 全局降级闸（工单 04 §2 / SPEC §3.1）
+//
+// 语义：进程级、单调不可逆的一次性开关。warmup 期与运行期任何 DML 故障都必须走此闸，
+// 置位后全进程不再尝试 DML（`preferred_hardware_eps` 先查闸再探测），避免「同一进程
+// 反复踩同一个坏 GPU 路径」导致每帧失败与日志刷屏。
+// ============================================================================
+
+static DIRECTML_DISABLED: AtomicBool = AtomicBool::new(false);
+static DIRECTML_DISABLE_REASON: OnceLock<String> = OnceLock::new();
+
+/// 置位 DML 全局降级闸（warmup / 运行期 DML 故障的唯一入口）
+///
+/// 幂等：仅首次置位输出 warn（携带原因），后续重复触发降级为 debug，防止高频故障刷屏。
+pub fn disable_directml(reason: &str) {
+    let first_trip = !DIRECTML_DISABLED.swap(true, Ordering::SeqCst);
+    if first_trip {
+        let _ = DIRECTML_DISABLE_REASON.set(reason.to_string());
+        tracing::warn!(
+            "OmniOrtRuntime: DirectML 全局降级闸已置位，进程内不再尝试 DML —— 原因: {}",
+            reason
+        );
+    } else {
+        tracing::debug!(
+            "OmniOrtRuntime: DirectML 降级闸已处于置位状态（重复触发，原因: {}）",
+            reason
+        );
+    }
+}
+
+/// 查询 DML 全局降级闸状态
+pub fn directml_disabled() -> bool {
+    DIRECTML_DISABLED.load(Ordering::SeqCst)
+}
+
+/// 查询 DML 降级闸首次置位原因（未置位时为 None）
+pub fn directml_disable_reason() -> Option<&'static str> {
+    DIRECTML_DISABLE_REASON.get().map(|s| s.as_str())
+}
+
+/// 测试辅助：复位全局降级闸
+///
+/// 仅供单测隔离使用（`#[cfg(test)]` 守卫，生产构建中不存在该符号，杜绝误把不可逆闸复位）。
+/// `OnceLock` 原因无法清空，测试只断言布尔闸；多测试并发触碰闸时须持有测试互斥锁串行化。
+#[cfg(test)]
+pub fn reset_directml_gate_for_test() {
+    DIRECTML_DISABLED.store(false, Ordering::SeqCst);
+}
+
+// ============================================================================
+// EP 策略分档（工单 04 §2 / SPEC §3.2）
+// ============================================================================
+
+/// v1 DirectML allowlist（唯一事实源，SPEC §3.2）
+///
+/// 扩档铁律：任何模型加入此表必须附同 harness 实测数据（同形状 CPU/DML ≥1.5x 且数值偏差
+/// ≤1e-4 相对量级），禁止凭直觉扩档。v1 仅 Gemma 视觉塔（文本塔实测中位 ~1.3x 且方差极大，维持 CPU）。
+pub const DML_ALLOWLIST_MODELS: &[&str] = &["gemma.vision_encoder"];
+
+/// EP 策略档位：与 `ModelTier`（内存驻留分级）**正交**，严禁合并成同一枚举
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpPolicy {
+    /// v1 DirectML allowlist（仅 Gemma 视觉塔）：Windows 上尝试 DML，
+    /// 闸已置位或探测不可用时自动降档为纯 CPU
+    DmlAllowlist,
+    /// 纯 CPU：不注入任何硬件加速 EP（文本塔 / OCR / CLIP / TTS 等全部非 allowlist 模型）
+    CpuOnly,
+}
+
+/// EP 阶梯节点（纯值类型，便于单测断言阶梯顺序，不依赖真实 DLL 与 GPU）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpKind {
+    /// DirectML 硬件加速
+    DirectMl,
+    /// 纯 CPU 多线程兜底
+    Cpu,
+}
+
+/// 纯函数：按策略与探测结果解析 Windows 侧 EP 候选阶梯（T1 单测切缝）
+///
+/// - `dml_probe_ok`：预探确认运行时 B 具备 DML 导出符号且 API 契约通过；
+/// - `dml_disabled`：全局降级闸状态（先查闸再探测，闸置位后阶梯恒为纯 CPU）。
+///
+/// 阶梯顺序铁律：DML 在前、CPU 收尾；`CpuOnly` 恒返回单节点 `[Cpu]`。
+pub fn resolve_ep_candidates(
+    policy: EpPolicy,
+    dml_probe_ok: bool,
+    dml_disabled: bool,
+) -> Vec<EpKind> {
+    match policy {
+        EpPolicy::DmlAllowlist if dml_probe_ok && !dml_disabled => {
+            vec![EpKind::DirectMl, EpKind::Cpu]
+        }
+        _ => vec![EpKind::Cpu],
+    }
+}
+
+// ============================================================================
+// 先探后绑（probe-then-bind）预探阶梯（工单 04 §1 / SPEC §3.1 第 6 步）
+//
+// 背景：ort 2.0.0-rc.9 下 DLL 加载失败是 **panic**（`lib.rs:109` unwrap_or_else panic），
+// 且 `G_ORT_DYLIB_PATH` 的 OnceLock 二次 set 被静默丢弃、`G_ORT_LIB` / `G_ORT_API`
+// 一经绑定永久缓存首个候选句柄。故**严禁**沿阶梯多次调用 `ort::init_from`：
+// 阶梯内每个候选先经 `libloading` 纯内存预探，唯有唯一胜出者才执行一次绑定。
+// ============================================================================
+
+/// 候选判定结论
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateVerdict {
+    /// 预探通过，可进入绑定阶段
+    Accept,
+    /// 文件不存在或无法被加载器打开（纯 CPU 裸环境 / 路径失效）
+    RejectUnloadable,
+    /// 文件名声明 DML 但缺少 `OrtSessionOptionsAppendExecutionProvider_DML` 导出符号（坏候选）
+    RejectMissingDmlSymbol,
+    /// `OrtGetApiBase()->GetApi(ort_sys::ORT_API_VERSION)` 返回空指针（API 版本断层）
+    RejectApiMismatch,
+    /// 候选具备 DML 能力，但同级 `DirectML.dll` 缺失或预加载失败 ⇒ 运行时会被 System32 同名复用截胡
+    RejectMissingDirectMl,
+}
+
+/// 纯函数：候选判定（T9 单测切缝，与真实 DLL 解耦）
+///
+/// 判定顺序：可加载性 → API 契约 → DML 符号（名字声明 DML 时）。纯 CPU 运行时 A
+/// 不声明 DML，缺 DML 符号属正常形态，不得拦截。
+pub fn judge_candidate(
+    claims_dml: bool,
+    loadable: bool,
+    has_dml_symbol: bool,
+    api_ok: bool,
+) -> CandidateVerdict {
+    if !loadable {
+        return CandidateVerdict::RejectUnloadable;
+    }
+    if !api_ok {
+        return CandidateVerdict::RejectApiMismatch;
+    }
+    if claims_dml && !has_dml_symbol {
+        return CandidateVerdict::RejectMissingDmlSymbol;
+    }
+    CandidateVerdict::Accept
+}
+
+/// 比较两个路径是否指向同一文件（先规范化，退化时按字面比较；Windows 大小写不敏感）
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let cb = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    if cfg!(target_os = "windows") {
+        ca.to_string_lossy()
+            .eq_ignore_ascii_case(&cb.to_string_lossy())
+    } else {
+        ca == cb
+    }
+}
+
+/// 预探报告（先探后绑的唯一胜出者 + 可观测字段）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrtProbeReport {
+    /// 胜出候选路径（裸名兜底时为裸文件名，如 "onnxruntime.dll"）
+    pub path: PathBuf,
+    /// 是否具备 DML 导出符号
+    pub dml_capable: bool,
+    /// `GetApi(ORT_API_VERSION)` 是否返回非空（头文件契约一致）
+    pub api_ok: bool,
+    /// 文件版本（FileVersion 四段式，取不到时为 None）
+    pub file_version: Option<String>,
+    /// 运行时自报版本（`OrtApiBase::GetVersionString`，如 "1.24.4"；AC-2 断言以它为准）
+    pub runtime_version: Option<String>,
+    /// 预探期以绝对路径钉死的 DirectML.dll
+    pub directml_pinned: Option<PathBuf>,
+}
+
+/// 文件名是否声明自己是 DirectML 运行时（`onnxruntime_dml.dll`）
+fn name_claims_dml(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase().contains("_dml"))
+        .unwrap_or(false)
+}
+
+/// 以绝对路径钉死 `DirectML.dll`，并永久持有句柄（防 System32 同名截胡）
+///
+/// Windows PE 加载器对同名模块实行已加载模块列表优先复用原则：若进程内任何图形 /
+/// 多媒体 / DXGI 组件先行触发了 `C:\Windows\System32\DirectML.dll`，后续加载
+/// `onnxruntime_dml.dll` 时将复用旧句柄而无视同级新版 DLL。故必须在任何 D3D12 / ORT
+/// 预探之前用**绝对路径**预加载，且**严禁**在函数退出时 Drop（Drop 会触发 FreeLibrary
+/// 卸载，等于没钉）。纯 CPU 裸环境（CI 未装配 DML 资产）文件缺失仅 debug，不阻塞阶梯。
+#[cfg(target_os = "windows")]
+pub fn pin_directml_dll(dir: &Path) -> Option<PathBuf> {
+    // 进程内同名模块只有一份：首次钉死成功后直接复用结论，避免阶梯逐候选重复 LoadLibrary
+    static PINNED_DIRECTML: OnceLock<Option<PathBuf>> = OnceLock::new();
+    if let Some(cached) = PINNED_DIRECTML.get() {
+        return cached.clone();
+    }
+
+    let candidate = dir.join("DirectML.dll");
+    if !candidate.exists() {
+        tracing::debug!(
+            "OmniOrtRuntime: {} 无 DirectML.dll（纯 CPU 裸环境），跳过 DML 候选预探",
+            dir.display()
+        );
+        return None;
+    }
+    // 绝对路径：杜绝加载器按搜索路径把同名 DLL 解析到 System32
+    let abs = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+    let pinned = match unsafe { libloading::Library::new(&abs) } {
+        Ok(lib) => {
+            // 永久持有句柄：此处 Drop 会 FreeLibrary 卸载，钉死语义即失效
+            std::mem::forget(lib);
+            tracing::info!(
+                "OmniOrtRuntime: 已以绝对路径钉死 DirectML.dll（防 System32 截胡）: {}",
+                abs.display()
+            );
+            Some(abs)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "OmniOrtRuntime: DirectML.dll 绝对路径预加载失败，DML 候选将被跳过: {} ({})",
+                abs.display(),
+                e
+            );
+            None
+        }
+    };
+    // 仅缓存成功结论：未找到的目录不得污染后续候选的钉死机会
+    if pinned.is_some() {
+        let _ = PINNED_DIRECTML.set(pinned.clone());
+    }
+    pinned
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn pin_directml_dll(_dir: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// 读取进程内已加载模块的真实文件路径（Windows `GetModuleHandleW` + `GetModuleFileNameW`）
+#[cfg(target_os = "windows")]
+pub fn loaded_module_path(module: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(module)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let handle = GetModuleHandleW(wide.as_ptr());
+        if handle.is_null() {
+            return None;
+        }
+        let mut buf = vec![0u16; 1024];
+        let len = GetModuleFileNameW(handle, buf.as_mut_ptr(), buf.len() as u32);
+        if len == 0 {
+            return None;
+        }
+        // 缓冲不足时 API 返回 nSize（而非长度），截断会产生半截路径并污染「截胡」断言
+        if len as usize >= buf.len() {
+            return None;
+        }
+        buf.truncate(len as usize);
+        Some(PathBuf::from(std::ffi::OsString::from_wide(&buf)))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn loaded_module_path(_module: &str) -> Option<PathBuf> {
+    None
+}
+
+/// 读取 PE 文件的 FileVersion（四段式 `a.b.c.d`），失败返回 None
+#[cfg(target_os = "windows")]
+pub fn file_version(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let size = GetFileVersionInfoSizeW(wide.as_ptr(), std::ptr::null_mut());
+        if size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        if GetFileVersionInfoW(wide.as_ptr(), 0, size, buf.as_mut_ptr() as *mut _) == 0 {
+            return None;
+        }
+        // 根块 `\` 指向 VS_FIXEDFILEINFO
+        let root: Vec<u16> = "\\".encode_utf16().chain(std::iter::once(0)).collect();
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut len: u32 = 0;
+        if VerQueryValueW(buf.as_ptr() as *const _, root.as_ptr(), &mut ptr, &mut len) == 0
+            || ptr.is_null()
+            || len < 16
+        {
+            return None;
+        }
+        // 布局：dwSignature(0) / dwStrucVersion(4) / dwFileVersionMS(8) / dwFileVersionLS(12)
+        // 必须用 `read_unaligned`：`ptr` 指向 `Vec<u8>`（对齐 1）内部，`from_raw_parts::<u32>`
+        // 的 4 字节对齐前提并不成立，属未定义行为（当前只靠 VS_VERSIONINFO 的 padding 侥幸对齐）。
+        let base = ptr as *const u8;
+        let ms = std::ptr::read_unaligned(base.add(8) as *const u32);
+        let ls = std::ptr::read_unaligned(base.add(12) as *const u32);
+        Some(format!(
+            "{}.{}.{}.{}",
+            ms >> 16,
+            ms & 0xffff,
+            ls >> 16,
+            ls & 0xffff
+        ))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn file_version(_path: &Path) -> Option<String> {
+    None
+}
+
+/// 单候选预探结论
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateProbe {
+    verdict: CandidateVerdict,
+    has_dml_symbol: bool,
+    /// `OrtGetApiBase()->GetApi(ORT_API_VERSION)` 是否返回非空（头文件契约一致）
+    api_ok: bool,
+    /// 运行时自报版本（`OrtApiBase::GetVersionString`，如 "1.24.4"）
+    ///
+    /// 与 PE `FileVersion` 互补：资源段可缺失、可被误写（SPEC §7.7 已有「1.28.0 官方不存在
+    /// 却被 BOM 登记」的前科），而版本字符串是 ORT 自己吐的，AC-2 的版本断言以它为准。
+    runtime_version: Option<String>,
+}
+
+/// 单候选预探：`libloading` 纯内存加载 + DML 符号 + ORT API 契约双检
+///
+/// 预探句柄在本函数内 Drop，仅用于符号与契约探测，真正绑定由 `ort::init_from` 完成，
+/// 不会污染 ort 的全局 OnceLock。
+#[cfg(target_os = "windows")]
+fn probe_candidate_file(path: &Path) -> CandidateProbe {
+    let claims_dml = name_claims_dml(path);
+    // 绝对路径加载：裸名兜底（"onnxruntime.dll"）交给 OS 加载器按搜索路径解析
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let lib = match unsafe { libloading::Library::new(&abs) } {
+        Ok(l) => l,
+        Err(e) => {
+            // 存在但加载失败 = 资产损坏 / 架构不符 / 缺依赖（真实故障，必须 warn 可观测）；
+            // 不存在 = 纯 CPU 裸环境的正常缺席（debug 即可，避免噪声）
+            if path.exists() {
+                tracing::warn!(
+                    "OmniOrtRuntime: 候选存在但加载失败（资产损坏/架构不符/缺依赖），跳过: {} ({})",
+                    path.display(),
+                    e
+                );
+            } else {
+                tracing::debug!("OmniOrtRuntime: 候选不存在，跳过: {}", path.display());
+            }
+            return CandidateProbe {
+                verdict: CandidateVerdict::RejectUnloadable,
+                has_dml_symbol: false,
+                api_ok: false,
+                runtime_version: None,
+            };
+        }
+    };
+
+    let has_dml_symbol = unsafe {
+        lib.get::<*const std::ffi::c_void>(b"OrtSessionOptionsAppendExecutionProvider_DML\0")
+            .is_ok()
+    };
+
+    // API 契约核验：GetApi(ORT_API_VERSION) 必须返回非空，从源头阻断头文件契约不匹配引发的 panic
+    let mut api_ok = false;
+    let mut runtime_version = None;
+    unsafe {
+        if let Ok(get_api_base) =
+            lib.get::<unsafe extern "system" fn() -> *const ort::sys::OrtApiBase>(b"OrtGetApiBase\0")
+        {
+            let base = get_api_base();
+            if !base.is_null() {
+                if let Some(get_api) = (*base).GetApi {
+                    api_ok = !get_api(ort::sys::ORT_API_VERSION).is_null();
+                }
+                if let Some(get_version) = (*base).GetVersionString {
+                    let raw = get_version();
+                    if !raw.is_null() {
+                        runtime_version = std::ffi::CStr::from_ptr(raw)
+                            .to_str()
+                            .ok()
+                            .map(|s| s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    drop(lib);
+
+    CandidateProbe {
+        verdict: judge_candidate(claims_dml, true, has_dml_symbol, api_ok),
+        has_dml_symbol,
+        api_ok,
+        runtime_version,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn probe_candidate_file(path: &Path) -> CandidateProbe {
+    // 非 Windows 无 `onnxruntime_dml.dll` 语义，不做 DML 符号探测，
+    // 但**必须**校验可加载性：`ort::init_from(...).commit()` 在 dylib 缺席、架构/ABI
+    // 不匹配或 `GetApi(ORT_API_VERSION)` 版本断层时是 panic（rc.9 `lib.rs:106` / `:176`），
+    // release `panic = "abort"` 下直接终止进程。预探谎报成功 = 把「静默降级」升级成 abort。
+    let exists = path.exists();
+    let loadable = exists && unsafe { libloading::Library::new(path) }.is_ok();
+    if exists && !loadable {
+        tracing::warn!(
+            "OmniOrtRuntime: 候选存在但无法被加载器打开（架构/ABI 不匹配或依赖缺失），跳过: {}",
+            path.display()
+        );
+    }
+    CandidateProbe {
+        verdict: if loadable {
+            CandidateVerdict::Accept
+        } else {
+            CandidateVerdict::RejectUnloadable
+        },
+        has_dml_symbol: false,
+        // 非 Windows 不做 API 契约探测，如实标记为 false（严禁谎报 true）
+        api_ok: false,
+        runtime_version: None,
+    }
+}
+
+/// DML 候选的防截胡校验：返回 `Some(原因)` 表示该候选必须被拒绝
+///
+/// 判据（工单 04 第 13 条「拦截缺失 `DirectML.dll` 的坏候选」）：候选具备 DML 能力，
+/// 但**本级目录**没有 `DirectML.dll`。此时 ORT 的 DML EP 只能按搜索路径命中
+/// `System32\DirectML.dll`，版本与运行时 B 未必匹配 ⇒ 静默截胡；且该时刻模块尚未驻留，
+/// `log_runtime_binding` 的截胡告警也无从观测，整条链路会零 warn 地跑在错误 DLL 上。
+///
+/// 注：裸名候选（无本级目录）同样拒绝——没有目录就无法以绝对路径钉死，防截胡契约不成立。
+///
+/// 判据二（与 `pin_directml_dll` 的结论对齐）：同级 `DirectML.dll` **存在但无法预加载**
+/// （架构不符 / 文件损坏）。此时 `pin_directml_dll` 已 warn「DML 候选将被跳过」，
+/// 若此处仅以 `exists()` 放行，行为就与日志相反：候选被 Accept，DML EP 转而命中
+/// `System32` 同名副本 —— 正是本工单要消灭的截胡。故以「模块是否真的驻留」为判据。
+fn dml_candidate_reject_reason(cand: &Path) -> Option<String> {
+    let Some(dir) = cand.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Some(format!(
+            "{}: 具备 DML 能力但候选为裸名（无本级目录），无法以绝对路径钉死 DirectML.dll",
+            cand.display()
+        ));
+    };
+    if !dir.join("DirectML.dll").exists() {
+        return Some(format!(
+            "{}: 具备 DML 能力但同级 DirectML.dll 缺失（DML EP 将命中 System32 同名旧版，属静默截胡）",
+            cand.display()
+        ));
+    }
+    // 文件在但钉不死（预加载失败）⇒ 进程内没有我们认可的那份 DirectML.dll
+    if loaded_module_path("DirectML.dll").is_none() {
+        return Some(format!(
+            "{}: 同级 DirectML.dll 存在但无法以绝对路径预加载（架构不符/文件损坏，DML EP 将命中 System32 同名副本）",
+            cand.display()
+        ));
+    }
+    None
+}
+
+/// 预探阶梯：逐候选判定，首个通过者胜出（T9 单测切缝，不触碰 `RUNTIME_INIT`）
+///
+/// 铁律：本函数**只预探不绑定**，故全败返回 Err 时不会污染 ort 全局单例，
+/// 修复资产后同进程重试仍可成功。
+pub fn probe_ladder(candidates: &[PathBuf]) -> Result<OrtProbeReport, String> {
+    let mut rejects: Vec<String> = Vec::new();
+    for cand in candidates {
+        // 防截胡：先以绝对路径钉死候选同级 DirectML.dll（必须在任何 ORT 预探之前）
+        let pinned = cand
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .and_then(pin_directml_dll);
+
+        let probe = probe_candidate_file(cand);
+
+        // 坏候选拦截必须在 Accept 之前：放行「有 DML 符号但拿不到本级 DirectML.dll」的候选
+        // 等于把截胡风险下沉到 EP 注册期，而那里已无任何可观测点。
+        if probe.verdict == CandidateVerdict::Accept && probe.has_dml_symbol {
+            if let Some(reason) = dml_candidate_reject_reason(cand) {
+                tracing::warn!("OmniOrtRuntime: 预探拦截 {}", reason);
+                rejects.push(reason);
+                continue;
+            }
+        }
+
+        match probe.verdict {
+            CandidateVerdict::Accept => {
+                // 防截胡交叉校验：钉死句柄是「进程内首个成功加载的同名模块」，若胜出候选目录
+                // 与该钉死路径不同，加载器会按同名复用首个副本 ⇒ DML 可能跑在陈旧 DLL 上。
+                // 这里必须显式告警，杜绝「断言基准 = 我们钉了什么」造成的恒真（AC-2）。
+                if let Some(dir) = cand.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    let expected = dir.join("DirectML.dll");
+                    // 内存驻留副本才是「EP 真正会用到的那个」——它比钉死句柄更接近事实
+                    let resident = loaded_module_path("DirectML.dll");
+                    let mismatch = match (pinned.as_ref(), resident.as_ref()) {
+                        (Some(p), Some(r)) => !is_same_file(p, r),
+                        _ => false,
+                    };
+                    if (expected.exists()
+                        && pinned
+                            .as_ref()
+                            .is_some_and(|p| !is_same_file(p, &expected)))
+                        || mismatch
+                    {
+                        tracing::warn!(
+                            "OmniOrtRuntime: 钉死的 DirectML.dll 与胜出运行时 B 不同目录（加载器将按同名复用首个副本）: pinned={} resident={} expected={}",
+                            pinned
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "<none>".to_string()),
+                            resident
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "<not-loaded>".to_string()),
+                            expected.display()
+                        );
+                    }
+                }
+                let fv = file_version(cand);
+                tracing::info!(
+                    "OmniOrtRuntime: 运行时 B 预探通过 candidate={} DML符号={} FileVersion={} ORTVersion={} DirectML钉死={}",
+                    cand.display(),
+                    probe.has_dml_symbol,
+                    fv.as_deref().unwrap_or("<unknown>"),
+                    probe.runtime_version.as_deref().unwrap_or("<unknown>"),
+                    pinned
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                );
+                return Ok(OrtProbeReport {
+                    path: cand.clone(),
+                    dml_capable: probe.has_dml_symbol,
+                    api_ok: probe.api_ok,
+                    file_version: fv,
+                    runtime_version: probe.runtime_version,
+                    directml_pinned: pinned,
+                });
+            }
+            CandidateVerdict::RejectUnloadable => {
+                if cand.exists() {
+                    // 存在却加载失败属真实故障（原因已在 probe_candidate_file 内 warn），
+                    // 必须进入全败 Err 串，严禁只留一句「拦截 0 个」的静默降级
+                    rejects.push(format!("{}: 存在但加载失败", cand.display()));
+                } else {
+                    tracing::debug!(
+                        "OmniOrtRuntime: 候选不存在/不可加载，跳过: {}",
+                        cand.display()
+                    );
+                }
+            }
+            CandidateVerdict::RejectMissingDmlSymbol => {
+                let msg = format!("{}: 声明 DML 但缺 DML 导出符号（坏候选）", cand.display());
+                tracing::warn!("OmniOrtRuntime: 预探拦截 {}", msg);
+                rejects.push(msg);
+            }
+            CandidateVerdict::RejectApiMismatch => {
+                let msg = format!(
+                    "{}: GetApi({}) 返回空指针（API 版本断层）",
+                    cand.display(),
+                    ort::sys::ORT_API_VERSION
+                );
+                tracing::warn!("OmniOrtRuntime: 预探拦截 {}", msg);
+                rejects.push(msg);
+            }
+            // 该结论由 `judge_candidate` 之外的防截胡校验产生，已在 match 之前 `continue`；
+            // 此处保留分支仅为穷尽性，避免后续新增判定时静默落空。
+            CandidateVerdict::RejectMissingDirectMl => {
+                let msg = format!("{}: 具备 DML 能力但缺少同级 DirectML.dll", cand.display());
+                tracing::warn!("OmniOrtRuntime: 预探拦截 {}", msg);
+                rejects.push(msg);
+            }
+        }
+    }
+    Err(format!(
+        "预探阶梯全败（候选 {} 个，拦截 {} 个）{}",
+        candidates.len(),
+        rejects.len(),
+        if rejects.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", rejects.join("; "))
+        }
+    ))
+}
+
 /// 统一 ONNX Runtime 单例管理器
 pub struct OmniOrtRuntime;
 
 static RUNTIME_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
+/// 初始化串行锁：杜绝并发线程各自预探后重复 `init_from`（rc.9 二次绑定会 panic）
+static INIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// 已绑定运行时的 DML 符号结论（预探产物，供 `directml_probe_ok` 叠加假阳性防线）
+static BOUND_DML_CAPABLE: AtomicBool = AtomicBool::new(false);
+
+/// 绑定阶段失败结论（不可重试）
+///
+/// `ort::init_from` 在 `commit()` 之前就已写入 `G_ORT_DYLIB_PATH`（rc.9 `environment.rs:393`
+/// 的 OnceLock，二次 set 被静默丢弃）。因此一旦 `commit()` 失败，换路径重试只会沿用旧路径
+/// 造成「日志路径 ≠ 实际绑定」的谎言——此处冻结首次失败结论，杜绝伪重试。
+static BIND_FAILED: OnceLock<String> = OnceLock::new();
+
 impl OmniOrtRuntime {
-    /// 自动发现本地有效的 ONNX Runtime DLL 路径 (Windows 防劫持与自定位)
-    pub fn discover_onnx_dll() -> Option<std::path::PathBuf> {
-        use std::path::PathBuf;
-        if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
-            let pb = PathBuf::from(p);
-            if pb.exists() {
-                return Some(pb);
+    /// 运行时 B 发现链（优先级从高到低，SPEC §3.1 第 1~5 步）
+    ///
+    /// 1. `OMNI_ORT_DLL` 显式路径（最高优先，兼容测试与排障）；
+    /// 2. `FIREFLY_ONNX_DIR` 目录：**先 `onnxruntime_dml.dll` 再 `onnxruntime.dll`**
+    ///    （防排障时把该变量指向 bin/omni 反而静默失去 DML 的假阳性形态）；
+    /// 3. `ORT_DYLIB_PATH`（既有语义并入本档）；
+    /// 4. exe 同级 `onnxruntime_dml.dll`；
+    /// 5. exe 同级 / 既有发现链的 `onnxruntime.dll`（仅运行时 A 的裸环境，如未装配 DML 的 CI）。
+    pub fn discover_onnx_dll_candidates() -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        let mut push = |p: PathBuf| {
+            if !p.as_os_str().is_empty() && !out.contains(&p) {
+                out.push(p);
             }
+        };
+
+        // 1. 显式路径（最高优先）
+        if let Ok(p) = std::env::var("OMNI_ORT_DLL") {
+            push(PathBuf::from(p));
         }
+        // 2. FIREFLY_ONNX_DIR：先 DML 后普通
         if let Ok(dir) = std::env::var("FIREFLY_ONNX_DIR") {
-            let pb = PathBuf::from(dir).join("onnxruntime.dll");
-            if pb.exists() {
-                return Some(pb);
-            }
+            let d = PathBuf::from(dir);
+            push(d.join("onnxruntime_dml.dll"));
+            push(d.join("onnxruntime.dll"));
         }
-        let mut check_dirs = Vec::new();
+        // 3. ORT_DYLIB_PATH（既有排障通道）
+        if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
+            push(PathBuf::from(p));
+        }
+
+        let mut roots: Vec<PathBuf> = Vec::new();
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(parent) = exe_path.parent() {
-                check_dirs.push(parent.to_path_buf());
+                roots.push(parent.to_path_buf());
             }
         }
         if let Ok(cur) = std::env::current_dir() {
-            check_dirs.push(cur);
+            roots.push(cur);
         }
-        for base in check_dirs {
+
+        // 4/5. exe 同级 + 向上发现链（工单 03 已把部署目录单点收敛到 bin/omni，严禁回锚 bin/onnx）
+        for base in roots {
             let mut cur = base;
             for _ in 0..6 {
-                let candidates = [
-                    cur.join("onnxruntime.dll"),
-                    cur.join("bin/omni/onnxruntime.dll"),
-                    cur.join("resources/bin/onnx/onnxruntime.dll"),
-                    cur.join("apps/desktop/build/extraResources/bin/onnx/onnxruntime.dll"),
-                    cur.join("build/extraResources/bin/onnx/onnxruntime.dll"),
-                    cur.join("target/debug/onnxruntime.dll"),
-                    cur.join("target/release/onnxruntime.dll"),
-                ];
-                for c in &candidates {
-                    if c.exists() {
-                        return Some(c.clone());
-                    }
-                }
+                push(cur.join("onnxruntime_dml.dll"));
+                push(cur.join("onnxruntime.dll"));
+                push(cur.join("bin/omni/onnxruntime_dml.dll"));
+                push(cur.join("bin/omni/onnxruntime.dll"));
+                push(cur.join("resources/bin/omni/onnxruntime_dml.dll"));
+                push(cur.join("resources/bin/omni/onnxruntime.dll"));
+                push(cur.join("apps/desktop/build/extraResources/bin/omni/onnxruntime_dml.dll"));
+                push(cur.join("apps/desktop/build/extraResources/bin/omni/onnxruntime.dll"));
+                push(cur.join("build/extraResources/bin/omni/onnxruntime_dml.dll"));
+                push(cur.join("build/extraResources/bin/omni/onnxruntime.dll"));
+                push(cur.join("target/debug/onnxruntime_dml.dll"));
+                push(cur.join("target/debug/onnxruntime.dll"));
+                push(cur.join("target/release/onnxruntime_dml.dll"));
+                push(cur.join("target/release/onnxruntime.dll"));
                 if let Some(parent) = cur.parent() {
                     cur = parent.to_path_buf();
                 } else {
@@ -121,54 +749,283 @@ impl OmniOrtRuntime {
                 }
             }
         }
-        None
+        out
     }
 
-    /// 在应用启动时初始化 ONNX Runtime 动态库搜索与加载
-    pub fn init() -> Result<(), String> {
-        #[cfg(target_os = "windows")]
-        {
-            if let Some(dll_path) = Self::discover_onnx_dll() {
-                if let Some(parent) = dll_path.parent() {
-                    let _ = set_safe_dll_directory(parent.to_str().unwrap_or(""));
+    /// 自动发现本地有效的 ONNX Runtime DLL 路径（历史入口，返回发现链首个真实存在的文件）
+    pub fn discover_onnx_dll() -> Option<PathBuf> {
+        Self::discover_onnx_dll_candidates()
+            .into_iter()
+            .find(|p| p.exists())
+    }
+
+    /// 预探运行时 B：发现链阶梯 + 裸名兜底，返回唯一胜出者（只探不绑）
+    ///
+    /// 注：`ORT_DYLIB_PATH` 在 `ort::init_from` 路径下会被 `G_ORT_DYLIB_PATH` 覆盖而失效
+    /// （rc.9 `environment.rs:393`），因此这里把它当成**显式候选**纳入阶梯而非依赖 ort 自解析。
+    #[cfg(target_os = "windows")]
+    fn probe_runtime_b() -> Result<OrtProbeReport, String> {
+        let candidates = Self::discover_onnx_dll_candidates();
+        match probe_ladder(&candidates) {
+            Ok(report) => Ok(report),
+            Err(e) => {
+                // 裸名兜底：交给 OS 加载器按 PATH / SetDllDirectory 解析
+                let bare = PathBuf::from("onnxruntime.dll");
+                match probe_ladder(std::slice::from_ref(&bare)) {
+                    Ok(report) => Ok(report),
+                    Err(bare_err) => Err(format!("{e}; 裸名兜底亦失败: {bare_err}")),
                 }
-                return Self::init_with_dll(dll_path.to_str().unwrap_or("onnxruntime.dll"));
             }
         }
-        Self::init_with_dll("onnxruntime.dll")
     }
 
-    /// 指定特定 DLL 路径初始化
-    pub fn init_with_dll(dll_path: &str) -> Result<(), String> {
-        RUNTIME_INIT
-            .get_or_init(|| {
-                #[cfg(target_os = "windows")]
-                {
-                    // 在 Windows 环境启动入口处建立安全 DLL 搜索隔离，免疫劫持
-                    // 若 dll_path 为显式路径，优先使用其父目录；否则回退至 "resources/bin/onnx"
-                    let candidate_dir = std::path::Path::new(dll_path)
-                        .parent()
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .and_then(|p| p.to_str())
-                        .unwrap_or("resources/bin/onnx");
-                    set_safe_dll_directory(candidate_dir);
-                }
+    /// 非 Windows 预探：仅做「dylib 是否真的可定位」的存在性校验
+    ///
+    /// 不做 PE 符号探测（无 `onnxruntime_dml.dll` 语义），但**必须**校验可加载性：
+    /// `ort::init_from(...).commit()` 在 dylib 缺席时是 panic（rc.9 `lib.rs:109`），
+    /// 预探谎报成功会直接把「静默降级」升级成进程 abort（release `panic = "abort"`）。
+    #[cfg(not(target_os = "windows"))]
+    fn probe_runtime_b() -> Result<OrtProbeReport, String> {
+        let bare = if cfg!(target_os = "macos") {
+            "libonnxruntime.dylib"
+        } else {
+            "libonnxruntime.so"
+        };
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        // `ORT_DYLIB_PATH` 会被 init_from 覆盖，故作为显式候选纳入阶梯
+        if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
+            if !p.is_empty() {
+                candidates.push(PathBuf::from(p));
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join(bare));
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join(bare));
+        }
+        candidates.push(PathBuf::from(bare));
 
-                // 实现全局动态加载入口：ort::init_from("onnxruntime.dll")
-                match ort::init_from(dll_path).commit() {
-                    Ok(_) => {
-                        tracing::info!("OmniOrtRuntime: 成功动态加载 ONNX Runtime ({})", dll_path);
-                        Self::log_execution_provider_capability();
-                        Ok(())
+        probe_ladder(&candidates).map(|mut report| {
+            report.dml_capable = false;
+            report
+        })
+    }
+
+    /// 绑定预探胜出者：全进程**唯一一次** `ort::init_from(...).commit()`
+    fn bind_probed(report: &OrtProbeReport) -> Result<(), String> {
+        // 绑定阶段一旦失败即冻结结论：`G_ORT_DYLIB_PATH` 已被首次 init_from 写入且不可覆盖，
+        // 换路径重试必然「日志说 B、实际跑 A」，故严禁伪重试。
+        if let Some(prev) = BIND_FAILED.get() {
+            tracing::debug!(
+                "OmniOrtRuntime: 绑定阶段已失败过，拒绝换路径重试（G_ORT_DYLIB_PATH 已冻结）: {}",
+                prev
+            );
+            return Err(prev.clone());
+        }
+
+        let dll_str = report.path.to_string_lossy().to_string();
+        #[cfg(target_os = "windows")]
+        {
+            // 在 Windows 环境启动入口处建立安全 DLL 搜索隔离，免疫劫持
+            // 若为显式路径，优先使用其父目录；否则回退至 "resources/bin/omni" (工单 03 单点收敛)
+            let candidate_dir = report
+                .path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .and_then(|p| p.to_str())
+                .unwrap_or("resources/bin/omni");
+            set_safe_dll_directory(candidate_dir);
+        }
+
+        // 实现全局动态加载入口：ort::init_from("onnxruntime.dll")
+        match ort::init_from(&dll_str).commit() {
+            Ok(_) => {
+                // 记录预探的 DML 符号结论：`is_available()` 在纯 CPU DLL 上有假阳性历史，
+                // 能力落点必须叠加预探结论（SPEC §7.7）
+                BOUND_DML_CAPABLE.store(report.dml_capable, Ordering::SeqCst);
+                tracing::info!(
+                    "OmniOrtRuntime: 成功动态加载 ONNX Runtime path={} FileVersion={} DML符号={}",
+                    if dll_str.is_empty() {
+                        "<os-loader>"
+                    } else {
+                        &dll_str
+                    },
+                    report.file_version.as_deref().unwrap_or("<unknown>"),
+                    report.dml_capable
+                );
+                Self::log_runtime_binding(report);
+                Self::log_execution_provider_capability();
+                Ok(())
+            }
+            Err(e) => {
+                let err_msg = format!("OmniOrtRuntime: 动态加载 ONNX Runtime 失败: {}", e);
+                tracing::error!("{}", err_msg);
+                let _ = BIND_FAILED.set(err_msg.clone());
+                Err(err_msg)
+            }
+        }
+    }
+
+    /// 运行时 B 绑定可观测行（AC-2 / SPEC §3.8）：路径 + FileVersion + 内存中 DirectML.dll 实际路径
+    fn log_runtime_binding(report: &OrtProbeReport) {
+        // 裸名兜底（无父目录）时，AC-2 要的是「真实路径」，故回填加载器实际命中的模块路径
+        // 注：`Path::new("onnxruntime.dll").parent()` 返回 `Some("")` 而非 `None`，
+        // 必须显式过滤空父目录，否则裸名分支永不生效、日志退化成字面量。
+        let runtime_b = if report.path.as_os_str().is_empty() {
+            "<os-loader>".to_string()
+        } else if report
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .is_none()
+        {
+            report
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(loaded_module_path)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| report.path.display().to_string())
+        } else {
+            report.path.display().to_string()
+        };
+        let gate = if directml_disabled() {
+            "已置位"
+        } else {
+            "未置位"
+        };
+        let gate_reason = directml_disable_reason()
+            .map(|r| format!(" 原因={r}"))
+            .unwrap_or_default();
+
+        #[cfg(target_os = "windows")]
+        {
+            let directml_resident = loaded_module_path("DirectML.dll");
+            let directml_desc = match directml_resident {
+                Some(ref p) => {
+                    // 仅在运行时 B 真具 DML 能力时断言驻留路径（纯 CPU 部署允许 System32 的旧版共存）
+                    if report.dml_capable {
+                        match report.directml_pinned.as_ref() {
+                            Some(pinned) if !is_same_file(p, pinned) => {
+                                tracing::warn!(
+                                    "OmniOrtRuntime: 内存中 DirectML.dll 路径未命中 bin/omni（疑被 System32 截胡）: {}",
+                                    p.display()
+                                );
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "OmniOrtRuntime: 运行时 B 具备 DML 能力但 DirectML.dll 未经绝对路径钉死（存在被 System32 复用的风险）: {}",
+                                    p.display()
+                                );
+                            }
+                            _ => {}
+                        }
                     }
-                    Err(e) => {
-                        let err_msg = format!("OmniOrtRuntime: 动态加载 ONNX Runtime 失败: {}", e);
-                        tracing::warn!("{}", err_msg);
-                        Err(err_msg)
-                    }
+                    p.display().to_string()
                 }
-            })
-            .clone()
+                None => "<not-loaded>".to_string(),
+            };
+            tracing::info!(
+                "OmniOrtRuntime: [RUNTIME-B] path={} FileVersion={} ORTVersion={} DirectML.dll(内存)={} DML符号={} allowlist={:?} 闸={}{}",
+                runtime_b,
+                report.file_version.as_deref().unwrap_or("<unknown>"),
+                report.runtime_version.as_deref().unwrap_or("<unknown>"),
+                directml_desc,
+                report.dml_capable,
+                DML_ALLOWLIST_MODELS,
+                gate,
+                gate_reason
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            tracing::info!(
+                "OmniOrtRuntime: [RUNTIME-B] path={} FileVersion={} ORTVersion={} DML符号={} 闸={}{}",
+                runtime_b,
+                report.file_version.as_deref().unwrap_or("<unknown>"),
+                report.runtime_version.as_deref().unwrap_or("<unknown>"),
+                report.dml_capable,
+                gate,
+                gate_reason
+            );
+        }
+    }
+
+    /// 在应用启动时初始化 ONNX Runtime：先探后绑（阶梯全败不污染 OnceLock）
+    pub fn init() -> Result<(), String> {
+        if let Some(done) = RUNTIME_INIT.get() {
+            return done.clone();
+        }
+        // 绑定阶段已失败 ⇒ 结论永久冻结（G_ORT_DYLIB_PATH 不可覆盖），此处零成本短路，
+        // 杜绝「每次建会话重跑全阶梯 + 打一条 INFO 预探通过却必然失败」的日志矛盾与放大
+        if let Some(prev) = BIND_FAILED.get() {
+            return Err(prev.clone());
+        }
+        let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(done) = RUNTIME_INIT.get() {
+            return done.clone();
+        }
+        if let Some(prev) = BIND_FAILED.get() {
+            return Err(prev.clone());
+        }
+
+        // 阶段 1：预探（绝不触碰 OnceLock / ort 全局单例；预探失败不记忆，修复资产后可重试）
+        let winner = match Self::probe_runtime_b() {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(
+                    "OmniOrtRuntime: 运行时 B 预探阶梯全败，推理初始化终止（ort 单例未被污染，修复资产后可重试）: {}",
+                    e
+                );
+                return Err(e);
+            }
+        };
+        // 阶段 2：唯一胜出者单次绑定（绑定失败由 BIND_FAILED 冻结，不再重试）
+        let bound = Self::bind_probed(&winner);
+        if bound.is_ok() {
+            let _ = RUNTIME_INIT.set(bound.clone());
+        }
+        bound
+    }
+
+    /// 指定特定 DLL 路径初始化（排障通道，同样先探后绑，严禁绕过预探）
+    pub fn init_with_dll(dll_path: &str) -> Result<(), String> {
+        if let Some(done) = RUNTIME_INIT.get() {
+            // 已绑定：严禁二次 init_from（rc.9 二次绑定会 panic / 静默失效）
+            tracing::debug!(
+                "OmniOrtRuntime: 已完成单例绑定，忽略重复初始化请求 ({})",
+                dll_path
+            );
+            return done.clone();
+        }
+        if let Some(prev) = BIND_FAILED.get() {
+            tracing::debug!("OmniOrtRuntime: 绑定阶段已失败过，排障通道不再重试: {}", prev);
+            return Err(prev.clone());
+        }
+        let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(done) = RUNTIME_INIT.get() {
+            return done.clone();
+        }
+        if let Some(prev) = BIND_FAILED.get() {
+            return Err(prev.clone());
+        }
+
+        let cand = PathBuf::from(dll_path);
+        let winner = match probe_ladder(std::slice::from_ref(&cand)) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!("OmniOrtRuntime: 显式 DLL 预探失败，拒绝绑定: {}", e);
+                return Err(e);
+            }
+        };
+        let bound = Self::bind_probed(&winner);
+        if bound.is_ok() {
+            let _ = RUNTIME_INIT.set(bound.clone());
+        }
+        bound
     }
 
     /// 确保已初始化
@@ -228,14 +1085,23 @@ impl OmniOrtRuntime {
             let cuda = ort::execution_providers::CUDAExecutionProvider::default()
                 .is_available()
                 .unwrap_or(false);
-            let dml = ort::execution_providers::DirectMLExecutionProvider::default()
+            let dml_raw = ort::execution_providers::DirectMLExecutionProvider::default()
                 .is_available()
                 .unwrap_or(false);
+            // `is_available()` 仅作候选判定：必须叠加预探的 DML 符号结论，否则纯 CPU DLL 上的
+            // 假阳性会让启动日志自相矛盾（SPEC §3.8 / §7.7「DirectML 日志虚假」前科）
+            let dml = dml_raw && BOUND_DML_CAPABLE.load(Ordering::SeqCst);
             tracing::info!(
-                "OmniOrtRuntime: EP 能力盘点 CUDA={}, DirectML={}",
+                "OmniOrtRuntime: EP 能力盘点 CUDA={}, DirectML={}（is_available 原始值={}）",
                 cuda,
-                dml
+                dml,
+                dml_raw
             );
+            if dml_raw && !dml {
+                tracing::warn!(
+                    "OmniOrtRuntime: DirectML is_available() 报 true 但运行时 DLL 无 DML 导出符号，已按预探结论否决（假阳性）"
+                );
+            }
             if !cuda && !dml {
                 tracing::warn!(
                     "OmniOrtRuntime: 当前 onnxruntime DLL 为纯 CPU 构建（无 CUDA/DirectML EP），全部推理将运行在 CPU 上"
@@ -249,32 +1115,83 @@ impl OmniOrtRuntime {
         }
     }
 
-    /// 获取当前平台优先推荐的硬件加速 Execution Provider 候选列表（按优先级排序）
-    pub fn preferred_hardware_eps() -> Vec<ort::execution_providers::ExecutionProviderDispatch> {
+    /// 探测当前已绑定运行时是否真正具备 DirectML EP（先查闸，闸置位后恒为 false）
+    ///
+    /// 注：`is_available()` 仅作**候选判定**，能力落点以 warmup 实跑为准（SPEC §3.8）；
+    /// 且该探针在纯 CPU DLL 上存在假阳性历史，故还必须叠加预探阶段的 DML 符号结论。
+    #[cfg(target_os = "windows")]
+    fn directml_probe_ok() -> bool {
+        if directml_disabled() {
+            return false;
+        }
+        // 未完成绑定前不得调用 ort 的 EP 探针（会触发 G_ORT_LIB 加载并可能 panic）
+        match RUNTIME_INIT.get() {
+            Some(Ok(())) => {}
+            _ => return false,
+        }
+        // 预探阶段的双重结论必须同时成立：DLL 真含 DML 导出符号（挡住纯 CPU DLL 的假阳性）
+        if !BOUND_DML_CAPABLE.load(Ordering::SeqCst) {
+            return false;
+        }
         use ort::execution_providers::ExecutionProvider;
+        ort::execution_providers::DirectMLExecutionProvider::default()
+            .is_available()
+            .unwrap_or(false)
+    }
 
+    /// 非 Windows 平台无 DirectML 阶梯（本期只治理 Windows DML 分档）
+    #[cfg(not(target_os = "windows"))]
+    fn directml_probe_ok() -> bool {
+        false
+    }
+
+    /// 获取当前平台优先推荐的硬件加速 Execution Provider 候选列表（按优先级排序）
+    ///
+    /// 语义等价于 `preferred_hardware_eps_for(EpPolicy::DmlAllowlist)`（历史入口）。
+    pub fn preferred_hardware_eps() -> Vec<ort::execution_providers::ExecutionProviderDispatch> {
+        Self::preferred_hardware_eps_for(EpPolicy::DmlAllowlist)
+    }
+
+    /// 按 EP 策略档位获取硬件加速候选（先查降级闸，再按阶梯解析）
+    ///
+    /// Windows 阶梯（SPEC §3.2）：`DmlAllowlist` → DML（闸未置位且探测通过）→ CPU；
+    /// `CpuOnly` → 严格无硬件 EP。CUDA 轨道按 SPEC §5/§8 推迟为独立扩展包，
+    /// 随包资产不含 CUDA provider，故 Windows 侧不再把 CUDA 列入阶梯。
+    /// macOS CoreML / Linux CUDA 分支本期不纳入 AC，保持历史行为不变。
+    pub fn preferred_hardware_eps_for(
+        policy: EpPolicy,
+    ) -> Vec<ort::execution_providers::ExecutionProviderDispatch> {
         let mut eps = Vec::new();
 
         #[cfg(target_os = "windows")]
         {
-            // 优先检查当前加载的 ONNX Runtime 二进制是否编译了 CUDA (需 onnxruntime-gpu 构建)
-            let cuda_ep = ort::execution_providers::CUDAExecutionProvider::default();
-            if cuda_ep.is_available().unwrap_or(false) {
-                tracing::info!("OmniOrtRuntime: 探测到当前 ONNX Runtime 包含 CUDA 硬件加速支持");
-                eps.push(cuda_ep.build());
+            let ladder = resolve_ep_candidates(policy, Self::directml_probe_ok(), directml_disabled());
+            for kind in ladder {
+                if kind == EpKind::DirectMl {
+                    // 门控收紧：is_available 必须明确为 true 才入列，杜绝纯 CPU DLL 被误判
+                    eps.push(
+                        ort::execution_providers::DirectMLExecutionProvider::default().build(),
+                    );
+                    tracing::info!(
+                        "OmniOrtRuntime: DML 进入 EP 阶梯（policy={:?}，闸={}）",
+                        policy,
+                        if directml_disabled() { "已置位" } else { "未置位" }
+                    );
+                }
             }
-
-            // 检查 DirectML 支持 (当前随包分发的 onnxruntime-directml 构建，覆盖全系 GPU/NPU)
-            // 门控收紧：is_available 必须明确为 true 才入列，杜绝纯 CPU DLL 被误判为具备 DML 能力
-            let dml_ep = ort::execution_providers::DirectMLExecutionProvider::default();
-            if dml_ep.is_available().unwrap_or(false) {
-                tracing::info!("OmniOrtRuntime: 探测到当前 ONNX Runtime 包含 DirectML 硬件加速支持");
-                eps.push(dml_ep.build());
+            if eps.is_empty() {
+                // 显式上报分档落点：严禁静默回退 CPU 后在日志中不可见
+                tracing::info!(
+                    "OmniOrtRuntime: EP 阶梯无硬件加速候选（policy={:?}，闸={}），走纯 CPU",
+                    policy,
+                    if directml_disabled() { "已置位" } else { "未置位" }
+                );
             }
         }
 
         #[cfg(target_os = "macos")]
         {
+            let _ = policy;
             let coreml_ep = ort::execution_providers::CoreMLExecutionProvider::default();
             if coreml_ep.is_available().unwrap_or(true) {
                 eps.push(coreml_ep.build());
@@ -283,37 +1200,170 @@ impl OmniOrtRuntime {
 
         #[cfg(target_os = "linux")]
         {
+            let _ = policy;
             let cuda_ep = ort::execution_providers::CUDAExecutionProvider::default();
             if cuda_ep.is_available().unwrap_or(false) {
                 eps.push(cuda_ep.build());
             }
         }
 
-        // 显式上报硬件加速缺席：严禁静默回退 CPU 后在日志中不可见
-        if eps.is_empty() {
-            tracing::warn!(
-                "OmniOrtRuntime: 未探测到任何硬件加速 EP 候选，本平台全部 Session 将回退为纯 CPU 推理"
-            );
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+        {
+            let _ = policy;
         }
 
         eps
     }
 
     /// 获取首选硬件加速 Execution Provider (向后兼容)
+    ///
+    /// **禁止用于构建 DML allowlist 模型**：返回的裸 dispatch 会绕开 `build_dml_session`
+    /// 强制的 `with_memory_pattern(false)` / `with_parallel_execution(false)`（SPEC §3.2）。
+    #[deprecated(note = "DML allowlist 模型必须走 build_session_verified，禁止直接取裸 EP dispatch")]
     pub fn preferred_hardware_ep() -> Option<ort::execution_providers::ExecutionProviderDispatch> {
         Self::preferred_hardware_eps().into_iter().next()
     }
 
     /// 执行提供商 (EP) 两阶段降级路由工厂
+    ///
+    /// 历史入口：默认 `EpPolicy::CpuOnly` —— 文本塔 / OCR / CLIP / TTS 等全部非 allowlist
+    /// 模型一律纯 CPU（SPEC §3.2 v1 裁定）。需要 DML 的模型必须显式走
+    /// `build_session_verified(..., EpPolicy::DmlAllowlist, warmup)`。
     pub fn build_session<P: AsRef<Path>>(
         model_path: P,
         tier: ModelTier,
     ) -> Result<ort::session::Session, ort::Error> {
-        Self::ensure_initialized();
+        Self::build_session_verified(model_path, tier, EpPolicy::CpuOnly, |_| Ok(()))
+    }
+
+    /// 三段回退主入口（构建期 → warmup → 纯 CPU 重建）
+    ///
+    /// - 构建期：按 `ep_policy` 阶梯构建，DML 分支显式关闭 memory pattern 与并行执行；
+    /// - warmup 期：构建成功后立即执行闭包（Gemma 视觉传生产形状哑输入），
+    ///   DML 失败时丢弃并**原地重建纯 CPU Session 复验**，复验通过才置降级闸；
+    /// - **严禁触发熔断器**：本函数在 DML 故障时返回 `Ok(cpu_session)`，上层不会进入
+    ///   `CircuitBreaker::trip` 分支（熔断语义严格保留给模型文件缺失/损坏）。
+    pub fn build_session_verified<P, W>(
+        model_path: P,
+        tier: ModelTier,
+        ep_policy: EpPolicy,
+        warmup: W,
+    ) -> Result<ort::session::Session, ort::Error>
+    where
+        P: AsRef<Path>,
+        W: Fn(&ort::session::Session) -> Result<(), ort::Error>,
+    {
+        // 运行时未绑定时必须返回 Err：`Session::builder()` 在 DLL 缺席时是 panic
+        // （ort rc.9 `lib_handle()` unwrap_or_else panic），release 档 `panic = "abort"`
+        // 会直接终止进程，绝不能让「静默降级」演变成进程崩溃。
+        Self::ensure_bound_for_session()?;
         let path = model_path.as_ref();
         let intra_threads = Self::recommended_intra_threads();
-        let eps = Self::preferred_hardware_eps();
-        Self::build_session_with_eps_internal(path, tier, eps, intra_threads)
+        let (session, used_dml) = Self::build_with_policy(path, tier, ep_policy, intra_threads)?;
+        finalize_warmup_with_fallback(
+            session,
+            used_dml,
+            warmup,
+            || Self::build_cpu_session(path, intra_threads),
+            path,
+        )
+    }
+
+    /// 确保运行时单例已绑定，未绑定时返回可传播错误（替代裸 `ensure_initialized`）
+    fn ensure_bound_for_session() -> Result<(), ort::Error> {
+        Self::init().map_err(ort::Error::new)
+    }
+
+    /// 按策略构建会话，返回 `(Session, 是否 DML 会话)`
+    ///
+    /// Windows：走 DML/CPU 分档阶梯（DML 分支施加 DML 专属配置）；
+    /// 非 Windows：沿用历史平台 EP 阶梯（macOS CoreML / Linux CUDA），本期不参与 DML 分档，
+    /// 因此 `used_dml` 恒为 false（warmup 失败按模型损坏语义上抛，不置 DML 闸）。
+    fn build_with_policy(
+        path: &Path,
+        tier: ModelTier,
+        policy: EpPolicy,
+        intra_threads: usize,
+    ) -> Result<(ort::session::Session, bool), ort::Error> {
+        if !cfg!(target_os = "windows") {
+            let eps = Self::preferred_hardware_eps_for(policy);
+            let session = Self::build_session_with_eps_internal(path, tier, eps, intra_threads)?;
+            return Ok((session, false));
+        }
+
+        for kind in resolve_ep_candidates(policy, Self::directml_probe_ok(), directml_disabled()) {
+            match kind {
+                EpKind::Cpu => break,
+                EpKind::DirectMl => match Self::build_dml_session(path, intra_threads) {
+                    Ok(session) => {
+                        tracing::info!(
+                            "OmniOrtRuntime: 成功构建 DirectML Session (model={}, policy={:?})",
+                            path.display(),
+                            policy
+                        );
+                        return Ok((session, true));
+                    }
+                    Err(err) => {
+                        // 构建期第一段失败：显式降级为纯 CPU（阶梯继续，非静默）
+                        tracing::warn!(
+                            "OmniOrtRuntime: DirectML Session 构建失败，阶梯降级为纯 CPU (model={}, error={:?})",
+                            path.display(),
+                            err
+                        );
+                    }
+                },
+            }
+        }
+        // 阶梯恒以 CPU 收尾（resolve_ep_candidates 保证），此处即纯 CPU 构建点
+        let session = Self::build_cpu_session(path, intra_threads)?;
+        tracing::info!(
+            "OmniOrtRuntime: 成功构建纯 CPU Session (model={}, policy={:?})",
+            path.display(),
+            policy
+        );
+        Ok((session, false))
+    }
+
+    /// 纯 CPU 多线程 Session 构建（三段回退的最终落点）
+    fn build_cpu_session(
+        path: &Path,
+        intra_threads: usize,
+    ) -> Result<ort::session::Session, ort::Error> {
+        ort::session::Session::builder()?
+            .with_intra_threads(intra_threads)?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+            .commit_from_file(path)
+    }
+
+    /// DirectML Session 构建（SPEC §3.2：显式关闭 CPU 静态内存拓扑推导并锁死单序列执行）
+    ///
+    /// `with_memory_pattern(false)`：关闭 CPU 静态内存拓扑推导，交由 D3D12/DML 自适应显存池；
+    /// `with_parallel_execution(false)`：DML EP 明确不支持并发 Run，锁死单序列执行。
+    /// 注：`ort 2.0.0-rc.9` 的 `SessionBuilder` **没有** `with_execution_mode` 方法，
+    /// `with_parallel_execution(false)` 即底层 `ExecutionMode::ORT_SEQUENTIAL`。
+    fn build_dml_session(
+        path: &Path,
+        intra_threads: usize,
+    ) -> Result<ort::session::Session, ort::Error> {
+        use ort::execution_providers::ExecutionProvider;
+        let dml_ep = ort::execution_providers::DirectMLExecutionProvider::default();
+        if !dml_ep.is_available().unwrap_or(false) {
+            return Err(ort::Error::new(
+                "DirectML EP 不可用（运行时无 DML 支持或驱动缺失）",
+            ));
+        }
+        ort::session::Session::builder()?
+            .with_intra_threads(intra_threads)?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+            .with_memory_pattern(false)?
+            .with_parallel_execution(false)?
+            // `error_on_failure()` 不可省：rc.9 的 `apply_execution_providers` 默认
+            // `error_on_failure == false`，EP 注册失败时**只打 tracing::error! 并返回 Ok**，
+            // 于是这里会拿到一个纯 CPU Session 却上报「DML 构建成功 + warmup 定标通过」，
+            // 正是 SPEC 明令消灭的「DML 日志虚假 + 静默降级」。改为失败即 Err 后，
+            // 该错误会进入 `build_with_policy` 的显式降级分支并 warn。
+            .with_execution_providers([dml_ep.build().error_on_failure()])?
+            .commit_from_file(path)
     }
 
     /// 统一两阶段执行提供商路由逻辑
@@ -357,15 +1407,27 @@ impl OmniOrtRuntime {
     }
 
     /// 内部多阶段构建逻辑：按优先级依次尝试硬件加速 EP，最终优雅回退到多线程优化 CPU Session
+    ///
+    /// 注：本入口为**构建期第一段的历史形态**（SPEC §3.3「既有实现保留，不删除」），
+    /// 它按裸 `ExecutionProviderDispatch` 迭代、不携带 EP 身份，故无法为 DML 分支施加
+    /// `with_memory_pattern(false)` / `with_parallel_execution(false)` 等 DML 专属配置。
+    /// **DML 分档模型必须走 `build_session_verified`**（内部经 `build_dml_session`）。
     pub fn build_session_with_eps_internal(
         path: &Path,
         _tier: ModelTier,
         eps: Vec<ort::execution_providers::ExecutionProviderDispatch>,
         intra_threads: usize,
     ) -> Result<ort::session::Session, ort::Error> {
+        // 与 build_session_verified 同一守卫：运行时未绑定时 `Session::builder()` 会 panic，
+        // 必须在此提前转成可传播 Err（公开入口同样受 A1 保护）
+        Self::ensure_bound_for_session()?;
         let path_str = path.display().to_string();
 
         for (idx, ep) in eps.into_iter().enumerate() {
+            // 同 build_dml_session：rc.9 默认吞掉 EP 注册失败并回退 CPU，
+            // 会让本循环把「CPU Session」误报成「硬件加速 Session」并中止阶梯。
+            // 显式要求失败即 Err，阶梯才会真正逐候选前进。
+            let ep = ep.error_on_failure();
             let res = (|| {
                 let mut b = ort::session::Session::builder()?
                     .with_intra_threads(intra_threads)?
@@ -415,6 +1477,99 @@ impl OmniOrtRuntime {
     ) -> Result<ort::session::Session, ort::Error> {
         let eps = ep.into_iter().collect();
         Self::build_session_with_eps_internal(path, tier, eps, intra_threads)
+    }
+}
+
+/// warmup 期回退决策（三段回退的第二段，T2 单测切缝）
+///
+/// 抽成与 `ort::Session` 解耦的泛型函数，使单测可用轻量占位类型（如 `String`）验证
+/// 「warmup 失败 ⇒ 原地重建纯 CPU 并复验 ⇒ 置 DML 闸」的机械顺序，不依赖真实模型与 GPU。
+///
+/// 语义铁律：
+/// 1. warmup 成功：原样返回会话（DML 会话完成实跑定标，`is_available()` 假阳性在此被证伪）；
+/// 2. warmup 失败且会话为 DML：丢弃 DML 会话 → 重建纯 CPU 会话并**重跑同一 warmup 复验**：
+///    - CPU 复验通过 ⇒ 根因确属 DML，置降级闸并返回 CPU 会话；
+///    - CPU 复验同样失败 ⇒ 根因是模型/喂参而非 DML，**严禁误置闸**，返回 CPU 侧错误；
+/// 3. warmup 失败且会话本就是 CPU（纯 CPU 部署 / 非 Windows 平台）：非 DML 故障，
+///    warn 后原样返回会话——不置闸、不上抛，避免把一次性 warmup 抖动升级为熔断器永久 trip；
+/// 4. 任何分支都**严禁触发熔断器**（熔断语义只保留给模型文件缺失/损坏）。
+fn finalize_warmup_with_fallback<S, E, W, R>(
+    session: S,
+    used_dml: bool,
+    warmup: W,
+    rebuild_cpu: R,
+    model: &Path,
+) -> Result<S, E>
+where
+    W: Fn(&S) -> Result<(), E>,
+    R: FnOnce() -> Result<S, E>,
+    E: std::fmt::Debug,
+{
+    match warmup(&session) {
+        Ok(()) => {
+            if used_dml {
+                tracing::info!(
+                    "OmniOrtRuntime: DML warmup 实跑定标通过 (model={})",
+                    model.display()
+                );
+            }
+            Ok(session)
+        }
+        Err(err) => {
+            if !used_dml {
+                tracing::warn!(
+                    "OmniOrtRuntime: 纯 CPU 会话 warmup 失败（非 DML 故障，不置闸不熔断，交由运行期失败路径处理）(model={}, error={:?})",
+                    model.display(),
+                    err
+                );
+                return Ok(session);
+            }
+            let reason = format!(
+                "warmup 失败 (model={}, error={:?})",
+                model.display(),
+                err
+            );
+            tracing::warn!(
+                "OmniOrtRuntime: DML warmup 失败，丢弃 DML 会话并原地重建纯 CPU Session 复验（严禁触发熔断器）(model={}, error={:?})",
+                model.display(),
+                err
+            );
+            // 先丢弃 DML 会话再重建：避免 DML 显存与 CPU 会话并存造成峰值占用翻倍
+            drop(session);
+            let cpu = match rebuild_cpu() {
+                Ok(s) => s,
+                Err(rebuild_err) => {
+                    // CPU 重建也失败：上抛 DML 侧原因（携带 model/error 上下文），
+                    // CPU 侧失败原因留在日志中，避免上层只看到一句「加载失败」
+                    tracing::error!(
+                        "OmniOrtRuntime: DML warmup 失败后纯 CPU Session 重建亦失败 (model={}, rebuild_error={:?})",
+                        model.display(),
+                        rebuild_err
+                    );
+                    return Err(err);
+                }
+            };
+            match warmup(&cpu) {
+                Ok(()) => {
+                    // CPU 复验通过 ⇒ 根因确属 DML，此时才置闸（避免把模型/喂参故障误判成 DML 故障）
+                    disable_directml(&reason);
+                    tracing::warn!(
+                        "OmniOrtRuntime: 纯 CPU 复验通过，已置 DML 降级闸并返回 CPU Session (model={})",
+                        model.display()
+                    );
+                    Ok(cpu)
+                }
+                Err(cpu_err) => {
+                    // CPU 同样跑不动 ⇒ 根因不是 DML；不置闸，把 CPU 侧错误交给上层熔断语义
+                    tracing::error!(
+                        "OmniOrtRuntime: 纯 CPU 复验同样失败，判定为模型/喂参故障（不置 DML 闸）(model={}, error={:?})",
+                        model.display(),
+                        cpu_err
+                    );
+                    Err(cpu_err)
+                }
+            }
+        }
     }
 }
 
@@ -585,6 +1740,9 @@ pub type WatchdogSession = GenericWatchdog<ort::session::Session>;
 mod tests {
     use super::*;
 
+    /// 全局降级闸为进程级静态，多个测试并发触碰时必须串行化，避免相互踩踏
+    static GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_model_tier_timeout() {
         assert_eq!(ModelTier::Tier1.idle_timeout(), None);
@@ -623,7 +1781,7 @@ mod tests {
 
     #[test]
     fn test_set_safe_dll_directory() {
-        assert!(set_safe_dll_directory("resources/bin/onnx"));
+        assert!(set_safe_dll_directory("resources/bin/omni"));
     }
 
     #[test]
@@ -677,6 +1835,282 @@ mod tests {
         assert_eq!(*item2, "model_v1");
         assert!(watchdog.is_loaded());
         assert_eq!(load_count.load(Ordering::SeqCst), 2);
+    }
+
+    /// 定位随包运行时 DLL（优先发现链，退化到仓库 extraResources/bin/omni）
+    fn locate_packaged_runtime_dll() -> Option<PathBuf> {
+        OmniOrtRuntime::discover_onnx_dll().or_else(|| {
+            let mut cur = std::env::current_dir().ok()?;
+            for _ in 0..8 {
+                let cand = cur.join("apps/desktop/build/extraResources/bin/omni/onnxruntime.dll");
+                if cand.exists() {
+                    return Some(cand);
+                }
+                cur = cur.parent()?.to_path_buf();
+            }
+            None
+        })
+    }
+
+    /// 定位随包 `bin/omni` 目录（双运行时四件套同层）
+    /// T9 资产缺失时的**显式跳过**（避免「测了个寂寞」的静默 pass）
+    ///
+    /// 默认打印 `SKIP（未执行断言）` 标记，让裸环境 CI 一眼看出断言未跑；
+    /// 若 CI 要求「T9 必须真跑」，设 `OMNI_ORT_TEST_REQUIRE_ASSETS=1` 让缺资产直接失败。
+    fn skip_t9_missing_assets(what: &str) {
+        if std::env::var("OMNI_ORT_TEST_REQUIRE_ASSETS").ok().as_deref() == Some("1") {
+            panic!("[T9] 缺少必需测试资产: {what}（OMNI_ORT_TEST_REQUIRE_ASSETS=1 时禁止跳过）");
+        }
+        eprintln!("[T9] SKIP（断言未执行）: 缺少测试资产 —— {what}");
+    }
+
+    fn locate_packaged_bin_omni() -> Option<PathBuf> {
+        if let Some(dir) = locate_packaged_runtime_dll().and_then(|p| p.parent().map(Path::to_path_buf))
+        {
+            if dir.join("onnxruntime.dll").exists() {
+                return Some(dir);
+            }
+        }
+        let mut cur = std::env::current_dir().ok()?;
+        for _ in 0..8 {
+            let cand = cur.join("apps/desktop/build/extraResources/bin/omni");
+            if cand.join("onnxruntime.dll").exists() {
+                return Some(cand);
+            }
+            cur = cur.parent()?.to_path_buf();
+        }
+        None
+    }
+
+    /// T1：EP allowlist 分档 —— Gemma 视觉（DmlAllowlist）尝试 DML，文本塔/OCR（CpuOnly）恒 CPU，
+    /// 闸置位后全回退 CPU
+    #[test]
+    fn test_t1_ep_policy_ladder_and_directml_gate() {
+        let _serial = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_directml_gate_for_test();
+        assert!(!directml_disabled());
+
+        // allowlist 模型：DML 在前、CPU 收尾
+        assert_eq!(
+            resolve_ep_candidates(EpPolicy::DmlAllowlist, true, false),
+            vec![EpKind::DirectMl, EpKind::Cpu]
+        );
+        // 探测不可用（纯 CPU 裸环境）：自动降档纯 CPU
+        assert_eq!(
+            resolve_ep_candidates(EpPolicy::DmlAllowlist, false, false),
+            vec![EpKind::Cpu]
+        );
+        // 文本塔 / OCR：即使 DML 可用也恒为纯 CPU（v1 裁定）
+        assert_eq!(
+            resolve_ep_candidates(EpPolicy::CpuOnly, true, false),
+            vec![EpKind::Cpu]
+        );
+
+        // 闸置位后 allowlist 模型同样全回退 CPU
+        disable_directml("T1 注入：验证闸置位后阶梯全回退");
+        assert!(directml_disabled());
+        assert_eq!(
+            resolve_ep_candidates(EpPolicy::DmlAllowlist, true, directml_disabled()),
+            vec![EpKind::Cpu]
+        );
+        reset_directml_gate_for_test();
+    }
+
+    /// T2：warmup 失败回退 —— 三个分支的机械顺序（T2 必须能证伪 `used_dml` 传错）
+    ///
+    /// 「熔断器未 trip」由契约保证：`build_session_verified` 在 DML warmup 失败且 CPU 复验通过时
+    /// 返回 `Ok(cpu_session)`，调用方（gemma.rs）因此不会进入 `CircuitBreaker::trip` 分支。
+    /// 换言之，本测试断言的 `Ok` 返回值就是「熔断未 trip」的充分条件 —— 熔断器只在 `Err`
+    /// 分支被 trip，此处不可能构造出 `Ok` 且 trip 的组合。
+    #[test]
+    fn test_t2_warmup_failure_rebuilds_cpu_and_trips_gate() {
+        let _serial = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_directml_gate_for_test();
+
+        // 用例 A：DML warmup 失败 + CPU 复验通过 ⇒ 返回 CPU 会话并置闸
+        let rebuilt = std::cell::Cell::new(false);
+        let outcome = finalize_warmup_with_fallback(
+            "dml-session".to_string(),
+            true,
+            |s: &String| {
+                if s.starts_with("dml") {
+                    Err("DML 前向 E_INVALIDARG".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                rebuilt.set(true);
+                Ok("cpu-session".to_string())
+            },
+            Path::new("vision_encoder_q4.onnx"),
+        );
+
+        assert_eq!(
+            outcome.expect("warmup 失败必须回退为 CPU 会话而非报错"),
+            "cpu-session"
+        );
+        assert!(rebuilt.get(), "必须原地重建纯 CPU Session");
+        assert!(directml_disabled(), "DML 故障经 CPU 复验确认后必须置降级闸");
+
+        // 用例 B：DML 与 CPU 复验双双失败 ⇒ 根因是模型/喂参而非 DML，严禁误置闸
+        reset_directml_gate_for_test();
+        let both_failed = finalize_warmup_with_fallback(
+            "dml-session".to_string(),
+            true,
+            |_s: &String| Err::<(), String>("喂参错误/模型损坏".to_string()),
+            || Ok("cpu-session".to_string()),
+            Path::new("broken.onnx"),
+        );
+        assert!(both_failed.is_err(), "CPU 也跑不动必须上抛");
+        assert!(
+            !directml_disabled(),
+            "CPU 复验同样失败时根因非 DML，不得置闸（否则掩盖模型损坏）"
+        );
+
+        // 用例 C：纯 CPU 会话 warmup 失败 ⇒ 原样返回，不置闸不上抛（不升级为熔断）
+        reset_directml_gate_for_test();
+        let cpu_only = finalize_warmup_with_fallback(
+            "cpu-session".to_string(),
+            false,
+            |_s: &String| Err::<(), String>("一次性抖动".to_string()),
+            || Ok("unreachable".to_string()),
+            Path::new("model_q4.onnx"),
+        );
+        assert_eq!(
+            cpu_only.expect("纯 CPU warmup 失败不得上抛（避免熔断器永久 trip）"),
+            "cpu-session"
+        );
+        assert!(!directml_disabled(), "纯 CPU 会话 warmup 失败不得置 DML 闸");
+        reset_directml_gate_for_test();
+    }
+
+    /// T9：先探后绑预探阶梯 —— 坏 DLL 被拦截并安全降级，全败显式报错且不污染 ort 单例
+    ///
+    /// PE 符号探测仅在 Windows 有意义，非 Windows 平台显式忽略（避免「绿=没跑」）。
+    #[cfg_attr(not(target_os = "windows"), ignore)]
+    #[test]
+    fn test_t9_probe_ladder_rejects_bad_dll_and_keeps_binding_clean() {
+        // 1) 纯判定语义（与真实 DLL 解耦）
+        assert_eq!(
+            judge_candidate(true, true, false, true),
+            CandidateVerdict::RejectMissingDmlSymbol
+        );
+        assert_eq!(
+            judge_candidate(true, true, true, false),
+            CandidateVerdict::RejectApiMismatch
+        );
+        // 运行时 A（纯 CPU）不声明 DML，缺 DML 符号属正常形态，不得拦截
+        assert_eq!(
+            judge_candidate(false, true, false, true),
+            CandidateVerdict::Accept
+        );
+        assert_eq!(
+            judge_candidate(true, false, false, false),
+            CandidateVerdict::RejectUnloadable
+        );
+
+        // 2) 真实文件：把**纯 CPU 运行时 A**（onnxruntime.dll）复制成 onnxruntime_dml.dll 假阳性样本
+        let Some(bin_dir) = locate_packaged_bin_omni() else {
+            skip_t9_missing_assets("随包 bin/omni（onnxruntime.dll）");
+            return;
+        };
+        let cpu_dll = bin_dir.join("onnxruntime.dll");
+        let real_dml = bin_dir.join("onnxruntime_dml.dll");
+        let tmp = std::env::temp_dir().join(format!("omni-t9-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("创建临时目录失败");
+        let fake_dml = tmp.join("onnxruntime_dml.dll");
+        std::fs::copy(&cpu_dll, &fake_dml).expect("复制假阳性 DLL 失败");
+
+        let probe = probe_candidate_file(&fake_dml);
+        assert_eq!(
+            probe.verdict,
+            CandidateVerdict::RejectMissingDmlSymbol,
+            "无 DML 符号的 *_dml 必须被预探拦截"
+        );
+        assert!(!probe.has_dml_symbol);
+
+        // 3) 阶梯：坏候选在前、真运行时在后 ⇒ 胜出者必须越过坏候选
+        let good = if real_dml.exists() {
+            real_dml.clone()
+        } else {
+            cpu_dll.clone()
+        };
+        let ladder = vec![fake_dml.clone(), good.clone()];
+        let winner = probe_ladder(&ladder).expect("阶梯应安全降级到下一个候选");
+        assert!(
+            !is_same_file(&winner.path, &fake_dml),
+            "胜出者严禁是坏候选"
+        );
+        assert!(is_same_file(&winner.path, &good));
+        if real_dml.exists() {
+            assert!(
+                winner.dml_capable,
+                "真实运行时 B（onnxruntime_dml.dll）必须通过 DML 导出符号预探"
+            );
+            // AC-2 可观测性：运行时 B 的 PE FileVersion 必须可读（启动日志依赖它）
+            println!("[T9] 运行时 B FileVersion={:?}", winner.file_version);
+            assert!(
+                winner.file_version.is_some(),
+                "运行时 B 必须可读出 PE FileVersion（AC-2 启动日志可观测性）"
+            );
+        }
+
+        // 4) 全败：显式报错且不写 RUNTIME_INIT（不污染 ort 单例）——失败后仍可成功预探
+        let bogus = vec![tmp.join("missing/onnxruntime_dml.dll")];
+        let err = probe_ladder(&bogus).expect_err("全败必须显式报错");
+        assert!(err.contains("预探阶梯全败"), "错误信息须可观测: {err}");
+        assert!(
+            probe_ladder(&ladder).is_ok(),
+            "预探失败不得污染后续预探能力"
+        );
+
+        // 5) 防截胡：具备 DML 能力但同级缺 DirectML.dll 的候选必须被拦截（工单 04 第 13 条）
+        if real_dml.exists() {
+            let orphan_dir = tmp.join("orphan");
+            std::fs::create_dir_all(&orphan_dir).expect("创建孤立目录失败");
+            let orphan = orphan_dir.join("onnxruntime_dml.dll");
+            std::fs::copy(&real_dml, &orphan).expect("复制真实 DML 运行时失败");
+            let orphan_err = probe_ladder(std::slice::from_ref(&orphan))
+                .expect_err("缺同级 DirectML.dll 的 DML 候选必须被拦截");
+            assert!(
+                orphan_err.contains("DirectML.dll"),
+                "拦截原因必须点名 DirectML.dll 缺失: {orphan_err}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// T9 附：DirectML.dll 必须以绝对路径钉死，且内存中实际驻留路径与钉死路径一致
+    #[cfg_attr(not(target_os = "windows"), ignore)]
+    #[test]
+    fn test_t9_directml_dll_pinned_by_absolute_path() {
+        let Some(cpu_dll) = locate_packaged_runtime_dll() else {
+            skip_t9_missing_assets("随包 onnxruntime 运行时");
+            return;
+        };
+        let Some(dir) = cpu_dll.parent() else {
+            skip_t9_missing_assets("运行时所在目录");
+            return;
+        };
+        if !dir.join("DirectML.dll").exists() {
+            skip_t9_missing_assets("同级 DirectML.dll（纯 CPU 裸环境）");
+            return;
+        }
+        let pinned = pin_directml_dll(dir).expect("DirectML.dll 存在时必须钉死成功");
+        assert!(
+            pinned.is_absolute(),
+            "必须使用绝对路径预加载，杜绝 System32 同名截胡"
+        );
+        let resident = loaded_module_path("DirectML.dll").expect("钉死后必须能在模块列表中找到");
+        assert!(
+            is_same_file(&resident, &pinned),
+            "内存驻留路径必须与钉死路径一致: {} vs {}",
+            resident.display(),
+            pinned.display()
+        );
     }
 
     #[test]

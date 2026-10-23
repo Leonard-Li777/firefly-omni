@@ -15,4 +15,16 @@ unicode-normalization.workspace = true
 ort.workspace = true
 pelite.workspace = true
 goblin.workspace = true
+# 先探后绑（工单 04）：libloading 做纯内存 DLL 符号/API 契约预探。
+# 全平台依赖：Windows 探 DML 导出符号，非 Windows 仅探「dylib 是否真能被加载器打开」
+# （预探谎报成功会让 `ort::init_from(...).commit()` 的 panic 直接 abort 进程）。
+libloading = "0.8"
+
+# windows-sys 读取内存驻留模块真实路径与 PE FileVersion（可观测性门禁）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+  "Win32_Storage_FileSystem",
+] }
 
