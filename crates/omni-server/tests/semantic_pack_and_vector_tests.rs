@@ -13,7 +13,7 @@ use axum::{
 };
 use omni_core::OmniConfig;
 use omni_server::{
-    create_app_router, routes::taxonomy::*, AppState, OmwDb,
+    create_app_router, encoder_id, routes::taxonomy::*, AppState, OmwDb,
     SemanticPackLoader, VectorEngine, VECTOR_DIM,
 };
 use rusqlite::Connection;
@@ -273,21 +273,21 @@ fn test_vector_engine_rabitq_and_int8_ann() {
     }
 
     // 1. 维度契约校验（仅接受 256/384/512/768 维，拒绝非法维度与 NaN）
-    assert!(engine.upsert("fp_invalid", &[0.1, 0.2]).is_err());
-    assert!(engine.upsert("fp_invalid_128", &vec![0.1f32; 128]).is_err());
-    assert!(engine.upsert("fp_invalid_1024", &vec![0.1f32; 1024]).is_err());
-    assert!(engine.upsert("fp_nan", &vec![f32::NAN; VECTOR_DIM]).is_err());
+    assert!(engine.upsert("fp_invalid", &[0.1, 0.2], encoder_id::UNKNOWN).is_err());
+    assert!(engine.upsert("fp_invalid_128", &vec![0.1f32; 128], encoder_id::UNKNOWN).is_err());
+    assert!(engine.upsert("fp_invalid_1024", &vec![0.1f32; 1024], encoder_id::UNKNOWN).is_err());
+    assert!(engine.upsert("fp_nan", &vec![f32::NAN; VECTOR_DIM], encoder_id::UNKNOWN).is_err());
 
     // 2. 写入四槽位特征向量 (256d, 384d, 512d, 768d)
     let vec_256 = vec![0.1f32; 256];
     let vec_768 = vec![0.1f32; 768];
-    engine.upsert("fp_base", &vec_256).expect("写入 256d base 失败");
-    engine.upsert("fp_base", &vec_768).expect("写入 768d base 失败");
-    engine.upsert("fp_base", &base_vec).expect("写入 512d base 失败");
-    engine.upsert("fp_similar", &similar_vec).expect("写入 512d similar 失败");
-    engine.upsert("fp_diff", &diff_vec).expect("写入 512d diff 失败");
+    engine.upsert("fp_base", &vec_256, encoder_id::GEMMA).expect("写入 256d base 失败");
+    engine.upsert("fp_base", &vec_768, encoder_id::GEMMA).expect("写入 768d base 失败");
+    engine.upsert("fp_base", &base_vec, encoder_id::CHINESE_CLIP).expect("写入 512d base 失败");
+    engine.upsert("fp_similar", &similar_vec, encoder_id::CHINESE_CLIP).expect("写入 512d similar 失败");
+    engine.upsert("fp_diff", &diff_vec, encoder_id::CHINESE_CLIP).expect("写入 512d diff 失败");
     engine
-        .upsert("fp_base", &base_vec_384)
+        .upsert("fp_base", &base_vec_384, encoder_id::BEKKO)
         .expect("写入 384d base 失败");
 
     assert_eq!(engine.count_by_dim(256), 1);
@@ -297,30 +297,30 @@ fn test_vector_engine_rabitq_and_int8_ann() {
     assert_eq!(engine.count(), 6);
 
     // 验证 get_vector 反量化读取
-    let restored_256 = engine.get_vector("fp_base", 256).expect("读取 256d 向量失败");
+    let restored_256 = engine.get_vector("fp_base", 256, None).expect("读取 256d 向量失败");
     assert_eq!(restored_256.len(), 256);
-    let restored_384 = engine.get_vector("fp_base", 384).expect("读取 384d 向量失败");
+    let restored_384 = engine.get_vector("fp_base", 384, None).expect("读取 384d 向量失败");
     assert_eq!(restored_384.len(), 384);
-    let restored_512 = engine.get_vector("fp_base", 512).expect("读取 512d 向量失败");
+    let restored_512 = engine.get_vector("fp_base", 512, None).expect("读取 512d 向量失败");
     assert_eq!(restored_512.len(), 512);
-    let restored_768 = engine.get_vector("fp_base", 768).expect("读取 768d 向量失败");
+    let restored_768 = engine.get_vector("fp_base", 768, None).expect("读取 768d 向量失败");
     assert_eq!(restored_768.len(), 768);
 
     // 3. 极速 Top-K 检索性能与精度 (2048d + 384d)
-    let matches_384 = engine.search(&base_vec_384, 2, None).expect("384d 检索失败");
+    let matches_384 = engine.search(&base_vec_384, 2, None, None).expect("384d 检索失败");
     assert_eq!(matches_384.len(), 1);
     assert_eq!(matches_384[0].file_fingerprint, "fp_base");
     assert!((matches_384[0].score - 1.0).abs() < 0.05);
 
     // 预热热身 (消除 debug 模式冷启动页缺失与首次内存分配抖动)
-    let _ = engine.search(&base_vec, 1, None);
+    let _ = engine.search(&base_vec, 1, None, None);
 
     let mut min_search_cost = std::time::Duration::from_secs(10);
     let mut last_matches = Vec::new();
     // 运行多次测量以平滑抖动
     for _ in 0..5 {
         let t_search = Instant::now();
-        let matches = engine.search(&base_vec, 2, None).expect("检索失败");
+        let matches = engine.search(&base_vec, 2, None, None).expect("检索失败");
         let cost = t_search.elapsed();
         if cost < min_search_cost {
             min_search_cost = cost;
@@ -356,10 +356,10 @@ fn test_vector_engine_rabitq_and_int8_ann() {
     let reloaded = VectorEngine::open(temp_dir.path()).expect("重新打开向量引擎失败");
     assert_eq!(reloaded.count_by_dim(512), 2);
     assert_eq!(reloaded.count_by_dim(384), 1);
-    let reloaded_matches = reloaded.search(&base_vec, 2, None).expect("重启后 512d 检索失败");
+    let reloaded_matches = reloaded.search(&base_vec, 2, None, None).expect("重启后 512d 检索失败");
     assert_eq!(reloaded_matches[0].file_fingerprint, "fp_base");
     assert_eq!(reloaded_matches[1].file_fingerprint, "fp_similar");
-    let reloaded_384 = reloaded.search(&base_vec_384, 2, None).expect("重启后 384d 检索失败");
+    let reloaded_384 = reloaded.search(&base_vec_384, 2, None, None).expect("重启后 384d 检索失败");
     assert_eq!(reloaded_384[0].file_fingerprint, "fp_base");
 }
 
