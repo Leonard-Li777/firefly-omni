@@ -556,3 +556,93 @@ async fn test_vision_watchdog_evict_and_recover() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// 工单 05 T3：运行期 Run 失败 → 两阶段锁安全回退 → 同帧纯 CPU 重建重跑（严禁伪向量）
+#[tokio::test]
+async fn test_ticket05_t3_run_failure_fallback_and_in_frame_cpu_rebuild() {
+    use omni_core::ort_runtime::{
+        directml_disable_reason, directml_disabled, inject_fail_next_run, reset_directml_gate_for_test,
+    };
+    use omni_pro::vision::gemma::{EmbeddingGemmaEngine, EmbeddingProfile};
+
+    // 前置：本用例验证「同帧纯 CPU 重建重跑」，必须有真实视觉权重才能证明产出的是真实向量。
+    // 注意：fail-next-run 与 DML 降级闸都是进程级全局状态，本用例需以 --test-threads=1 运行。
+    assert!(
+        EmbeddingGemmaEngine::vision_model_available(),
+        "T3 需要本地部署视觉模型权重（apps/desktop/build/extraResources/models/gemma），否则无法验证同帧 CPU 重建"
+    );
+
+    // 复位降级闸，保证「首次置位」路径可被观测
+    reset_directml_gate_for_test();
+    assert!(!directml_disabled(), "初始状态 DML 降级闸必须为未置位");
+
+    let engine = EmbeddingGemmaEngine::new(EmbeddingProfile::GemmaUnified);
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 64));
+
+    // 注入下一次 Run 失败（一次性），模拟 DirectML 运行期崩溃
+    inject_fail_next_run(true);
+    let vec = engine
+        .encode_image(&img)
+        .expect("运行期失败后必须由同帧 CPU 重建重跑成功产出真实向量，严禁返回伪向量");
+
+    // 断言 1：DML 全局降级闸已置位并记录首次置位原因
+    assert!(directml_disabled(), "运行期失败必须触发 disable_directml 置位降级闸");
+    assert!(directml_disable_reason().is_some(), "降级闸必须记录首次置位原因");
+    // 断言 2：故障 Session 已在闭包外被 watchdog 卸载（阶段 2，绝不持锁卸载）
+    assert!(
+        !engine.vision_watchdog().is_loaded(),
+        "两阶段回退必须在闭包外卸载故障 Session"
+    );
+    // 断言 3：同帧 CPU 重跑产出真实 L2 归一化向量，绝非全零/NaN 伪向量
+    assert_eq!(vec.len(), engine.mrl_dimension(), "产出向量维度必须等于当前 MRL 维度");
+    assert!(vec.iter().all(|x| x.is_finite()), "产出向量不得包含 NaN/Inf");
+    let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-3, "同帧 CPU 重建产出向量必须经过 L2 归一化 (norm={norm})");
+    let l1: f32 = vec.iter().map(|x| x.abs()).sum();
+    assert!(l1 > 1.0, "全零伪向量必须被拒绝（L1 能量 {l1} 过低）");
+
+    // 断言 4：降级闸置位后再次编码必须走纯 CPU 路径自愈，且结果确定
+    let again = engine.encode_image(&img).expect("降级闸置位后纯 CPU 路径必须继续可用");
+    let cos: f32 = vec.iter().zip(again.iter()).map(|(a, b)| a * b).sum();
+    assert!(cos >= 0.9999, "置位降级闸后的 CPU 重建必须确定性复现同一向量 (cos={cos})");
+}
+
+/// 工单 05 T4：多线程并发 encode_image 经 Mutex<Session> 串行化，无 panic/UB 且与串行结果一致
+#[tokio::test]
+async fn test_ticket05_t4_multithread_mutex_serialization() {
+    use omni_pro::vision::gemma::{EmbeddingGemmaEngine, EmbeddingProfile};
+
+    assert!(
+        EmbeddingGemmaEngine::vision_model_available(),
+        "T4 需要本地部署视觉模型权重（apps/desktop/build/extraResources/models/gemma），否则并发前向不可验证"
+    );
+
+    let engine = Arc::new(EmbeddingGemmaEngine::new(EmbeddingProfile::GemmaUnified));
+    let img = Arc::new(image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 64)));
+
+    // 串行基准：同一张图先跑一次，作为并发结果的确定性参照
+    let serial = engine.encode_image(&img).expect("串行基准推理必须成功");
+
+    // 4 线程并发对同一张图前向推理：DirectML 单 Session 不允许并发 Run，
+    // Mutex<Session> 必须让四路请求排队串行，不得 panic / UB / 结果污染。
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let eng = Arc::clone(&engine);
+        let image = Arc::clone(&img);
+        handles.push(tokio::spawn(async move { eng.encode_image(&image) }));
+    }
+
+    for (idx, handle) in handles.into_iter().enumerate() {
+        let vec = handle
+            .await
+            .expect("并发任务线程不得 panic")
+            .expect("并发推理不得失败");
+        assert_eq!(vec.len(), serial.len(), "线程 {idx} 产出向量维度必须与串行一致");
+        assert!(vec.iter().all(|x| x.is_finite()), "线程 {idx} 产出向量不得包含 NaN/Inf");
+        let cos: f32 = serial.iter().zip(vec.iter()).map(|(a, b)| a * b).sum();
+        assert!(
+            cos >= 0.9999,
+            "线程 {idx} 并发结果必须与串行基准一致 (cos={cos})，出现偏差说明 Mutex 串行化失效"
+        );
+    }
+}
