@@ -531,7 +531,7 @@ pub mod vision {
         pub fn extract_clip_image_embedding(
             _img: &image::DynamicImage,
             _lang: Option<&str>,
-        ) -> Option<Vec<f32>> {
+        ) -> Option<(Vec<f32>, u8)> {
             None
         }
 
@@ -1321,6 +1321,7 @@ pub mod vector_engine {
     pub struct VectorMatchResult {
         pub file_fingerprint: String,
         pub score: f32,
+        pub encoder_id: u8,
     }
 
     pub type VectorMatch = VectorMatchResult;
@@ -1331,6 +1332,8 @@ pub mod vector_engine {
         #[serde(alias = "file_fingerprint")]
         pub file_fingerprint: String,
         pub vector: Vec<f32>,
+        #[serde(default)]
+        pub encoder_id: u8,
     }
 
     #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1346,6 +1349,8 @@ pub mod vector_engine {
         #[serde(default = "default_top_k")]
         pub top_k: usize,
         pub threshold: Option<f32>,
+        #[serde(default)]
+        pub encoder_filter: Option<Vec<u8>>,
     }
 
     fn default_top_k() -> usize {
@@ -1376,7 +1381,7 @@ pub mod vector_engine {
         pub fn count_by_dim(&self, _dim: usize) -> usize {
             0
         }
-        pub fn upsert(&self, _fingerprint: &str, _vec: &[f32]) -> anyhow::Result<()> {
+        pub fn upsert(&self, _fingerprint: &str, _vec: &[f32], _encoder_id: u8) -> anyhow::Result<()> {
             anyhow::bail!("Open-core mode: vector engine requires omni-pro");
         }
         pub fn batch_upsert(&self, _items: &[VectorUpsertItem]) -> anyhow::Result<usize> {
@@ -1390,10 +1395,19 @@ pub mod vector_engine {
             _query: &[f32],
             _top_k: usize,
             _threshold: Option<f32>,
+            _encoder_filter: Option<&[u8]>,
         ) -> anyhow::Result<Vec<VectorMatchResult>> {
             Ok(Vec::new())
         }
-        pub fn get_vector(&self, _fingerprint: &str, _dim: usize) -> Option<Vec<f32>> {
+        pub fn get_vector(
+            &self,
+            _fingerprint: &str,
+            _dim: usize,
+            _allowed: Option<&[u8]>,
+        ) -> Option<Vec<f32>> {
+            None
+        }
+        pub fn get_vector_entry(&self, _fingerprint: &str, _dim: usize) -> Option<(Vec<f32>, u8)> {
             None
         }
         pub fn delete(&self, _fingerprints: &[String]) -> anyhow::Result<usize> {

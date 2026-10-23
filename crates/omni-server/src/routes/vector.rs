@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 use crate::AppState;
+use omni_pro::vector_engine::encoder_id;
 
 /// 单个向量条目
 #[derive(Debug, Clone, Deserialize)]
@@ -23,6 +24,10 @@ pub struct VectorUpsertItem {
     #[serde(alias = "file_fingerprint")]
     pub file_fingerprint: String,
     pub vector: Vec<f32>,
+    /// 编码器身份（0=Unknown/Legacy, 1=Bekko, 2=ChineseCLIP, 3=MobileCLIP, 4=Gemma）。
+    /// HTTP 层用 `Option<u8>` 接收以便区分缺省；缺省处理见 handler 的 expand 过渡态注释。
+    #[serde(default)]
+    pub encoder_id: Option<u8>,
 }
 
 /// 灵活支持单项或批量的 Upsert 载荷
@@ -55,6 +60,10 @@ pub struct VectorSearchRequest {
     pub top_k: usize,
     /// 相似度阈值 ([-1.0, 1.0]，低于此阈值的项被过滤)
     pub threshold: Option<f32>,
+    /// 编码器白名单：非空数组时，仅对命中编码器的记录打分（过滤发生在
+    /// RaBitQ 预判 / 打分 / 排序 / truncate 之前，防止 top-K 被异空间记录占满而饿死）
+    #[serde(default)]
+    pub encoder_filter: Option<Vec<u8>>,
 }
 
 fn default_top_k() -> usize {
@@ -68,6 +77,8 @@ pub struct VectorMatchItem {
     pub file_fingerprint: String,
     pub score: f32,
     pub rank: usize,
+    /// 命中记录的编码器身份（zvec v3 encoder_id）
+    pub encoder_id: u8,
 }
 
 /// 检索响应体
@@ -101,6 +112,8 @@ fn default_get_dim() -> usize {
 pub struct VectorGetItem {
     pub file_fingerprint: String,
     pub vector: Vec<f32>,
+    /// 该向量落盘时携带的编码器身份（zvec v3 encoder_id），供 desktop 探活/白名单判定
+    pub encoder_id: u8,
 }
 
 /// 批量读取反量化向量响应体
@@ -171,10 +184,12 @@ pub async fn vector_get_handler(
     let result = tokio::task::spawn_blocking(move || {
         let mut items = Vec::with_capacity(fps.len());
         for fp in fps {
-            if let Some(vec) = vector_engine.get_vector(&fp, dim) {
+            // 不做白名单过滤：encoderId 原样透出，由 desktop 按当前档位判定（探活/白名单）
+            if let Some((vec, enc)) = vector_engine.get_vector_entry(&fp, dim) {
                 items.push(VectorGetItem {
                     file_fingerprint: fp,
                     vector: vec,
+                    encoder_id: enc,
                 });
             }
         }
@@ -223,15 +238,32 @@ pub async fn vector_upsert_handler(
 
     let vector_engine = state.vector.clone();
 
-    // 在 spawn_blocking 中执行批量量化与单次原子落盘，消除磁盘写放大
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-        let batch_items: Vec<omni_pro::vector_engine::VectorUpsertItem> = items
-            .into_iter()
-            .map(|it| omni_pro::vector_engine::VectorUpsertItem {
+    // 【过渡态 · 工单 02 expand】HTTP upsert 缺 `encoderId` 时暂时写入 0（Unknown/Legacy）并告警。
+    // 这是 expand 阶段的刻意放宽，**由工单 03 收紧为 400 `encoder_id_required`，不得长期保留**。
+    // 缺字节默认 0 只适用于旧落盘文件读取，不适用于 HTTP 入参。
+    let batch_items: Vec<omni_pro::vector_engine::VectorUpsertItem> = items
+        .into_iter()
+        .map(|it| {
+            let encoder_id = match it.encoder_id {
+                Some(value) => value,
+                None => {
+                    tracing::warn!(
+                        "[vector/upsert] 缺省 encoderId (fp={})，过渡态暂写 0；工单 03 将收紧为 400 encoder_id_required",
+                        it.file_fingerprint
+                    );
+                    encoder_id::UNKNOWN
+                }
+            };
+            omni_pro::vector_engine::VectorUpsertItem {
                 file_fingerprint: it.file_fingerprint,
                 vector: it.vector,
-            })
-            .collect();
+                encoder_id,
+            }
+        })
+        .collect();
+
+    // 在 spawn_blocking 中执行批量量化与单次原子落盘，消除磁盘写放大
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
         vector_engine.batch_upsert(&batch_items)
     })
     .await;
@@ -268,9 +300,27 @@ pub async fn vector_search_handler(
 ) -> Result<Json<VectorSearchResponse>, (StatusCode, Json<VectorSearchResponse>)> {
     let vector_engine = state.vector.clone();
 
+    // 【过渡态 · 工单 02 expand】查询缺省 `encoderFilter`（或空数组）时暂时不过滤并告警。
+    // 这是 expand 阶段的刻意放宽，**由工单 03 收紧为 400 `encoder_filter_required`，不得长期保留**；
+    // 产品契约上该字段必填，禁止把缺省解释为「不过滤」长期存在。
+    let encoder_filter = match req.encoder_filter {
+        Some(list) if !list.is_empty() => Some(list),
+        _ => {
+            tracing::warn!(
+                "[vector/search] 缺省 encoderFilter（或为空数组），过渡态暂不过滤；工单 03 将收紧为 400 encoder_filter_required"
+            );
+            None
+        }
+    };
+
     let start = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        vector_engine.search(&req.vector, req.top_k, req.threshold)
+        vector_engine.search(
+            &req.vector,
+            req.top_k,
+            req.threshold,
+            encoder_filter.as_deref(),
+        )
     })
     .await;
 
@@ -285,6 +335,7 @@ pub async fn vector_search_handler(
                     file_fingerprint: m.file_fingerprint,
                     score: m.score,
                     rank: idx + 1,
+                    encoder_id: m.encoder_id,
                 })
                 .collect();
 

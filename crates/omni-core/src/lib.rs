@@ -59,6 +59,30 @@ macro_rules! tag_display {
 /// Omni 核心引擎版本号
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// zvec v3 编码器身份契约（单字节 `encoder_id`，**不加 modality 位**）
+///
+/// 取值固定：`0=Unknown/Legacy, 1=Bekko, 2=ChineseCLIP, 3=MobileCLIP, 4=Gemma`。
+/// 该字节标识「编码器族 / 向量空间身份」，不标识模态或池化变体；池化口径变更属于空间版本
+/// 变更，必须升 `ZVEC_VERSION`。统一定义在 omni-core，供 `vector_engine` / `omni-vision` /
+/// `omni-server` 复用，禁止各层散落魔数。
+pub mod encoder_id {
+    /// 未知 / v2 旧记录（无身份字节时默认值）
+    pub const UNKNOWN: u8 = 0;
+    /// bekko-a8m 384d 文本嵌入
+    pub const BEKKO: u8 = 1;
+    /// Chinese-CLIP（中文图文双塔）
+    pub const CHINESE_CLIP: u8 = 2;
+    /// MobileCLIP（非中文图文塔，与 ChineseCLIP 空间不通用）
+    pub const MOBILE_CLIP: u8 = 3;
+    /// EmbeddingGemma（MRL 256/512/768）
+    pub const GEMMA: u8 = 4;
+
+    /// classic_light 384 槽位查询/直读白名单：仅 Bekko，允许 v2 旧记录过渡
+    pub const CLASSIC_384_ALLOWED: &[u8] = &[UNKNOWN, BEKKO];
+    /// gemma_unified 档位查询/直读白名单：512 槽与 classic CLIP 共用，必须严格排除
+    pub const GEMMA_ALLOWED: &[u8] = &[GEMMA];
+}
+
 /// 基础分析与配置规范 (对齐 Desktop ConfigKey)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -507,6 +531,11 @@ pub struct OmniPerceptionResult {
     pub name_slots: Option<serde_json::Value>,
     #[serde(default)]
     pub embedding_dense: Option<Vec<f32>>,
+    /// 主向量 `embedding_dense` 的编码器出处（zvec v3 `encoder_id`：
+    /// 0=Unknown/Legacy, 1=Bekko, 2=ChineseCLIP, 3=MobileCLIP, 4=Gemma）。
+    /// 仅透传文本/视觉编码层的真实出处，**禁止下游按界面语言或档位猜测**。
+    #[serde(default)]
+    pub embedding_encoder_id: Option<u8>,
 
     pub phash: Option<String>,
     pub is_corrupted: bool,
@@ -532,6 +561,10 @@ pub struct OmniVideoChunk {
     pub start_sec: f32,
     pub end_sec: f32,
     pub vector: Vec<f32>,
+    /// 切片向量的编码器出处（zvec v3 `encoder_id`；视频切片由 Gemma 视觉塔产出，恒为 4）。
+    /// 由视觉层写入并原样透传，禁止下游按档位猜测。
+    #[serde(default)]
+    pub encoder_id: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asr_text: Option<String>,
 }

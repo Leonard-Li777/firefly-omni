@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tracing::info;
 
 pub use omni_pro::{
-    OmwDb, SemanticPackLoader, VectorEngine, VectorMatch, VECTOR_DIM, VECTOR_DIM_512,
+    encoder_id, OmwDb, SemanticPackLoader, VectorEngine, VectorMatch, VECTOR_DIM, VECTOR_DIM_512,
     VECTOR_DIM_384, VECTOR_DIM_DENSE,
 };
 use omni_pro::omw_query;
@@ -1087,6 +1087,8 @@ struct VisionComputed {
     inspect_img: Option<image::DynamicImage>,
     /// CLIP 图像嵌入向量（512 维归一化），用于级联假设仲裁
     image_embedding: Option<Vec<f32>>,
+    /// 图像嵌入向量的编码器出处（zvec v3 encoder_id），由 omni-vision 返回，禁止本层猜
+    image_encoder_id: Option<u8>,
     /// CLIP 互斥组分类结果：(标签名, 置信度, 组名)
     /// 覆盖：内容形态/文字存在性/色彩模式/截图细分 四个互斥维度
     clip_mutual_tags: Vec<(String, f32, &'static str)>,
@@ -1103,6 +1105,22 @@ struct VisionComputed {
     tag_ms: u64,
     ram_ms: u64,
     subtasks: std::collections::BTreeMap<String, u64>,
+}
+
+/// 阶段一主向量的编码器出处：有文本向量时取文本编码层出处，否则取视觉层出处。
+///
+/// 纯透传函数：出处由产出层（omni-text / omni-vision）给出，**禁止在此按界面语言或档位猜测**。
+/// 主向量优先级与 `embedding_dense = text_emb.or(image_embedding)` 保持一致。
+fn resolve_main_vector_encoder(
+    has_text_vector: bool,
+    text_encoder: Option<u8>,
+    image_encoder: Option<u8>,
+) -> Option<u8> {
+    if has_text_vector {
+        text_encoder
+    } else {
+        image_encoder
+    }
 }
 
 /// 多核零拷贝并行视觉感知流水线: 图像单次加载与降采样，7 线程并发计算，消除串行阻塞与重复推理
@@ -1198,9 +1216,12 @@ fn run_vision_pipeline(
                 });
 
                 // 9. 图像嵌入向量提取 (用于级联假设仲裁与多模态稠密检索)，统一走 timed_spawn! 计时宏
+                // 编码器出处由产出层回传：Gemma 视觉塔 → 4；CLIP 图像塔 → 由 omni-vision 判定 2/3。
                 let h_embed = omni_core::timed_spawn!(s, {
                     if embedding_profile == "gemma_unified" {
-                        omni_pro::OmniVisionEngine::encode_gemma_image(&inspect_img).ok()
+                        omni_pro::OmniVisionEngine::encode_gemma_image(&inspect_img)
+                            .ok()
+                            .map(|v| (v, omni_pro::vector_engine::encoder_id::GEMMA))
                     } else {
                         omni_pro::OmniVisionEngine::extract_clip_image_embedding(&inspect_img, lang)
                     }
@@ -1227,7 +1248,6 @@ fn run_vision_pipeline(
                 let (bw, bw_ms) = join_or_log!(h_bw, "bw", (false, 0));
                 let (ram_res, ram_ms) = join_or_log!(h_ram, "ram", (Vec::new(), 0));
                 let (img_embed, embed_ms) = join_or_log!(h_embed, "clip_embed", (None, 0));
-
                 out.has_text = Some(td);
                 out.text_detect_ms = td_ms;
                 // (WP2b) 分数快照与标签名拆分：clip_tags 保持 Vec<String> 兼容既有门禁/消歧流程
@@ -1247,7 +1267,13 @@ fn run_vision_pipeline(
                 out.bw_ms = bw_ms;
                 out.ram_tags = ram_res;
                 out.ram_ms = ram_ms;
-                out.image_embedding = img_embed;
+                // 解包 (向量, 编码器出处)：出处与向量同源同生，不在此层推断
+                let (img_vec, img_enc) = match img_embed {
+                    Some((v, enc)) => (Some(v), Some(enc)),
+                    None => (None, None),
+                };
+                out.image_embedding = img_vec;
+                out.image_encoder_id = img_enc;
                 // CLIP 互斥分类：利用图像嵌入向量对内容形态/色彩/文字等互斥组分类（仅 Classic Light 模式使用）
                 let mut mutual_ms = 0u64;
                 if let Some(ref emb) = out.image_embedding {
@@ -1907,6 +1933,8 @@ async fn perceive_file_handler(
 
     let ram_tags = vision_res.ram_tags;
     let image_embedding = vision_res.image_embedding;
+    // 图像向量的编码器出处由视觉层随向量一并返回，后续原样透传
+    let image_encoder_id = vision_res.image_encoder_id;
     let clip_mutual_tags = vision_res.clip_mutual_tags;
 
     // CLIP 互斥分类结果增强 morphology_tags：
@@ -2458,18 +2486,22 @@ async fn perceive_file_handler(
         let profile = cfg.embedding_profile.clone();
         let res = tokio::task::spawn_blocking(move || {
             let mut r = omni_pro::text::OmniTextEngine::analyze(&text, &fname, mtime, Some(&*hownet));
+            // 编码器出处随向量一起返回：Bekko 384 默认 1；gemma 文本编码成功才升为 4。
+            // 禁止下游按 profile/界面语言猜测（gemma 编码失败时向量仍是 Bekko 384）。
+            let mut encoder = omni_pro::vector_engine::encoder_id::BEKKO;
             if profile == "gemma_unified" {
                 if let Ok(vec) = omni_pro::OmniVisionEngine::encode_gemma_text(&text) {
                     r.embedding_dense = vec;
+                    encoder = omni_pro::vector_engine::encoder_id::GEMMA;
                 }
             }
-            r
+            (r, encoder)
         })
         .await;
         let text_duration = t_text.elapsed().as_millis() as u64;
         let cur_text_ms = benchmark.get("text_ms").unwrap_or(0);
         benchmark.record("text_ms", cur_text_ms + text_duration);
-        if let Ok(ref result) = res {
+        if let Ok((ref result, _)) = res {
             benchmark.record("bekko_embed_ms", result.bekko_embed_ms);
             benchmark.record("keybert_ms", result.keybert_ms);
             benchmark.record("slot_summary_ms", result.slot_summary_ms);
@@ -2485,8 +2517,8 @@ async fn perceive_file_handler(
         None
     };
 
-    let (text_title, mut text_keywords, text_entities, text_summary, text_one_desc, text_slots, text_emb, text_smart_name) = match text_analysis {
-        Some(res) => (
+    let (text_title, mut text_keywords, text_entities, text_summary, text_one_desc, text_slots, text_emb, text_emb_encoder, text_smart_name) = match text_analysis {
+        Some((res, encoder)) => (
             res.title,
             res.keywords,
             res.entities.iter().filter_map(|e| serde_json::to_value(e).ok()).collect(),
@@ -2494,12 +2526,14 @@ async fn perceive_file_handler(
             res.one_sentence_desc,
             serde_json::to_value(&res.name_slots).ok(),
             Some(res.embedding_dense),
+            Some(encoder),
             res.smart_name,
         ),
         None => (
             None,
             Vec::new(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -2940,6 +2974,12 @@ async fn perceive_file_handler(
         one_sentence_desc: text_one_desc,
         name_slots: text_slots,
         embedding_dense: text_emb.clone().or(image_embedding),
+        // 主向量编码器出处：与向量同源（文本层 or 视觉层），禁止本层猜测
+        embedding_encoder_id: resolve_main_vector_encoder(
+            text_emb.is_some(),
+            text_emb_encoder,
+            image_encoder_id,
+        ),
         benchmark: Some(benchmark),
         author,
         binary_info: binary_analysis_info,
@@ -2951,11 +2991,14 @@ async fn perceive_file_handler(
     if let Some(ref fp) = req.file_fingerprint {
         let mut batch_items = Vec::with_capacity(result.video_chunks.len() + 1);
 
-        // 1. 主向量一并打包 (优先取稠密嵌入)
+        // 1. 主向量一并打包 (优先取稠密嵌入)，编码器出处与向量同源透传
         if let Some(ref main_vec) = result.embedding_dense {
             batch_items.push(omni_pro::vector_engine::VectorUpsertItem {
                 file_fingerprint: fp.clone(),
                 vector: main_vec.clone(),
+                encoder_id: result.embedding_encoder_id.unwrap_or(
+                    omni_pro::vector_engine::encoder_id::UNKNOWN,
+                ),
             });
         }
 
@@ -2964,6 +3007,7 @@ async fn perceive_file_handler(
             batch_items.push(omni_pro::vector_engine::VectorUpsertItem {
                 file_fingerprint: format!("{}:c{}", fp, c.chunk_index),
                 vector: c.vector.clone(),
+                encoder_id: c.encoder_id,
             });
         }
 
@@ -3465,6 +3509,15 @@ async fn search_cluster_handler(
         let target_dim = normalize_embedding_dim(&active_profile, req.embedding_dim, configured_mrl);
         let is_gemma = active_profile.contains("gemma");
 
+        // HAC 直读必须带当前档位的编码器白名单：
+        // classic 384 → [0,1]（Bekko + v2 legacy 过渡）；gemma activeDim → [4]。
+        // gemma@512 不得把同槽位的 classic CLIP(encoder=2) 向量喂进 HAC，不匹配按未命中走 JIT。
+        let allowed_encoders: &[u8] = if is_gemma {
+            omni_pro::vector_engine::encoder_id::GEMMA_ALLOWED
+        } else {
+            omni_pro::vector_engine::encoder_id::CLASSIC_384_ALLOWED
+        };
+
         tracing::info!(
             "[HAC] 聚类向量档位: profile={}, dim={}, documents={}",
             active_profile,
@@ -3507,7 +3560,11 @@ async fn search_cluster_handler(
                     docs.push(doc);
                     continue;
                 }
-                if let Some(vec) = vector.get_vector(&doc.fingerprint, target_dim) {
+                if let Some(vec) = vector.get_vector(
+                    &doc.fingerprint,
+                    target_dim,
+                    Some(allowed_encoders),
+                ) {
                     doc.embedding = vec;
                     docs.push(doc);
                     continue;
@@ -4537,4 +4594,40 @@ async fn cleanup_fix_handler(
         processed_paths: outcome.2,
         errors: outcome.3,
     })
+}
+
+#[cfg(test)]
+mod encoder_origin_tests {
+    use super::*;
+
+    /// 工单 02 AC：阶段一主向量出处必须来自产出层，不得按界面语言或档位猜测。
+    #[test]
+    fn main_vector_encoder_origin_is_not_guessed() {
+        use omni_pro::vector_engine::encoder_id;
+
+        // 文本向量存在时，出处必须取文本层给出的值（即使视觉层给了不同出处）
+        assert_eq!(
+            resolve_main_vector_encoder(true, Some(encoder_id::BEKKO), Some(encoder_id::MOBILE_CLIP)),
+            Some(encoder_id::BEKKO),
+            "有文本向量时主向量出处必须为文本层出处"
+        );
+        // 文本缺失时，出处必须原样采用视觉层出处（例如回退 mobileclip 时是 3，不是 2）
+        assert_eq!(
+            resolve_main_vector_encoder(false, None, Some(encoder_id::MOBILE_CLIP)),
+            Some(encoder_id::MOBILE_CLIP),
+            "无文本向量时必须原样透传视觉层出处，禁止按语言猜成 ChineseCLIP"
+        );
+        // 两路都没有向量时不得编造出处
+        assert_eq!(
+            resolve_main_vector_encoder(false, None, None),
+            None,
+            "无向量时不得编造 encoder_id"
+        );
+        // 有文本向量但文本层未给出处（异常路径）时，不得偷偷回退视觉出处造成向量/出处错配
+        assert_eq!(
+            resolve_main_vector_encoder(true, None, Some(encoder_id::CHINESE_CLIP)),
+            None,
+            "文本向量存在时不得改用视觉层出处，避免向量与出处错配"
+        );
+    }
 }
