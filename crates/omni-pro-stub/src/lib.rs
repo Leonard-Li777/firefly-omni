@@ -1117,6 +1117,8 @@ pub mod search {
     #[serde(rename_all = "camelCase")]
     pub struct IndexedDocument {
         pub fingerprint: String,
+        /// 空向量 = 仅稀疏轨（与专业版契约一致，缺省字段同样允许）
+        #[serde(default)]
         pub embedding: Vec<f32>,
         pub searchable_text: String,
     }

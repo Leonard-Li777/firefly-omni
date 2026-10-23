@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 use crate::AppState;
-use omni_pro::vector_engine::encoder_id;
 
 /// 单个向量条目
 #[derive(Debug, Clone, Deserialize)]
@@ -25,7 +24,8 @@ pub struct VectorUpsertItem {
     pub file_fingerprint: String,
     pub vector: Vec<f32>,
     /// 编码器身份（0=Unknown/Legacy, 1=Bekko, 2=ChineseCLIP, 3=MobileCLIP, 4=Gemma）。
-    /// HTTP 层用 `Option<u8>` 接收以便区分缺省；缺省处理见 handler 的 expand 过渡态注释。
+    /// HTTP 层用 `Option<u8>` 接收以便区分缺省；缺省一律 400 `encoder_id_required`
+    /// （缺字节默认 0 只适用于旧落盘文件读取，不适用于 HTTP 入参）。
     #[serde(default)]
     pub encoder_id: Option<u8>,
 }
@@ -60,8 +60,9 @@ pub struct VectorSearchRequest {
     pub top_k: usize,
     /// 相似度阈值 ([-1.0, 1.0]，低于此阈值的项被过滤)
     pub threshold: Option<f32>,
-    /// 编码器白名单：非空数组时，仅对命中编码器的记录打分（过滤发生在
-    /// RaBitQ 预判 / 打分 / 排序 / truncate 之前，防止 top-K 被异空间记录占满而饿死）
+    /// 编码器白名单：必填且不得为空数组，仅对命中编码器的记录打分（过滤发生在
+    /// RaBitQ 预判 / 打分 / 排序 / truncate 之前，防止 top-K 被异空间记录占满而饿死）。
+    /// 缺省或空数组一律 400 `encoder_filter_required`，禁止解释为「不过滤」。
     #[serde(default)]
     pub encoder_filter: Option<Vec<u8>>,
 }
@@ -217,6 +218,70 @@ pub async fn vector_get_handler(
     }
 }
 
+/// upsert 入参校验：把 HTTP 条目转换为引擎条目。
+///
+/// 缺 `encoderId` 一律 400 `encoder_id_required`。本函数是纯校验，不触碰引擎，
+/// 由 handler 在 `spawn_blocking` 与任何写入之前调用；缺字节默认 0 仅适用于旧落盘文件读取，
+/// 不适用于 HTTP 入参。
+fn resolve_upsert_batch(
+    items: Vec<VectorUpsertItem>,
+) -> Result<Vec<omni_pro::vector_engine::VectorUpsertItem>, (StatusCode, &'static str)> {
+    let mut batch = Vec::with_capacity(items.len());
+    for it in items {
+        let encoder_id = it
+            .encoder_id
+            .ok_or((StatusCode::BAD_REQUEST, "encoder_id_required"))?;
+        batch.push(omni_pro::vector_engine::VectorUpsertItem {
+            file_fingerprint: it.file_fingerprint,
+            vector: it.vector,
+            encoder_id,
+        });
+    }
+    Ok(batch)
+}
+
+/// 检索入参校验：`encoderFilter` 必填且不得为空数组，缺省/空数组一律
+/// 400 `encoder_filter_required`。纯校验，由 handler 在 `spawn_blocking` 与检索之前调用。
+fn resolve_encoder_filter(
+    filter: Option<Vec<u8>>,
+) -> Result<Vec<u8>, (StatusCode, &'static str)> {
+    match filter {
+        Some(list) if !list.is_empty() => Ok(list),
+        _ => Err((StatusCode::BAD_REQUEST, "encoder_filter_required")),
+    }
+}
+
+/// 构造 upsert 拒绝响应（与校验函数返回的状态码/错误串一一对应）
+fn upsert_rejection(
+    status: StatusCode,
+    error: &'static str,
+) -> (StatusCode, Json<VectorUpsertResponse>) {
+    (
+        status,
+        Json(VectorUpsertResponse {
+            success: false,
+            count: 0,
+            error: Some(error.to_string()),
+        }),
+    )
+}
+
+/// 构造 search 拒绝响应（与校验函数返回的状态码/错误串一一对应）
+fn search_rejection(
+    status: StatusCode,
+    error: &'static str,
+) -> (StatusCode, Json<VectorSearchResponse>) {
+    (
+        status,
+        Json(VectorSearchResponse {
+            matches: Vec::new(),
+            duration_us: 0,
+            count: 0,
+            error: Some(error.to_string()),
+        }),
+    )
+}
+
 /// 写入或更新特征向量: POST /api/v1/vector/upsert
 pub async fn vector_upsert_handler(
     State(state): State<AppState>,
@@ -236,31 +301,13 @@ pub async fn vector_upsert_handler(
         }));
     }
 
-    let vector_engine = state.vector.clone();
+    // 契约已收紧：缺 `encoderId` 一律 400，且必须在任何写入（含 spawn_blocking）之前完成校验。
+    let batch_items = match resolve_upsert_batch(items) {
+        Ok(batch) => batch,
+        Err((status, error)) => return Err(upsert_rejection(status, error)),
+    };
 
-    // 【过渡态 · 工单 02 expand】HTTP upsert 缺 `encoderId` 时暂时写入 0（Unknown/Legacy）并告警。
-    // 这是 expand 阶段的刻意放宽，**由工单 03 收紧为 400 `encoder_id_required`，不得长期保留**。
-    // 缺字节默认 0 只适用于旧落盘文件读取，不适用于 HTTP 入参。
-    let batch_items: Vec<omni_pro::vector_engine::VectorUpsertItem> = items
-        .into_iter()
-        .map(|it| {
-            let encoder_id = match it.encoder_id {
-                Some(value) => value,
-                None => {
-                    tracing::warn!(
-                        "[vector/upsert] 缺省 encoderId (fp={})，过渡态暂写 0；工单 03 将收紧为 400 encoder_id_required",
-                        it.file_fingerprint
-                    );
-                    encoder_id::UNKNOWN
-                }
-            };
-            omni_pro::vector_engine::VectorUpsertItem {
-                file_fingerprint: it.file_fingerprint,
-                vector: it.vector,
-                encoder_id,
-            }
-        })
-        .collect();
+    let vector_engine = state.vector.clone();
 
     // 在 spawn_blocking 中执行批量量化与单次原子落盘，消除磁盘写放大
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
@@ -300,17 +347,11 @@ pub async fn vector_search_handler(
 ) -> Result<Json<VectorSearchResponse>, (StatusCode, Json<VectorSearchResponse>)> {
     let vector_engine = state.vector.clone();
 
-    // 【过渡态 · 工单 02 expand】查询缺省 `encoderFilter`（或空数组）时暂时不过滤并告警。
-    // 这是 expand 阶段的刻意放宽，**由工单 03 收紧为 400 `encoder_filter_required`，不得长期保留**；
-    // 产品契约上该字段必填，禁止把缺省解释为「不过滤」长期存在。
-    let encoder_filter = match req.encoder_filter {
-        Some(list) if !list.is_empty() => Some(list),
-        _ => {
-            tracing::warn!(
-                "[vector/search] 缺省 encoderFilter（或为空数组），过渡态暂不过滤；工单 03 将收紧为 400 encoder_filter_required"
-            );
-            None
-        }
+    // 契约已收紧：`encoderFilter` 缺省或空数组一律 400，且必须在任何检索（含 spawn_blocking）之前完成校验。
+    // 产品契约上该字段必填，禁止把缺省解释为「不过滤」。
+    let encoder_filter = match resolve_encoder_filter(req.encoder_filter) {
+        Ok(list) => list,
+        Err((status, error)) => return Err(search_rejection(status, error)),
     };
 
     let start = Instant::now();
@@ -319,7 +360,7 @@ pub async fn vector_search_handler(
             &req.vector,
             req.top_k,
             req.threshold,
-            encoder_filter.as_deref(),
+            Some(encoder_filter.as_slice()),
         )
     })
     .await;
@@ -733,3 +774,105 @@ pub async fn batch_embed_text_handler(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omni_pro::vector_engine::encoder_id;
+
+    /// 构造一条合法的引擎侧写入条目（384d，便于落到 384 槽）
+    fn engine_item(fp: &str, encoder: u8) -> omni_pro::vector_engine::VectorUpsertItem {
+        omni_pro::vector_engine::VectorUpsertItem {
+            file_fingerprint: fp.to_string(),
+            vector: vec![0.1_f32; 384],
+            encoder_id: encoder,
+        }
+    }
+
+    /// AC: upsert 缺 `encoderId` → 400 `encoder_id_required`，且校验发生在任何写入之前
+    #[test]
+    fn upsert_without_encoder_id_returns_400_and_writes_nothing() {
+        let engine = omni_pro::VectorEngine::in_memory();
+        // 预置一条合法记录：用于证明 400 分支不会产生额外落盘
+        engine
+            .batch_upsert(&[engine_item("fp_seed", encoder_id::BEKKO)])
+            .expect("预置合法向量失败");
+        assert_eq!(engine.count(), 1);
+
+        let (status, error) = resolve_upsert_batch(vec![VectorUpsertItem {
+            file_fingerprint: "fp_missing_encoder".to_string(),
+            vector: vec![0.1_f32; 384],
+            encoder_id: None,
+        }])
+        .expect_err("缺 encoderId 必须被拒绝");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error, "encoder_id_required");
+
+        // 错误体（HTTP 实际返回体）断言
+        let (body_status, Json(body)) = upsert_rejection(status, error);
+        assert_eq!(body_status, StatusCode::BAD_REQUEST);
+        assert!(!body.success);
+        assert_eq!(body.count, 0);
+        assert_eq!(body.error.as_deref(), Some("encoder_id_required"));
+
+        // 未发生写入：记录数不变，且缺 encoderId 的指纹不存在任何槽位记录
+        assert_eq!(engine.count(), 1, "400 分支不得发生写入");
+        assert!(
+            engine.get_vector_entry("fp_missing_encoder", 384).is_none(),
+            "缺 encoderId 的条目不得落盘"
+        );
+    }
+
+    /// 合法入参不得被误拒：显式 encoderId 可正常转换
+    #[test]
+    fn upsert_with_encoder_id_is_accepted() {
+        let batch = resolve_upsert_batch(vec![VectorUpsertItem {
+            file_fingerprint: "fp_ok".to_string(),
+            vector: vec![0.1_f32; 384],
+            encoder_id: Some(encoder_id::GEMMA),
+        }])
+        .expect("显式 encoderId 必须通过校验");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].encoder_id, encoder_id::GEMMA);
+    }
+
+    /// AC: search 的 `encoderFilter` 缺省或空数组 → 400 `encoder_filter_required`
+    #[test]
+    fn search_without_encoder_filter_returns_400_and_reads_nothing() {
+        let engine = omni_pro::VectorEngine::in_memory();
+        engine
+            .batch_upsert(&[engine_item("fp_seed", encoder_id::BEKKO)])
+            .expect("预置合法向量失败");
+        let before = engine.count();
+
+        for filter in [None, Some(Vec::new())] {
+            let (status, error) =
+                resolve_encoder_filter(filter).expect_err("缺省或空 encoderFilter 必须被拒绝");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error, "encoder_filter_required");
+
+            let (body_status, Json(body)) = search_rejection(status, error);
+            assert_eq!(body_status, StatusCode::BAD_REQUEST);
+            assert_eq!(body.count, 0);
+            assert!(body.matches.is_empty());
+            assert_eq!(body.error.as_deref(), Some("encoder_filter_required"));
+        }
+
+        // 未发生写入：检索拒绝路径不触碰引擎
+        assert_eq!(engine.count(), before, "400 分支不得发生写入");
+    }
+
+    /// 合法白名单不得被误拒
+    #[test]
+    fn search_with_encoder_filter_is_accepted() {
+        assert_eq!(
+            resolve_encoder_filter(Some(vec![encoder_id::UNKNOWN, encoder_id::BEKKO]))
+                .expect("classic 384 白名单必须通过"),
+            vec![encoder_id::UNKNOWN, encoder_id::BEKKO]
+        );
+        assert_eq!(
+            resolve_encoder_filter(Some(vec![encoder_id::GEMMA])).expect("gemma 白名单必须通过"),
+            vec![encoder_id::GEMMA]
+        );
+    }
+}
