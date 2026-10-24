@@ -24,6 +24,10 @@ pub mod tag_admissibility;
 pub mod dimension_policies_generated;
 pub use dimension_policies_generated::*;
 
+/// 强类型错误枚举与跨层降级判定契约 (Ticket 07)
+pub mod error;
+pub use error::OmniError;
+
 /// ONNX Runtime 统一动态底座、EP 两阶段路由与分级看门狗 (Ticket 2)
 pub mod ort_runtime;
 pub use ort_runtime::*;

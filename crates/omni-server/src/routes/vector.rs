@@ -267,6 +267,17 @@ fn upsert_rejection(
 }
 
 /// 构造 search 拒绝响应（与校验函数返回的状态码/错误串一一对应）
+
+/// 将底层产生的 OmniError 或 anyhow::Error 映射为统一的 HTTP 状态码与稳定错误码字符串 (Ticket 07)
+pub fn map_omni_error_response(err: &anyhow::Error) -> (StatusCode, String) {
+    if let Some(oe) = err.downcast_ref::<omni_core::OmniError>() {
+        let status = StatusCode::from_u16(oe.http_status_code())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, oe.kind().to_string())
+    } else {
+        (StatusCode::BAD_REQUEST, err.to_string())
+    }
+}
 fn search_rejection(
     status: StatusCode,
     error: &'static str,
@@ -321,14 +332,17 @@ pub async fn vector_upsert_handler(
             count: saved_count,
             error: None,
         })),
-        Ok(Err(err)) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(VectorUpsertResponse {
-                success: false,
-                count: 0,
-                error: Some(err.to_string()),
-            }),
-        )),
+        Ok(Err(err)) => {
+            let (status, err_code) = map_omni_error_response(&err);
+            Err((
+                status,
+                Json(VectorUpsertResponse {
+                    success: false,
+                    count: 0,
+                    error: Some(err_code),
+                }),
+            ))
+        }
         Err(join_err) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(VectorUpsertResponse {
@@ -388,15 +402,18 @@ pub async fn vector_search_handler(
                 error: None,
             }))
         }
-        Ok(Err(err)) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(VectorSearchResponse {
-                matches: Vec::new(),
-                duration_us,
-                count: 0,
-                error: Some(err.to_string()),
-            }),
-        )),
+        Ok(Err(err)) => {
+            let (status, err_code) = map_omni_error_response(&err);
+            Err((
+                status,
+                Json(VectorSearchResponse {
+                    matches: Vec::new(),
+                    duration_us,
+                    count: 0,
+                    error: Some(err_code),
+                }),
+            ))
+        }
         Err(join_err) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(VectorSearchResponse {
@@ -774,8 +791,196 @@ pub async fn batch_embed_text_handler(
     }
 }
 
+
+/* ------------------------------------------------------------------ *
+ * 工单 10：Chinese-CLIP 文本塔编码接口 POST /api/v1/vector/embed-clip-text
+ * ------------------------------------------------------------------ */
+
+/// CLIP 文本编码并发上限（规格 §4.2：Semaphore(2)，同时只允许 2 次编码）
+static CLIP_TEXT_ENCODE_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+
+/// 并发等待超时（规格 §4.2：等待超过 200ms 返回 429 busy，**不返回 504**）
+const CLIP_TEXT_ENCODE_WAIT_MS: u64 = 200;
+
+fn clip_text_encode_semaphore() -> &'static tokio::sync::Semaphore {
+    CLIP_TEXT_ENCODE_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(2))
+}
+
+/// CLIP 文本编码请求体
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbedClipTextRequest {
+    pub text: String,
+}
+
+/// CLIP 文本编码响应体（规格 §4.2 契约）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbedClipTextResponse {
+    pub success: bool,
+    /// 512 维 L2 归一化文本向量（ChineseCLIP 文本空间）
+    pub vector: Vec<f32>,
+    pub dim: usize,
+    /// 固定 2（ChineseCLIP），供写入侧直接透传 zvec v3 encoder_id
+    pub encoder_id: u8,
+    /// 首次调用是否触发模型加载（仅供埋点/UI，**不参与超时预算**）
+    pub cold_start: bool,
+    pub load_ms: u128,
+    pub encode_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// CLIP 文本编码错误响应体（与成功响应同型，便于 desktop 单一路径解析）
+fn clip_text_error(
+    status: StatusCode,
+    error: &'static str,
+    started: Instant,
+) -> (StatusCode, Json<EmbedClipTextResponse>) {
+    (
+        status,
+        Json(EmbedClipTextResponse {
+            success: false,
+            vector: Vec::new(),
+            dim: omni_pro::vision::CLIP_TEXT_DIM,
+            encoder_id: omni_pro::vector_engine::encoder_id::CHINESE_CLIP,
+            cold_start: false,
+            load_ms: 0,
+            encode_ms: started.elapsed().as_millis(),
+            error: Some(error.to_string()),
+        }),
+    )
+}
+
+/// POST /api/v1/vector/embed-clip-text（工单 10）
+///
+/// 契约（规格 §4.2 / §6 故障矩阵）：
+/// - 文本为空 → 422 `empty_text`；
+/// - 模型三件套缺失 / 词表不可读 / 输出无 text_embeds / 加载失败 → 503，
+///   分别 `model_missing` / `vocab_missing` / `unsupported_text_output` / `load_failed`；
+/// - 并发饱和（等待 > 200ms）→ 429 `busy`；
+/// - **永不返回 504**：超时由 desktop 侧的冷/热预算控制，服务端只做并发上限。
+pub async fn embed_clip_text_handler(
+    Json(req): Json<EmbedClipTextRequest>,
+) -> Result<Json<EmbedClipTextResponse>, (StatusCode, Json<EmbedClipTextResponse>)> {
+    let started = Instant::now();
+    let text = req.text.trim().to_string();
+    if text.is_empty() {
+        return Err(clip_text_error(StatusCode::UNPROCESSABLE_ENTITY, "empty_text", started));
+    }
+
+    // 并发上限：Semaphore(2) + 200ms 等待上限，超限即 429 busy（不算失败、不计熔断）
+    let permit = match tokio::time::timeout(
+        std::time::Duration::from_millis(CLIP_TEXT_ENCODE_WAIT_MS),
+        clip_text_encode_semaphore().acquire(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            return Err(clip_text_error(StatusCode::TOO_MANY_REQUESTS, "busy", started));
+        }
+    };
+
+    // 模型加载与推理包在 spawn_blocking，避免阻塞 Reactor
+    let joined = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let clip_dir = match omni_pro::OmniVisionEngine::resolve_clip_model_dir() {
+            Some(d) => d,
+            None => return Err(("model_missing", 0u128, 0u128)),
+        };
+        // 三件套只读探测（不加载模型）：模型 + 词表
+        if !omni_pro::vision::clip_text_model_ready(&clip_dir) {
+            return Err(("model_missing", 0u128, 0u128));
+        }
+        if !omni_pro::vision::clip_text_vocab_ready(&clip_dir) {
+            return Err(("vocab_missing", 0u128, 0u128));
+        }
+
+        let load_start = Instant::now();
+        // 预热/加载：内部经 Tier 3 看门狗惰性加载（300s 空闲释放），get_or_load 即单飞入口
+        let cold_start = omni_pro::vision::clip_text_session_is_cold();
+        let encoded =
+            omni_pro::OmniVisionEngine::encode_text_with_clip_detailed(&text, &clip_dir);
+        let load_ms = load_start.elapsed().as_millis();
+        match encoded {
+            Ok(v) => Ok((v, cold_start, load_ms, 0u128)),
+            // 失败原因由引擎侧直接给出（model_missing/vocab_missing/
+            // unsupported_text_output/load_failed），此处只做透传
+            Err(reason) => Err((reason, load_ms, 0u128)),
+        }
+    })
+    .await;
+
+    match joined {
+        Ok(Ok((vector, cold_start, load_ms, encode_ms))) => Ok(Json(EmbedClipTextResponse {
+            success: true,
+            dim: vector.len(),
+            vector,
+            encoder_id: omni_pro::vector_engine::encoder_id::CHINESE_CLIP,
+            cold_start,
+            load_ms,
+            encode_ms,
+            error: None,
+        })),
+        Ok(Err((reason, _, _))) => {
+            // 四个已登记原因（model_missing / vocab_missing /
+            // unsupported_text_output / load_failed）一律 503；
+            // 未登记原因同样按 503 处理，**永不降级/升级为 504**。
+            Err(clip_text_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                reason,
+                started,
+            ))
+        }
+        Err(join_err) => {
+            tracing::warn!("CLIP 文本编码任务 panic: {join_err}");
+            Err(clip_text_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "load_failed",
+                started,
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Ticket 07 验收单测：断言 4 个稳定错误码与对应 HTTP 状态码映射一致
+    #[test]
+    fn test_omni_error_mapping_to_http_codes() {
+        let e_missing: anyhow::Error = omni_core::OmniError::ModelMissing {
+            path: std::path::PathBuf::from("models/vision.onnx"),
+        }.into();
+        let (status, code) = map_omni_error_response(&e_missing);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(code, "model_missing");
+
+        let e_load: anyhow::Error = omni_core::OmniError::ModelLoadFailed {
+            path: std::path::PathBuf::from("models/vision.onnx"),
+            source: "bad onnx".into(),
+        }.into();
+        let (status, code) = map_omni_error_response(&e_load);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "model_load_failed");
+
+        let e_dml: anyhow::Error = omni_core::OmniError::DmlRuntimeFailed {
+            encoder: "gemma.vision",
+            source: "device lost".into(),
+        }.into();
+        let (status, code) = map_omni_error_response(&e_dml);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "dml_runtime_failed");
+
+        let e_input: anyhow::Error = omni_core::OmniError::InvalidInput {
+            field: "vector",
+            reason: "dim != 512".into(),
+        }.into();
+        let (status, code) = map_omni_error_response(&e_input);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "invalid_input");
+    }
+
     use super::*;
     use omni_pro::vector_engine::encoder_id;
 
@@ -874,5 +1079,133 @@ mod tests {
             resolve_encoder_filter(Some(vec![encoder_id::GEMMA])).expect("gemma 白名单必须通过"),
             vec![encoder_id::GEMMA]
         );
+    }
+
+    /* ---------------- 工单 10：embed-clip-text 契约测试 ---------------- */
+
+    /// 错误矩阵：`clip_text_error` 必须把状态码与 error 码同时带给 desktop
+    #[test]
+    fn clip_text_error_carries_status_and_code() {
+        for (status, code) in [
+            (StatusCode::UNPROCESSABLE_ENTITY, "empty_text"),
+            (StatusCode::TOO_MANY_REQUESTS, "busy"),
+            (StatusCode::SERVICE_UNAVAILABLE, "model_missing"),
+            (StatusCode::SERVICE_UNAVAILABLE, "vocab_missing"),
+            (StatusCode::SERVICE_UNAVAILABLE, "unsupported_text_output"),
+            (StatusCode::SERVICE_UNAVAILABLE, "load_failed"),
+        ] {
+            let (got_status, Json(body)) =
+                clip_text_error(status, code, Instant::now());
+            assert_eq!(got_status, status, "{code} 的状态码必须稳定");
+            assert_eq!(body.error.as_deref(), Some(code));
+            assert!(!body.success);
+            assert!(body.vector.is_empty());
+            // 固定 encoderId=2，供写入侧直接透传 zvec v3
+            assert_eq!(body.encoder_id, encoder_id::CHINESE_CLIP);
+            assert_eq!(body.dim, omni_pro::vision::CLIP_TEXT_DIM);
+        }
+    }
+
+    /// 错误矩阵不得出现 504：超时由 desktop 侧预算控制，服务端只做并发上限
+    #[test]
+    fn clip_text_error_never_uses_gateway_timeout() {
+        for code in [
+            "empty_text",
+            "busy",
+            "model_missing",
+            "vocab_missing",
+            "unsupported_text_output",
+            "load_failed",
+        ] {
+            let (status, _) = clip_text_error(StatusCode::SERVICE_UNAVAILABLE, code, Instant::now());
+            assert_ne!(status, StatusCode::GATEWAY_TIMEOUT, "{code} 不得映射为 504");
+        }
+    }
+
+    /// 请求体按 camelCase 反序列化，`text` 为唯一必填字段
+    #[test]
+    fn clip_text_request_deserializes_camel_case() {
+        let req: EmbedClipTextRequest =
+            serde_json::from_str(r#"{"text":"一只橘猫"}"#).expect("text 字段必须可解析");
+        assert_eq!(req.text, "一只橘猫");
+
+        let missing: Result<EmbedClipTextRequest, _> = serde_json::from_str(r#"{}"#);
+        assert!(missing.is_err(), "缺 text 必须反序列化失败（后续走 422）");
+    }
+
+    /// 并发上限：`Semaphore(2)` —— 第三次 acquire 在 200ms 预算内必然拿不到许可
+    #[tokio::test]
+    async fn clip_text_encode_semaphore_caps_at_two() {
+        let sem = clip_text_encode_semaphore();
+        let _a = sem.acquire().await.expect("第 1 个许可");
+        let _b = sem.acquire().await.expect("第 2 个许可");
+        // 许可已耗尽：第三条必须在 200ms 内超时，对应 429 busy
+        let third = tokio::time::timeout(
+            std::time::Duration::from_millis(CLIP_TEXT_ENCODE_WAIT_MS),
+            sem.acquire(),
+        )
+        .await;
+        assert!(third.is_err(), "Semaphore(2) 必须让第 3 次获取超时");
+
+        // 归还后立即可用（证明不是死锁/永久占用）
+        drop(_a);
+        let again = tokio::time::timeout(
+            std::time::Duration::from_millis(CLIP_TEXT_ENCODE_WAIT_MS),
+            sem.acquire(),
+        )
+        .await;
+        assert!(again.is_ok(), "归还许可后必须可再获取");
+    }
+
+    /// 成功响应契约：encoderId 恒为 2，vector 与 dim 自洽
+    #[test]
+    fn clip_text_success_response_shape() {
+        let vector = vec![0.5_f32; omni_pro::vision::CLIP_TEXT_DIM];
+        let body = EmbedClipTextResponse {
+            success: true,
+            dim: vector.len(),
+            vector,
+            encoder_id: encoder_id::CHINESE_CLIP,
+            cold_start: true,
+            load_ms: 12,
+            encode_ms: 3,
+            error: None,
+        };
+        let json = serde_json::to_string(&body).expect("响应必须可序列化");
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"dim\":512"));
+        assert!(json.contains("\"encoderId\":2"));
+        assert!(json.contains("\"coldStart\":true"));
+        // 成功路径不得出现 error 字段
+        assert!(!json.contains("\"error\""), "成功响应不得携带 error");
+    }
+
+    /// 探活不加载模型：`clip_text_model_ready` / `clip_text_vocab_ready` 只做元数据/内容判断，
+    /// 走的是只读代码路径（不构建 session），因此 RSS 不增长。
+    #[test]
+    fn clip_text_health_probes_are_read_only() {
+        // 空目录：三件套俱缺 → 探活全 false
+        let empty = std::env::temp_dir().join("firefly-clip-probe-empty-does-not-exist");
+        let _ = std::fs::remove_dir_all(&empty);
+        assert!(!omni_pro::vision::clip_text_model_ready(&empty));
+        assert!(!omni_pro::vision::clip_text_vocab_ready(&empty));
+
+        // 只有模型没有词表 → modelReady=true / vocabReady=false（可分辨，不是恒 false）
+        let dir = std::env::temp_dir().join("firefly-clip-probe-model-only");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        std::fs::write(dir.join("cn_clip_text.onnx"), b"not-a-real-model").expect("写桩文件");
+        assert!(omni_pro::vision::clip_text_model_ready(&dir));
+        assert!(!omni_pro::vision::clip_text_vocab_ready(&dir));
+
+        // 词表为空文件 → 仍不可用（空词表会污染 OnceLock，必须拒绝）
+        std::fs::write(dir.join("cn_clip_vocab.txt"), b"\n\n").expect("写空词表");
+        assert!(!omni_pro::vision::clip_text_vocab_ready(&dir));
+
+        // 非空词表 → 就绪
+        std::fs::write(dir.join("cn_clip_vocab.txt"), "[PAD]\n[UNK]\ncat\n").expect("写词表");
+        assert!(omni_pro::vision::clip_text_vocab_ready(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
