@@ -1759,7 +1759,17 @@ async fn perceive_file_handler(
             if should_transcribe {
                 let t_audio = std::time::Instant::now();
                 // 优先使用请求中传入的截取时长，否则读取全局配置
-                let duration_seconds = req.audio_analysis_duration.unwrap_or(cfg.audio_analysis_duration);
+                let requested_audio_duration =
+                    req.audio_analysis_duration.unwrap_or(cfg.audio_analysis_duration);
+                // D2 联动（2026-10-24 裁决）：视频侧已按 120s 预算截断时，ASR 必须收敛到同一上限。
+                // 否则视频截在 542s、ASR 却跑完整 2h（7200 × 0.112 = 806s），115s 预算被直接打穿。
+                // 未截断 / 时长未知（None）时保持原行为，不擅自裁剪用户请求的时长。
+                let duration_seconds = match video_timings.analysis_duration_sec {
+                    Some(limit) if limit.is_finite() && limit > 0.0 => {
+                        requested_audio_duration.min(limit.round().max(1.0) as u32)
+                    }
+                    _ => requested_audio_duration,
+                };
                 let file_path_for_audio = file_path.clone();
                 let sherpa_engine = state.sherpa.clone();
 
