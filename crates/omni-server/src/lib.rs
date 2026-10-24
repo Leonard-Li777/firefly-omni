@@ -1187,7 +1187,7 @@ fn run_vision_pipeline(
         .to_lowercase();
 
     let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tiff" | "gif");
-    let is_video = matches!(ext.as_str(), "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm");
+    let is_video = omni_core::is_video_ext(&ext);
 
     if is_image {
         if let Ok(img) = image::open(file_path) {
@@ -1550,8 +1550,8 @@ async fn perceive_file_handler(
 
     // 2. 根据 MIME 类型与扩展名判定大类分支
     let is_image = mime_type.starts_with("image/") || matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff");
-    let is_video = mime_type.starts_with("video/") || matches!(ext.as_str(), "mp4" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "webm");
-    let is_audio = mime_type.starts_with("audio/") || matches!(ext.as_str(), "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "opus" | "ape" | "aiff");
+    let is_video = mime_type.starts_with("video/") || omni_core::is_video_ext(&ext);
+    let is_audio = mime_type.starts_with("audio/") || omni_core::is_audio_ext(&ext);
 
     // 并行任务: NTFS ADS 溯源
     let f_ads = {
@@ -1568,7 +1568,7 @@ async fn perceive_file_handler(
         }
     };
 
-    let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, video_chunks)) = if is_image {
+    let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, video_chunks, video_timings)) = if is_image {
         let f_img = async {
             // 步骤 A1: 前置 ExifTool 全量元数据提取 (画质姿态/方向依赖 exiftool 提取的元数据)
             let t_meta = std::time::Instant::now();
@@ -1696,7 +1696,7 @@ async fn perceive_file_handler(
         benchmark.record_opt("text_ms", text_ms);
         benchmark.extract_ms = Some(vision_res.duration_ms.max(metadata_ms).max(ocr_ms.unwrap_or(0)));
 
-        (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, Vec::new()))
+        (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, Vec::new(), None))
     } else {
         let f_non_img = async {
             let t_extract = std::time::Instant::now();
@@ -1728,16 +1728,25 @@ async fn perceive_file_handler(
                 v.watermark_status = Some(v_wm_status.to_string());
 
                 let file_path_for_video = file_path.clone();
-                let video_interval = req.video_frame_interval_seconds.unwrap_or(5.0);
+                // 抽帧间隔已从 UI 移除，这里只是求解器的**下限**：真正取值由
+                // `solve_video_analysis_budget_with_asr` 按预算反解（只会放大、不会更密）。
+                // 故下限取引擎最密的 1.0s —— 短视频因此更密，长视频结果不变（求解器本就选到 60s）。
+                let video_interval = req.video_frame_interval_seconds.unwrap_or(1.0);
                 let video_soft_token_budget = req
                     .video_soft_token_budget
                     .unwrap_or(omni_pro::perceive::VIDEO_SOFT_TOKEN_BUDGET_DEFAULT);
+                // 预算模型必须知道 ASR 真实会跑多久：ASR 成本是 min(A, D)·r，不是 D·r。
+                // 这里与下方 ASR 分支取同一个上限（请求值 → 全局配置），保证两边同源。
+                let audio_cap_for_budget = req
+                    .audio_analysis_duration
+                    .unwrap_or(cfg.audio_analysis_duration) as f64;
                 let (chunks, timings) = tokio::task::spawn_blocking(move || {
                     omni_pro::perceive::process_video_time_chunks_with_timings(
                         std::path::Path::new(&file_path_for_video),
                         video_interval,
                         None,
                         video_soft_token_budget,
+                        Some(audio_cap_for_budget),
                     )
                 })
                 .await
@@ -1747,13 +1756,15 @@ async fn perceive_file_handler(
             }
 
             // 音频/视频文件: 纯内存解码 (16kHz 单声道) → GTCRN 降噪 + Silero VAD + SenseVoice 转录 + CED-mini 声学打标
-            let is_audio = mime_type.starts_with("audio/")
-                || matches!(ext.as_str(), "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "opus" | "ape" | "aiff");
+            let is_audio = mime_type.starts_with("audio/") || omni_core::is_audio_ext(&ext);
             let is_audio_or_video = is_audio || is_video;
             let mut audio_ms: Option<u64> = None;
 
             // 仅在音视频文件且 enable_asr 未显式关闭时执行纯内存声学流水线
+            // 纯乐谱格式（mid/midi）无语音波形且缺乏音色库，显式排除在 ASR 之外
+            let is_not_pure_midi = !matches!(ext.as_str(), "mid" | "midi");
             let should_transcribe = is_audio_or_video
+                && is_not_pure_midi
                 && req.enable_asr.unwrap_or(true);
 
             if should_transcribe {
@@ -1761,12 +1772,18 @@ async fn perceive_file_handler(
                 // 优先使用请求中传入的截取时长，否则读取全局配置
                 let requested_audio_duration =
                     req.audio_analysis_duration.unwrap_or(cfg.audio_analysis_duration);
-                // D2 联动（2026-10-24 裁决）：视频侧已按 120s 预算截断时，ASR 必须收敛到同一上限。
-                // 否则视频截在 542s、ASR 却跑完整 2h（7200 × 0.112 = 806s），115s 预算被直接打穿。
+                // D2 联动（2026-10-24 裁决）：视频侧已按 90s 向量预算截断时，ASR 必须收敛到同一上限。
+                // 否则视频截在 3531s、ASR 却跑完整 2h（7200 × 0.112 = 806s），85s 可用预算被直接打穿。
                 // 未截断 / 时长未知（None）时保持原行为，不擅自裁剪用户请求的时长。
-                let duration_seconds = match video_timings.analysis_duration_sec {
+                // ASR 时长严格按两阶段解耦的 audio_analysis_duration_sec 截断，避免误用全片视频时长
+                let duration_seconds = match video_timings.audio_analysis_duration_sec.or(video_timings.analysis_duration_sec) {
                     Some(limit) if limit.is_finite() && limit > 0.0 => {
                         requested_audio_duration.min(limit.round().max(1.0) as u32)
+                    }
+                    // 纯音频：没有画面要抢预算，直接吃满 90s 向量预算（≈425s）。
+                    // 「语音识别时长」设置只约束视频——否则纯音频会被同一个 30s 上限锁死。
+                    _ if is_audio => {
+                        omni_pro::perceive::max_audio_analysis_duration_sec() as u32
                     }
                     _ => requested_audio_duration,
                 };
@@ -1848,7 +1865,7 @@ async fn perceive_file_handler(
             }
         }
 
-        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, None, video_chunks))
+        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, None, video_chunks, Some(video_timings)))
     };
 
     benchmark.ads_ms = ads_ms;
@@ -3039,6 +3056,17 @@ async fn perceive_file_handler(
         benchmark: Some(benchmark),
         author,
         binary_info: binary_analysis_info,
+        // 生效采样间隔随切片下发（由视频管线按预算求解后写入每个切片），
+        // 供桌面端落库与缓存升级判据使用；无切片时为 None。
+        // 注意：必须写在 `video_chunks` 之前，否则字段移动后无法再借用。
+        video_sampling_interval_seconds: video_chunks
+            .first()
+            .map(|c| c.sampling_interval_seconds),
+        video_analysis_duration_sec: video_timings
+            .as_ref()
+            .and_then(|t| t.visual_analysis_duration_sec.or(t.analysis_duration_sec))
+            .map(|d| d as f32),
+        video_truncated: video_timings.as_ref().and_then(|t| t.video_truncated),
         video_chunks,
         vector_saved: None,
     });

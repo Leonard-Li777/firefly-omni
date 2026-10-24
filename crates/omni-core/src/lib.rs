@@ -553,6 +553,19 @@ pub struct OmniPerceptionResult {
     /// 视频时序切片集合（30 秒切片，包含 512 维向量、起止时间及可选切片 ASR）
     #[serde(default)]
     pub video_chunks: Vec<OmniVideoChunk>,
+    /// 本次视频分析实际生效的采样间隔（秒）
+    ///
+    /// 抽帧间隔已不由用户配置：引擎按 90s 向量预算自决（短视频用最密间隔，
+    /// 长视频自动放大）。下游据此落库 `file_video_chunks.sampling_interval_seconds`，
+    /// 禁止再用配置值代替——否则「切片跨度是否过期」的判据会误判。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_sampling_interval_seconds: Option<f32>,
+    /// 本次视频分析实际有效分析的时长（秒），截断时为截断点，未截断时为视频总时长
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_analysis_duration_sec: Option<f32>,
+    /// 视频画面是否触发了分析时长截断（画面未覆盖至片尾时为 true）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_truncated: Option<bool>,
     /// 向量是否由 Omni 内部就地持久化落盘
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_saved: Option<bool>,
@@ -571,6 +584,13 @@ pub struct OmniVideoChunk {
     pub encoder_id: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asr_text: Option<String>,
+    /// 本切片所属分析所使用的采样间隔（秒）
+    ///
+    /// 抽帧间隔已不由用户配置：引擎按 120s 单文件预算自决。桌面端落库
+    /// `file_video_chunks.sampling_interval_seconds` 必须用这个值，
+    /// 否则「切片跨度是否过期」的判据会拿错误基线误判。
+    #[serde(default)]
+    pub sampling_interval_seconds: f32,
 }
 
 /// 级联提示词候选假设项 (用于 CLIP 文本向量仲裁)
@@ -1024,6 +1044,29 @@ pub fn is_root_dimension(code: &str) -> bool {
 }
 
 pub use tag_identity::{concept_from_language_code, detect_fact_language};
+
+/// 判定扩展名是否属于视频大类（与桌面端 CATEGORY_EXT_MAP[FileCategory.VIDEO] 对齐的 20 种格式）
+pub fn is_video_ext(ext: &str) -> bool {
+    let clean = ext.trim_start_matches('.').to_ascii_lowercase();
+    matches!(
+        clean.as_str(),
+        "mp4" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "webm"
+            | "m4v" | "mpeg" | "mpg" | "3gp" | "ogv" | "rm" | "rmvb"
+            | "asf" | "vob" | "f4v" | "m2ts" | "mxf" | "dv"
+    )
+}
+
+/// 判定扩展名是否属于音频大类（与桌面端 CATEGORY_EXT_MAP[FileCategory.AUDIO] 对齐的 26 种格式）
+pub fn is_audio_ext(ext: &str) -> bool {
+    let clean = ext.trim_start_matches('.').to_ascii_lowercase();
+    matches!(
+        clean.as_str(),
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma"
+            | "aiff" | "opus" | "ape" | "dsd" | "dsf" | "dff" | "mqa"
+            | "ac3" | "dts" | "ra" | "au" | "snd" | "caf" | "amr"
+            | "3ga" | "mid" | "midi" | "weba" | "oga"
+    )
+}
 
 
 
