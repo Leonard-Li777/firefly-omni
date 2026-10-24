@@ -502,6 +502,123 @@ pub struct SenseVoiceResult {
     pub audio_events: Vec<String>,
 }
 
+/// ASR 分块时长（秒）。
+///
+/// 实测依据（`docs/specs/video-analysis-time-budget-and-tier-design.md` §1.2）：整段单次
+/// `decode` 的 RTF 随时长超线性劣化（0.550），60s 分块可压回 0.112（约 4.9x）。
+/// 该常量必须与预算模型里的 `VIDEO_ASR_REALTIME_FACTOR` 口径一致，改一处必须同步另一处。
+pub const ASR_CHUNK_SEC: f32 = 60.0;
+
+/// 分块切点的能量吸附半径（秒）。在切点前后各 2s 内找能量最低处落刀，
+/// 避免把一个词劈成两半导致前后两块都识别失败。
+const ASR_CHUNK_SNAP_SEC: f32 = 2.0;
+
+/// 能量吸附的短时分析帧长（秒）。
+const ASR_CHUNK_SNAP_WIN_SEC: f32 = 0.02;
+
+/// 把分块切点吸附到 `[end-radius, end+radius]` 内能量最低的短时帧中心。
+///
+/// 返回值被夹紧在 `(start, samples.len())` 内部，保证：
+/// 1. 前一块长度 ≥ 一个分析帧（不会切出空块）；
+/// 2. 后一块仍有 ≥ 一个分析帧可切（循环必然推进，不会死循环）。
+fn snap_chunk_boundary(samples: &[f32], start: usize, end: usize, sample_rate: i32) -> usize {
+    let win = ((sample_rate as f32) * ASR_CHUNK_SNAP_WIN_SEC).max(1.0) as usize;
+    let radius = ((sample_rate as f32) * ASR_CHUNK_SNAP_SEC).max(1.0) as usize;
+
+    let lo = end.saturating_sub(radius).max(start + win);
+    let hi = (end + radius).min(samples.len().saturating_sub(win));
+    // 可用搜索区间过窄（音频尾部 / 极短块）时放弃吸附，退回固定切点。
+    // 注意：必须保证返回值严格大于 start，否则调用方的 while 循环会原地打转。
+    if hi <= lo + win * 2 {
+        let floor = start.saturating_add(win).min(samples.len());
+        return end.max(floor).min(samples.len());
+    }
+
+    let mut best_idx = end;
+    let mut best_energy = f64::MAX;
+    let mut pos = lo;
+    while pos + win <= hi {
+        let energy: f64 = samples[pos..pos + win]
+            .iter()
+            .map(|s| (*s as f64) * (*s as f64))
+            .sum();
+        if energy < best_energy {
+            best_energy = energy;
+            best_idx = pos + win / 2;
+        }
+        pos += win;
+    }
+    best_idx.clamp(lo, hi)
+}
+
+/// 从若干「非空」候选里取票数最多者；票数相同时取先出现者（保持确定性）。
+fn majority_option<'a, I: Iterator<Item = &'a str>>(iter: I) -> Option<String> {
+    let mut tally: Vec<(&'a str, usize)> = Vec::new();
+    for value in iter {
+        match tally.iter_mut().find(|(k, _)| *k == value) {
+            Some(slot) => slot.1 += 1,
+            None => tally.push((value, 1)),
+        }
+    }
+    let mut best: Option<(&'a str, usize)> = None;
+    for (key, count) in tally {
+        if best.is_none_or(|(_, best_count)| count > best_count) {
+            best = Some((key, count));
+        }
+    }
+    best.map(|(key, _)| key.to_string())
+}
+
+/// 合并分块转录结果。
+///
+/// 合并规则（与 `parse_sense_voice_tokens` 的语义保持兼容）：
+/// - `text`：非空片段按空格拼接后归一化空白；
+/// - `lang` / `emotion`：**多数票**（整段路径是「首个语言 + 末个情绪」，分块后多数票更稳）；
+/// - `audio_events`：保序去重并集；
+/// - 文本为空时 `lang`/`emotion` 一并置空（沿用原「无文本则标记失去依托」的约定）。
+fn merge_sense_voice_parts(parts: Vec<SenseVoiceResult>) -> Option<SenseVoiceResult> {
+    if parts.is_empty() {
+        return None;
+    }
+
+    let joined = parts
+        .iter()
+        .map(|p| p.text.as_str())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let mut audio_events: Vec<String> = Vec::new();
+    for part in &parts {
+        for event in &part.audio_events {
+            if !audio_events.iter().any(|e| e == event) {
+                audio_events.push(event.clone());
+            }
+        }
+    }
+
+    if text.is_empty() && audio_events.is_empty() {
+        return None;
+    }
+
+    let (lang, emotion) = if text.is_empty() {
+        (None, None)
+    } else {
+        (
+            majority_option(parts.iter().filter_map(|p| p.lang.as_deref())),
+            majority_option(parts.iter().filter_map(|p| p.emotion.as_deref())),
+        )
+    };
+
+    Some(SenseVoiceResult {
+        text,
+        lang,
+        emotion,
+        audio_events,
+    })
+}
+
 /// 解析 SenseVoice 输出的原始带有特殊 Token 的文本并执行「声学标记优先 + 文本字符集兜底」双层语言判定
 pub fn parse_sense_voice_tokens(raw_text: &str) -> SenseVoiceResult {
     if raw_text.trim().is_empty() {
@@ -695,12 +812,55 @@ fn detect_language_from_text(text: &str) -> Option<String> {
 
 impl SherpaManager {
     /// 使用 SenseVoice 进行端到端语音识别与声学元数据解析 (ASR + 语言 + 情感 + 声音事件)
+    ///
+    /// 长音频按 [`ASR_CHUNK_SEC`] 分块转录后合并（2026-10-24 修正）。原因：整段一次性
+    /// `accept_waveform` + `decode` 的 RTF 随音频时长超线性劣化（实测 0.550，60s 分块 0.112），
+    /// 而 120s 预算模型按分块值建模，不分块会让长视频被 ASR 单侧打穿。
+    /// 不足一块的短视频仍走原整段路径，行为零变化。
     pub fn transcribe_full(&self, samples: &[f32], sample_rate: i32) -> Option<SenseVoiceResult> {
         let recognizer = self.recognizer.as_ref()?;
 
         // 防空张量守卫
         let min_samples = (sample_rate as f32 * 0.1) as usize;
         if samples.len() < min_samples {
+            return None;
+        }
+
+        let chunk_len = ((sample_rate as f32) * ASR_CHUNK_SEC).max(1.0) as usize;
+        let mut parts: Vec<SenseVoiceResult> = Vec::new();
+
+        if samples.len() <= chunk_len {
+            parts.extend(Self::transcribe_segment(recognizer, samples, sample_rate));
+        } else {
+            let mut pos = 0usize;
+            while pos < samples.len() {
+                let mut end = (pos + chunk_len).min(samples.len());
+                if end < samples.len() {
+                    end = snap_chunk_boundary(samples, pos, end, sample_rate);
+                }
+                if end <= pos {
+                    // 理论上不可达（吸附函数保证推进）；防御性兜底，避免死循环
+                    break;
+                }
+                parts.extend(Self::transcribe_segment(
+                    recognizer,
+                    &samples[pos..end],
+                    sample_rate,
+                ));
+                pos = end;
+            }
+        }
+
+        merge_sense_voice_parts(parts)
+    }
+
+    /// 单块转录：一次 `accept_waveform` + `decode`，解析后返回。空块 / 空文本返回 `None`。
+    fn transcribe_segment(
+        recognizer: &OfflineRecognizer,
+        samples: &[f32],
+        sample_rate: i32,
+    ) -> Option<SenseVoiceResult> {
+        if samples.is_empty() {
             return None;
         }
 
@@ -1341,6 +1501,132 @@ mod tests {
         let (transcript, events) = manager.process_audio_pipeline(&[], 16000);
         assert!(transcript.is_none());
         assert!(events.is_empty());
+    }
+
+    // ---- ASR 分块合并与切点吸附（2026-10-24 修正） ----
+
+    fn sv(text: &str, lang: Option<&str>, emotion: Option<&str>, events: &[&str]) -> SenseVoiceResult {
+        SenseVoiceResult {
+            text: text.to_string(),
+            lang: lang.map(str::to_string),
+            emotion: emotion.map(str::to_string),
+            audio_events: events.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_merge_sense_voice_parts_joins_text_and_dedups_events() {
+        let merged = merge_sense_voice_parts(vec![
+            sv("今天开会", Some("zh"), Some("neutral"), &["bgm", "laughter"]),
+            sv("讨论预算", Some("zh"), Some("neutral"), &["laughter", "applause"]),
+        ])
+        .expect("两块都有内容，不应返回 None");
+
+        assert_eq!(merged.text, "今天开会 讨论预算");
+        assert_eq!(merged.lang.as_deref(), Some("zh"));
+        // 事件取保序去重并集
+        assert_eq!(merged.audio_events, vec!["bgm", "laughter", "applause"]);
+    }
+
+    #[test]
+    fn test_merge_sense_voice_parts_picks_majority_marker() {
+        // 情绪多数票：3 块里 2 块 angry ⇒ angry（而非末块 wins 的 neutral）
+        let merged = merge_sense_voice_parts(vec![
+            sv("一", Some("zh"), Some("angry"), &[]),
+            sv("二", Some("en"), Some("angry"), &[]),
+            sv("三", Some("zh"), Some("neutral"), &[]),
+        ])
+        .expect("非空");
+
+        assert_eq!(merged.emotion.as_deref(), Some("angry"));
+        assert_eq!(merged.lang.as_deref(), Some("zh"));
+    }
+
+    #[test]
+    fn test_merge_sense_voice_parts_tie_keeps_first_seen() {
+        // 票数相同 ⇒ 取先出现者，保证确定性
+        let merged = merge_sense_voice_parts(vec![
+            sv("a", Some("ja"), Some("happy"), &[]),
+            sv("b", Some("ko"), Some("sad"), &[]),
+        ])
+        .expect("非空");
+
+        assert_eq!(merged.lang.as_deref(), Some("ja"));
+        assert_eq!(merged.emotion.as_deref(), Some("happy"));
+    }
+
+    #[test]
+    fn test_merge_sense_voice_parts_returns_none_when_all_empty() {
+        assert!(merge_sense_voice_parts(Vec::new()).is_none());
+        assert!(merge_sense_voice_parts(vec![sv("", None, None, &[])]).is_none());
+    }
+
+    #[test]
+    fn test_merge_sense_voice_parts_keeps_events_when_text_empty() {
+        // 只有事件、没有文本：保留事件，但 lang/emotion 必须置空（沿用原「无文本则标记失去依托」）
+        let merged = merge_sense_voice_parts(vec![sv("", Some("zh"), Some("happy"), &["bgm"])])
+            .expect("有事件，不应返回 None");
+
+        assert_eq!(merged.text, "");
+        assert_eq!(merged.audio_events, vec!["bgm"]);
+        assert!(merged.lang.is_none());
+        assert!(merged.emotion.is_none());
+    }
+
+    #[test]
+    fn test_snap_chunk_boundary_moves_to_low_energy_point() {
+        // 采样率在此显式用 usize，供切片下标运算；传参时再转 i32
+        let sr = 16000usize;
+        let mut samples = vec![0.5f32; sr * 10];
+        // 在 60s 切点前 1s 处挖一个 40ms 静音窗口 ⇒ 吸附应命中它附近
+        let quiet_center = sr * 5;
+        for s in &mut samples[quiet_center - 320..quiet_center + 320] {
+            *s = 0.0;
+        }
+
+        let cut = snap_chunk_boundary(&samples, 0, sr * 5 + 8000, sr as i32);
+        // 吸附结果必须落在静音窗口内（窗口中心 ±20ms）
+        assert!(
+            cut.abs_diff(quiet_center) <= 320,
+            "切点 {cut} 未吸附到静音窗口 {quiet_center} 附近"
+        );
+    }
+
+    #[test]
+    fn test_snap_chunk_boundary_stays_inside_valid_range() {
+        let sr = 16000usize;
+        let samples = vec![0.3f32; sr * 10];
+        let start = sr * 2;
+        let end = sr * 4;
+
+        let cut = snap_chunk_boundary(&samples, start, end, sr as i32);
+        // 必须严格推进，且不越过音频末尾
+        assert!(cut > start, "切点必须 > 起点（否则死循环）");
+        assert!(cut <= samples.len(), "切点不得越过音频末尾");
+        // 吸附半径 2s ⇒ 偏移不超过 ±2s
+        assert!(cut.abs_diff(end) <= sr * 2);
+    }
+
+    #[test]
+    fn test_snap_chunk_boundary_falls_back_near_tail() {
+        let sr = 16000usize;
+        // 极短缓冲（1000 样本 < 吸附半径 2s）⇒ 搜索区间退化，必须走兜底分支且不 panic
+        let samples = vec![0.3f32; 1000];
+        let cut = snap_chunk_boundary(&samples, 0, 1000, sr as i32);
+        assert!(cut > 0 && cut <= samples.len());
+
+        // 尾部：起点紧邻末尾，返回值必须严格推进，避免调用方死循环
+        let samples = vec![0.3f32; sr * 3];
+        let start = samples.len() - 400;
+        let cut = snap_chunk_boundary(&samples, start, samples.len(), sr as i32);
+        assert!(cut > start, "切点必须严格大于起点");
+        assert!(cut <= samples.len());
+    }
+
+    #[test]
+    fn test_asr_chunk_sec_matches_budget_model_factor() {
+        // 分块时长是与预算模型 VIDEO_ASR_REALTIME_FACTOR 绑定的口径，改动必须同步
+        assert!((ASR_CHUNK_SEC - 60.0).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -224,10 +224,14 @@ pub mod perceive {
         pub ffmpeg_ms: u64,
         pub decode_ms: u64,
         pub vision_ms: u64,
+        /// 本次实际分析的时长上限（镜像私有版契约）；桩恒为 `None`
+        pub analysis_duration_sec: Option<f64>,
     }
 
     /// 视频帧视觉软 token 预算下界（开源桩镜像私有版契约，保证调用方 API 一致）
-    pub const VIDEO_SOFT_TOKEN_BUDGET_MIN: usize = 70;
+    ///
+    /// 2026-10-24 D3 裁决：70 档由 48 档替换（两者检索一致性相同，48 快 35%）
+    pub const VIDEO_SOFT_TOKEN_BUDGET_MIN: usize = 48;
 
     /// 视频帧视觉软 token 预算上界
     pub const VIDEO_SOFT_TOKEN_BUDGET_MAX: usize = 140;
@@ -238,6 +242,23 @@ pub mod perceive {
     /// 将软 token 预算收敛到受支持区间（镜像私有版行为）
     pub fn normalize_video_soft_token_budget(budget: usize) -> usize {
         budget.clamp(VIDEO_SOFT_TOKEN_BUDGET_MIN, VIDEO_SOFT_TOKEN_BUDGET_MAX)
+    }
+
+    /// 按执行后端归一软 token 预算（镜像私有版签名）
+    ///
+    /// 开源桩不含视觉塔与执行后端，故 `has_accelerator` 分支无实际作用，
+    /// 保留同签名只为让调用方代码在两种构建下都能编译。
+    pub fn resolve_video_soft_token_budget(requested: usize, has_accelerator: bool) -> usize {
+        if has_accelerator {
+            VIDEO_SOFT_TOKEN_BUDGET_MAX
+        } else {
+            normalize_video_soft_token_budget(requested)
+        }
+    }
+
+    /// 开源桩无硬件加速后端
+    pub fn video_accelerator_available() -> bool {
+        false
     }
 
     pub fn process_video_time_chunks(
