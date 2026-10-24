@@ -249,9 +249,11 @@ async fn test_ac3_vector_engine_512d_storage_and_search() {
     vec_512[1] = 0.6;
 
     // 写入 512 维向量: POST /api/v1/vector/upsert
+    // 契约要求显式 `encoderId`（gemma_unified 档位为 EmbeddingGemma=4），缺省一律 400
     let upsert_body = serde_json::json!({
         "fileFingerprint": "fp_test_512",
-        "vector": vec_512
+        "vector": vec_512,
+        "encoderId": omni_core::encoder_id::GEMMA
     });
 
     let req = Request::builder()
@@ -270,9 +272,11 @@ async fn test_ac3_vector_engine_512d_storage_and_search() {
     assert_eq!(body["count"], 1);
 
     // 查询 512 维向量: POST /api/v1/vector/search
+    // 契约要求 `encoderFilter` 必填且非空，禁止缺省解释为「不过滤」
     let search_body = serde_json::json!({
         "vector": vec_512,
-        "topK": 5
+        "topK": 5,
+        "encoderFilter": [omni_core::encoder_id::GEMMA]
     });
 
     let search_req = Request::builder()
@@ -320,7 +324,8 @@ async fn test_ac3_5_video_aligned_chunking_and_storage() {
 
         let upsert_body = serde_json::json!({
             "fileFingerprint": format!("fp_video_test_chunk_{}", idx),
-            "vector": v
+            "vector": v,
+            "encoderId": omni_core::encoder_id::GEMMA
         });
 
         let req = Request::builder()
@@ -339,7 +344,8 @@ async fn test_ac3_5_video_aligned_chunking_and_storage() {
     query[1] = 1.0;
     let search_body = serde_json::json!({
         "vector": query,
-        "topK": 1
+        "topK": 1,
+        "encoderFilter": [omni_core::encoder_id::GEMMA]
     });
 
     let search_req = Request::builder()

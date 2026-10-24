@@ -1288,6 +1288,23 @@ impl OmniOrtRuntime {
         policy: EpPolicy,
         intra_threads: usize,
     ) -> Result<(ort::session::Session, bool), ort::Error> {
+        // 【工单 04/05/06 缝合门禁：DML 白名单强校验】
+        // 任何声明 DmlAllowlist 的模型路径必须属于 DML_ALLOWLIST_MODELS 事实源规范
+        // （v1 仅 gemma.vision_encoder，匹配 vision_encoder*.onnx 与 vision_model*.onnx）。
+        // 违规非白名单模型严禁走 DML，强制降级为 CpuOnly 并打印警告。
+        let mut policy = policy;
+        if policy == EpPolicy::DmlAllowlist {
+            let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+            let is_allowed = file_name.starts_with("vision_encoder") || file_name.starts_with("vision_model");
+            if !is_allowed {
+                tracing::warn!(
+                    "OmniOrtRuntime: 模型 {:?} 不在 DML_ALLOWLIST_MODELS 白名单中，强制打回纯 CPU 策略",
+                    path
+                );
+                policy = EpPolicy::CpuOnly;
+            }
+        }
+
         if !cfg!(target_os = "windows") {
             let eps = Self::preferred_hardware_eps_for(policy);
             let session = Self::build_session_with_eps_internal(path, tier, eps, intra_threads)?;
@@ -2296,9 +2313,29 @@ mod tests {
     /// 回落到 CPU，因此「EP 可用 + Session 构建成功」并不等于推理真跑在 GPU 上。
     /// 本基准用同一真实模型、同一输入形状分别在 CPU 与 DirectML 会话上重复前向，
     /// 用吞吐差值给出可证伪的结论。
+    ///
+    /// 环境变量：
+    /// - `OMNI_EP_BENCH=1`：启用基准（缺失则直接返回）；
+    /// - `OMNI_EP_BENCH_STRICT=1`：启用 AC-3 门禁，视觉塔 N=1260 加速比 < 2.5x 直接断言失败
+    ///   （默认不断言，避免无 GPU 的 CI 误红）；
+    /// - `OMNI_BENCH_SKIP_TEXT=1`：跳过文本塔基准（长序列文本塔耗时较高）；
+    /// - `OMNI_BENCH_VISION`：切换被测视觉模型文件名（默认 `vision_encoder_q4.onnx`）。
     #[test]
     fn test_bench_vision_encoder_ep_throughput() {
+        // 严格门禁（AC-3 加速比 / AC-6 数值一致性）只在真机显式开启，避免无 GPU 的 CI 误红；
+        // 开启后「拿不到可判定数据」一律 panic —— 否则门禁会被环境问题静默绕过（漏红）。
+        //
+        // ⚠️ 必须在 `OMNI_EP_BENCH` 的早退**之前**求值并交叉校验：否则
+        // `OMNI_EP_BENCH_STRICT=1` 但漏设 `OMNI_EP_BENCH=1` 时会走「未启用基准，跳过」
+        // 分支 —— 门禁一次都没跑，测试却 ok，这是最危险的假绿形态。
+        let strict = std::env::var("OMNI_EP_BENCH_STRICT").is_ok();
         if std::env::var("OMNI_EP_BENCH").is_err() {
+            if strict {
+                panic!(
+                    "[EP-BENCH] OMNI_EP_BENCH_STRICT=1 但 OMNI_EP_BENCH 未设置 ⇒ 门禁不会执行。\
+                     拒绝以「跳过」冒充通过：请同时设置 OMNI_EP_BENCH=1"
+                );
+            }
             println!("[EP-BENCH] 未设置 OMNI_EP_BENCH=1，跳过真实吞吐基准");
             return;
         }
@@ -2308,12 +2345,25 @@ mod tests {
         let dll = match OmniOrtRuntime::discover_onnx_dll() {
             Some(d) => d,
             None => {
+                if strict {
+                    panic!("[EP-BENCH] strict 模式未发现 onnxruntime DLL（资产未装配），无法判定 AC");
+                }
                 println!("[EP-BENCH] 未找到 onnxruntime.dll，跳过");
                 return;
             }
         };
-        println!("[EP-BENCH] DLL: {}", dll.display());
-        let _ = OmniOrtRuntime::init_with_dll(dll.to_str().unwrap_or("onnxruntime.dll"));
+        // 注意：这里打印的是**请求绑定**的路径。`init_with_dll` 在绑定已成功过时会走缓存
+        // 直接返回 Ok，不校验传入路径 ⇒ 若同进程内已有别的测试先完成绑定，本行路径可能与
+        // 实际生效的 DLL 不一致。故基准**必须在独占进程内单独运行**（用测试名过滤，
+        // 不要与 `test_probe_real_execution_provider_availability` 等同进程并发）。
+        println!("[EP-BENCH] 请求绑定 DLL: {}", dll.display());
+        if let Err(e) = OmniOrtRuntime::init_with_dll(dll.to_str().unwrap_or("onnxruntime.dll")) {
+            // 绑定失败后 `Session::builder()` 只会抛出无关的 panic，归因必须落在这一层
+            if strict {
+                panic!("[EP-BENCH] 运行时绑定失败: {e}");
+            }
+            println!("[EP-BENCH] 运行时绑定失败（继续，后续会话构建大概率失败）: {e}");
+        }
 
         // 允许用 OMNI_BENCH_VISION 切换被测视觉模型（如未量化的 vision_model.onnx），
         // 用于区分「DML 不支持 Q4 量化算子」与「DML/驱动本身不可用」两种失败
@@ -2322,137 +2372,487 @@ mod tests {
         let model = match locate_gemma_sibling(&vision_file) {
             Some(m) => m,
             None => {
+                if strict {
+                    panic!("[EP-BENCH] strict 模式未找到 gemma {vision_file}（模型资产未装配）");
+                }
                 println!("[EP-BENCH] 未找到 gemma {vision_file}，跳过");
                 return;
             }
         };
         println!("[EP-BENCH] 模型: {}", model.display());
 
-        // 真实形状：pixel_values [1, 140, 768] f32 + pixel_position_ids [1, 140, 2] i64
-        // 140 = 官方 video_processor.max_soft_tokens
-        const SEQ: usize = 140;
+        // 生产形状双档（工单 06 / T8）：
+        //   视觉塔输入 pixel_values [1, N, 768] f32 + pixel_position_ids [1, N, 2] i64，
+        //   N = soft_tokens × PATCH × PATCH = soft_tokens × 3 × 3（模型内部按 3×3 池化回 soft token）。
+        //   视频标准档：140 soft tokens（官方 video_processor.max_soft_tokens）→ 1260 patches；
+        //   视频精简档： 70 soft tokens（`perceive.rs` 的 `VIDEO_SOFT_TOKEN_BUDGET_MIN`）→ 630 patches。
+        //
+        // ⚠️ **静态图不是 70**：`gemma.rs` 的图像前处理固定用 **280** soft token 预算
+        // （`aspect_ratio_preserving_size_with_budget(w, h, 280)` / `preprocess_image_with_soft_budget(img, 280)`），
+        // 即 N = 280 × 9 = 2520 patches。本基准**未覆盖**该形状（成本约为 1260 档的 2 倍，
+        // 且 AC-3 只对视频标准档设门禁）；要评估静态图 DML 收益须另行加档。
+        // 早期版本把 630 标注为「图像 70 soft tokens」是错的 —— 630 只是视频精简档。
+        //
+        // 旧基准的 `SEQ = 140` 误把「soft token 数」当成 patch 数，输入只有生产形状的 1/9，
+        // 得出的吞吐数字无法用于任何决策（SPEC §1 第 9 条），故此处以真实 patch 数为唯一口径。
         const FEAT: usize = 768;
-        const ITERS: u32 = 15;
+        const WARMUP: u32 = 2;
+        const ITERS: u32 = 5;
+        /// 视频帧视觉软 token 预算（`perceive.rs::VIDEO_SOFT_TOKEN_BUDGET_MAX`）
+        const VIDEO_SOFT_TOKENS: usize = 140;
+        /// 生产视频帧数（SPEC §7.4 的 106~107 帧口径），仅用于 N=1260 与文本塔的外推
+        const VIDEO_FRAMES: usize = 107;
+        const PROD_SHAPES: [(usize, &str); 2] =
+            [(1260, "视频标准 140 soft tokens"), (630, "视频精简 70 soft tokens")];
+        /// 视觉塔图输出名（`gemma/vision_encoder_q4.onnx` 的图输出，也是文本塔
+        /// `image_features` 输入的来源）。AC-6 必须按名取，见 `vision_features` 注释。
+        const VISION_OUTPUT: &str = "image_features";
+        /// 视觉塔每 soft token 的特征维（`image_features` 的输出宽度）。
+        ///
+        /// ⚠️ 这与**文本塔的 hidden 维**不是同一个量：视觉塔把 patch 特征投影成 512 维
+        /// 供文本塔当 `image_features` 输入，而文本塔自身输出 `last_hidden_state` /
+        /// `sentence_embedding` 是另一个宽度。二者不可互相代入（早期注释误称「= 文本塔
+        /// embedding 宽度」，会让人以为 512 是文本塔的 hidden size）。
+        const VISION_HIDDEN: usize = 512;
 
-        /// 构建会话：`ep=None` 走纯 CPU 基线
-        fn build(
-            path: &std::path::Path,
-            ep: Option<ort::execution_providers::ExecutionProviderDispatch>,
-        ) -> Result<ort::session::Session, ort::Error> {
-            let mut b = ort::session::Session::builder()?
-                .with_intra_threads(OmniOrtRuntime::recommended_intra_threads())?
-                .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?;
-            if let Some(ep) = ep {
-                b = b.with_execution_providers([ep])?;
-            }
-            b.commit_from_file(path)
+        let intra = OmniOrtRuntime::recommended_intra_threads();
+        println!(
+            "[EP-BENCH] 口径: profile={} intra_threads={} cores={:?}（debug 档绝对值不可与 SPEC §7.2 的 release 数据直接比较，只比同进程内的 CPU/DML 比值）",
+            if cfg!(debug_assertions) { "debug" } else { "release" },
+            intra,
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0)
+        );
+
+        /// 构建 CPU 基线会话：复用生产 `build_cpu_session`，保证线程/优化档位同源
+        fn build_cpu(path: &Path) -> Result<ort::session::Session, ort::Error> {
+            OmniOrtRuntime::build_cpu_session(path, OmniOrtRuntime::recommended_intra_threads())
         }
 
-        /// 预热后计时 ITERS 次前向，输出单次耗时与 107 帧外推
-        fn bench<F>(label: &str, session: &mut ort::session::Session, feed: &F)
-        where
-            F: Fn(&mut ort::session::Session) -> Result<(), ort::Error>,
-        {
-            for _ in 0..3 {
-                if let Err(e) = feed(session) {
-                    println!("[EP-BENCH] {label}: 前向失败 -> {e}");
-                    return;
+        /// 构建 DirectML 会话：复用生产 `build_dml_session`
+        ///
+        /// 必须走生产实现而非就地 `builder()`：生产分支含
+        /// `with_memory_pattern(false)` / `with_parallel_execution(false)` /
+        /// `error_on_failure()`。缺最后一项时 rc.9 会吞掉 EP 注册失败、返回纯 CPU Session
+        /// 却上报「DML 成功」，基准就会把 CPU 数字当成 DML 数字（SPEC §7.7 假阳性）。
+        fn build_dml(path: &Path) -> Result<ort::session::Session, ort::Error> {
+            OmniOrtRuntime::build_dml_session(path, OmniOrtRuntime::recommended_intra_threads())
+        }
+
+        /// 生产形状的 soft token 网格 `(w, h)`：`n_patches = w × h × 9`
+        ///
+        /// 坐标不能任意递增：视觉图内部按 3×3 池化把 patch 散射进 `w×h` 的 soft token 缓冲
+        /// （`ScatterElements` 的 data 长度恰为 soft token 数），故 patch 网格必须是 3 的倍数，
+        /// 且坐标必须落在该网格内 —— 否则会报
+        /// `indices element out of data bounds, idx=... must be within [-N, N-1]`。
+        /// 视频档 140 soft tokens = 14×10（patch 42×30 = 1260）；图像档 70 = 10×7（patch 30×21 = 630）。
+        fn soft_grid(n_patches: usize) -> (usize, usize) {
+            match n_patches {
+                1260 => (14, 10),
+                630 => (10, 7),
+                _ => {
+                    // 兜底：取「≤ √soft 的最大因子」做宽，保证严格整除且尽量接近正方形。
+                    // （旧实现用 `ceil(√soft)` 直接当宽，对 280 soft tokens（静态图档，N=2520）
+                    // 得 17，280 % 17 ≠ 0 ⇒ 明明有合法分解 (14, 20) 却断言失败。
+                    // 网格与输入必须自洽：越界坐标会触发 ScatterElements out-of-bounds，
+                    // 留 -1 补齐又会改变 soft 缓冲行数。）
+                    assert!(
+                        n_patches % 9 == 0,
+                        "视觉档位 {n_patches} 不是 9 的倍数，无法构成 3×3 池化网格"
+                    );
+                    let soft = n_patches / 9;
+                    let w = (1..=((soft as f64).sqrt() as usize))
+                        .rev()
+                        .find(|d| soft % d == 0)
+                        .unwrap_or(1);
+                    assert!(
+                        w > 0 && soft % w == 0,
+                        "视觉档位 {n_patches}（soft={soft}）无合法方形分解，请显式登记网格"
+                    );
+                    (w, soft / w)
                 }
             }
-            let t0 = Instant::now();
-            for _ in 0..ITERS {
-                if let Err(e) = feed(session) {
-                    println!("[EP-BENCH] {label}: 计时循环中失败 -> {e}");
-                    return;
-                }
-            }
-            let per = t0.elapsed() / ITERS;
-            println!(
-                "[EP-BENCH] {label}: 单次前向 {:?}，107 帧外推 ≈ {:?}",
-                per,
-                per * 107
+        }
+
+        /// 构造视觉塔生产形状输入：**确定性伪随机像素** + **合法网格坐标**
+        ///
+        /// 坐标按 `patch_w = grid_w × 3` 递增铺满整个网格 —— 不用全 0 坐标，因为全 0 是退化
+        /// 输入（`ScatterElements` 的索引全集中到同一位置），会掩盖归一化/池化算子上的数值分歧。
+        /// 由于 `soft_grid` 保证 `w × h × 9 == n_patches`，铺满后不会剩余 patch，故不需要
+        /// `-1` 补齐分支（旧实现留了一段永不执行的补齐逻辑，反而让人误以为存在部分填充形状）。
+        ///
+        /// 像素用 `(i % 251) / 251.0` 而非常数：常数输入会让部分归一化/量化算子的相对误差退化，
+        /// 测出的 `max_abs` 不具代表性（SPEC §7.5 的 harness 亦用随机像素）。
+        /// 同时它必须是**确定性**的 —— AC-6 要求 CPU 与 DML 吃同一份输入，任何随机源都会让比对失效。
+        fn vision_inputs(
+            n_patches: usize,
+            feat: usize,
+        ) -> Result<[ort::session::SessionInputValue<'static>; 2], ort::Error> {
+            let (grid_w, grid_h) = soft_grid(n_patches);
+            let patch_w = grid_w * 3;
+            debug_assert_eq!(
+                patch_w * (grid_h * 3),
+                n_patches,
+                "soft_grid 与 patch 数不自洽：{grid_w}×{grid_h} soft tokens 应为 {} patches",
+                grid_w * grid_h * 9
             );
-        }
-
-        let feed_vision = |session: &mut ort::session::Session| -> Result<(), ort::Error> {
-            let pv = ort::value::Tensor::from_array((
-                vec![1usize, SEQ, FEAT],
-                vec![0.01f32; SEQ * FEAT],
-            ))?;
-            let pid = ort::value::Tensor::from_array((
-                vec![1usize, SEQ, 2usize],
-                vec![0i64; SEQ * 2],
-            ))?;
-            let inputs: [ort::session::SessionInputValue<'static>; 2] = [pv.into(), pid.into()];
-            session.run(inputs).map(|_| ())
-        };
-
-        match build(&model, None) {
-            Ok(mut s) => {
-                bench("视觉塔 CPU 基线", &mut s, &feed_vision);
+            let mut positions = Vec::with_capacity(n_patches * 2);
+            for i in 0..n_patches {
+                positions.push((i % patch_w) as i64);
+                positions.push((i / patch_w) as i64);
             }
-            Err(e) => println!("[EP-BENCH] 视觉塔 CPU 会话构建失败 -> {e}"),
+            let pv = ort::value::Tensor::from_array((
+                vec![1usize, n_patches, feat],
+                // 确定性伪随机像素（非全常数）：常数输入会让部分归一化/量化算子的
+                // 相对误差退化，测出的 max_abs 不具代表性（SPEC §7.5 的 harness 亦用随机像素）
+                (0..n_patches * feat)
+                    .map(|i| (i % 251) as f32 / 251.0)
+                    .collect::<Vec<f32>>(),
+            ))?;
+            let pid = ort::value::Tensor::from_array((vec![1usize, n_patches, 2usize], positions))?;
+            Ok([pv.into(), pid.into()])
         }
 
-        // 注：`build(self)` 会消费 provider 实例，故可用性先行判定、每个分支各自新建实例
+        /// 预热 WARMUP 次后计时 ITERS 次前向，返回（中位 / 最小 / 最大）单次耗时（毫秒）
+        ///
+        /// 取中位而非均值：DML 首轮常伴显存分配抖动，均值会被单个离群样本拉偏
+        /// （SPEC §7.2 的实测表同样以中位 + 区间呈现）。
+        /// `frames` 仅对生产口径（视频 N=1260 / 文本塔）传 `Some(VIDEO_FRAMES)`，
+        /// 避免给视频精简档 N=630 也套一个「107 帧外推」的伪数字。
+        ///
+        /// **计时窗口只覆盖 `session.run`**：`prepare` 在窗口外调用，因为被测命题是「前向吞吐」。
+        /// 旧实现把 `vision_inputs(...)` 写在计时闭包里（`session.run(vision_inputs(..)?)`），
+        /// 张量构造（1260×768 f32 ≈ 3.9MB + 坐标 1260×2 i64）也算进了单帧耗时 —— 该成本对
+        /// CPU/DML 两侧相同，会系统性**稀释**加速比（DML 前向越短，被稀释得越狠），
+        /// 属于对结论不利方向的偏差，但仍是口径错误。
+        ///
+        /// 注：`SessionInputValue` 未实现 `Clone`，无法「构造一次反复 run」，故每轮仍需重新构造，
+        /// 只是构造已移出计时窗口。
+        fn bench<const N: usize, P>(
+            label: &str,
+            frames: Option<usize>,
+            session: &mut ort::session::Session,
+            prepare: &P,
+        ) -> Option<(f64, f64, f64)>
+        where
+            P: Fn() -> Result<[ort::session::SessionInputValue<'static>; N], ort::Error>,
+        {
+            for _ in 0..WARMUP {
+                let inputs = match prepare() {
+                    Ok(i) => i,
+                    Err(e) => {
+                        println!("[EP-BENCH] {label}: 预热输入构造失败 -> {e}");
+                        return None;
+                    }
+                };
+                if let Err(e) = session.run(inputs) {
+                    println!("[EP-BENCH] {label}: 预热失败 -> {e}");
+                    return None;
+                }
+            }
+            let mut samples: Vec<f64> = Vec::with_capacity(ITERS as usize);
+            for _ in 0..ITERS {
+                let inputs = match prepare() {
+                    Ok(i) => i,
+                    Err(e) => {
+                        println!("[EP-BENCH] {label}: 输入构造失败 -> {e}");
+                        return None;
+                    }
+                };
+                let t0 = Instant::now();
+                if let Err(e) = session.run(inputs) {
+                    println!("[EP-BENCH] {label}: 计时循环中失败 -> {e}");
+                    return None;
+                }
+                samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = samples[samples.len() / 2];
+            let (min, max) = (samples[0], samples[samples.len() - 1]);
+            match frames {
+                Some(n) => println!(
+                    "[EP-BENCH] {label}: 中位 {:.0}ms（区间 {:.0}~{:.0}ms，{ITERS} 轮，{n} 帧外推 ≈ {:.1}s）",
+                    median,
+                    min,
+                    max,
+                    median * n as f64 / 1000.0
+                ),
+                None => println!(
+                    "[EP-BENCH] {label}: 中位 {:.0}ms（区间 {:.0}~{:.0}ms，{ITERS} 轮）",
+                    median, min, max
+                ),
+            }
+            Some((median, min, max))
+        }
+
+        /// 取视觉塔 `image_features` 输出为 f32 向量（供 AC-6 金标一致性比对）
+        ///
+        /// 与 `feed_vision` 共用 `vision_inputs`，确保比对的是「同输入、不同 EP」的差异；
+        /// 失败时返回具体原因而非静默 `None`（strict 门禁需要可判定的失败信号）。
+        ///
+        /// **为什么按名取而不是 `into_iter().next()`**：输出顺序不属于模型对外契约，
+        /// 一旦导出器调整输出顺序或新增辅助输出，按序取就会把另一个张量当成金标来比 ——
+        /// 得到一个恒通过、却与视觉特征毫无关系的 max_abs。取到后还必须断言长度 =
+        /// `soft_tokens × VISION_HIDDEN`，把「截断 / 广播错位的张量」挡在可比数据之外。
+        fn vision_features(
+            session: &mut ort::session::Session,
+            n_patches: usize,
+        ) -> Result<Vec<f32>, String> {
+            let soft_tokens = n_patches / 9;
+            let expect_len = soft_tokens * VISION_HIDDEN;
+            let inputs =
+                vision_inputs(n_patches, FEAT).map_err(|e| format!("构造视觉输入失败: {e}"))?;
+            let outputs = session
+                .run(inputs)
+                .map_err(|e| format!("视觉前向失败: {e}"))?;
+            let value = outputs.get(VISION_OUTPUT).ok_or_else(|| {
+                let mut names: Vec<&str> = outputs.keys().collect();
+                names.sort_unstable();
+                format!("输出中不存在 `{VISION_OUTPUT}`（实际输出 {names:?}）")
+            })?;
+            let tensor = value
+                .try_extract_tensor::<f32>()
+                .map_err(|e| format!("`{VISION_OUTPUT}` 不是 f32 张量: {e}"))?;
+            let data = tensor
+                .as_slice()
+                .ok_or_else(|| format!("`{VISION_OUTPUT}` 张量非连续内存，无法逐元素比对"))?;
+            if data.len() != expect_len {
+                return Err(format!(
+                    "`{VISION_OUTPUT}` 长度 {} ≠ 期望 {expect_len}（{soft_tokens} soft tokens × {VISION_HIDDEN}）",
+                    data.len()
+                ));
+            }
+            Ok(data.to_vec())
+        }
+
+        // 注：`is_available` 仅作候选判定；DML 是否真生效由 `build_dml_session` 的
+        // `error_on_failure()` + 构建成功共同保证
         let dml_available = ort::execution_providers::DirectMLExecutionProvider::default()
             .is_available()
             .unwrap_or(false);
-        let dml_dispatch =
-            || ort::execution_providers::DirectMLExecutionProvider::default().build();
-        if dml_available {
-            match build(&model, Some(dml_dispatch())) {
-                Ok(mut s) => {
-                    bench("视觉塔 DirectML", &mut s, &feed_vision);
+        if !dml_available {
+            println!("[EP-BENCH] DirectML 不可用，仅输出 CPU 基线（当前 DLL 无 DML EP）");
+        }
+
+        // ---- 视觉塔：逐档 CPU 基线 vs DirectML ----
+        let mut vision_ratios: Vec<(usize, f64)> = Vec::new();
+        for (n_patches, tag) in PROD_SHAPES {
+            // 只有视频标准档（N=1260）是生产视频帧形状，才做 107 帧外推
+            let frames = (n_patches == 1260).then_some(VIDEO_FRAMES);
+            println!("[EP-BENCH] === 视觉塔生产形状 N={n_patches}（{tag}）===");
+            // 只负责构造输入；`bench` 会在计时窗口之外调用它（见 `bench` 文档）
+            let prepare_vision = || vision_inputs(n_patches, FEAT);
+
+            let mut cpu_session = match build_cpu(&model) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    println!("[EP-BENCH] 视觉塔 CPU 会话构建失败 -> {e}");
+                    None
                 }
-                Err(e) => println!("[EP-BENCH] 视觉塔 DirectML 会话构建失败 -> {e}"),
+            };
+            let cpu = cpu_session.as_mut().and_then(|s| {
+                bench(
+                    &format!("视觉塔 CPU      N={n_patches}"),
+                    frames,
+                    s,
+                    &prepare_vision,
+                )
+            });
+            let mut dml_session = if dml_available {
+                match build_dml(&model) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        println!("[EP-BENCH] 视觉塔 DirectML 会话构建失败 -> {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let dml = dml_session.as_mut().and_then(|s| {
+                bench(
+                    &format!("视觉塔 DirectML N={n_patches}"),
+                    frames,
+                    s,
+                    &prepare_vision,
+                )
+            });
+
+            if let (Some(cpu), Some(dml)) = (cpu, dml) {
+                let ratio = cpu.0 / dml.0.max(1e-6);
+                println!(
+                    "[EP-BENCH] 视觉塔加速比 N={n_patches}: {ratio:.2}x（CPU 中位 {:.0}ms / DML 中位 {:.0}ms）",
+                    cpu.0, dml.0
+                );
+                vision_ratios.push((n_patches, ratio));
+            }
+
+            // AC-6 金标一致性：同输入下 CPU 与 DML `image_features` 逐元素最大绝对偏差
+            // （DML 走 D3D12 算子实现，浮点累加顺序不同 ⇒ 期望非零但极小；阈值 1e-4 见 AC-6）
+            if let (Some(cs), Some(ds)) = (cpu_session.as_mut(), dml_session.as_mut()) {
+                let cpu_feat = vision_features(cs, n_patches);
+                let dml_feat = vision_features(ds, n_patches);
+                match (cpu_feat, dml_feat) {
+                    (Ok(a), Ok(b)) => {
+                        // 两侧长度都已在 `vision_features` 内锁定为 soft_tokens × VISION_HIDDEN，
+                        // 同档位同形状 ⇒ 必然等长；此处只做断言兜底，不再靠运行时判等决定是否可比
+                        debug_assert_eq!(
+                            a.len(),
+                            b.len(),
+                            "AC-6 两侧长度不一致（vision_features 的长度门禁失效）"
+                        );
+                        // ⚠️ 不能用 `fold(0.0, f32::max)`：`f32::max` 在任一操作数为 NaN 时
+                        // 返回**另一个**操作数（`NaN.max(x) == x`），于是「两侧输出都含 NaN」
+                        // 会被静默折叠成 max_abs = 0 ⇒ 门禁恒通过。DML 驱动/量化算子出错时
+                        // 恰恰最可能产出 NaN，这正是最需要拦住的形态。故显式把非有限差值判为
+                        // 不可判定，而不是交给 fold 吞掉。
+                        let mut max_abs = 0.0f32;
+                        let mut non_finite: Option<(usize, f32, f32)> = None;
+                        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                            let d = (x - y).abs();
+                            if !d.is_finite() {
+                                non_finite = Some((i, *x, *y));
+                                break;
+                            }
+                            max_abs = max_abs.max(d);
+                        }
+                        if let Some((i, x, y)) = non_finite {
+                            let msg = format!(
+                                "金标一致性 N={n_patches}: 第 {i} 个元素差值非有限（cpu={x} dml={y}）⇒ 输出含 NaN/Inf，AC-6 不可判定"
+                            );
+                            if strict {
+                                panic!("[EP-BENCH] {msg}");
+                            }
+                            println!("[EP-BENCH] {msg}");
+                        } else {
+                            println!(
+                                "[EP-BENCH] 金标一致性 N={n_patches}: max_abs={max_abs:.3e}（AC-6 阈值 ≤1e-4，输出维 {} = {} soft tokens × {VISION_HIDDEN}）",
+                                a.len(),
+                                n_patches / 9
+                            );
+                            // AC-6 只对生产视频标准档（N=1260）设门禁：视频精简档 N=630 是参考档，
+                            // 其 max_abs 实测已在阈值边缘（~9.0e-5），据此 gate 会变成 flaky 断言；
+                            // 该档只输出数据供人工判断，不参与自动判定。
+                            if strict && n_patches == 1260 {
+                                assert!(
+                                    max_abs <= 1e-4,
+                                    "AC-6 未达标：视觉塔 N={n_patches} DML vs CPU max_abs={max_abs:.3e} > 1e-4"
+                                );
+                            }
+                        }
+                    }
+                    (cpu_res, dml_res) => {
+                        // 失败原因逐侧透出，且 `vision_features` 已把「输出缺失 / 非 f32 /
+                        // 非连续内存 / 长度不等于 soft_tokens×VISION_HIDDEN」区分成不同文案；
+                        // 这里只负责汇总，不再笼统归为「拿不到数据」。
+                        let mut reasons: Vec<String> = Vec::new();
+                        if let Err(e) = &cpu_res {
+                            reasons.push(format!("CPU 侧: {e}"));
+                        }
+                        if let Err(e) = &dml_res {
+                            reasons.push(format!("DML 侧: {e}"));
+                        }
+                        let msg = format!(
+                            "金标一致性 N={n_patches} 未取得可比数据 —— {}",
+                            reasons.join("；")
+                        );
+                        // strict 下「拿不到数据」等同门禁失效，必须硬失败
+                        if strict {
+                            panic!("[EP-BENCH] {msg}");
+                        }
+                        println!("[EP-BENCH] {msg}");
+                    }
+                }
+            }
+        }
+
+        // 文本塔：生产链路里每帧除视觉前向还要过一次文本塔，故必须单独测它才能定位真正大头。
+        // 生产形状（gemma.rs `forward_patches_with_session`）：
+        //   ids = [<bos>=2, <|image>=255999, n×<|image|>=258880, <image|>=258882, <eos>=1] ⇒ seq = n + 4
+        //   image_features = [n, 512]，其中 n = **视觉塔输出的 soft token 数**（视频 140），
+        //   不是视觉塔输入的 patch 数（1260）——模型内部已按 3×3 池化回 soft token。
+        // 旧基准的 seq=143 错误是「少算 1 个 token」（正确 144），与 patch/soft token 混淆无关。
+        if std::env::var("OMNI_BENCH_SKIP_TEXT").is_ok() {
+            println!("[EP-BENCH] OMNI_BENCH_SKIP_TEXT 已设置，跳过文本塔基准");
+        } else if let Some(text_model) = locate_gemma_sibling("model_q4.onnx") {
+            let n_tokens = VIDEO_SOFT_TOKENS;
+            let text_seq = n_tokens + 4;
+            println!("[EP-BENCH] === 文本塔生产形状 seq={text_seq}（{n_tokens} soft tokens）===");
+            let prepare_text =
+                || -> Result<[ort::session::SessionInputValue<'static>; 5], ort::Error> {
+                    let mut ids: Vec<i64> = Vec::with_capacity(text_seq);
+                    ids.push(2); // <bos>
+                    ids.push(255999); // <|image> (boi)
+                    ids.extend(std::iter::repeat(258880).take(n_tokens)); // <|image|>
+                    ids.push(258882); // <image|> (eoi)
+                    ids.push(1); // <eos>
+                    debug_assert_eq!(ids.len(), text_seq);
+                    let input_ids = ort::value::Tensor::from_array((vec![1usize, text_seq], ids))?;
+                    let mask = ort::value::Tensor::from_array((
+                        vec![1usize, text_seq],
+                        vec![1i64; text_seq],
+                    ))?;
+                    let img = ort::value::Tensor::from_array((
+                        vec![n_tokens, 512usize],
+                        vec![0.01f32; n_tokens * 512],
+                    ))?;
+                    // 未使用的模态：生产侧经 `ort::inputs!` + ndarray 传 `Array2::zeros((0, 512))`（0 行），
+                    // 但 `Tensor::from_array` 原生构造路径会拒绝长度为 0 的轴
+                    // （`Invalid dimension at 0; all dimensions must be >= 1`），故此处退化为 1 行零向量。
+                    // 影响面：仅让两个未使用模态各多 1 个 token，对文本塔注意力耗时的量级可忽略。
+                    let vid =
+                        ort::value::Tensor::from_array((vec![1usize, 512usize], vec![0.0f32; 512]))?;
+                    let aud =
+                        ort::value::Tensor::from_array((vec![1usize, 512usize], vec![0.0f32; 512]))?;
+                    Ok([input_ids.into(), mask.into(), img.into(), vid.into(), aud.into()])
+                };
+
+            match build_cpu(&text_model) {
+                Ok(mut s) => {
+                    bench(
+                        &format!("文本塔 CPU      seq={text_seq}"),
+                        Some(VIDEO_FRAMES),
+                        &mut s,
+                        &prepare_text,
+                    );
+                }
+                Err(e) => println!("[EP-BENCH] 文本塔 CPU 会话构建失败 -> {e}"),
+            }
+            if dml_available {
+                match build_dml(&text_model) {
+                    Ok(mut s) => {
+                        bench(
+                            &format!("文本塔 DirectML seq={text_seq}"),
+                            Some(VIDEO_FRAMES),
+                            &mut s,
+                            &prepare_text,
+                        );
+                    }
+                    Err(e) => println!("[EP-BENCH] 文本塔 DirectML 会话构建失败 -> {e}"),
+                }
             }
         } else {
-            println!("[EP-BENCH] DirectML 不可用，跳过（当前 DLL 无 DML EP）");
-        }
-
-        // 文本塔：生产链路里每帧除视觉前向还要过一次文本塔，
-        // 实测 6:30/107 帧 ≈ 3.6s/帧 远大于视觉塔耗时，故必须单独测它才能定位真正大头。
-        let Some(text_model) = locate_gemma_sibling("model_q4.onnx") else {
             println!("[EP-BENCH] 未找到 gemma model_q4.onnx，跳过文本塔基准");
-            return;
-        };
-        // 生产 ids: [bos, soft_token_marker, soft×n, eoi, eos] → n=140 时 seq=143
-        const TEXT_SEQ: usize = 143;
-        let feed_text = |session: &mut ort::session::Session| -> Result<(), ort::Error> {
-            let ids = ort::value::Tensor::from_array((
-                vec![1usize, TEXT_SEQ],
-                vec![2i64; TEXT_SEQ],
-            ))?;
-            let mask = ort::value::Tensor::from_array((
-                vec![1usize, TEXT_SEQ],
-                vec![1i64; TEXT_SEQ],
-            ))?;
-            let img = ort::value::Tensor::from_array((
-                vec![SEQ, 512usize],
-                vec![0.01f32; SEQ * 512],
-            ))?;
-            // 注：ORT 不允许 0 维张量（"all dimensions must be >= 1"），
-            // 故未使用的模态各给 1 个 token，量级可忽略
-            let vid = ort::value::Tensor::from_array((vec![1usize, 512usize], vec![0.0f32; 512]))?;
-            let aud = ort::value::Tensor::from_array((vec![1usize, 512usize], vec![0.0f32; 512]))?;
-            let inputs: [ort::session::SessionInputValue<'static>; 5] =
-                [ids.into(), mask.into(), img.into(), vid.into(), aud.into()];
-            session.run(inputs).map(|_| ())
-        };
-
-        match build(&text_model, None) {
-            Ok(mut s) => {
-                bench("文本塔 CPU 基线", &mut s, &feed_text);
-            }
-            Err(e) => println!("[EP-BENCH] 文本塔 CPU 会话构建失败 -> {e}"),
         }
-        if dml_available {
-            match build(&text_model, Some(dml_dispatch())) {
-                Ok(mut s) => {
-                    bench("文本塔 DirectML", &mut s, &feed_text);
+
+        // 严格门禁（AC-3）：仅真机 DML 档启用，避免无 GPU 的 CI 因加速比缺失而误红
+        if strict {
+            let video = vision_ratios
+                .iter()
+                .find(|(n, _)| *n == 1260)
+                .map(|(_, r)| *r);
+            match video {
+                Some(r) => {
+                    println!("[EP-BENCH] AC-3 门禁：视觉塔 N=1260 加速比 {r:.2}x（阈值 ≥2.5x）");
+                    assert!(
+                        r >= 2.5,
+                        "AC-3 未达标：视觉塔 N=1260 DirectML 加速比 {r:.2}x < 2.5x"
+                    );
                 }
-                Err(e) => println!("[EP-BENCH] 文本塔 DirectML 会话构建失败 -> {e}"),
+                None => panic!(
+                    "[EP-BENCH] AC-3 门禁未取得可判定数据：N=1260 缺少 CPU/DML 双档（DML 不可用或构建/前向失败）"
+                ),
             }
         }
     }
