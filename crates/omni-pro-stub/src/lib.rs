@@ -226,6 +226,34 @@ pub mod perceive {
         pub vision_ms: u64,
         /// 本次实际分析的时长上限（镜像私有版契约）；桩恒为 `None`
         pub analysis_duration_sec: Option<f64>,
+        pub visual_analysis_duration_sec: Option<f64>,
+        pub audio_analysis_duration_sec: Option<f64>,
+        pub video_truncated: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct VideoDecoupledBudget {
+        pub video_duration_sec: f64,
+        pub audio_duration_sec: f64,
+        pub effective_interval_sec: f64,
+        pub estimated_frames: usize,
+        pub audio_truncated: bool,
+        pub video_truncated: bool,
+    }
+
+    /// 纯音频管线综合 RTF（镜像私有版契约）
+    pub const AUDIO_PIPELINE_REALTIME_FACTOR: f64 = 0.20;
+
+    /// 单文件「向量化 + ASR」预算（镜像私有版契约：总 120s − AI 阶段预留 30s）
+    pub const VIDEO_ANALYSIS_BUDGET_SEC: f64 = 90.0;
+
+    /// 预算内预留的固定开销（镜像私有版契约）
+    pub const VIDEO_ANALYSIS_FIXED_OVERHEAD_SEC: f64 = 5.0;
+
+    /// 纯音频在单文件预算内可分析的最大时长（镜像私有版契约，公式同私有版）
+    pub fn max_audio_analysis_duration_sec() -> f64 {
+        (VIDEO_ANALYSIS_BUDGET_SEC - VIDEO_ANALYSIS_FIXED_OVERHEAD_SEC)
+            / AUDIO_PIPELINE_REALTIME_FACTOR
     }
 
     /// 视频帧视觉软 token 预算下界（开源桩镜像私有版契约，保证调用方 API 一致）
@@ -248,11 +276,24 @@ pub mod perceive {
     ///
     /// 开源桩不含视觉塔与执行后端，故 `has_accelerator` 分支无实际作用，
     /// 保留同签名只为让调用方代码在两种构建下都能编译。
-    pub fn resolve_video_soft_token_budget(requested: usize, has_accelerator: bool) -> usize {
-        if has_accelerator {
-            VIDEO_SOFT_TOKEN_BUDGET_MAX
-        } else {
-            normalize_video_soft_token_budget(requested)
+    pub fn resolve_video_soft_token_budget(requested: usize, _has_accelerator: bool) -> usize {
+        normalize_video_soft_token_budget(requested)
+    }
+
+    pub fn solve_video_analysis_budget_decoupled_with_asr(
+        duration_sec: f64,
+        _soft_token_budget: usize,
+        min_interval_sec: f64,
+        _asr_cap_sec: f64,
+        _skip_decode_rate: f64,
+    ) -> VideoDecoupledBudget {
+        VideoDecoupledBudget {
+            video_duration_sec: duration_sec,
+            audio_duration_sec: duration_sec.min(30.0),
+            effective_interval_sec: min_interval_sec.max(1.0),
+            estimated_frames: 1,
+            audio_truncated: false,
+            video_truncated: false,
         }
     }
 
@@ -274,6 +315,7 @@ pub mod perceive {
         _sampling_interval_seconds: f32,
         _asr_text: Option<&str>,
         _soft_token_budget: usize,
+        _audio_analysis_duration_sec: Option<f64>,
     ) -> (Vec<omni_core::OmniVideoChunk>, VideoProcessTimings) {
         (Vec::new(), VideoProcessTimings::default())
     }
