@@ -835,7 +835,6 @@ pub struct EmbedClipTextResponse {
 fn clip_text_error(
     status: StatusCode,
     error: &'static str,
-    started: Instant,
 ) -> (StatusCode, Json<EmbedClipTextResponse>) {
     (
         status,
@@ -845,8 +844,10 @@ fn clip_text_error(
             dim: omni_pro::vision::CLIP_TEXT_DIM,
             encoder_id: omni_pro::vector_engine::encoder_id::CHINESE_CLIP,
             cold_start: false,
+            // 失败路径不东拼西凑：`encode_ms` 恒 0（未发生编码），
+            // 不拿「请求总耗时」冒充编码耗时（那会把并发排队时间算成推理时间）。
             load_ms: 0,
-            encode_ms: started.elapsed().as_millis(),
+            encode_ms: 0,
             error: Some(error.to_string()),
         }),
     )
@@ -863,10 +864,9 @@ fn clip_text_error(
 pub async fn embed_clip_text_handler(
     Json(req): Json<EmbedClipTextRequest>,
 ) -> Result<Json<EmbedClipTextResponse>, (StatusCode, Json<EmbedClipTextResponse>)> {
-    let started = Instant::now();
     let text = req.text.trim().to_string();
     if text.is_empty() {
-        return Err(clip_text_error(StatusCode::UNPROCESSABLE_ENTITY, "empty_text", started));
+        return Err(clip_text_error(StatusCode::UNPROCESSABLE_ENTITY, "empty_text"));
     }
 
     // 并发上限：Semaphore(2) + 200ms 等待上限，超限即 429 busy（不算失败、不计熔断）
@@ -878,7 +878,7 @@ pub async fn embed_clip_text_handler(
     {
         Ok(Ok(permit)) => permit,
         _ => {
-            return Err(clip_text_error(StatusCode::TOO_MANY_REQUESTS, "busy", started));
+            return Err(clip_text_error(StatusCode::TOO_MANY_REQUESTS, "busy"));
         }
     };
 
@@ -897,17 +897,17 @@ pub async fn embed_clip_text_handler(
             return Err(("vocab_missing", 0u128, 0u128));
         }
 
-        let load_start = Instant::now();
+        // `loadMs` / `encodeMs` 由引擎侧分开计时（R4 复核：此前 load 含编码、encode 恒 0）
         // 预热/加载：内部经 Tier 3 看门狗惰性加载（300s 空闲释放），get_or_load 即单飞入口
         let cold_start = omni_pro::vision::clip_text_session_is_cold();
         let encoded =
-            omni_pro::OmniVisionEngine::encode_text_with_clip_detailed(&text, &clip_dir);
-        let load_ms = load_start.elapsed().as_millis();
+            omni_pro::OmniVisionEngine::encode_text_with_clip_timed(&text, &clip_dir);
+
         match encoded {
-            Ok(v) => Ok((v, cold_start, load_ms, 0u128)),
+            Ok((v, load_ms, encode_ms)) => Ok((v, cold_start, load_ms, encode_ms)),
             // 失败原因由引擎侧直接给出（model_missing/vocab_missing/
             // unsupported_text_output/load_failed），此处只做透传
-            Err(reason) => Err((reason, load_ms, 0u128)),
+            Err(reason) => Err((reason, 0u128, 0u128)),
         }
     })
     .await;
@@ -927,19 +927,11 @@ pub async fn embed_clip_text_handler(
             // 四个已登记原因（model_missing / vocab_missing /
             // unsupported_text_output / load_failed）一律 503；
             // 未登记原因同样按 503 处理，**永不降级/升级为 504**。
-            Err(clip_text_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                reason,
-                started,
-            ))
+            Err(clip_text_error(StatusCode::SERVICE_UNAVAILABLE, reason))
         }
         Err(join_err) => {
             tracing::warn!("CLIP 文本编码任务 panic: {join_err}");
-            Err(clip_text_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "load_failed",
-                started,
-            ))
+            Err(clip_text_error(StatusCode::SERVICE_UNAVAILABLE, "load_failed"))
         }
     }
 }
@@ -1095,7 +1087,7 @@ mod tests {
             (StatusCode::SERVICE_UNAVAILABLE, "load_failed"),
         ] {
             let (got_status, Json(body)) =
-                clip_text_error(status, code, Instant::now());
+                clip_text_error(status, code);
             assert_eq!(got_status, status, "{code} 的状态码必须稳定");
             assert_eq!(body.error.as_deref(), Some(code));
             assert!(!body.success);
@@ -1117,7 +1109,7 @@ mod tests {
             "unsupported_text_output",
             "load_failed",
         ] {
-            let (status, _) = clip_text_error(StatusCode::SERVICE_UNAVAILABLE, code, Instant::now());
+            let (status, _) = clip_text_error(StatusCode::SERVICE_UNAVAILABLE, code);
             assert_ne!(status, StatusCode::GATEWAY_TIMEOUT, "{code} 不得映射为 504");
         }
     }

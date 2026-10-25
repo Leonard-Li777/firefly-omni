@@ -4567,6 +4567,7 @@ dependencies = [
 name = "omni-vision"
 version = "0.1.9"
 dependencies = [
+ "ahash",
  "anyhow",
  "image",
  "magika",
