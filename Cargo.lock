@@ -4511,6 +4511,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "crc32fast",
  "futures-util",

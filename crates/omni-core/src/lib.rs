@@ -505,6 +505,10 @@ pub struct OmniPerceptionResult {
     /// 第三阶段双锚点交叉向量验证与互斥门禁融合出的终极完美标签集 (第一落库权威)
     #[serde(default)]
     pub fused_tags: Vec<TagChainItem>,
+    /// 全文本打标结构化直出链 (`text_tagger` 引擎)
+    /// 涵盖 ASR 语音、LRC 歌词、OCR 文字与文档正文提取的主题、体裁与情绪标签
+    #[serde(default)]
+    pub text_tags: Vec<TagChainItem>,
     /// 原生事实标签直出链 (`fact` 组)：元数据直读 (ExifTool/音频/文档/图像) + 下沉既有物理事实
     ///
     /// 原名 `meta_tags`，因其中相当一部分标签并非来自元数据（来源/状态/密级/质量/语言为下沉物理事实），
@@ -566,6 +570,9 @@ pub struct OmniPerceptionResult {
     /// 视频画面是否触发了分析时长截断（画面未覆盖至片尾时为 true）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_truncated: Option<bool>,
+    /// 视频代表帧生成的官方封面 WebP 图像（Base64 编码，供桌面端就地原子缓存）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_webp_base64: Option<String>,
     /// 向量是否由 Omni 内部就地持久化落盘
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_saved: Option<bool>,
@@ -624,8 +631,12 @@ pub struct MultimodalContext {
     pub audio_transcript: Option<String>,
     pub lrc_text: Option<String>,
     pub visual_tags: Vec<TagChainItem>,
+    /// 全文本打标结构化直出链 (Ticket 01)
+    #[serde(default)]
+    pub text_tags: Vec<TagChainItem>,
     pub exif_metadata: serde_json::Value,
     pub is_image: bool,
+    pub is_video: bool,
     pub is_document: bool,
     pub is_audio_or_video: bool,
     pub language: Option<String>,
@@ -1043,7 +1054,7 @@ pub fn is_root_dimension(code: &str) -> bool {
         || concepts::Concept::from_code(code).map(|concept_item| concept_item.is_top_root()).unwrap_or(false)
 }
 
-pub use tag_identity::{concept_from_language_code, detect_fact_language};
+pub use tag_identity::{concept_from_language_code, detect_fact_language, is_image_exclusive_concept, is_image_exclusive_tag};
 
 /// 判定扩展名是否属于视频大类（与桌面端 CATEGORY_EXT_MAP[FileCategory.VIDEO] 对齐的 20 种格式）
 pub fn is_video_ext(ext: &str) -> bool {
