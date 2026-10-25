@@ -2596,16 +2596,34 @@ async fn perceive_file_handler(
         let hownet = state.hownet.clone();
         let profile = cfg.embedding_profile.clone();
         let res = tokio::task::spawn_blocking(move || {
-            let mut r = omni_pro::text::OmniTextEngine::analyze(&text, &fname, mtime, Some(&*hownet));
+            // 双档位契约：gemma_unified 档位下主向量与 KeyBERT 主题词抽取**都由 EmbeddingGemma
+            // 文本塔产出**，全程不触碰已退役的 bekko-a8m（否则每次文件分析都会加载 384d 旧模型）。
+            // classic_light 档位保持原路径（bekko-a8m 384d），行为不变。
+            let is_gemma = profile == "gemma_unified";
+            let r = if is_gemma {
+                // fallback_dim = 0：编码失败回退空向量，由下面 encoder 判定为「无主向量」
+                omni_pro::text::OmniTextEngine::analyze_with_embedder(
+                    &text,
+                    &fname,
+                    mtime,
+                    Some(&*hownet),
+                    &GemmaTextEmbedder,
+                    0,
+                )
+            } else {
+                omni_pro::text::OmniTextEngine::analyze(&text, &fname, mtime, Some(&*hownet))
+            };
             // 编码器出处随向量一起返回：Bekko 384 默认 1；gemma 文本编码成功才升为 4。
-            // 禁止下游按 profile/界面语言猜测（gemma 编码失败时向量仍是 Bekko 384）。
-            let mut encoder = omni_pro::vector_engine::encoder_id::BEKKO;
-            if profile == "gemma_unified" {
-                if let Ok(vec) = omni_pro::OmniVisionEngine::encode_gemma_text(&text) {
-                    r.embedding_dense = vec;
-                    encoder = omni_pro::vector_engine::encoder_id::GEMMA;
+            // 禁止下游按 profile/界面语言猜测（gemma 编码失败时向量为空，不得标 4）。
+            let encoder = if is_gemma {
+                if !r.embedding_dense.is_empty() {
+                    omni_pro::vector_engine::encoder_id::GEMMA
+                } else {
+                    omni_pro::vector_engine::encoder_id::UNKNOWN
                 }
-            }
+            } else {
+                omni_pro::vector_engine::encoder_id::BEKKO
+            };
             (r, encoder)
         })
         .await;
@@ -3084,10 +3102,14 @@ async fn perceive_file_handler(
         structured_summary: text_summary,
         one_sentence_desc: text_one_desc,
         name_slots: text_slots,
-        embedding_dense: text_emb.clone().or(image_embedding),
+        // 空文本向量不得遮蔽视觉主向量：gemma 文本塔编码失败时 text_emb 为空向量
+        embedding_dense: text_emb
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or(image_embedding),
         // 主向量编码器出处：与向量同源（文本层 or 视觉层），禁止本层猜测
         embedding_encoder_id: resolve_main_vector_encoder(
-            text_emb.is_some(),
+            text_emb.as_ref().is_some_and(|v| !v.is_empty()),
             text_emb_encoder,
             image_encoder_id,
         ),
@@ -3113,15 +3135,19 @@ async fn perceive_file_handler(
     if let Some(ref fp) = req.file_fingerprint {
         let mut batch_items = Vec::with_capacity(result.video_chunks.len() + 1);
 
-        // 1. 主向量一并打包 (优先取稠密嵌入)，编码器出处与向量同源透传
+        // 1. 主向量一并打包 (优先取稠密嵌入)，编码器出处与向量同源透传。
+        // 空向量必须跳过：gemma 文本塔编码失败时 embedding_dense 为空（fallback_dim=0），
+        // 写入空向量会污染 zvec 槽位并让后续检索恒定失配。
         if let Some(ref main_vec) = result.embedding_dense {
-            batch_items.push(omni_pro::vector_engine::VectorUpsertItem {
-                file_fingerprint: fp.clone(),
-                vector: main_vec.clone(),
-                encoder_id: result.embedding_encoder_id.unwrap_or(
-                    omni_pro::vector_engine::encoder_id::UNKNOWN,
-                ),
-            });
+            if !main_vec.is_empty() {
+                batch_items.push(omni_pro::vector_engine::VectorUpsertItem {
+                    file_fingerprint: fp.clone(),
+                    vector: main_vec.clone(),
+                    encoder_id: result.embedding_encoder_id.unwrap_or(
+                        omni_pro::vector_engine::encoder_id::UNKNOWN,
+                    ),
+                });
+            }
         }
 
         // 2. 切片向量打包
@@ -3214,13 +3240,20 @@ async fn text_analyze_handler(
     let mtime = req.mtime;
     let profile = state.config.lock().unwrap().embedding_profile.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let mut r = omni_pro::text::OmniTextEngine::analyze(&text, &file_name, mtime, Some(&*hownet));
+        // 与 perceive 同源：gemma_unified 档位由 EmbeddingGemma 文本塔接管主向量与 KeyBERT，
+        // 严禁先跑 bekko-a8m 再覆盖（那是「已选 gemma 却加载 bekko」的另一条路径）。
         if profile == "gemma_unified" {
-            if let Ok(vec) = omni_pro::OmniVisionEngine::encode_gemma_text(&text) {
-                r.embedding_dense = vec;
-            }
+            omni_pro::text::OmniTextEngine::analyze_with_embedder(
+                &text,
+                &file_name,
+                mtime,
+                Some(&*hownet),
+                &GemmaTextEmbedder,
+                0,
+            )
+        } else {
+            omni_pro::text::OmniTextEngine::analyze(&text, &file_name, mtime, Some(&*hownet))
         }
-        r
     })
     .await;
     Json(match res {
@@ -3415,12 +3448,19 @@ async fn search_hybrid_handler(
     Json(req): Json<SearchHybridRequest>,
 ) -> Json<SearchHybridResponse> {
     let search = state.search.clone();
+    // 查询向量编码器跟随当前嵌入档位（双档位契约）：gemma_unified → EmbeddingGemma 文本塔，
+    // classic_light → bekko-a8m 384d。严禁在 gemma 档位下恒加载 bekko（已退役档位模型）。
+    let embedding_profile = state.config.lock().unwrap().embedding_profile.clone();
     let res = tokio::task::spawn_blocking(move || {
-        // 跨支柱补缝：若未显式提供 query_embedding，但提供了 query_text，自动通过 BekkoEmbedder 计算 384 维特征向量
+        // 跨支柱补缝：若未显式提供 query_embedding，但提供了 query_text，按当前档位计算查询向量
         let query_emb = match (req.query_embedding, req.query_text.as_deref()) {
             (Some(emb), _) => Some(emb),
             (None, Some(text)) if !text.trim().is_empty() => {
-                omni_pro::text::BekkoEmbedder::new().embed(text).ok()
+                if embedding_profile.contains("gemma") {
+                    omni_pro::OmniVisionEngine::encode_gemma_text(text).ok()
+                } else {
+                    omni_pro::text::BekkoEmbedder::new().embed(text).ok()
+                }
             }
             _ => None,
         };
@@ -3500,6 +3540,29 @@ fn default_max_leaf_size() -> usize {
 /// JIT 向量缓存上限：超出后整体清空，避免长驻进程无界增长
 const JIT_CACHE_MAX_ENTRIES: usize = 4096;
 
+/// `gemma_unified` 档位的文本嵌入器适配：把 EmbeddingGemma 文本塔接到
+/// `omni_pro::text::TextEmbedder` 抽象上，供 `OmniTextEngine::analyze_with_embedder`
+/// 的主向量与 KeyBERT 主题词抽取共用。
+///
+/// 存在意义（缺陷根因）：`OmniTextEngine::analyze` 早期恒构造 `BekkoEmbedder`，
+/// 导致「已选 gemma_unified 却仍在加载 bekko-a8m 384d」——perceive 的文本分析
+/// 正是那条日志的真实来源（检索侧已另行档位化）。
+struct GemmaTextEmbedder;
+
+impl omni_pro::text::TextEmbedder for GemmaTextEmbedder {
+    fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        // encode_text 内部已按引擎 mrl_dimension 截断并 L2 归一化，无需二次裁剪
+        omni_pro::OmniVisionEngine::encode_gemma_text(text)
+    }
+
+    /// EmbeddingGemma 文本塔单次编码成本远高于 bekko-a8m（大参数量 + 512 token），
+    /// 候选词按 48 收敛：MMR 只取 top-5，48 个候选已足以表达多样性，
+    /// 避免长文档抽词把单文件分析预算吃满。
+    fn keybert_candidate_cap(&self) -> usize {
+        48
+    }
+}
+
 /// 进程内 JIT 向量缓存 (profile + 维度 + 富文本 → 最终向量)。
 ///
 /// 聚类每次换提示词都会重新请求，若每轮都重跑 EmbeddingGemma（46 条约 3s），
@@ -3542,7 +3605,7 @@ fn jit_embedding(
 ///
 /// EmbeddingGemma 使用 MRL 训练，截断前缀并重新 L2 归一化仍是合法语义向量，
 /// 因此当编码维度大于目标维度时允许前缀截断；小于目标维度则无法补齐。
-fn fit_embedding_to_dim(mut vector: Vec<f32>, target_dim: usize) -> Option<Vec<f32>> {
+pub(crate) fn fit_embedding_to_dim(mut vector: Vec<f32>, target_dim: usize) -> Option<Vec<f32>> {
     if vector.len() == target_dim {
         return Some(vector);
     }
@@ -4433,29 +4496,27 @@ async fn vision_tags_handler(
     let mut scored_tags: Option<Vec<(String, f32)>> = None;
     if omni_pro::is_pro_enabled() {
         if cfg.embedding_profile == "gemma_unified" {
-            if let Ok(img) = image::open(&file_path) {
-                let scored = omni_pro::OmniVisionEngine::extract_gemma_visual_tags_scored_from_image(
-                    &img,
-                    req.top_k.unwrap_or(5),
-                );
-                tags = scored.iter().map(|(c, _)| c.clone()).collect();
-                scored_tags = Some(scored);
+            // gemma_unified 档位：严格只走 EmbeddingGemma 视觉感知，禁止互通，禁止降级到 CLIP
+            match image::open(&file_path) {
+                Ok(img) => {
+                    let scored = omni_pro::OmniVisionEngine::extract_gemma_visual_tags_scored_from_image(
+                        &img,
+                        req.top_k.unwrap_or(5),
+                    );
+                    tags = scored.iter().map(|(c, _)| c.clone()).collect();
+                    scored_tags = Some(scored);
+                }
+                Err(e) => {
+                    tracing::error!("[OmniVision] gemma_unified 无法打开图片: {e}");
+                }
             }
-        }
-        if tags.is_empty() {
+        } else {
+            // classic_light 档位：严格只走 CLIP 视觉感知，禁止互通，禁止借道 Gemma
             tags = omni_pro::OmniVisionEngine::extract_clip_visual_tags(
                 &file_path,
                 req.language.as_deref(),
                 req.top_k.unwrap_or(5),
             );
-        }
-    }
-
-    if tags.is_empty() {
-        if let Ok(res) = OmniExtractor::extract(&file_path, &cfg).await {
-            if let Some(arr) = res.metadata.get("visual_tags").and_then(|v| v.as_array()) {
-                tags = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
-            }
         }
     }
 
