@@ -9,9 +9,13 @@ fn main() {
     {
         // 【盲审采纳】资产目录 DLL 单独更新后强制重跑本构建脚本，
         // 否则 cargo test 可能静默使用 target 内的陈旧 DLL
-        println!(
-            "cargo:rerun-if-changed=../../../desktop/build/extraResources/bin/omni"
-        );
+        // 相对路径指向上游 Monorepo 的 apps/desktop（避免因路径不存在导致 Cargo 每次构建都强制击穿缓存重跑）
+        let extra_omni = PathBuf::from("../../../apps/desktop/build/extraResources/bin/omni");
+        if extra_omni.exists() {
+            println!(
+                "cargo:rerun-if-changed=../../../apps/desktop/build/extraResources/bin/omni"
+            );
+        }
         if let Ok(out_dir) = std::env::var("OUT_DIR") {
             let out_path = PathBuf::from(out_dir);
             // OUT_DIR 通常为 target/{debug|release}/build/omni-server-xxxx/out
@@ -39,7 +43,6 @@ fn main() {
                 //    源目录即双运行时四件套 (onnxruntime.dll / sherpa-onnx-c-api.dll /
                 //    onnxruntime_dml.dll / DirectML.dll)，下方通配复制会将其全部同步至
                 //    target/{debug,release} 与 deps，使 cargo test 可直接就地驱动 DML。
-                let extra_omni = PathBuf::from("../../../desktop/build/extraResources/bin/omni");
                 if extra_omni.exists() {
                     if let Ok(entries) = std::fs::read_dir(&extra_omni) {
                         for entry in entries.flatten() {
