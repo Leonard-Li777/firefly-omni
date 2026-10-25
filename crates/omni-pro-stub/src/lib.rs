@@ -1005,6 +1005,30 @@ pub mod text {
         }
     }
 
+    pub const ASR_UNCONTROLLED_CONFIDENCE: f32 = 0.65;
+    pub const CONTROLLED_TEXT_TAG_CONFIDENCE: f32 = 0.90;
+
+    /// 全文本打标器存根 (Ticket 01)
+    pub struct TextTagger;
+
+    impl TextTagger {
+        pub fn tag_text(
+            _text: &str,
+            _source_kind: Option<&str>,
+            _vector_table: Option<&PrecomputedVectorTable>,
+        ) -> Vec<omni_core::TagChainItem> {
+            Vec::new()
+        }
+
+        pub fn tag_asr_or_lrc(
+            _asr: Option<&str>,
+            _lrc: Option<&str>,
+            _vector_table: Option<&PrecomputedVectorTable>,
+        ) -> Vec<omni_core::TagChainItem> {
+            Vec::new()
+        }
+    }
+
     /// 两阶段快速标签识别编排器存根
     pub struct FastTagRecognizer;
 
