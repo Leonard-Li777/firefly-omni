@@ -66,7 +66,7 @@ fn main() {
                 let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
                 // 过滤掉不需要的 Tesseract OCR 和 Leptonica 静态库
                 let lower_stem = stem.to_lowercase();
-                if lower_stem.contains("tesseract") || lower_stem.contains("leptonica") {
+                if lower_stem.contains("tesseract") || lower_stem.contains("leptonica") || lower_stem.contains("_all") || lower_stem.contains("_combined") {
                     continue;
                 }
 
