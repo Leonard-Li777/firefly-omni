@@ -1147,48 +1147,48 @@ async fn extract_file_handler(
     res
 }
 
-#[derive(Default)]
-struct VisionComputed {
-    has_text: Option<bool>,
-    morphology_tags: Vec<String>,
-    morphology_high_confidence_tags: Vec<String>,
-    clip_tags: Vec<String>,
+#[derive(Default, Clone)]
+pub struct VisionComputed {
+    pub has_text: Option<bool>,
+    pub morphology_tags: Vec<String>,
+    pub morphology_high_confidence_tags: Vec<String>,
+    pub clip_tags: Vec<String>,
     /// (WP2b) CLIP 标定置信度快照：标签名 → 标定分，供 6.2 TagChainItem.confidence 贯通
-    clip_tag_confs: std::collections::HashMap<String, f32>,
-    clip_high_confidence_tags: Vec<String>,
-    nsfw_probs: Option<[f32; 5]>,
-    watermark_level: Option<u8>,
-    watermark_status: Option<String>,
-    has_watermark: Option<bool>,
-    mosaic_level: Option<u8>,
-    mosaic_status: Option<String>,
-    has_mosaic: Option<bool>,
-    aesthetic_score: Option<f32>,
-    quality_score: Option<f32>,
-    quality_issues: Vec<String>,
-    photo_type: Option<String>,
-    ram_tags: Vec<omni_core::RamTagItem>,
-    inspect_img: Option<image::DynamicImage>,
+    pub clip_tag_confs: std::collections::HashMap<String, f32>,
+    pub clip_high_confidence_tags: Vec<String>,
+    pub nsfw_probs: Option<[f32; 5]>,
+    pub watermark_level: Option<u8>,
+    pub watermark_status: Option<String>,
+    pub has_watermark: Option<bool>,
+    pub mosaic_level: Option<u8>,
+    pub mosaic_status: Option<String>,
+    pub has_mosaic: Option<bool>,
+    pub aesthetic_score: Option<f32>,
+    pub quality_score: Option<f32>,
+    pub quality_issues: Vec<String>,
+    pub photo_type: Option<String>,
+    pub ram_tags: Vec<omni_core::RamTagItem>,
+    pub inspect_img: Option<image::DynamicImage>,
     /// CLIP 图像嵌入向量（512 维归一化），用于级联假设仲裁
-    image_embedding: Option<Vec<f32>>,
+    pub image_embedding: Option<Vec<f32>>,
     /// 图像嵌入向量的编码器出处（zvec v3 encoder_id），由 omni-vision 返回，禁止本层猜
-    image_encoder_id: Option<u8>,
+    pub image_encoder_id: Option<u8>,
     /// CLIP 互斥组分类结果：(标签名, 置信度, 组名)
     /// 覆盖：内容形态/文字存在性/色彩模式/截图细分 四个互斥维度
-    clip_mutual_tags: Vec<(String, f32, &'static str)>,
-    duration_ms: u64,
+    pub clip_mutual_tags: Vec<(String, f32, &'static str)>,
+    pub duration_ms: u64,
 
     // 各视觉子任务独立耗时 (毫秒)
-    text_detect_ms: u64,
-    clip_ms: u64,
-    nsfw_ms: u64,
-    watermark_ms: u64,
-    mosaic_ms: u64,
-    aesthetic_ms: u64,
-    bw_ms: u64,
-    tag_ms: u64,
-    ram_ms: u64,
-    subtasks: std::collections::BTreeMap<String, u64>,
+    pub text_detect_ms: u64,
+    pub clip_ms: u64,
+    pub nsfw_ms: u64,
+    pub watermark_ms: u64,
+    pub mosaic_ms: u64,
+    pub aesthetic_ms: u64,
+    pub bw_ms: u64,
+    pub tag_ms: u64,
+    pub ram_ms: u64,
+    pub subtasks: std::collections::BTreeMap<String, u64>,
 }
 
 /// 阶段一主向量的编码器出处：有文本向量时取文本编码层出处，否则取视觉层出处。
@@ -1207,7 +1207,361 @@ fn resolve_main_vector_encoder(
     }
 }
 
-/// 多核零拷贝并行视觉感知流水线: 图像单次加载与降采样，7 线程并发计算，消除串行阻塞与重复推理
+/// 视频领域排他门禁：视频媒体严禁挂载纯图片专有维度（截图细分、摄影照片细分等）
+pub fn filter_video_visual_tags(tags: &mut Vec<String>) {
+    tags.retain(|t| !omni_core::is_image_exclusive_tag(t));
+}
+
+/// 纯内存多核零拷贝并行视觉感知流水线: 支持单张图像与视频代表帧的视觉打标与特征提取
+pub fn run_vision_pipeline_on_image(
+    inspect_img: &image::DynamicImage,
+    exif_orient: Option<&str>,
+    enable_visual_tags: bool,
+    lang: Option<&str>,
+    embedding_profile: &str,
+) -> Result<VisionComputed, String> {
+    let t_vision = std::time::Instant::now();
+    let mut out = VisionComputed::default();
+
+    // 档位硬门禁校验：两模式绝对物理隔离与零降级抛错
+    if embedding_profile == "gemma_unified" {
+        let gemma = omni_pro::OmniVisionEngine::gemma_engine();
+        if gemma.circuit_breaker().is_disabled() {
+            return Err("EmbeddingGemma 视觉塔已熔断或禁用，gemma_unified 档位禁止降级到 CLIP".to_string());
+        }
+    }
+
+    let (raw_w, raw_h) = (inspect_img.width(), inspect_img.height());
+    // 大图自适应预降采样 (限制长边 <= 1280px)，采用高速 thumbnail 将千万级像素运算量削减 95%
+    let thumb_owned;
+    let img_ref = if raw_w > 1280 || raw_h > 1280 {
+        thumb_owned = inspect_img.thumbnail(1280, 1280);
+        &thumb_owned
+    } else {
+        inspect_img
+    };
+
+    // 多核并行：7 大视觉算子零拷贝只读引用借用 &img_ref，独立计时
+    let scope_res = std::thread::scope(|s| -> Result<(), String> {
+        // 1. 文本探活 (DBNet / MobileNet 骨干)
+        let h_text = omni_core::timed_spawn!(s, {
+            omni_pro::OmniVisionEngine::fast_detect_has_text(img_ref)
+        });
+
+        // 2. 视觉语义标签 (Chinese-CLIP / Mobile-CLIP / EmbeddingGemma)
+        // 档位绝对隔离：gemma_unified 严格只走 Gemma，classic_light 严格只走 CLIP，严禁降级
+        let h_clip = omni_core::timed_spawn!(s, {
+            if enable_visual_tags {
+                if embedding_profile == "gemma_unified" {
+                    let tags = omni_pro::OmniVisionEngine::extract_gemma_visual_tags_scored_from_image(
+                        img_ref,
+                        10,
+                    );
+                    Ok(tags)
+                } else {
+                    let tags = omni_pro::OmniVisionEngine::extract_clip_visual_tags_scored_from_image(
+                        img_ref,
+                        lang,
+                        10,
+                    );
+                    Ok(tags)
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        });
+
+        // 3. NSFW 模型 5 分类概率推理
+        let h_nsfw = omni_core::timed_spawn!(s, {
+            omni_pro::OmniVisionEngine::run_nsfw_model(img_ref)
+        });
+
+        // 4. 频域水印检测
+        let h_wm = omni_core::timed_spawn!(s, {
+            omni_pro::perceive::detect_watermark_level(img_ref)
+        });
+
+        // 5. 宏块打码检测
+        let h_mc = omni_core::timed_spawn!(s, {
+            omni_pro::perceive::detect_mosaic_level(img_ref)
+        });
+
+        // 6. 物理美学与画质评估 (直接消费前置 ExifTool 提取的 exif_orient！)
+        let h_aes = omni_core::timed_spawn!(s, {
+            omni_pro::perceive::evaluate_image_aesthetic_and_quality(img_ref, exif_orient)
+        });
+
+        // 7. 黑白全彩检测
+        let h_bw = omni_core::timed_spawn!(s, {
+            omni_pro::OmniVisionEngine::detect_is_black_and_white(img_ref)
+        });
+
+        // 8. RAM++ 细粒度实体与泛维度/泛标签投影提取
+        let h_ram = omni_core::timed_spawn!(s, {
+            if enable_visual_tags {
+                omni_pro::OmniVisionEngine::extract_ram_tags(img_ref, lang, 10)
+            } else {
+                Vec::new()
+            }
+        });
+
+        // 9. 图像嵌入向量提取 (用于级联假设仲裁与多模态稠密检索)，统一走 timed_spawn! 计时宏
+        // 编码器出处由产出层回传：Gemma 视觉塔 → 4；CLIP 图像塔 → 由 omni-vision 判定 2/3。
+        let h_embed = omni_core::timed_spawn!(s, {
+            if embedding_profile == "gemma_unified" {
+                match omni_pro::OmniVisionEngine::encode_gemma_image(img_ref) {
+                    Ok(v) => Ok(Some((v, omni_pro::vector_engine::encoder_id::GEMMA))),
+                    Err(e) => {
+                        Err(format!("EmbeddingGemma 图像向量编码失败: {:?}，禁止降级到 CLIP", e))
+                    }
+                }
+            } else {
+                Ok(omni_pro::OmniVisionEngine::extract_clip_image_embedding(img_ref, lang))
+            }
+        });
+
+        // 汇聚并行子任务: panic 时回退默认值并记录日志，避免零耗时误导瓶颈判定
+        macro_rules! join_or_log {
+            ($handle:expr, $name:literal, $default:expr) => {
+                match $handle.join() {
+                    Ok(v) => v,
+                    Err(err) => {
+                        tracing::warn!("视觉流水线子任务 {} panic，回退默认值: {:?}", $name, err);
+                        $default
+                    }
+                }
+            };
+        }
+        let (td, td_ms) = join_or_log!(h_text, "text_detect", (false, 0));
+        let (ct_res, ct_ms) = join_or_log!(h_clip, "clip", (Ok(Vec::new()), 0));
+        let ct_scored = match ct_res {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        let (np, np_ms) = join_or_log!(h_nsfw, "nsfw", (None, 0));
+        let (wl, wl_ms) = join_or_log!(h_wm, "watermark", (0, 0));
+        let (ml, ml_ms) = join_or_log!(h_mc, "mosaic", (0, 0));
+        let (ar, ar_ms) = join_or_log!(h_aes, "aesthetic", ((7.5, Vec::new()), 0));
+        let (bw, bw_ms) = join_or_log!(h_bw, "bw", (false, 0));
+        let (ram_res, ram_ms) = join_or_log!(h_ram, "ram", (Vec::new(), 0));
+        let (embed_res, embed_ms) = join_or_log!(h_embed, "clip_embed", (Ok(None), 0));
+        let img_embed = match embed_res {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+
+        out.has_text = Some(td);
+        out.text_detect_ms = td_ms;
+        // (WP2b) 分数快照与标签名拆分：clip_tags 保持 Vec<String> 兼容既有门禁/消歧流程
+        out.clip_tag_confs = ct_scored.iter().cloned().collect();
+        out.clip_tags = ct_scored.into_iter().map(|(t, _)| t).collect();
+        out.clip_ms = ct_ms;
+        out.nsfw_probs = np;
+        out.nsfw_ms = np_ms;
+        out.watermark_level = Some(wl);
+        out.watermark_ms = wl_ms;
+        out.mosaic_level = Some(ml);
+        out.mosaic_ms = ml_ms;
+        out.aesthetic_score = Some(ar.0);
+        out.quality_score = Some(ar.0);
+        out.quality_issues = ar.1;
+        out.aesthetic_ms = ar_ms;
+        out.bw_ms = bw_ms;
+        out.ram_tags = ram_res;
+        out.ram_ms = ram_ms;
+        // 解包 (向量, 编码器出处)：出处与向量同源同生，不在此层推断
+        let (img_vec, img_enc) = match img_embed {
+            Some((v, enc)) => (Some(v), Some(enc)),
+            None => (None, None),
+        };
+        out.image_embedding = img_vec;
+        out.image_encoder_id = img_enc;
+        // CLIP 互斥分类：利用图像嵌入向量对内容形态/色彩/文字等互斥组分类（仅 Classic Light 模式使用）
+        let mut mutual_ms = 0u64;
+        if let Some(ref emb) = out.image_embedding {
+            if embedding_profile != "gemma_unified" {
+                let t_mutual = std::time::Instant::now();
+                out.clip_mutual_tags = omni_pro::OmniVisionEngine::classify_mutual_exclusive_groups(
+                    emb.as_slice(),
+                    lang,
+                );
+                mutual_ms = t_mutual.elapsed().as_millis() as u64;
+            }
+        }
+        // 标签分支挂钟 = 并行段长尾 (CLIP/NSFW/RAM/Embed 取 Max) + 串行尾巴 (互斥分类)
+        let tag_wall_ms = ct_ms.max(np_ms).max(ram_ms).max(embed_ms) + mutual_ms;
+        out.tag_ms = tag_wall_ms;
+
+        // 统一汇总至子任务度量字典
+        out.subtasks.insert("text_detect_ms".to_string(), td_ms);
+        out.subtasks.insert("clip_ms".to_string(), ct_ms);
+        out.subtasks.insert("clip_embed_ms".to_string(), embed_ms);
+        out.subtasks.insert("clip_mutual_ms".to_string(), mutual_ms);
+        out.subtasks.insert("nsfw_ms".to_string(), np_ms);
+        out.subtasks.insert("watermark_ms".to_string(), wl_ms);
+        out.subtasks.insert("mosaic_ms".to_string(), ml_ms);
+        out.subtasks.insert("aesthetic_ms".to_string(), ar_ms);
+        out.subtasks.insert("bw_ms".to_string(), bw_ms);
+        out.subtasks.insert("ram_ms".to_string(), ram_ms);
+        out.subtasks.insert("tag_ms".to_string(), tag_wall_ms);
+
+        // 零耗时内存推导
+        out.has_watermark = Some(wl > 0);
+        out.watermark_status = Some(match wl {
+            2 => "heavy",
+            1 => "light",
+            _ => "none",
+        }.to_string());
+
+        out.has_mosaic = Some(ml > 0);
+        out.mosaic_status = Some(match ml {
+            2 => "heavy",
+            1 => "thin",
+            _ => "none",
+        }.to_string());
+
+        let aspect = img_ref.width() as f32 / img_ref.height().max(1) as f32;
+        let (mut morphology_tags, mut morphology_high_confidence_tags) =
+            omni_pro::OmniVisionEngine::derive_morphology_tags(aspect, td, bw);
+
+        // 物理事实轻量算子注入 (DEC-05)
+        // 1. 画幅算子 (ID 143)
+        let aspect_concept = omni_pro::OmniVisionEngine::detect_aspect_ratio_type(raw_w, raw_h);
+        let aspect_name = aspect_concept.zh_name().to_string();
+        if !morphology_tags.contains(&aspect_name) {
+            morphology_tags.push(aspect_name.clone());
+            morphology_high_confidence_tags.push(aspect_name);
+        }
+
+        // 2. 背景算子 (ID 139)
+        let bg_concept = omni_pro::OmniVisionEngine::detect_background_type(img_ref);
+        let bg_name = bg_concept.zh_name().to_string();
+        if !morphology_tags.contains(&bg_name) {
+            morphology_tags.push(bg_name.clone());
+            morphology_high_confidence_tags.push(bg_name);
+        }
+
+        // 3. 主色调与色系算子 (ID 149)
+        let (main_color_opt, color_series_opt) = omni_pro::OmniVisionEngine::detect_main_color_and_series(img_ref);
+        if let Some(mc) = main_color_opt {
+            let mc_name = mc.zh_name().to_string();
+            if !morphology_tags.contains(&mc_name) {
+                morphology_tags.push(mc_name.clone());
+                morphology_high_confidence_tags.push(mc_name);
+            }
+        }
+        if let Some(series_concept) = color_series_opt {
+            let cs_name = series_concept.zh_name().to_string();
+            if !morphology_tags.contains(&cs_name) {
+                morphology_tags.push(cs_name.clone());
+                morphology_high_confidence_tags.push(cs_name);
+            }
+        }
+
+        // 4. 画质等级算子 (ID 122)
+        if let Some(rq) = omni_pro::OmniVisionEngine::detect_resolution_quality(raw_w, raw_h) {
+            let rq_name = rq.zh_name().to_string();
+            if !morphology_tags.contains(&rq_name) {
+                morphology_tags.push(rq_name.clone());
+                morphology_high_confidence_tags.push(rq_name);
+            }
+        }
+
+        // 无字图排版门禁：若未探活出文本内容，严禁打上依赖排版文字的海报宣发或截图标签
+        if !td {
+            out.clip_tags.retain(|t| {
+                !tag_matches_concept(t, "海报宣发") && !tag_matches_concept(t, "截图")
+            });
+        }
+
+        // CLIP 高置信度标签截取 Top 5，同互斥单选组内仅保留最高排序项
+        let mut high_conf: Vec<String> = Vec::with_capacity(5);
+        let mut seen_groups: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+        for t in &out.clip_tags {
+            if high_conf.len() >= 5 {
+                break;
+            }
+            let code = normalize_tag_to_code(t);
+            if omni_core::tag_admissibility::is_rejected_code(&code) {
+                continue;
+            }
+            let group = match omni_core::tag_identity::concept_from_code(code.as_str()) {
+                Some(Concept::Windows截图)
+                | Some(Concept::macOS截图)
+                | Some(Concept::iOS截图)
+                | Some(Concept::Android截图)
+                | Some(Concept::Linux截图) => Some("system_ecology"),
+
+                Some(Concept::实拍)
+                | Some(Concept::手绘)
+                | Some(Concept::CG渲染)
+                | Some(Concept::AI生成) => Some("generation_carrier"),
+
+                Some(Concept::横屏)
+                | Some(Concept::竖屏)
+                | Some(Concept::超宽长条)
+                | Some(Concept::正方形) => Some("aspect_ratio"),
+
+                _ => None,
+            };
+
+            if let Some(g) = group {
+                if seen_groups.insert(g) {
+                    high_conf.push(t.clone());
+                }
+            } else {
+                high_conf.push(t.clone());
+            }
+        }
+        out.clip_high_confidence_tags = high_conf;
+
+        // 漫画细分标签形态门禁
+        let is_anime_art = out.clip_tags.iter().any(|t| {
+            tag_matches_concept(t, "二次元")
+                || tag_matches_concept(t, "动漫")
+                || tag_matches_concept(t, "插画")
+                || tag_matches_concept(t, "漫画")
+                || tag_matches_concept(t, "手绘")
+        });
+        if is_anime_art {
+            if aspect < 0.45 {
+                if !morphology_tags.contains(&"条漫".to_string()) {
+                    morphology_tags.push("条漫".to_string());
+                }
+            } else if (aspect >= 0.55 && aspect <= 0.90) || (aspect >= 1.20 && aspect <= 1.60) {
+                if !morphology_tags.contains(&"页漫".to_string()) {
+                    morphology_tags.push("页漫".to_string());
+                }
+            }
+        }
+
+        out.morphology_tags = morphology_tags;
+        out.morphology_high_confidence_tags = morphology_high_confidence_tags;
+
+        // 图像细分形态分类
+        let p_type = omni_pro::perceive::infer_image_modal_type(
+            img_ref,
+            &out.morphology_tags,
+            &out.clip_tags,
+            &[],
+            td,
+            "",
+        );
+        out.photo_type = Some(p_type);
+
+        Ok(())
+    });
+
+    if let Err(e) = scope_res {
+        return Err(e);
+    }
+
+    out.inspect_img = Some(img_ref.clone());
+    out.duration_ms = t_vision.elapsed().as_millis() as u64;
+    Ok(out)
+}
+
+/// 兼容既有磁盘路径调用的薄包装层
 fn run_vision_pipeline(
     file_path: &str,
     exif_orient: Option<&str>,
@@ -1216,8 +1570,6 @@ fn run_vision_pipeline(
     embedding_profile: &str,
 ) -> VisionComputed {
     let t_vision = std::time::Instant::now();
-    let mut out = VisionComputed::default();
-
     let ext = std::path::Path::new(file_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -1228,330 +1580,41 @@ fn run_vision_pipeline(
     let is_video = omni_core::is_video_ext(&ext);
 
     if is_image {
-        if let Ok(img) = image::open(file_path) {
-            let (raw_w, raw_h) = (img.width(), img.height());
-            // 大图自适应预降采样 (限制长边 <= 1280px)，采用高速 thumbnail 将千万级像素运算量削减 95%
-            let inspect_img = if raw_w > 1280 || raw_h > 1280 {
-                img.thumbnail(1280, 1280)
-            } else {
-                img
-            };
-
-            // 多核并行：7 大视觉算子零拷贝只读引用借用 &inspect_img，独立计时
-            std::thread::scope(|s| {
-                // 1. 文本探活 (DBNet / MobileNet 骨干)
-                let h_text = omni_core::timed_spawn!(s, {
-                    omni_pro::OmniVisionEngine::fast_detect_has_text(&inspect_img)
-                });
-
-                // 2. 视觉语义标签 (Chinese-CLIP / Mobile-CLIP / EmbeddingGemma)
-                // (WP2b) 带分提取：分数在提取层保留，贯通至 TagChainItem.confidence，杜绝 0.92 硬编码灌水
-                let h_clip = omni_core::timed_spawn!(s, {
-                    if enable_visual_tags {
-                        if embedding_profile == "gemma_unified" {
-                            omni_pro::OmniVisionEngine::extract_gemma_visual_tags_scored_from_image(
-                                &inspect_img,
-                                10,
-                            )
-                        } else {
-                            omni_pro::OmniVisionEngine::extract_clip_visual_tags_scored_from_image(
-                                &inspect_img,
-                                lang,
-                                10,
-                            )
-                        }
-                    } else {
-                        Vec::new()
-                    }
-                });
-
-                // 3. NSFW 模型 5 分类概率推理
-                let h_nsfw = omni_core::timed_spawn!(s, {
-                    omni_pro::OmniVisionEngine::run_nsfw_model(&inspect_img)
-                });
-
-                // 4. 频域水印检测
-                let h_wm = omni_core::timed_spawn!(s, {
-                    omni_pro::perceive::detect_watermark_level(&inspect_img)
-                });
-
-                // 5. 宏块打码检测
-                let h_mc = omni_core::timed_spawn!(s, {
-                    omni_pro::perceive::detect_mosaic_level(&inspect_img)
-                });
-
-                // 6. 物理美学与画质评估 (直接消费前置 ExifTool 提取的 exif_orient！)
-                let h_aes = omni_core::timed_spawn!(s, {
-                    omni_pro::perceive::evaluate_image_aesthetic_and_quality(&inspect_img, exif_orient)
-                });
-
-                // 7. 黑白全彩检测
-                let h_bw = omni_core::timed_spawn!(s, {
-                    omni_pro::OmniVisionEngine::detect_is_black_and_white(&inspect_img)
-                });
-
-                // 8. RAM++ 细粒度实体与泛维度/泛标签投影提取
-                let h_ram = omni_core::timed_spawn!(s, {
-                    if enable_visual_tags {
-                        omni_pro::OmniVisionEngine::extract_ram_tags(&inspect_img, lang, 10)
-                    } else {
-                        Vec::new()
-                    }
-                });
-
-                // 9. 图像嵌入向量提取 (用于级联假设仲裁与多模态稠密检索)，统一走 timed_spawn! 计时宏
-                // 编码器出处由产出层回传：Gemma 视觉塔 → 4；CLIP 图像塔 → 由 omni-vision 判定 2/3。
-                let h_embed = omni_core::timed_spawn!(s, {
-                    if embedding_profile == "gemma_unified" {
-                        omni_pro::OmniVisionEngine::encode_gemma_image(&inspect_img)
-                            .ok()
-                            .map(|v| (v, omni_pro::vector_engine::encoder_id::GEMMA))
-                    } else {
-                        omni_pro::OmniVisionEngine::extract_clip_image_embedding(&inspect_img, lang)
-                    }
-                });
-
-                // 汇聚并行子任务: panic 时回退默认值并记录日志，避免零耗时误导瓶颈判定
-                macro_rules! join_or_log {
-                    ($handle:expr, $name:literal, $default:expr) => {
-                        match $handle.join() {
-                            Ok(v) => v,
-                            Err(err) => {
-                                tracing::warn!("视觉流水线子任务 {} panic，回退默认值: {:?}", $name, err);
-                                $default
-                            }
-                        }
-                    };
-                }
-                let (td, td_ms) = join_or_log!(h_text, "text_detect", (false, 0));
-                let (ct_scored, ct_ms) = join_or_log!(h_clip, "clip", (Vec::new(), 0));
-                let (np, np_ms) = join_or_log!(h_nsfw, "nsfw", (None, 0));
-                let (wl, wl_ms) = join_or_log!(h_wm, "watermark", (0, 0));
-                let (ml, ml_ms) = join_or_log!(h_mc, "mosaic", (0, 0));
-                let (ar, ar_ms) = join_or_log!(h_aes, "aesthetic", ((7.5, Vec::new()), 0));
-                let (bw, bw_ms) = join_or_log!(h_bw, "bw", (false, 0));
-                let (ram_res, ram_ms) = join_or_log!(h_ram, "ram", (Vec::new(), 0));
-                let (img_embed, embed_ms) = join_or_log!(h_embed, "clip_embed", (None, 0));
-                out.has_text = Some(td);
-                out.text_detect_ms = td_ms;
-                // (WP2b) 分数快照与标签名拆分：clip_tags 保持 Vec<String> 兼容既有门禁/消歧流程
-                out.clip_tag_confs = ct_scored.iter().cloned().collect();
-                out.clip_tags = ct_scored.into_iter().map(|(t, _)| t).collect();
-                out.clip_ms = ct_ms;
-                out.nsfw_probs = np;
-                out.nsfw_ms = np_ms;
-                out.watermark_level = Some(wl);
-                out.watermark_ms = wl_ms;
-                out.mosaic_level = Some(ml);
-                out.mosaic_ms = ml_ms;
-                out.aesthetic_score = Some(ar.0);
-                out.quality_score = Some(ar.0);
-                out.quality_issues = ar.1;
-                out.aesthetic_ms = ar_ms;
-                out.bw_ms = bw_ms;
-                out.ram_tags = ram_res;
-                out.ram_ms = ram_ms;
-                // 解包 (向量, 编码器出处)：出处与向量同源同生，不在此层推断
-                let (img_vec, img_enc) = match img_embed {
-                    Some((v, enc)) => (Some(v), Some(enc)),
-                    None => (None, None),
-                };
-                out.image_embedding = img_vec;
-                out.image_encoder_id = img_enc;
-                // CLIP 互斥分类：利用图像嵌入向量对内容形态/色彩/文字等互斥组分类（仅 Classic Light 模式使用）
-                let mut mutual_ms = 0u64;
-                if let Some(ref emb) = out.image_embedding {
-                    if embedding_profile != "gemma_unified" {
-                        let t_mutual = std::time::Instant::now();
-                        out.clip_mutual_tags = omni_pro::OmniVisionEngine::classify_mutual_exclusive_groups(
-                            emb.as_slice(),
-                            lang,
+        match image::open(file_path) {
+            Ok(img) => {
+                match run_vision_pipeline_on_image(&img, exif_orient, enable_visual_tags, lang, embedding_profile) {
+                    Ok(mut computed) => {
+                        computed.duration_ms = t_vision.elapsed().as_millis() as u64;
+                        tracing::info!(
+                            "[OmniServer] 图片文本前置检测: file={}, has_text={}",
+                            file_path,
+                            computed.has_text.unwrap_or(false)
                         );
-                        mutual_ms = t_mutual.elapsed().as_millis() as u64;
+                        return computed;
+                    }
+                    Err(e) => {
+                        tracing::error!("[OmniServer] 图像视觉感知流水线失败: file={}, err={}", file_path, e);
+                        let mut out = VisionComputed::default();
+                        out.duration_ms = t_vision.elapsed().as_millis() as u64;
+                        return out;
                     }
                 }
-                // 标签分支挂钟 = 并行段长尾 (CLIP/NSFW/RAM/Embed 取 Max) + 串行尾巴 (互斥分类)
-                // 图像嵌入提取在 scope 内并行执行，互斥分类在 scope 外部消费嵌入向量顺序执行
-                let tag_wall_ms = ct_ms.max(np_ms).max(ram_ms).max(embed_ms) + mutual_ms;
-                out.tag_ms = tag_wall_ms;
-
-                // 统一汇总至子任务度量字典
-                out.subtasks.insert("text_detect_ms".to_string(), td_ms);
-                out.subtasks.insert("clip_ms".to_string(), ct_ms);
-                out.subtasks.insert("clip_embed_ms".to_string(), embed_ms);
-                out.subtasks.insert("clip_mutual_ms".to_string(), mutual_ms);
-                out.subtasks.insert("nsfw_ms".to_string(), np_ms);
-                out.subtasks.insert("watermark_ms".to_string(), wl_ms);
-                out.subtasks.insert("mosaic_ms".to_string(), ml_ms);
-                out.subtasks.insert("aesthetic_ms".to_string(), ar_ms);
-                out.subtasks.insert("bw_ms".to_string(), bw_ms);
-                out.subtasks.insert("ram_ms".to_string(), ram_ms);
-                out.subtasks.insert("tag_ms".to_string(), tag_wall_ms);
-
-                // 零耗时内存推导
-                out.has_watermark = Some(wl > 0);
-                out.watermark_status = Some(match wl {
-                    2 => "heavy",
-                    1 => "light",
-                    _ => "none",
-                }.to_string());
-
-                out.has_mosaic = Some(ml > 0);
-                out.mosaic_status = Some(match ml {
-                    2 => "heavy",
-                    1 => "thin",
-                    _ => "none",
-                }.to_string());
-
-                let aspect = inspect_img.width() as f32 / inspect_img.height().max(1) as f32;
-                let (mut morphology_tags, mut morphology_high_confidence_tags) =
-                    omni_pro::OmniVisionEngine::derive_morphology_tags(aspect, td, bw);
-
-                // 物理事实轻量算子注入 (DEC-05)
-                // 1. 画幅算子 (ID 143)
-                let aspect_concept = omni_pro::OmniVisionEngine::detect_aspect_ratio_type(raw_w, raw_h);
-                let aspect_name = aspect_concept.zh_name().to_string();
-                if !morphology_tags.contains(&aspect_name) {
-                    morphology_tags.push(aspect_name.clone());
-                    morphology_high_confidence_tags.push(aspect_name);
-                }
-
-                // 2. 背景算子 (ID 139)
-                let bg_concept = omni_pro::OmniVisionEngine::detect_background_type(&inspect_img);
-                let bg_name = bg_concept.zh_name().to_string();
-                if !morphology_tags.contains(&bg_name) {
-                    morphology_tags.push(bg_name.clone());
-                    morphology_high_confidence_tags.push(bg_name);
-                }
-
-                // 3. 主色调与色系算子 (ID 149)
-                let (main_color_opt, color_series_opt) = omni_pro::OmniVisionEngine::detect_main_color_and_series(&inspect_img);
-                if let Some(mc) = main_color_opt {
-                    let mc_name = mc.zh_name().to_string();
-                    if !morphology_tags.contains(&mc_name) {
-                        morphology_tags.push(mc_name.clone());
-                        morphology_high_confidence_tags.push(mc_name);
-                    }
-                }
-                if let Some(series_concept) = color_series_opt {
-                    let cs_name = series_concept.zh_name().to_string();
-                    if !morphology_tags.contains(&cs_name) {
-                        morphology_tags.push(cs_name.clone());
-                        morphology_high_confidence_tags.push(cs_name);
-                    }
-                }
-
-                // 4. 画质等级算子 (ID 122)
-                if let Some(rq) = omni_pro::OmniVisionEngine::detect_resolution_quality(raw_w, raw_h) {
-                    let rq_name = rq.zh_name().to_string();
-                    if !morphology_tags.contains(&rq_name) {
-                        morphology_tags.push(rq_name.clone());
-                        morphology_high_confidence_tags.push(rq_name);
-                    }
-                }
-
-                // 无字图排版门禁：若未探活出文本内容，严禁打上依赖排版文字的海报宣发或截图标签
-                // Spec D9：闭环规则按概念 code 匹配，兼容中英别名
-                if !td {
-                    out.clip_tags.retain(|t| {
-                        !tag_matches_concept(t, "海报宣发") && !tag_matches_concept(t, "截图")
-                    });
-                }
-
-                // CLIP 高置信度标签截取 Top 5，同互斥单选组内仅保留最高排序项 (杜绝 Windows/macOS/Linux 截图同存)
-                let mut high_conf: Vec<String> = Vec::with_capacity(5);
-                let mut seen_groups: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
-                for t in &out.clip_tags {
-                    if high_conf.len() >= 5 {
-                        break;
-                    }
-                    let code = normalize_tag_to_code(t);
-                    // G1 词形闸哨兵：空 code 表示该词未通过准入，不得进入高置信度截取
-                    if omni_core::tag_admissibility::is_rejected_code(&code) {
-                        continue;
-                    }
-                    // 经跨注册表桥接：`Concept` 注册表与别名表 code 分歧（GH #719）
-                    // 会使直查静默落空，导致同概念在 zh/en 下分组不一致。
-                    let group = match omni_core::tag_identity::concept_from_code(code.as_str()) {
-                        Some(Concept::Windows截图)
-                        | Some(Concept::macOS截图)
-                        | Some(Concept::iOS截图)
-                        | Some(Concept::Android截图)
-                        | Some(Concept::Linux截图) => Some("system_ecology"),
-
-                        Some(Concept::实拍)
-                        | Some(Concept::手绘)
-                        | Some(Concept::CG渲染)
-                        | Some(Concept::AI生成) => Some("generation_carrier"),
-
-                        Some(Concept::横屏)
-                        | Some(Concept::竖屏)
-                        | Some(Concept::超宽长条)
-                        | Some(Concept::正方形) => Some("aspect_ratio"),
-
-                        _ => None,
-                    };
-
-                    if let Some(g) = group {
-                        if seen_groups.insert(g) {
-                            high_conf.push(t.clone());
-                        }
-                    } else {
-                        high_conf.push(t.clone());
-                    }
-                }
-                out.clip_high_confidence_tags = high_conf;
-
-                // 漫画细分标签形态门禁：仅当内容明确具有动漫/漫画/插画特征时，才根据版式推导条漫/页漫
-                let is_anime_art = out.clip_tags.iter().any(|t| {
-                    tag_matches_concept(t, "二次元")
-                        || tag_matches_concept(t, "动漫")
-                        || tag_matches_concept(t, "插画")
-                        || tag_matches_concept(t, "漫画")
-                        || tag_matches_concept(t, "手绘")
-                });
-                if is_anime_art {
-                    if aspect < 0.45 {
-                        if !morphology_tags.contains(&"条漫".to_string()) {
-                            morphology_tags.push("条漫".to_string());
-                        }
-                    } else if (aspect >= 0.55 && aspect <= 0.90) || (aspect >= 1.20 && aspect <= 1.60) {
-                        if !morphology_tags.contains(&"页漫".to_string()) {
-                            morphology_tags.push("页漫".to_string());
-                        }
-                    }
-                }
-
-                out.morphology_tags = morphology_tags;
-                out.morphology_high_confidence_tags = morphology_high_confidence_tags;
-
-                // 图像细分形态分类
-                let p_type = omni_pro::perceive::infer_image_modal_type(
-                    &inspect_img,
-                    &out.morphology_tags,
-                    &out.clip_tags,
-                    &[],
-                    td,
-                    file_path,
-                );
-                out.photo_type = Some(p_type);
-            });
-
-            out.inspect_img = Some(inspect_img);
-
-            tracing::info!(
-                "[OmniServer] 图片文本前置检测: file={}, has_text={}",
-                file_path,
-                out.has_text.unwrap_or(false)
-            );
+            }
+            Err(e) => {
+                tracing::warn!("[OmniServer] 无法打开图像文件: file={}, err={}", file_path, e);
+            }
         }
     } else if is_video {
         let (v_wm_lvl, v_wm_status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(file_path));
+        let mut out = VisionComputed::default();
         out.watermark_level = Some(v_wm_lvl);
         out.has_watermark = Some(v_wm_lvl > 0);
         out.watermark_status = Some(v_wm_status.to_string());
+        out.duration_ms = t_vision.elapsed().as_millis() as u64;
+        return out;
     }
 
+    let mut out = VisionComputed::default();
     out.duration_ms = t_vision.elapsed().as_millis() as u64;
     out
 }
@@ -1606,7 +1669,7 @@ async fn perceive_file_handler(
         }
     };
 
-    let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, video_chunks, video_timings)) = if is_image {
+    let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, video_chunks, video_timings, video_cover_webp_base64)) = if is_image {
         let f_img = async {
             // 步骤 A1: 前置 ExifTool 全量元数据提取 (画质姿态/方向依赖 exiftool 提取的元数据)
             let t_meta = std::time::Instant::now();
@@ -1734,7 +1797,7 @@ async fn perceive_file_handler(
         benchmark.record_opt("text_ms", text_ms);
         benchmark.extract_ms = Some(vision_res.duration_ms.max(metadata_ms).max(ocr_ms.unwrap_or(0)));
 
-        (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, Vec::new(), None))
+        (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, Vec::new(), None, None))
     } else {
         let f_non_img = async {
             let t_extract = std::time::Instant::now();
@@ -1759,6 +1822,7 @@ async fn perceive_file_handler(
             let mut v = VisionComputed::default();
             let mut video_chunks: Vec<omni_core::OmniVideoChunk> = Vec::new();
             let mut video_timings = omni_pro::perceive::VideoProcessTimings::default();
+            let mut video_cover_webp_base64: Option<String> = None;
             if is_video && is_pro {
                 let (v_wm_lvl, v_wm_status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(&file_path));
                 v.watermark_level = Some(v_wm_lvl);
@@ -1778,8 +1842,8 @@ async fn perceive_file_handler(
                 let audio_cap_for_budget = req
                     .audio_analysis_duration
                     .unwrap_or(cfg.audio_analysis_duration) as f64;
-                let (chunks, timings) = tokio::task::spawn_blocking(move || {
-                    omni_pro::perceive::process_video_time_chunks_with_timings(
+                let (chunks, timings, rep_frame) = tokio::task::spawn_blocking(move || {
+                    omni_pro::perceive::process_video_time_chunks_with_representative(
                         std::path::Path::new(&file_path_for_video),
                         video_interval,
                         None,
@@ -1791,6 +1855,70 @@ async fn perceive_file_handler(
                 .unwrap_or_default();
                 video_chunks = chunks;
                 video_timings = timings;
+                if let Some(ref rep_rgb) = rep_frame {
+                    // 1. 官方 WebP 封面直出 (Ticket 03)
+                    match omni_pro::cover::raw_to_webp(rep_rgb.as_raw(), rep_rgb.width(), rep_rgb.height(), 3) {
+                        Ok(webp_bytes) => {
+                            use base64::Engine;
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&webp_bytes);
+                            video_cover_webp_base64 = Some(b64);
+                        }
+                        Err(e) => {
+                            tracing::warn!("[OmniServer] 视频代表帧转换为 WebP 封面失败: {:?}", e);
+                        }
+                    }
+
+                    // 2. 代表帧纯内存视觉感知打标与特征提取
+                    let dyn_img = image::DynamicImage::ImageRgb8(rep_rgb.clone());
+                    match run_vision_pipeline_on_image(
+                        &dyn_img,
+                        None,
+                        req.enable_visual_tags.unwrap_or(true),
+                        req.language.as_deref(),
+                        &cfg.embedding_profile,
+                    ) {
+                        Ok(mut rep_vision) => {
+                            // 视频领域排他门禁：严格剔除截图细分、摄影照片细分等图片专有维度
+                            filter_video_visual_tags(&mut rep_vision.clip_tags);
+                            filter_video_visual_tags(&mut rep_vision.clip_high_confidence_tags);
+                            filter_video_visual_tags(&mut rep_vision.morphology_tags);
+                            filter_video_visual_tags(&mut rep_vision.morphology_high_confidence_tags);
+
+                            // 视频代表帧门禁：严禁保留图片专有互斥组（截图场景细分、摄影题材细分）及专有概念
+                            rep_vision.clip_mutual_tags.retain(|(tag, _, group)| {
+                                if *group == GROUP_SCREENSHOT_SUB || *group == GROUP_PHOTO_SUB {
+                                    return false;
+                                }
+                                if omni_core::is_image_exclusive_tag(tag) {
+                                    return false;
+                                }
+                                true
+                            });
+
+                            rep_vision.photo_type = None;
+
+                            v.clip_tags = rep_vision.clip_tags;
+                            v.clip_tag_confs = rep_vision.clip_tag_confs;
+                            v.clip_high_confidence_tags = rep_vision.clip_high_confidence_tags;
+                            v.clip_mutual_tags = rep_vision.clip_mutual_tags;
+                            v.aesthetic_score = rep_vision.aesthetic_score;
+                            v.quality_score = rep_vision.quality_score;
+                            v.quality_issues = rep_vision.quality_issues;
+                            v.has_text = rep_vision.has_text;
+                            v.ram_tags = rep_vision.ram_tags;
+                            v.nsfw_probs = rep_vision.nsfw_probs;
+                            v.morphology_tags = rep_vision.morphology_tags;
+                            v.morphology_high_confidence_tags = rep_vision.morphology_high_confidence_tags;
+                            if v.image_embedding.is_none() {
+                                v.image_embedding = rep_vision.image_embedding;
+                                v.image_encoder_id = rep_vision.image_encoder_id;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!("[OmniServer] 视频代表帧视觉感知打标失败: {}", err);
+                        }
+                    }
+                }
             }
 
             // 音频/视频文件: 纯内存解码 (16kHz 单声道) → GTCRN 降噪 + Silero VAD + SenseVoice 转录 + CED-mini 声学打标
@@ -1883,9 +2011,9 @@ async fn perceive_file_handler(
                 }
             }
 
-            (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings)
+            (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings, video_cover_webp_base64)
         };
-        let (ads_res, (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings)) = tokio::join!(f_ads, f_non_img);
+        let (ads_res, (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings, video_cover_webp_base64)) = tokio::join!(f_ads, f_non_img);
 
         benchmark.extract_ms = Some(extract_ms);
         benchmark.audio_ms = audio_ms;
@@ -1903,7 +2031,7 @@ async fn perceive_file_handler(
             }
         }
 
-        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, None, video_chunks, Some(video_timings)))
+        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, None, video_chunks, Some(video_timings), video_cover_webp_base64))
     };
 
     benchmark.ads_ms = ads_ms;
@@ -2111,8 +2239,8 @@ async fn perceive_file_handler(
         }
     }
 
-    // CLIP 互斥组与 photo_type 细化联动更新（语义优先于规则推导）
-    if !clip_mutual_tags.is_empty() {
+    // CLIP 互斥组与 photo_type 细化联动更新（语义优先于规则推导，严格仅适用于图片）
+    if !clip_mutual_tags.is_empty() && is_image {
         // 优先取截图细分（比泛截图更精确）
         if let Some((sub_tag, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == GROUP_SCREENSHOT_SUB) {
             if photo_type.is_none()
@@ -2684,8 +2812,10 @@ async fn perceive_file_handler(
         audio_transcript: asr.clone(),
         lrc_text: lrc.clone(),
         visual_tags: structured_visual_tags.clone(),
+        text_tags: Vec::new(),
         exif_metadata: metadata.clone(),
         is_image,
+        is_video,
         is_document: !is_image && !is_video,
         is_audio_or_video: is_video || has_asr || lrc.is_some(),
         language: req.language.clone(),
@@ -3127,6 +3257,8 @@ async fn perceive_file_handler(
             .and_then(|t| t.visual_analysis_duration_sec.or(t.analysis_duration_sec))
             .map(|d| d as f32),
         video_truncated: video_timings.as_ref().and_then(|t| t.video_truncated),
+        cover_webp_base64: video_cover_webp_base64,
+        text_tags: Vec::new(),
         video_chunks,
         vector_saved: None,
     });
@@ -4806,5 +4938,60 @@ mod encoder_origin_tests {
             None,
             "文本向量存在时不得改用视觉层出处，避免向量与出处错配"
         );
+    }
+}
+
+#[cfg(test)]
+mod representative_vision_tests {
+    use super::*;
+
+    #[test]
+    fn test_representative_frame_vision_pipeline_profile_dispatch() {
+        // 1. 构造代表帧图像
+        let img = image::DynamicImage::new_rgb8(100, 100);
+
+        // 2. 测试 classic_light 档位分流与隔离
+        let res_classic = run_vision_pipeline_on_image(&img, None, false, None, "classic_light");
+        assert!(res_classic.is_ok(), "classic_light 模式在关闭视觉打标时必须成功返回");
+        let comp_classic = res_classic.unwrap();
+        // 验证没有调用 Gemma 视觉塔
+        if let Some(enc) = comp_classic.image_encoder_id {
+            assert_ne!(enc, omni_pro::vector_engine::encoder_id::GEMMA, "classic_light 档位严禁使用 Gemma 编码器");
+        }
+
+        // 3. 测试 gemma_unified 档位分流与隔离
+        // 在 gemma_unified 下若 Gemma 熔断，必须立即 Fail-Fast 报错
+        let gemma = omni_pro::OmniVisionEngine::gemma_engine();
+        gemma.circuit_breaker().trip("模拟熔断测试物理隔离".to_string());
+        let res_gemma = run_vision_pipeline_on_image(&img, None, true, None, "gemma_unified");
+        assert!(res_gemma.is_err(), "gemma_unified 档位在 Gemma 熔断时必须 Fail-Fast 报错，严禁降级到 CLIP");
+        gemma.circuit_breaker().mark_ready(); // 恢复状态
+
+        // 4. 测试全媒体视频领域排他门禁与全细分拦截
+        let mut test_tags = vec![
+            "猫".to_string(),
+            "截图".to_string(),
+            "Windows截图".to_string(),
+            "游戏截图".to_string(),
+            "UI界面截图".to_string(),
+            "摄影照片".to_string(),
+            "风景照".to_string(),
+            "夜景照".to_string(),
+            "建筑摄影".to_string(),
+            "黄昏".to_string(),
+            "实拍".to_string(),
+        ];
+        filter_video_visual_tags(&mut test_tags);
+        assert!(test_tags.contains(&"猫".to_string()), "内容标签 猫 必须保留");
+        assert!(test_tags.contains(&"黄昏".to_string()), "内容标签 黄昏 必须保留");
+        assert!(test_tags.contains(&"实拍".to_string()), "跨模态生成载体 实拍 必须保留");
+        assert!(!test_tags.contains(&"截图".to_string()), "图片专有维度 截图 必须被门禁剔除");
+        assert!(!test_tags.contains(&"Windows截图".to_string()), "图片专有维度 Windows截图 必须被门禁剔除");
+        assert!(!test_tags.contains(&"游戏截图".to_string()), "图片专有维度 游戏截图 必须被门禁剔除");
+        assert!(!test_tags.contains(&"UI界面截图".to_string()), "图片专有维度 UI界面截图 必须被门禁剔除");
+        assert!(!test_tags.contains(&"摄影照片".to_string()), "图片专有维度 摄影照片 必须被门禁剔除");
+        assert!(!test_tags.contains(&"风景照".to_string()), "图片专有维度 风景照 必须被门禁剔除");
+        assert!(!test_tags.contains(&"夜景照".to_string()), "图片专有维度 夜景照 必须被门禁剔除");
+        assert!(!test_tags.contains(&"建筑摄影".to_string()), "图片专有维度 建筑摄影 必须被门禁剔除");
     }
 }

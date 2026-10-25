@@ -540,6 +540,20 @@ fn en_to_code() -> &'static HashMap<String, String> {
     })
 }
 
+/// 展示名解析失败时的规范哨兵（Rust 侧单一事实源）。
+///
+/// 适用面：受控 code 在全部解析轨（AOT Concept 枚举 / semantic.pack 动态规范词典 /
+/// 静态别名表 / 前缀 slug 兜底）均落空、`tag_display` 按既有契约原样回吐裸 code 时，
+/// 调用方词形闸统一降级到本哨兵，**严禁把裸受控 code 当展示名写入用户可见路径**
+/// （name_path / 展示名入场等）。与桌面端 `SENTINEL_NAMES.UNCLASSIFIED` 约定同构。
+pub fn unclassified_display(lang: &str) -> String {
+    if lang.trim().to_lowercase().starts_with("zh") {
+        "未归类".to_string()
+    } else {
+        "Unclassified".to_string()
+    }
+}
+
 /// 将标准 tag_code 反查对应语言的规范展示名称 (若未查到则提取 slug 兜底)
 pub fn tag_display(code: &str, lang: &str) -> String {
     let clean_code = code.trim();
@@ -589,7 +603,7 @@ pub fn tag_display(code: &str, lang: &str) -> String {
             if let Some(zh) = code_to_canonical_zh().get(clean_code) {
                 return zh.clone();
             }
-            return if is_zh { "未归类".to_string() } else { "Unclassified".to_string() };
+            return unclassified_display(lang);
         }
         return stripped.replace('_', " ");
     }
@@ -602,6 +616,40 @@ pub fn tag_display(code: &str, lang: &str) -> String {
     }
 
     clean_code.to_string()
+}
+
+/// 展示名解析 + **语言降级（en 兜底）** + 词形闸，用户可见路径的唯一安全入口。
+///
+/// ## 降级链（依 `docs/features/ai/task-omw-display-name-code-leak-and-build-time-en-fallback.md` 裁定）
+///
+/// 裁定原文：「概念在本语言缺词形时，**必须在构建期用英文词形兜底**，严禁把 code 当词形落库」。
+/// 构建期由 `build-semantic-pack.ts::runInsertAlias` 的 R-C 词形红线落实（`lemma === tagCode`
+/// 时回落 `codeToNameEn`），故健康 pack 的 `tag_aliases_zh_CN` 在中文缺词形处存的就是英文词形。
+/// 但构建期只覆盖「有 zh 行但词形退化成 code」，「zh 侧零行」分支（实测 5,892 个 omw/hownet code）
+/// 不会进入 `runInsertAlias`，此时运行时必须自行完成同一降级，否则会回吐裸 code：
+///
+/// 1. 请求语言 canonical（`tag_display`）；
+/// 2. 请求语言缺失（回吐裸 code）→ **英文 canonical 兜底**（en 兜底方向：中文缺词形用英文名）；
+/// 3. 英文亦缺失 → [`unclassified_display`] 哨兵（**严禁回吐裸受控 code**）。
+///
+/// 与 `tag_display` 的分工：`tag_display` 保留「解析不到即回吐 code」的既有契约（fusion.rs
+/// 多处 `canon != code` 词形闸依赖它做「弃用/回落入参词形」判定）；本函数供**必须产出可读串**的
+/// 展示路径（name_path 物化等）使用。
+pub fn tag_display_with_fallback(code: &str, lang: &str) -> String {
+    let clean_code = code.trim();
+    let primary = tag_display(clean_code, lang);
+    if primary != clean_code {
+        return primary;
+    }
+    // en 兜底：仅当请求语言不是 en 时才需要跨语回退（en 自身已在 primary 试过）
+    let norm = normalize_language_code(lang);
+    if norm != "en" {
+        let en = tag_display(clean_code, "en");
+        if en != clean_code {
+            return en;
+        }
+    }
+    unclassified_display(lang)
 }
 
 /// 受控 code → [`crate::concepts::Concept`]（**跨注册表桥接，唯一收口**）。
@@ -678,6 +726,59 @@ pub fn builtin_tag_code(tag: &str) -> Option<&'static str> {
     let en = alias_map().get(&key)?;
     // 再取 code 的 'static 引用
     en_to_code().get(en.as_str()).map(|s| s.as_str())
+}
+
+/// 判断受控概念是否为纯图片专有维度（截图细分、摄影照片细分等）。
+/// 全媒体排他门禁铁律：非视觉介质（如音频、文档）以及非静态图片介质（如视频）严禁挂载此类概念。
+pub fn is_image_exclusive_concept(concept_item: crate::concepts::Concept) -> bool {
+    use crate::concepts::Concept;
+    matches!(
+        concept_item,
+        Concept::截图
+            | Concept::截图细分
+            | Concept::Windows截图
+            | Concept::macOS截图
+            | Concept::iOS截图
+            | Concept::Android截图
+            | Concept::Linux截图
+            | Concept::网页长截图
+            | Concept::UI界面截图
+            | Concept::聊天截图
+            | Concept::代码截图
+            | Concept::游戏截图
+            | Concept::支付凭证截图
+            | Concept::系统报错截图
+            | Concept::社交动态截图
+            | Concept::影视视频截图
+            | Concept::文档截图
+            | Concept::地图导航截图
+            | Concept::终端控制台截图
+            | Concept::订单物流截图
+            | Concept::桌面全屏截图
+            | Concept::摄影照片
+            | Concept::摄影照片细分
+            | Concept::建筑摄影
+            | Concept::微距摄影
+            | Concept::故障摄影
+            | Concept::风景照
+            | Concept::人物照
+            | Concept::婚纱照
+            | Concept::街拍抓拍
+            | Concept::夜景照
+    )
+}
+
+/// 判断标签字符串（展示名、多语言别名或受控 code）是否属于纯图片专有维度。
+/// 经 `concept_from_code_or_alias` 统一桥接，支持多语言展示名与受控代码。
+pub fn is_image_exclusive_tag(tag: &str) -> bool {
+    let clean = tag.trim();
+    if clean.is_empty() {
+        return false;
+    }
+    if let Some(target_concept) = concept_from_code_or_alias(clean) {
+        return is_image_exclusive_concept(target_concept);
+    }
+    false
 }
 
 /// 基于客观字符分布与语言学特征识别受控语言事实 (Zero False Positive, 宁缺勿错)
@@ -1667,6 +1768,39 @@ mod tests {
         assert_eq!(concept_from_language_code("en-US"), Some(Concept::英文));
         assert_eq!(concept_from_language_code("japanese"), Some(Concept::日语));
         assert_eq!(concept_from_language_code("unknown_code"), None);
+    }
+
+    #[test]
+    fn test_is_image_exclusive_tag_coverage() {
+        // 1. 截图家族：涵盖多语言别名、中文名与受控 code
+        assert!(is_image_exclusive_tag("截图"));
+        assert!(is_image_exclusive_tag("Screenshot"));
+        assert!(is_image_exclusive_tag("hownet.000000135085.v"));
+        assert!(is_image_exclusive_tag("Windows截图"));
+        assert!(is_image_exclusive_tag("builtin.windows_screenshot"));
+        assert!(is_image_exclusive_tag("游戏截图"));
+        assert!(is_image_exclusive_tag("builtin.game_screenshot"));
+        assert!(is_image_exclusive_tag("UI界面截图"));
+        assert!(is_image_exclusive_tag("聊天截图"));
+
+        // 2. 摄影照片家族：涵盖摄影题材细分
+        assert!(is_image_exclusive_tag("摄影照片"));
+        assert!(is_image_exclusive_tag("builtin.photography"));
+        assert!(is_image_exclusive_tag("风景照"));
+        assert!(is_image_exclusive_tag("builtin.landscape_photos"));
+        assert!(is_image_exclusive_tag("人物照"));
+        assert!(is_image_exclusive_tag("婚纱照"));
+        assert!(is_image_exclusive_tag("夜景照"));
+        assert!(is_image_exclusive_tag("建筑摄影"));
+        assert!(is_image_exclusive_tag("微距摄影"));
+
+        // 3. 负例：通用多模态或视频适用的内容标签不得被误杀
+        assert!(!is_image_exclusive_tag("猫"));
+        assert!(!is_image_exclusive_tag("黄昏"));
+        assert!(!is_image_exclusive_tag("实拍"));
+        assert!(!is_image_exclusive_tag("全彩"));
+        assert!(!is_image_exclusive_tag("有字图"));
+        assert!(!is_image_exclusive_tag(""));
     }
 
     #[test]
