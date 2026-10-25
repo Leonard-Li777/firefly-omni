@@ -435,7 +435,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.security_level": {
+  "omw.14428404.n": {
     "id": 17,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1412,7 +1412,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.illumination": {
+  "omw.03769397.n": {
     "id": 138,
     "threshold": 0.6,
     "applicableFileTypes": [
