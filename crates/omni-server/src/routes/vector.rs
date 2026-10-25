@@ -811,6 +811,8 @@ fn clip_text_encode_semaphore() -> &'static tokio::sync::Semaphore {
 #[serde(rename_all = "camelCase")]
 pub struct EmbedClipTextRequest {
     pub text: String,
+    #[serde(default)]
+    pub lang: Option<String>,
 }
 
 /// CLIP 文本编码响应体（规格 §4.2 契约）
@@ -835,6 +837,7 @@ pub struct EmbedClipTextResponse {
 fn clip_text_error(
     status: StatusCode,
     error: &'static str,
+    encoder_id: u8,
 ) -> (StatusCode, Json<EmbedClipTextResponse>) {
     (
         status,
@@ -842,7 +845,7 @@ fn clip_text_error(
             success: false,
             vector: Vec::new(),
             dim: omni_pro::vision::CLIP_TEXT_DIM,
-            encoder_id: omni_pro::vector_engine::encoder_id::CHINESE_CLIP,
+            encoder_id,
             cold_start: false,
             // 失败路径不东拼西凑：`encode_ms` 恒 0（未发生编码），
             // 不拿「请求总耗时」冒充编码耗时（那会把并发排队时间算成推理时间）。
@@ -865,8 +868,20 @@ pub async fn embed_clip_text_handler(
     Json(req): Json<EmbedClipTextRequest>,
 ) -> Result<Json<EmbedClipTextResponse>, (StatusCode, Json<EmbedClipTextResponse>)> {
     let text = req.text.trim().to_string();
+    let lang = req.lang.clone();
+    let is_zh = lang.as_deref().map(|l| l.starts_with("zh")).unwrap_or(true);
+    let default_encoder_id = if is_zh {
+        omni_pro::vector_engine::encoder_id::CHINESE_CLIP
+    } else {
+        omni_pro::vector_engine::encoder_id::MOBILE_CLIP
+    };
+
     if text.is_empty() {
-        return Err(clip_text_error(StatusCode::UNPROCESSABLE_ENTITY, "empty_text"));
+        return Err(clip_text_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "empty_text",
+            default_encoder_id,
+        ));
     }
 
     // 并发上限：Semaphore(2) + 200ms 等待上限，超限即 429 busy（不算失败、不计熔断）
@@ -878,7 +893,11 @@ pub async fn embed_clip_text_handler(
     {
         Ok(Ok(permit)) => permit,
         _ => {
-            return Err(clip_text_error(StatusCode::TOO_MANY_REQUESTS, "busy"));
+            return Err(clip_text_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "busy",
+                default_encoder_id,
+            ));
         }
     };
 
@@ -887,51 +906,62 @@ pub async fn embed_clip_text_handler(
         let _permit = permit;
         let clip_dir = match omni_pro::OmniVisionEngine::resolve_clip_model_dir() {
             Some(d) => d,
-            None => return Err(("model_missing", 0u128, 0u128)),
+            None => return Err(("model_missing", default_encoder_id, 0u128, 0u128)),
         };
-        // 三件套只读探测（不加载模型）：模型 + 词表
-        if !omni_pro::vision::clip_text_model_ready(&clip_dir) {
-            return Err(("model_missing", 0u128, 0u128));
-        }
-        if !omni_pro::vision::clip_text_vocab_ready(&clip_dir) {
-            return Err(("vocab_missing", 0u128, 0u128));
+        // 探活检查：根据语言判断 Chinese-CLIP 还是 MobileCLIP
+        if is_zh {
+            if !omni_pro::vision::clip_text_model_ready(&clip_dir) {
+                return Err(("model_missing", default_encoder_id, 0u128, 0u128));
+            }
+            if !omni_pro::vision::clip_text_vocab_ready(&clip_dir) {
+                return Err(("vocab_missing", default_encoder_id, 0u128, 0u128));
+            }
+        } else {
+            if !omni_pro::vision::mobileclip_text_model_ready(&clip_dir) {
+                return Err(("model_missing", default_encoder_id, 0u128, 0u128));
+            }
+            if !omni_pro::vision::mobileclip_tokenizer_ready(&clip_dir) {
+                return Err(("vocab_missing", default_encoder_id, 0u128, 0u128));
+            }
         }
 
-        // `loadMs` / `encodeMs` 由引擎侧分开计时（R4 复核：此前 load 含编码、encode 恒 0）
-        // 预热/加载：内部经 Tier 3 看门狗惰性加载（300s 空闲释放），get_or_load 即单飞入口
-        let cold_start = omni_pro::vision::clip_text_session_is_cold();
+        let cold_start = if is_zh {
+            omni_pro::vision::clip_text_session_is_cold()
+        } else {
+            omni_pro::vision::mobileclip_text_session_is_cold()
+        };
         let encoded =
-            omni_pro::OmniVisionEngine::encode_text_with_clip_timed(&text, &clip_dir);
+            omni_pro::OmniVisionEngine::encode_clip_text_timed(&text, &clip_dir, lang.as_deref());
 
         match encoded {
-            Ok((v, load_ms, encode_ms)) => Ok((v, cold_start, load_ms, encode_ms)),
+            Ok((v, encoder_id, load_ms, encode_ms)) => Ok((v, encoder_id, cold_start, load_ms, encode_ms)),
             // 失败原因由引擎侧直接给出（model_missing/vocab_missing/
             // unsupported_text_output/load_failed），此处只做透传
-            Err(reason) => Err((reason, 0u128, 0u128)),
+            Err(reason) => Err((reason, default_encoder_id, 0u128, 0u128)),
         }
     })
     .await;
 
     match joined {
-        Ok(Ok((vector, cold_start, load_ms, encode_ms))) => Ok(Json(EmbedClipTextResponse {
+        Ok(Ok((vector, encoder_id, cold_start, load_ms, encode_ms))) => Ok(Json(EmbedClipTextResponse {
             success: true,
             dim: vector.len(),
             vector,
-            encoder_id: omni_pro::vector_engine::encoder_id::CHINESE_CLIP,
+            encoder_id,
             cold_start,
             load_ms,
             encode_ms,
             error: None,
         })),
-        Ok(Err((reason, _, _))) => {
+        Ok(Err((reason, encoder_id, _, _))) => {
             // 四个已登记原因（model_missing / vocab_missing /
             // unsupported_text_output / load_failed）一律 503；
             // 未登记原因同样按 503 处理，**永不降级/升级为 504**。
-            Err(clip_text_error(StatusCode::SERVICE_UNAVAILABLE, reason))
+            Err(clip_text_error(StatusCode::SERVICE_UNAVAILABLE, reason, encoder_id))
         }
         Err(join_err) => {
             tracing::warn!("CLIP 文本编码任务 panic: {join_err}");
-            Err(clip_text_error(StatusCode::SERVICE_UNAVAILABLE, "load_failed"))
+            Err(clip_text_error(StatusCode::SERVICE_UNAVAILABLE, "load_failed", default_encoder_id))
         }
     }
 }
@@ -1087,7 +1117,7 @@ mod tests {
             (StatusCode::SERVICE_UNAVAILABLE, "load_failed"),
         ] {
             let (got_status, Json(body)) =
-                clip_text_error(status, code);
+                clip_text_error(status, code, encoder_id::CHINESE_CLIP);
             assert_eq!(got_status, status, "{code} 的状态码必须稳定");
             assert_eq!(body.error.as_deref(), Some(code));
             assert!(!body.success);
@@ -1109,7 +1139,7 @@ mod tests {
             "unsupported_text_output",
             "load_failed",
         ] {
-            let (status, _) = clip_text_error(StatusCode::SERVICE_UNAVAILABLE, code);
+            let (status, _) = clip_text_error(StatusCode::SERVICE_UNAVAILABLE, code, encoder_id::CHINESE_CLIP);
             assert_ne!(status, StatusCode::GATEWAY_TIMEOUT, "{code} 不得映射为 504");
         }
     }
@@ -1123,6 +1153,11 @@ mod tests {
 
         let missing: Result<EmbedClipTextRequest, _> = serde_json::from_str(r#"{}"#);
         assert!(missing.is_err(), "缺 text 必须反序列化失败（后续走 422）");
+
+        let req_with_lang: EmbedClipTextRequest =
+            serde_json::from_str(r#"{"text":"a red car","lang":"en"}"#).expect("带 lang 的请求必须可解析");
+        assert_eq!(req_with_lang.text, "a red car");
+        assert_eq!(req_with_lang.lang.as_deref(), Some("en"));
     }
 
     /// 并发上限：`Semaphore(2)` —— 第三次 acquire 在 200ms 预算内必然拿不到许可
@@ -1197,6 +1232,15 @@ mod tests {
         // 非空词表 → 就绪
         std::fs::write(dir.join("cn_clip_vocab.txt"), "[PAD]\n[UNK]\ncat\n").expect("写词表");
         assert!(omni_pro::vision::clip_text_vocab_ready(&dir));
+
+        // MobileCLIP 探活只读断言
+        assert!(!omni_pro::vision::mobileclip_text_model_ready(&empty));
+        assert!(!omni_pro::vision::mobileclip_tokenizer_ready(&empty));
+        std::fs::write(dir.join("mobileclip-b-int8-text.onnx"), b"not-a-real-model").expect("写桩文件");
+        assert!(omni_pro::vision::mobileclip_text_model_ready(&dir));
+        assert!(!omni_pro::vision::mobileclip_tokenizer_ready(&dir));
+        std::fs::write(dir.join("mobileclip-tokenizer.json"), vec![b'a'; 200]).expect("写桩分词器");
+        assert!(omni_pro::vision::mobileclip_tokenizer_ready(&dir));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
