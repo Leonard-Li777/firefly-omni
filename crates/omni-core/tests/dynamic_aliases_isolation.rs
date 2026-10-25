@@ -17,7 +17,7 @@
 use omni_core::tag_identity::{
     builtin_tag_code, clear_dynamic_aliases, detect_tag_language, load_aliases_for_lang,
     load_aliases_from_entries, normalize_tag_to_code, resolve_controlled_tag_code,
-    resolve_controlled_tag_two_stage, tag_display, tag_matches_concept,
+    resolve_controlled_tag_two_stage, tag_display, tag_display_with_fallback, tag_matches_concept,
 };
 
 /// 文件内串行门：两个用例都会 `clear_dynamic_aliases()`，必须互斥（否则互踩）。
@@ -254,6 +254,43 @@ fn tag_display_resolves_dynamic_canonical_for_omw_and_hownet() {
 
     // 完全未登录的 code 保持旧行为（原样返回）
     assert_eq!(tag_display("omw.99999999.n", "zh-CN"), "omw.99999999.n");
+
+    clear_dynamic_aliases();
+}
+
+/// 降级链守卫（裁定：`docs/features/ai/task-omw-display-name-code-leak-and-build-time-en-fallback.md`）：
+/// 「概念在本语言缺词形时，必须在构建期用英文词形兜底，严禁把 code 当词形落库」。
+///
+/// 构建期 `runInsertAlias` 的 R-C 红线只覆盖「有 zh 行但词形退化成 code」；
+/// 「zh 侧零行」分支（实测 pack 内 5,892 个 omw/hownet code）不会进入该红线，
+/// 故运行时展示路径必须自带 en 兜底，且 en 亦缺失时才落未归类哨兵。
+#[test]
+fn tag_display_with_fallback_degrades_missing_zh_to_en() {
+    let _guard = serial();
+    clear_dynamic_aliases();
+
+    // 生产同构分布：zh 侧有 电信/视频，缺口节点 omw.06276697.n 仅 en 侧有 broadcasting
+    load_aliases_for_lang(
+        "zh",
+        vec![("电信", "omw.06271778.n", true), ("视频", "omw.06277280.n", true)],
+    );
+    load_aliases_for_lang("en", vec![("broadcasting", "omw.06276697.n", true)]);
+
+    // 1. 中文有词形 → 中文（降级不得反噬正常解析）
+    assert_eq!(tag_display_with_fallback("omw.06271778.n", "zh"), "电信");
+    assert_eq!(tag_display_with_fallback("omw.06271778.n", "zh-CN"), "电信");
+
+    // 2. 中文零行 + 英文有词形 → 英文 canonical 兜底（不得回吐 code、不得落哨兵）
+    assert_eq!(tag_display_with_fallback("omw.06276697.n", "zh"), "broadcasting");
+    assert_eq!(tag_display_with_fallback("omw.06276697.n", "zh-CN"), "broadcasting");
+
+    // 3. 全部语言均无词形 → 未归类哨兵（严禁裸受控 code 外溢）
+    assert_eq!(tag_display_with_fallback("omw.99999999.n", "zh"), "未归类");
+    assert_eq!(tag_display_with_fallback("omw.99999999.n", "en"), "Unclassified");
+
+    // 4. 契约不变：tag_display 仍回吐裸 code（fusion.rs 词形闸依赖此契约判定弃用）
+    assert_eq!(tag_display("omw.06276697.n", "zh"), "omw.06276697.n");
+    assert_eq!(tag_display("omw.99999999.n", "zh"), "omw.99999999.n");
 
     clear_dynamic_aliases();
 }
