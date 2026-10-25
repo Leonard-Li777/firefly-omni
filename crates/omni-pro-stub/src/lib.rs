@@ -153,6 +153,41 @@ pub mod cover {
 
 pub use cover::{raw_to_webp, CoverRenderer};
 
+
+pub mod representative {
+    use image::RgbImage;
+
+    #[derive(Clone, Debug)]
+    pub struct RepresentativeFrameCandidate {
+        pub score: f32,
+        pub timestamp_sec: f64,
+        pub scan_index: usize,
+        pub frame: RgbImage,
+    }
+
+    pub struct RepresentativeFrameSelector {
+        _total_duration_sec: f64,
+        _total_planned_frames: usize,
+    }
+
+    impl RepresentativeFrameSelector {
+        pub fn new(total_duration_sec: f64, total_planned_frames: usize) -> Self {
+            Self {
+                _total_duration_sec: total_duration_sec,
+                _total_planned_frames: total_planned_frames,
+            }
+        }
+        pub fn observe(&mut self, _frame: &RgbImage, _timestamp_sec: f64, _scan_index: usize) {}
+        pub fn finish(self) -> Option<RgbImage> {
+            None
+        }
+        pub fn finish_with_candidate(self) -> Option<RepresentativeFrameCandidate> {
+            None
+        }
+    }
+}
+pub use representative::*;
+
 pub mod perceive {
     use std::path::Path;
 
@@ -318,6 +353,80 @@ pub mod perceive {
         _audio_analysis_duration_sec: Option<f64>,
     ) -> (Vec<omni_core::OmniVideoChunk>, VideoProcessTimings) {
         (Vec::new(), VideoProcessTimings::default())
+    }
+
+    pub fn process_video_time_chunks_with_representative(
+        _video_path: &Path,
+        _sampling_interval_seconds: f32,
+        _asr_text: Option<&str>,
+        _soft_token_budget: usize,
+        _audio_analysis_duration_sec: Option<f64>,
+    ) -> (Vec<omni_core::OmniVideoChunk>, VideoProcessTimings, Option<image::RgbImage>) {
+        (Vec::new(), VideoProcessTimings::default(), None)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ShotDetectDegrade {
+        FilterUnavailable,
+        InvocationFailed,
+        EmptyOutput,
+    }
+
+    impl ShotDetectDegrade {
+        pub fn is_expected(&self) -> bool {
+            matches!(self, Self::FilterUnavailable)
+        }
+    }
+
+    pub const MAX_SCDET_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+    pub const SCDET_DEFAULT_THRESHOLD: f64 = 10.0;
+
+    pub fn parse_scdet_cuts(_output: &str) -> Result<Vec<f64>, ShotDetectDegrade> {
+        Ok(Vec::new())
+    }
+
+    pub fn split_video_by_shots(
+        _total_duration_sec: f32,
+        _cuts: &[f64],
+        _max_chunk_sec: f32,
+    ) -> Vec<(usize, f32, f32)> {
+        Vec::new()
+    }
+
+    pub fn detect_shot_cuts(_ffmpeg_path: &Path, _video_path: &Path) -> Result<Vec<f64>, ShotDetectDegrade> {
+        Err(ShotDetectDegrade::FilterUnavailable)
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct VideoShotBudget {
+        pub selected_shots: Vec<(usize, f32, f32)>,
+        pub analysis_duration_sec: f64,
+        pub truncated: bool,
+        pub estimated_cost_sec: f64,
+    }
+
+    pub fn solve_video_shots_budget(
+        _total_duration_sec: f64,
+        _raw_cuts: &[f64],
+        _soft_token_budget: usize,
+        _asr_cap_sec: f64,
+    ) -> VideoShotBudget {
+        VideoShotBudget {
+            selected_shots: Vec::new(),
+            analysis_duration_sec: 0.0,
+            truncated: false,
+            estimated_cost_sec: 0.0,
+        }
+    }
+
+    pub fn detect_shot_cuts_with_options(
+        _ffmpeg_path: &Path,
+        _video_path: &Path,
+        _threshold: f64,
+        _duration_sec: Option<f64>,
+        _max_probe_sec: Option<f64>,
+    ) -> Result<Vec<f64>, ShotDetectDegrade> {
+        Err(ShotDetectDegrade::FilterUnavailable)
     }
 }
 
