@@ -492,6 +492,15 @@ pub struct MatchPassagesItem {
 pub struct MatchPassagesRequest {
     pub query: String,
     pub items: Vec<MatchPassagesItem>,
+    /// 当前嵌入档位：`classic_light` (bekko-a8m 384d) | `gemma_unified` (EmbeddingGemma 文本塔 MRL 256/512/768d)。
+    /// 缺省按 `classic_light` 处理（兼容 ADR-0039 历史契约与既有测试）。
+    /// gemma_unified 档位下**严禁**回退 bekko-a8m——那正是「已选 gemma 却仍在加载 bekko 模型」的缺陷根因。
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// gemma_unified 档位的目标 MRL 维度；缺省时取引擎当前 MRL 维度。
+    /// 仅 256/512/768 合法，其余值忽略并按引擎维度处理。
+    #[serde(default)]
+    pub dim: Option<usize>,
 }
 
 /// 单文件最佳段落对齐命中结果
@@ -514,14 +523,16 @@ pub struct MatchPassagesResponse {
     pub error: Option<String>,
 }
 
-/// 段落嵌入进程级缓存：key = 文本 FNV-1a 哈希，value = L2 归一化 384d 向量
-/// 用于 match-passages 重复候选段落命中时跳过 ONNX 冷推理，对齐 ADR-0039「按需动态计算」性能契约
-static PASSAGE_EMBED_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Vec<f32>>>> =
+/// 段落嵌入进程级缓存：key = 档位|维度|文本 FNV-1a 哈希，value = L2 归一化向量
+/// 用于 match-passages 重复候选段落命中时跳过 ONNX 冷推理，对齐 ADR-0039「按需动态计算」性能契约。
+/// key 必须含档位与维度：同一段落在 classic_light (bekko 384d) 与 gemma_unified (MRL) 下
+/// 产出的是不同空间、不同维度的向量，混用缓存会造成跨空间余弦误算。
+static PASSAGE_EMBED_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>> =
     std::sync::OnceLock::new();
 
 const PASSAGE_EMBED_CACHE_MAX: usize = 8192;
 
-fn passage_cache() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Vec<f32>>> {
+fn passage_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>> {
     PASSAGE_EMBED_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -534,18 +545,47 @@ fn fnv1a64(text: &str) -> u64 {
     h
 }
 
-/// 获取段落向量：优先命中进程级缓存，否则调用 BekkoEmbedder（常驻 OnceLock 会话）并回填
+/// 段落对齐编码器：按当前嵌入档位选择文本塔。
+///
+/// - `Bekko`：classic_light 档，bekko-a8m 384d（ADR-0039 原始契约）；
+/// - `Gemma`：gemma_unified 档，EmbeddingGemma 文本塔 + MRL 截断到目标维度。
+///
+/// 双档位向量空间正交（384d bekko 与 256/512/768d Gemma MRL 不兼容），编码器必须与
+/// 库内槽位向量的编码器一致，否则余弦相似度跨空间无意义。
+enum PassageEncoder {
+    Bekko(omni_pro::text::BekkoEmbedder),
+    Gemma { dim: usize },
+}
+
+impl PassageEncoder {
+    /// 按档位编码单段文本（L2 归一化）。gemma 档位编码失败时显式返回错误，
+    /// 由调用方上报 400，严禁静默回退 bekko（避免再次加载已退役档位的模型）。
+    fn encode(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        match self {
+            Self::Bekko(embedder) => embedder.embed(text),
+            Self::Gemma { dim } => {
+                let vec = omni_pro::OmniVisionEngine::encode_gemma_text(text)?;
+                crate::fit_embedding_to_dim(vec, *dim).ok_or_else(|| {
+                    anyhow::anyhow!("gemma 文本向量无法对齐到目标 MRL 维度 {}d", dim)
+                })
+            }
+        }
+    }
+}
+
+/// 获取段落向量：优先命中进程级缓存，否则按当前档位编码并回填
 fn embed_passage_cached(
-    embedder: &omni_pro::text::BekkoEmbedder,
+    encoder: &PassageEncoder,
+    cache_scope: &str,
     passage: &str,
 ) -> anyhow::Result<Vec<f32>> {
-    let key = fnv1a64(passage);
+    let key = format!("{}|{}", cache_scope, fnv1a64(passage));
     if let Ok(cache) = passage_cache().lock() {
         if let Some(v) = cache.get(&key) {
             return Ok(v.clone());
         }
     }
-    let vec = embedder.embed(passage)?;
+    let vec = encoder.encode(passage)?;
     if let Ok(mut cache) = passage_cache().lock() {
         if cache.len() >= PASSAGE_EMBED_CACHE_MAX {
             cache.clear();
@@ -557,19 +597,49 @@ fn embed_passage_cached(
 
 /// 密集向量段落对齐处理器: POST /api/v1/vector/match-passages
 ///
-/// 依据 ADR-0039 与 PRD 0039 契约：
-/// 1. 仅对 query 编码 1 次生成 384 维特征向量；
-/// 2. 利用 bekko-a8m 常驻会话对候选段落批量打分（段落向量进程级缓存，重复候选零推理）；
+/// 依据 ADR-0039 与 PRD 0039 契约，并按双档位模型（embeddinggemma 规格 §2.1）分派文本塔：
+/// 1. 仅对 query 编码 1 次生成当前档位特征向量；
+/// 2. 利用当前档位常驻会话对候选段落批量打分（段落向量进程级缓存，重复候选零推理）；
 /// 3. 返回最佳匹配段落及其下标与相似度；小样本冷路径目标 <15ms，缓存命中路径为纯点积。
+///
+/// 档位分派：`gemma_unified` → EmbeddingGemma 文本塔（MRL 256/512/768d，与库内 gemma 槽位同空间）；
+/// 缺省/`classic_light` → bekko-a8m 384d（历史契约不变）。gemma 档位编码失败返回 400，
+/// 严禁静默回退 bekko——那会让「已选 gemma_unified」的会话再次加载 bekko-a8m 模型。
 pub async fn match_passages_handler(
     Json(req): Json<MatchPassagesRequest>,
 ) -> Result<Json<MatchPassagesResponse>, (StatusCode, Json<MatchPassagesResponse>)> {
     let start = Instant::now();
 
+    // 档位判定与 batch-embed-text 同源：profile 含 gemma 即 gemma_unified；
+    // 目标维度仅接受合法 MRL 槽位，非法值回退引擎当前 MRL 维度。
+    let is_gemma = req
+        .profile
+        .as_deref()
+        .map(|p| p.to_ascii_lowercase().contains("gemma"))
+        .unwrap_or(false);
+    let target_dim = if is_gemma {
+        req.dim
+            .filter(|d| matches!(d, 256 | 512 | 768))
+            .unwrap_or_else(omni_pro::OmniVisionEngine::gemma_mrl_dimension)
+    } else {
+        384
+    };
+    // 段落缓存作用域：档位 + 维度，杜绝 classic/gemma 向量串用（见 PASSAGE_EMBED_CACHE 注释）
+    let cache_scope = if is_gemma {
+        format!("gemma_unified|{target_dim}")
+    } else {
+        "classic_light|384".to_string()
+    };
+
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<PassageMatchResult>> {
-        let embedder = omni_pro::text::BekkoEmbedder::new();
-        // 核心契约：query 仅单次编码 (384d)
-        let query_vec = embedder.embed(&req.query)?;
+        // 按当前嵌入档位装配编码器：gemma_unified 走 EmbeddingGemma 文本塔，classic_light 走 bekko-a8m
+        let encoder = if is_gemma {
+            PassageEncoder::Gemma { dim: target_dim }
+        } else {
+            PassageEncoder::Bekko(omni_pro::text::BekkoEmbedder::new())
+        };
+        // 核心契约：query 仅单次编码
+        let query_vec = encoder.encode(&req.query)?;
 
         let mut matches = Vec::with_capacity(req.items.len());
 
@@ -589,7 +659,7 @@ pub async fn match_passages_handler(
             let mut best_text = String::new();
 
             for (idx, passage) in item.passages.iter().enumerate() {
-                let p_vec = embed_passage_cached(&embedder, passage)?;
+                let p_vec = embed_passage_cached(&encoder, &cache_scope, passage)?;
                 let sim = omni_pro::text::BekkoEmbedder::cosine_similarity(&query_vec, &p_vec);
                 if sim > best_sim {
                     best_sim = sim;

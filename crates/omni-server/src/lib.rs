@@ -2799,6 +2799,32 @@ async fn perceive_file_handler(
         ),
     };
 
+    // 8.5 全文本打标 (Ticket 01 & Ticket 04 text_tags)
+    let extracted_text_tags = if is_pro {
+        static GLOBAL_TEXT_VECTOR_TABLE: std::sync::OnceLock<Option<omni_pro::text::PrecomputedVectorTable>> =
+            std::sync::OnceLock::new();
+        let vt_ref = GLOBAL_TEXT_VECTOR_TABLE.get_or_init(|| {
+            omni_pro::text::PrecomputedVectorTable::discover_table_path()
+                .and_then(|p| omni_pro::text::PrecomputedVectorTable::load_from_file(p).ok())
+        });
+
+        if asr.is_some() || lrc.is_some() {
+            omni_pro::text::TextTagger::tag_asr_or_lrc(asr.as_deref(), lrc.as_deref(), vt_ref.as_ref())
+        } else if !is_image && !markdown_content.trim().is_empty() {
+            omni_pro::text::TextTagger::tag_text(&markdown_content, Some("document"), vt_ref.as_ref())
+        } else if let Some(ref ocr) = ocr_text {
+            if !ocr.trim().is_empty() {
+                omni_pro::text::TextTagger::tag_text(ocr, Some("ocr"), vt_ref.as_ref())
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
     // 9. 第三阶段: 双锚点交叉向量验证与多模态终局融合 (Task 626)
     // 汇聚第二阶段收集到的所有多模态异构信息为 MultimodalContext
     let current_policies = state.dimension_policies.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -2812,7 +2838,7 @@ async fn perceive_file_handler(
         audio_transcript: asr.clone(),
         lrc_text: lrc.clone(),
         visual_tags: structured_visual_tags.clone(),
-        text_tags: Vec::new(),
+        text_tags: extracted_text_tags.clone(),
         exif_metadata: metadata.clone(),
         is_image,
         is_video,
@@ -2937,6 +2963,11 @@ async fn perceive_file_handler(
         .collect();
 
     let fused_tags: Vec<omni_core::TagChainItem> = fused_tags
+        .into_iter()
+        .map(backfill_chain_item)
+        .collect();
+
+    let extracted_text_tags: Vec<omni_core::TagChainItem> = extracted_text_tags
         .into_iter()
         .map(backfill_chain_item)
         .collect();
@@ -3258,7 +3289,7 @@ async fn perceive_file_handler(
             .map(|d| d as f32),
         video_truncated: video_timings.as_ref().and_then(|t| t.video_truncated),
         cover_webp_base64: video_cover_webp_base64,
-        text_tags: Vec::new(),
+        text_tags: extracted_text_tags,
         video_chunks,
         vector_saved: None,
     });
@@ -4993,5 +5024,85 @@ mod representative_vision_tests {
         assert!(!test_tags.contains(&"风景照".to_string()), "图片专有维度 风景照 必须被门禁剔除");
         assert!(!test_tags.contains(&"夜景照".to_string()), "图片专有维度 夜景照 必须被门禁剔除");
         assert!(!test_tags.contains(&"建筑摄影".to_string()), "图片专有维度 建筑摄影 必须被门禁剔除");
+    }
+
+    #[test]
+    fn test_video_multimodal_fused_tags_with_rep_frame() {
+        // 1. 构造音视频视听双模态上下文
+        let asr_text = "今天我们在这堂公开课上，带领大家深入研讨这部伟大的小说，现场气氛十分热烈激昂。";
+        // 通过 TextTagger 提取 ASR 文本标签
+        let text_tags = omni_pro::text::TextTagger::tag_asr_or_lrc(Some(asr_text), None, None);
+        assert!(!text_tags.is_empty(), "必须从 ASR 文本中提取出文本标签");
+
+        // 2. 构造代表帧视觉标签（画面主体：猫咪，场景：草地）
+        let visual_tags = vec![
+            omni_core::TagChainItem {
+                code: "omw.02121620.n".to_string(), // 猫咪
+                name: "猫咪".to_string(),
+                confidence: 0.92,
+                via_parent_code: Some("builtin.content_tags".to_string()),
+                parent_codes: vec!["builtin.content_tags".to_string()],
+                source: Some("visual".to_string()),
+                ..Default::default()
+            },
+            omni_core::TagChainItem {
+                code: "omw.08572105.n".to_string(), // 草地
+                name: "草地".to_string(),
+                confidence: 0.88,
+                via_parent_code: Some("builtin.content_tags".to_string()),
+                parent_codes: vec!["builtin.content_tags".to_string()],
+                source: Some("visual".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        // 3. 构建视频模式 MultimodalContext (is_video = true)
+        let ctx = omni_core::MultimodalContext {
+            file_path: "D:/test/lecture_cat.mp4".to_string(),
+            file_name: "lecture_cat.mp4".to_string(),
+            mime_type: "video/mp4".to_string(),
+            document_text: None,
+            ocr_text: None,
+            audio_transcript: Some(asr_text.to_string()),
+            lrc_text: None,
+            visual_tags,
+            text_tags: text_tags.clone(),
+            exif_metadata: serde_json::json!({}),
+            is_image: false,
+            is_video: true,
+            is_document: false,
+            is_audio_or_video: true,
+            language: Some("zh".to_string()),
+            dimension_policies: None,
+        };
+
+        // 4. 调用融合仲裁引擎
+        let outcome = omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate(&ctx);
+
+        // 5. 验证 fused_tags 聚合视听双模态特征
+        let fused_names: Vec<&str> = outcome.fused_tags.iter().map(|t| t.name.as_str()).collect();
+        println!("[DEBUG TEST] fused_names = {:?}", fused_names);
+        for tag in &outcome.fused_tags {
+            println!("  [fused_tag] code={}, name={}, conf={}, source={:?}", tag.code, tag.name, tag.confidence, tag.source);
+        }
+
+        // 必须包含画面特征（如 猫咪 或 草地）
+        assert!(
+            fused_names.contains(&"猫咪") || fused_names.contains(&"草地"),
+            "fused_tags 必须包含视频代表帧视觉画面特征，实际: {:?}",
+            fused_names
+        );
+
+        // 必须包含文本特征（如 小说 或 激昂 或 公开课）
+        assert!(
+            fused_names.contains(&"小说") || fused_names.contains(&"公开课") || fused_names.contains(&"激昂"),
+            "fused_tags 必须包含 ASR 语音文本提取的体裁/情绪特征，实际: {:?}",
+            fused_names
+        );
+
+        // 6. 验证视频介质不触发视觉污染惩罚（content_description 应正常生成）
+        assert!(outcome.content_description.is_some(), "视频介质代表帧视觉描述必须正常生成，不得被视觉污染一票否决");
+        let desc = outcome.content_description.as_ref().unwrap();
+        assert!(!desc.is_empty(), "描述句不得为空");
     }
 }

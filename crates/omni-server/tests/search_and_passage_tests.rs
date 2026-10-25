@@ -335,6 +335,84 @@ async fn test_vector_match_passages_cache_hit_is_fast() {
     );
 }
 
+/// 双档位契约回归：match-passages 必须按请求档位分派文本塔，gemma_unified 档位下严禁回退 bekko-a8m。
+///
+/// 缺陷背景：该端点早期无档位概念，恒用 BekkoEmbedder 编码 query 与段落，
+/// 导致「已选 gemma_unified 的会话仍加载 bekko-a8m 模型」且段落相似度跨向量空间无意义。
+#[tokio::test]
+async fn test_vector_match_passages_dual_profiles() {
+    let app = setup_test_app();
+
+    let build_req = |profile: &str, dim: usize| -> Request<Body> {
+        let payload = serde_json::json!({
+            "query": "2025年企业净利润与营业收入大幅增长",
+            "profile": profile,
+            "dim": dim,
+            "items": [{
+                "fileFingerprint": "fp_dual_profile",
+                "passages": [
+                    "本公司关于办公区空调节能与用电安全管理规范细则，请各部门严格遵守执行。",
+                    "2025年度报告显示，公司营业收入和净利润双双突破历史新高，各项经营财务指标表现强劲优异。",
+                    "关于组织全体员工参加秋季户外徒步及露营团建活动的日程安排与物资准备清单。"
+                ]
+            }]
+        });
+        Request::builder()
+            .uri("/api/v1/vector/match-passages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    };
+
+    // 1. classic_light (bekko-a8m 384d)：历史契约不变
+    let resp = app.clone().oneshot(build_req("classic_light", 384)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let classic: MatchPassagesResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(classic.matches.len(), 1);
+    assert_eq!(
+        classic.matches[0].best_passage_index, 1,
+        "classic 档位必须对齐到财务段落"
+    );
+
+    // 2. gemma_unified (EmbeddingGemma 文本塔 + MRL 512d)：必须成功编码，不得静默回退 bekko
+    let resp = app.clone().oneshot(build_req("gemma_unified", 512)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "gemma_unified 档位必须走 EmbeddingGemma 文本塔；返回非 200 说明回退或编码失败"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let gemma: MatchPassagesResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(gemma.matches.len(), 1);
+    assert_eq!(
+        gemma.matches[0].best_passage_index, 1,
+        "gemma 文本塔同样必须对齐到财务段落"
+    );
+    assert!(
+        gemma.matches[0].similarity >= -1.0 && gemma.matches[0].similarity <= 1.0,
+        "余弦相似度必须落在合法区间，当前: {}",
+        gemma.matches[0].similarity
+    );
+    // 两档位向量空间正交（384d bekko vs 512d Gemma MRL），同一 query/段落对的余弦不可能相等；
+    // 若相等说明段落缓存未按档位隔离（串用另一档位的 384d 向量）。
+    assert!(
+        (gemma.matches[0].similarity - classic.matches[0].similarity).abs() > 1e-6,
+        "classic 与 gemma 档位相似度相同 ⇒ 段落缓存未按档位隔离: classic={} gemma={}",
+        classic.matches[0].similarity,
+        gemma.matches[0].similarity
+    );
+
+    // 3. 非法 MRL 维度 (1024) 必须回退引擎当前维度而非报错/截断成零向量
+    let resp = app.oneshot(build_req("gemma_unified", 1024)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "非法 MRL 维度应回退引擎当前维度，不得直接失败"
+    );
+}
+
 #[tokio::test]
 async fn test_batch_embed_text_dual_profiles() {
     let app = setup_test_app();
