@@ -260,35 +260,73 @@ async fn engine_vision_evict_handler() -> Json<serde_json::Value> {
 }
 
 
+#[derive(Debug, Deserialize)]
+struct HealthQuery {
+    lang: Option<String>,
+}
+
 /// 健康检查：附 Pro 模块与地理/HowNet 子系统可用性，供前端 UI 与桌面端启动时探测
-/// 工单 10：`/health.clipText` 五字段探活。
+/// 工单 10：`/health.clipText` 五字段探活（支持按 lang 探测 Chinese-CLIP 与 MobileCLIP）。
 ///
 /// - `available`：仅在三件套（模型 + 词表 + 输出可验证）齐备时为 true；
 /// - `imageEncoder`：当前激活图像塔（`chinese_clip` / `mobileclip` / `none`）；
 /// - `textModelReady` / `vocabReady`：**只查文件存在与可读，不加载模型**；
 /// - `textOutputVerified`：三态 null（未加载）/ true / false（首次编码结果）。
-fn clip_text_health() -> serde_json::Value {
+fn clip_text_health(lang: Option<&str>) -> serde_json::Value {
     let clip_dir = omni_pro::OmniVisionEngine::resolve_clip_model_dir();
-    let (text_model_ready, vocab_ready) = match clip_dir.as_ref() {
+    let is_zh = lang.map(|l| l.starts_with("zh")).unwrap_or(true);
+    let (zh_model_ready, zh_vocab_ready) = match clip_dir.as_ref() {
         Some(dir) => (
             omni_pro::vision::clip_text_model_ready(dir),
             omni_pro::vision::clip_text_vocab_ready(dir),
         ),
         None => (false, false),
     };
-    let text_output_verified = omni_pro::vision::clip_text_output_verified();
-    let image_encoder = omni_pro::vision::active_clip_image_encoder_label().to_string();
+    let (mobile_model_ready, mobile_vocab_ready) = match clip_dir.as_ref() {
+        Some(dir) => (
+            omni_pro::vision::mobileclip_text_model_ready(dir),
+            omni_pro::vision::mobileclip_tokenizer_ready(dir),
+        ),
+        None => (false, false),
+    };
+    let zh_verified = omni_pro::vision::clip_text_output_verified();
+    let mobile_verified = omni_pro::vision::mobileclip_text_output_verified();
+
+    let image_encoder = omni_pro::vision::active_clip_image_encoder_label(lang).to_string();
+    let (text_model_ready, vocab_ready, text_output_verified) = if is_zh {
+        (zh_model_ready, zh_vocab_ready, zh_verified)
+    } else {
+        (mobile_model_ready, mobile_vocab_ready, mobile_verified)
+    };
     let available = text_model_ready && vocab_ready && text_output_verified != Some(false);
+
     serde_json::json!({
         "available": available,
         "imageEncoder": image_encoder,
         "textModelReady": text_model_ready,
         "vocabReady": vocab_ready,
         "textOutputVerified": text_output_verified,
+        "chineseClip": {
+            "available": zh_model_ready && zh_vocab_ready && zh_verified != Some(false),
+            "imageEncoder": "chinese_clip",
+            "textModelReady": zh_model_ready,
+            "vocabReady": zh_vocab_ready,
+            "textOutputVerified": zh_verified,
+        },
+        "mobileClip": {
+            "available": mobile_model_ready && mobile_vocab_ready && mobile_verified != Some(false),
+            "imageEncoder": "mobileclip",
+            "textModelReady": mobile_model_ready,
+            "vocabReady": mobile_vocab_ready,
+            "textOutputVerified": mobile_verified,
+        }
     })
 }
 
-async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn health_handler(
+    State(state): State<AppState>,
+    Query(query): Query<HealthQuery>,
+) -> Json<serde_json::Value> {
     let is_pro = omni_pro::is_pro_enabled();
     let geo_available = if is_pro {
         let geo = state.geo.clone();
@@ -340,7 +378,7 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "omwSource": omw_source_label,
         "graphReady": graph_ready,
         // 工单 10：CLIP 文本塔探活五字段（只读探测，不加载模型）
-        "clipText": clip_text_health()
+        "clipText": clip_text_health(query.lang.as_deref())
     }))
 }
 
