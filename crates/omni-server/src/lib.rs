@@ -3711,6 +3711,8 @@ pub struct SearchClusterRequest {
     pub similarity_floor: f32,
     #[serde(default = "default_similarity_step")]
     pub similarity_step: f32,
+    #[serde(default)]
+    pub clustering_mode: Option<omni_pro::search::ClusteringMode>,
 }
 
 fn default_similarity_floor() -> f32 {
@@ -4050,6 +4052,7 @@ async fn search_cluster_handler(
             max_leaf_size: req.max_leaf_size,
             similarity_floor: req.similarity_floor,
             similarity_step: req.similarity_step,
+            clustering_mode: req.clustering_mode.unwrap_or_default(),
         };
         search.cluster_with_options(
             &docs,

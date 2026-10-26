@@ -1400,6 +1400,23 @@ pub mod search {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ClusteringMode {
+        #[serde(rename = "precise", alias = "accuracy")]
+        Precise,
+        #[serde(rename = "balanced")]
+        Balanced,
+        #[serde(rename = "complete", alias = "coverage", alias = "recall")]
+        Complete,
+    }
+
+    impl Default for ClusteringMode {
+        fn default() -> Self {
+            ClusteringMode::Balanced
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct ClusterTreeOptions {
@@ -1410,6 +1427,8 @@ pub mod search {
         pub max_leaf_size: usize,
         pub similarity_floor: f32,
         pub similarity_step: f32,
+        #[serde(default)]
+        pub clustering_mode: ClusteringMode,
     }
 
     impl Default for ClusterTreeOptions {
@@ -1422,6 +1441,7 @@ pub mod search {
                 max_leaf_size: 50,
                 similarity_floor: 0.20,
                 similarity_step: 0.10,
+                clustering_mode: ClusteringMode::default(),
             }
         }
     }
