@@ -3707,6 +3707,18 @@ pub struct SearchClusterRequest {
     pub max_root_directories: usize,
     #[serde(default = "default_max_subdirectories")]
     pub max_subdirectories: usize,
+    #[serde(default = "default_similarity_floor")]
+    pub similarity_floor: f32,
+    #[serde(default = "default_similarity_step")]
+    pub similarity_step: f32,
+}
+
+fn default_similarity_floor() -> f32 {
+    0.20
+}
+
+fn default_similarity_step() -> f32 {
+    0.10
 }
 
 fn default_max_depth() -> usize {
@@ -4036,6 +4048,8 @@ async fn search_cluster_handler(
             max_subdirectories: req.max_subdirectories,
             distance_threshold: req.distance_threshold,
             max_leaf_size: req.max_leaf_size,
+            similarity_floor: req.similarity_floor,
+            similarity_step: req.similarity_step,
         };
         search.cluster_with_options(
             &docs,
@@ -4049,7 +4063,7 @@ async fn search_cluster_handler(
             // 分区粒度可观测：巨型簇（占据过半样本）是"任意提示词都只有一个大目录"的形态指纹，
             // 线上排障必须能直接从引擎日志看到是否又出现了这种分区
             let sizes: Vec<usize> = tree.clusters.iter().map(|c| c.fingerprints.len()).collect();
-            let total = sizes.iter().sum::<usize>() + tree.other_files.len();
+            let total = sizes.iter().sum::<usize>() + tree.unclassified_files.len();
             if let Some(largest) = sizes.iter().max() {
                 if total > 0 && *largest * 2 > total {
                     tracing::warn!(
@@ -4057,7 +4071,7 @@ async fn search_cluster_handler(
                         largest,
                         total,
                         sizes,
-                        tree.other_files.len()
+                        tree.unclassified_files.len()
                     );
                 }
             }
