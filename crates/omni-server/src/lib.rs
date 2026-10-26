@@ -2989,6 +2989,23 @@ async fn perceive_file_handler(
     let mut structured_visual_tags = arbitrate_tags_by_dimension_policies(structured_visual_tags, &current_policies);
     let mut fused_tags = arbitrate_tags_by_dimension_policies(fused_tags, &current_policies);
 
+    // 9.1-b 情绪对立对跨集合联合互斥（响应出口最后一道门）：
+    //   视觉组与融合组是两条独立通道，各自仲裁后可能对同一对情绪**各留一侧**
+    //   （视觉组留「兴奋」、融合组留「压抑」）；桌面端按组并集落库，矛盾对仍会同时出现在
+    //   标签面板（真实事故：DSC01875.jpg）。故此处跨集合再裁一次：对立对只留置信度更高一侧。
+    //   情绪维度仍为多选（互补情绪如「致郁+压抑+紧张」不受影响），仅对立对成员参与裁决。
+    {
+        let dropped = omni_core::emotion_opposition::arbitrate_opposing_emotions_across_sets(
+            &mut [&mut structured_visual_tags, &mut fused_tags],
+        );
+        if dropped > 0 {
+            tracing::debug!(
+                "[OmniServer] 情绪对立对跨集合联合互斥: 剔除 {} 条矛盾情绪标签",
+                dropped
+            );
+        }
+    }
+
     // 9.2 二进制文件 (BinaryLens) 事实标签与正交多路径标签派生
     if let Some(ref bin) = binary_analysis_info {
         // A. 运行平台标签 (Windows / Linux / macOS)
