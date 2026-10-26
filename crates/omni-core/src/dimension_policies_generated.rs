@@ -2056,11 +2056,40 @@ pub fn arbitrate_tags_by_dimension_policies(
         }
     }
 
+    // ★ 情绪对立对互斥（多选维度内的语义对立裁决）
+    //   情绪维度「builtin.emotion_tags」（id 121）属 DEC-02 多选白名单——互补情绪
+    //   （如「致郁 + 压抑 + 紧张」）必须能并存，故不能靠单选 argmax 兜底；
+    //   但同一情感轴两端的**对立对**（兴奋 ↔ 压抑 / 欢乐 ↔ 悲伤 / 治愈 ↔ 致郁 /
+    //   轻松 ↔ 紧张）同维共现即自相矛盾（真实事故：DSC01875.jpg 同时挂载「兴奋」「压抑」）。
+    //   此处仅对已通过门限的候选做裁决：保留置信度更高一侧，同分保留先到者（确定性）。
+    let emotion_faces: Vec<Option<(crate::concepts::Concept, f32)>> = tags
+        .iter()
+        .enumerate()
+        .map(|(idx, tag)| {
+            // 未通过门限的候选不参与裁决（避免低分幽灵标签反向压制有效标签）
+            if !matches!(tag_dims.get(idx), Some(Some(_))) {
+                return None;
+            }
+            let concept_item = crate::tag_identity::concept_from_code_or_alias(&tag.code)?;
+            crate::emotion_opposition::opposing_emotion(concept_item)
+                .map(|_| (concept_item, tag.confidence))
+        })
+        .collect();
+    let dropped_emotion_idx =
+        crate::emotion_opposition::resolve_opposing_emotion_conflicts(&emotion_faces);
+
     // 第二遍：组装胜出标签列表
     let mut result = Vec::with_capacity(tags.len());
     let mut seen_codes = std::collections::HashSet::new();
 
     for (idx, tag) in tags.into_iter().enumerate() {
+        if dropped_emotion_idx.contains(&idx) {
+            tracing::debug!(
+                "[维度裁决:情绪对立互斥淘汰] tag={} code={} conf={:.3}",
+                tag.name, tag.code, tag.confidence
+            );
+            continue;
+        }
         if let Some(Some((dim_code, is_multi, _))) = tag_dims.get(idx) {
             if *is_multi {
                 if seen_codes.insert(tag.code.clone()) {
@@ -2214,5 +2243,44 @@ mod tests {
 
         // 总胜出标签数量 = 2 (主体) + 2 (题材) + 1 (系统单选胜出) + 1 (独立标签) = 6
         assert_eq!(arbitrated.len(), 6);
+    }
+
+    #[test]
+    fn test_arbitrate_tags_by_dimension_policies_opposing_emotion_mutex() {
+        let policies = get_default_dimension_policies();
+
+        let emotion_tag = |concept_item: crate::concepts::Concept, confidence: f32| {
+            crate::TagChainItem {
+                code: concept_item.code().to_string(),
+                name: concept_item.zh_name().to_string(),
+                confidence,
+                via_parent_code: Some(crate::concepts::Concept::情绪标签.code().to_string()),
+                ..Default::default()
+            }
+        };
+
+        // 真实事故复现：DSC01875.jpg 同维共现「兴奋」「压抑」，且伴随互补情绪「紧张」「致郁」
+        let tags = vec![
+            emotion_tag(crate::concepts::Concept::兴奋, 0.66),
+            emotion_tag(crate::concepts::Concept::压抑, 0.84),
+            emotion_tag(crate::concepts::Concept::紧张, 0.71),
+            emotion_tag(crate::concepts::Concept::致郁, 0.75),
+        ];
+
+        let arbitrated = arbitrate_tags_by_dimension_policies(tags, &policies);
+
+        // 对立对只留高分侧：压抑保留，兴奋淘汰
+        assert!(
+            arbitrated.iter().any(|t| t.code == crate::concepts::Concept::压抑.code()),
+            "高分侧「压抑」必须保留"
+        );
+        assert!(
+            !arbitrated.iter().any(|t| t.code == crate::concepts::Concept::兴奋.code()),
+            "「兴奋」与「压抑」对立，低分侧必须落选"
+        );
+        // 互补情绪照旧多选并存（多选维度契约不被收窄）
+        assert!(arbitrated.iter().any(|t| t.code == crate::concepts::Concept::紧张.code()));
+        assert!(arbitrated.iter().any(|t| t.code == crate::concepts::Concept::致郁.code()));
+        assert_eq!(arbitrated.len(), 3);
     }
 }
