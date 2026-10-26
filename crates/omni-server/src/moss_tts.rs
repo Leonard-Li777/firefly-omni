@@ -1175,7 +1175,7 @@ impl MossTtsManager {
                 }
             }
         } else {
-            tracing::warn!("[MossTtsManager] 未找到 MOSS-TTS ONNX 模型目录");
+            tracing::info!("[MossTtsManager] 未找到 MOSS-TTS ONNX 模型目录，离线语音合成引擎处于软降级未就绪状态");
             None
         };
 
@@ -1189,6 +1189,15 @@ impl MossTtsManager {
 
     /// 辅助：定位 MOSS-TTS 模型目录
     fn resolve_moss_model_dir() -> Option<PathBuf> {
+        // 1. 优先读取显式环境变量下发路径 (最高优先级)
+        if let Ok(env_path) = std::env::var("OMNI_MOSS_MODEL_PATH") {
+            let p = PathBuf::from(env_path);
+            if p.join("moss_tts_prefill.onnx").exists() {
+                return Some(p);
+            }
+        }
+
+        // 2. 向上回溯探测相对路径
         let search_roots = [
             std::env::current_dir().unwrap_or_default(),
             std::env::current_exe()
@@ -1216,11 +1225,30 @@ impl MossTtsManager {
                 }
             }
         }
+
+        // 3. 用户全局缓存目录回退 (防跨 worktree 丢失)
+        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+            let home_cache = PathBuf::from(home)
+                .join(".cache/moss_tts_test/models/MOSS-TTS-Nano-100M-ONNX");
+            if home_cache.join("moss_tts_prefill.onnx").exists() {
+                return Some(home_cache);
+            }
+        }
+
         None
     }
 
     /// 辅助：定位预置音色库路径
     fn resolve_preset_voices_bin() -> Option<PathBuf> {
+        // 1. 优先读取显式环境变量下发路径 (最高优先级)
+        if let Ok(env_path) = std::env::var("OMNI_MOSS_VOICES_PATH") {
+            let p = PathBuf::from(env_path);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+
+        // 2. 向上回溯探测相对路径
         let search_roots = [
             std::env::current_dir().unwrap_or_default(),
             std::env::current_exe()
@@ -1249,6 +1277,15 @@ impl MossTtsManager {
                 }
             }
         }
+
+        // 3. 用户全局缓存目录回退 (防跨 worktree 丢失)
+        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+            let home_cache = PathBuf::from(home).join(".cache/moss_tts_test/test_voices.bin");
+            if home_cache.exists() {
+                return Some(home_cache);
+            }
+        }
+
         None
     }
 
