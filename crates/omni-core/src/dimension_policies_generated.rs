@@ -1002,7 +1002,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.comic_segmentation": {
+  "builtin.comic_categories": {
     "id": 118,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1127,7 +1127,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.coding_level": {
+  "builtin.mosaic_censorship_level": {
     "id": 124,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1166,7 +1166,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.photography_categories": {
+  "builtin.photo_categories": {
     "id": 126,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1204,7 +1204,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.breakdown_of_contracts_and_bills": {
+  "builtin.contracts_bills_breakdown": {
     "id": 128,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1354,7 +1354,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.screenshot_breakdown": {
+  "builtin.screenshot_categories": {
     "id": 135,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1373,7 +1373,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.generate_vector": {
+  "builtin.generation_medium": {
     "id": 136,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1393,7 +1393,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.scenery_farewell": {
+  "builtin.shot_size": {
     "id": 137,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1776,7 +1776,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "builtin.peep_exposed_segmentation": {
+  "builtin.peep_wardrobe_malfunction_segmentation": {
     "id": 156,
     "threshold": 0.6,
     "applicableFileTypes": [

@@ -8,6 +8,7 @@ pub use tag_identity::is_controlled_code;
 pub mod concepts;
 
 /// 情绪维度（builtin.emotion_tags）对立对互斥：多选维度内语义对立情绪严禁共现
+pub mod concept_opposition;
 pub mod emotion_opposition;
 
 /// AOT 自动生成的受控标签别名常量表（SSOT 来自 file-dimension-source.ts）

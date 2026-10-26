@@ -1050,7 +1050,6 @@ pub const GATE_CODES: &[&str] = &[
     crate::concepts::Concept::无水印.code(),
     crate::concepts::Concept::有水印.code(),
     // ── 照片质量 / 曝光（维度「照片质量」id 127）──────────────────────────────
-    crate::concepts::Concept::曝光正常.code(),
     crate::concepts::Concept::暗光欠曝.code(),
     crate::concepts::Concept::逆光死白.code(),
     crate::concepts::Concept::优质精选.code(),
@@ -1331,7 +1330,6 @@ mod tests {
             ("低质量", "Low Quality"),
             ("无水印", "No watermark"),
             ("有水印", "Watermarked"),
-            ("曝光正常", "Normal Exposure"),
             ("曝光良好", "Good Exposure"),
             ("R-18", "R-18"),
             ("R-15", "R-15"),
@@ -1364,7 +1362,7 @@ mod tests {
         for w in [
             "安全", "全年龄", "合规", "违规", "敏感", "R-18", "R18", "R-15", "R15", "露骨",
             "成人向", "无码", "有码", "无修", "高质量", "中等质量", "低质量", "画质高", "画质中",
-            "画质低", "无水印", "有水印", "带水印", "去水印", "曝光正常", "曝光不足", "曝光过度",
+            "画质低", "无水印", "有水印", "带水印", "去水印", "曝光不足", "曝光过度",
             "曝光良好", "纯文字", "微量文本", "无字图", "有字图",
         ] {
             assert!(is_gate_tag(w, ""), "历史词表覆盖回退: {w}");
@@ -1388,7 +1386,6 @@ mod tests {
     fn improved_en_display_forms_resolve_to_frozen_codes() {
         for (new_form, legacy_form, frozen_code) in [
             ("Watermarked", "There is watermark", "builtin.watermarked"),
-            ("Normal Exposure", "Exposure is normal", "builtin.normal_exposure"),
             (
                 "Underexposed in Low Light",
                 "Underexposure in Low Light",
@@ -1432,7 +1429,6 @@ mod tests {
             ("builtin.defocused", "脱焦"),
             ("builtin.empty_scene", "无人空镜"),
             ("builtin.watermarked", "有水印"),
-            ("builtin.normal_exposure", "曝光正常"),
         ] {
             assert_eq!(
                 crate::concepts::Concept::from_code(code).map(|it| it.zh_name()),
