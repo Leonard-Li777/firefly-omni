@@ -15,7 +15,8 @@
 //! 表成员一律使用 [`Concept`] 权威枚举，严禁在业务层写自然语言词串比对（PRD-0058）。
 
 use crate::concepts::Concept;
-use std::collections::{HashMap, HashSet};
+use crate::concept_opposition::{CuratedRegistry, OppositionResolver, RelationKind};
+use std::collections::HashSet;
 
 /// 情绪维度（`builtin.emotion_tags`）内的语义对立对（每对仅声明一次，判定时对称生效）。
 ///
@@ -28,17 +29,23 @@ pub const OPPOSING_EMOTION_PAIRS: &[(Concept, Concept)] = &[
     (Concept::兴奋, Concept::压抑),
 ];
 
+/// 情感维度对立对注册表：作为泛化解析器 [`OppositionResolver`] 的受控源之一
+///
+/// 为何必须保留这张硬编码表：实测语义包 `omw_sense_relations` 中「兴奋（omw.00918939.s）」
+/// 「压抑（omw.02423762.v）」「悲伤（omw.01365785.s）」等义位**零反义边**（兴奋与压抑甚至
+/// 零词义关系边，且二者词性一为形容词卫星义位、一为动词义位），OWM 结构上无法表达这对对立，
+/// 因此情感对立对的权威源只能是受控注册表；外部本体图谱仅作追加补充。
+pub const EMOTION_REGISTRY: CuratedRegistry = CuratedRegistry::new(OPPOSING_EMOTION_PAIRS);
+
 /// 返回该概念的情绪对立面；非对立对成员返回 `None`。
+///
+/// 兼容入口：内部委托给泛化解析器（仅情感注册表源），与 [`crate::concept_opposition`]
+/// 的通用判定同源，避免「情感专用判定」与「通用判定」两套事实源漂移。
 pub fn opposing_emotion(concept_item: Concept) -> Option<Concept> {
-    OPPOSING_EMOTION_PAIRS.iter().find_map(|(lhs, rhs)| {
-        if *lhs == concept_item {
-            Some(*rhs)
-        } else if *rhs == concept_item {
-            Some(*lhs)
-        } else {
-            None
-        }
-    })
+    OppositionResolver::emotion_only()
+        .counterparts(RelationKind::Antonym, concept_item)
+        .into_iter()
+        .next()
 }
 
 /// 在候选标签中裁决情绪对立冲突，返回**必须落选的候选索引集合**。
@@ -50,57 +57,7 @@ pub fn opposing_emotion(concept_item: Concept) -> Option<Concept> {
 ///   否则落选侧会从另一个别名"复活"，矛盾对依旧共现；
 /// - 返回集合仅供调用方剔除，不改变其它候选的相对顺序。
 pub fn resolve_opposing_emotion_conflicts(candidates: &[Option<(Concept, f32)>]) -> HashSet<usize> {
-    // 概念 → (代表索引, 最高置信度)
-    let mut present: HashMap<Concept, (usize, f32)> = HashMap::new();
-    // 概念 → 全部出现索引（跨别名重复时需整组剔除）
-    let mut occurrences: HashMap<Concept, Vec<usize>> = HashMap::new();
-    for (idx, candidate) in candidates.iter().enumerate() {
-        let Some((concept_item, confidence)) = candidate else {
-            continue;
-        };
-        occurrences.entry(*concept_item).or_default().push(idx);
-        present
-            .entry(*concept_item)
-            .and_modify(|(best_idx, best_conf)| {
-                let better = match (best_conf.is_nan(), confidence.is_nan()) {
-                    (true, false) => true,
-                    (false, true) => false,
-                    (true, true) => idx < *best_idx,
-                    (false, false) => *confidence > *best_conf,
-                };
-                if better {
-                    *best_idx = idx;
-                    *best_conf = *confidence;
-                }
-            })
-            .or_insert((idx, *confidence));
-    }
-
-    let mut dropped: HashSet<usize> = HashSet::new();
-    for (lhs, rhs) in OPPOSING_EMOTION_PAIRS {
-        let (Some(&(lhs_idx, lhs_conf)), Some(&(rhs_idx, rhs_conf))) =
-            (present.get(lhs), present.get(rhs))
-        else {
-            continue;
-        };
-        if lhs_idx == rhs_idx {
-            continue;
-        }
-        // 同分（含双 NaN）时保留先到者：索引小者胜出，保证确定性
-        let lhs_wins = match (lhs_conf.is_nan(), rhs_conf.is_nan()) {
-            (true, true) => lhs_idx < rhs_idx,
-            (true, false) => false,
-            (false, true) => true,
-            (false, false) if lhs_conf > rhs_conf => true,
-            (false, false) if rhs_conf > lhs_conf => false,
-            (false, false) => lhs_idx < rhs_idx,
-        };
-        let loser = if lhs_wins { rhs } else { lhs };
-        if let Some(idxs) = occurrences.get(loser) {
-            dropped.extend(idxs.iter().copied());
-        }
-    }
-    dropped
+    OppositionResolver::emotion_only().resolve_conflicts(candidates)
 }
 
 /// 在多个标签集合之间做情绪对立联合裁决（就地剔除落选项），返回剔除条数。
@@ -114,51 +71,7 @@ pub fn resolve_opposing_emotion_conflicts(candidates: &[Option<(Concept, f32)>])
 pub fn arbitrate_opposing_emotions_across_sets(
     sets: &mut [&mut Vec<crate::TagChainItem>],
 ) -> usize {
-    // 全局索引 → (集合下标, 集合内下标)
-    let mut slots: Vec<(usize, usize)> = Vec::new();
-    // 全局索引 → 情绪面（仅对立对成员入池）
-    let mut faces: Vec<Option<(Concept, f32)>> = Vec::new();
-
-    for (set_idx, set) in sets.iter().enumerate() {
-        for (tag_idx, tag) in set.iter().enumerate() {
-            let face = crate::tag_identity::concept_from_code_or_alias(&tag.code)
-                .filter(|concept_item| opposing_emotion(*concept_item).is_some())
-                .map(|concept_item| (concept_item, tag.confidence));
-            faces.push(face);
-            slots.push((set_idx, tag_idx));
-        }
-    }
-
-    let dropped = resolve_opposing_emotion_conflicts(&faces);
-    if dropped.is_empty() {
-        return 0;
-    }
-
-    let mut per_set: Vec<Vec<usize>> = vec![Vec::new(); sets.len()];
-    for global_idx in &dropped {
-        let (set_idx, tag_idx) = slots[*global_idx];
-        let tag = &sets[set_idx][tag_idx];
-        tracing::debug!(
-            "[情绪对立互斥:跨集合联合裁决] set={} tag={} code={} conf={:.3}",
-            set_idx,
-            tag.name,
-            tag.code,
-            tag.confidence
-        );
-        per_set[set_idx].push(tag_idx);
-    }
-
-    let mut removed = 0usize;
-    for (set_idx, set) in sets.iter_mut().enumerate() {
-        let mut idxs = per_set[set_idx].clone();
-        // 逆序删除，避免下标漂移
-        idxs.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
-        for tag_idx in idxs {
-            set.remove(tag_idx);
-            removed += 1;
-        }
-    }
-    removed
+    OppositionResolver::emotion_only().arbitrate_across_sets(sets)
 }
 
 #[cfg(test)]

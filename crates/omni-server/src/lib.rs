@@ -2989,18 +2989,47 @@ async fn perceive_file_handler(
     let mut structured_visual_tags = arbitrate_tags_by_dimension_policies(structured_visual_tags, &current_policies);
     let mut fused_tags = arbitrate_tags_by_dimension_policies(fused_tags, &current_policies);
 
-    // 9.1-b 情绪对立对跨集合联合互斥（响应出口最后一道门）：
-    //   视觉组与融合组是两条独立通道，各自仲裁后可能对同一对情绪**各留一侧**
+    // 9.1-b 语义对立对跨集合联合互斥（响应出口最后一道门）：
+    //   视觉组与融合组是两条独立通道，各自仲裁后可能对同一对对立概念**各留一侧**
     //   （视觉组留「兴奋」、融合组留「压抑」）；桌面端按组并集落库，矛盾对仍会同时出现在
     //   标签面板（真实事故：DSC01875.jpg）。故此处跨集合再裁一次：对立对只留置信度更高一侧。
-    //   情绪维度仍为多选（互补情绪如「致郁+压抑+紧张」不受影响），仅对立对成员参与裁决。
+    //   数据源为「受控注册表（情感轴 + 视觉/画幅互斥轴，有限本体人工确权）
+    //   + OMW 反义图谱（按本次候选现取）」，任一源判定成对即裁决；
+    //   多选维度仍为多选（互补情绪如「致郁+压抑+紧张」不受影响）。
     {
-        let dropped = omni_core::emotion_opposition::arbitrate_opposing_emotions_across_sets(
-            &mut [&mut structured_visual_tags, &mut fused_tags],
-        );
+        // 外部本体源：只取本次候选实际涉及的 OMW 反义边（受控概念 4 万量级，全量装表无必要），
+        // 且仅在语义包已挂载（Pro）时可用；CE 无语义包 ⇒ 仅受控注册表生效。
+        let omw_pairs = sem_graph.as_ref().map(|graph| {
+            let mut pairs = Vec::new();
+            for tag in structured_visual_tags.iter().chain(fused_tags.iter()) {
+                let Some(concept_item) =
+                    omni_core::tag_identity::concept_from_code_or_alias(&tag.code)
+                else {
+                    continue;
+                };
+                for antonym in graph.antonym_codes(&tag.code) {
+                    if let Some(other) =
+                        omni_core::tag_identity::concept_from_code_or_alias(&antonym)
+                    {
+                        pairs.push((concept_item, other));
+                    }
+                }
+            }
+            omni_core::concept_opposition::PairSet::from_pairs(pairs)
+        });
+
+        let mut opposition_sources: Vec<&dyn omni_core::concept_opposition::OppositeSource> = vec![
+            &omni_core::emotion_opposition::EMOTION_REGISTRY,
+            &omni_core::concept_opposition::CONTROLLED_VISUAL_REGISTRY,
+        ];
+        if let Some(ref pair_set) = omw_pairs {
+            opposition_sources.push(pair_set);
+        }
+        let dropped = omni_core::concept_opposition::OppositionResolver::new(opposition_sources)
+            .arbitrate_across_sets(&mut [&mut structured_visual_tags, &mut fused_tags]);
         if dropped > 0 {
             tracing::debug!(
-                "[OmniServer] 情绪对立对跨集合联合互斥: 剔除 {} 条矛盾情绪标签",
+                "[OmniServer] 语义对立对跨集合联合互斥: 剔除 {} 条矛盾标签",
                 dropped
             );
         }
@@ -3333,8 +3362,17 @@ async fn perceive_file_handler(
         // 写入空向量会污染 zvec 槽位并让后续检索恒定失配。
         if let Some(ref main_vec) = result.embedding_dense {
             if !main_vec.is_empty() {
+                // 阶段一正文大头向量隔离：有正文文本的文件写入 {fp}:tc0 切片槽，
+                // 主槽 {fp} 专用于阶段二 Canonical 聚焦语义向量（供聚类与整理消费）。
+                // 纯视觉多模态（图片/视频主特征）无正文时，仍写入 {fp} 主槽。
+                let is_text_body = text_emb.as_ref().is_some_and(|v| !v.is_empty());
+                let target_fp = if is_text_body {
+                    format!("{}:tc0", fp)
+                } else {
+                    fp.clone()
+                };
                 batch_items.push(omni_pro::vector_engine::VectorUpsertItem {
-                    file_fingerprint: fp.clone(),
+                    file_fingerprint: target_fp,
                     vector: main_vec.clone(),
                     encoder_id: result.embedding_encoder_id.unwrap_or(
                         omni_pro::vector_engine::encoder_id::UNKNOWN,

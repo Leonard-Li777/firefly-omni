@@ -1682,6 +1682,11 @@ pub mod semantic_graph {
             _tag: &mut omni_core::TagChainItem,
             _file_group: Option<&str>,
         ) {}
+        /// R5 泛化入口镜像（CE 无语义包 ⇒ 恒空，与真仓 `SemanticGraph::antonym_codes`
+        /// API 面对齐，保证 omni-server 双版本共享代码可编译）
+        pub fn antonym_codes(&self, _code: &str) -> Vec<String> {
+            Vec::new()
+        }
     }
 }
 
