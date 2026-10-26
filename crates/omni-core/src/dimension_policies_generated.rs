@@ -2056,13 +2056,17 @@ pub fn arbitrate_tags_by_dimension_policies(
         }
     }
 
-    // ★ 情绪对立对互斥（多选维度内的语义对立裁决）
-    //   情绪维度「builtin.emotion_tags」（id 121）属 DEC-02 多选白名单——互补情绪
-    //   （如「致郁 + 压抑 + 紧张」）必须能并存，故不能靠单选 argmax 兜底；
-    //   但同一情感轴两端的**对立对**（兴奋 ↔ 压抑 / 欢乐 ↔ 悲伤 / 治愈 ↔ 致郁 /
-    //   轻松 ↔ 紧张）同维共现即自相矛盾（真实事故：DSC01875.jpg 同时挂载「兴奋」「压抑」）。
+    // ★ 语义对立对互斥（多选维度内的语义对立裁决，泛化解算器驱动）
+    //   多选维度（如情绪「builtin.emotion_tags」id 121，属 DEC-02 多选白名单）内的互补标签
+    //   （「致郁 + 压抑 + 紧张」）必须能并存，故不能靠单选 argmax 兜底；但同一语义轴两端的
+    //   **对立对**同维共现即自相矛盾（真实事故：DSC01875.jpg 同时挂载「兴奋」「压抑」）。
+    //   对立关系来源不再限于「情绪专用硬编码」，而是可组合的受控注册表
+    //   （情绪轴 + 视觉/画幅/色调轴，见 crate::concept_opposition）：有限受控本体的互斥关系由
+    //   注册表承担，OWM 反义图谱（semantic.pack）在装配层作为**追加外部源**注入，
+    //   二者经由同一解算器判定（omni-core 内无 DB 连接时退回纯受控注册表）。
     //   此处仅对已通过门限的候选做裁决：保留置信度更高一侧，同分保留先到者（确定性）。
-    let emotion_faces: Vec<Option<(crate::concepts::Concept, f32)>> = tags
+    let opposition = crate::concept_opposition::OppositionResolver::controlled_only();
+    let opposition_faces: Vec<Option<(crate::concepts::Concept, f32)>> = tags
         .iter()
         .enumerate()
         .map(|(idx, tag)| {
@@ -2071,21 +2075,22 @@ pub fn arbitrate_tags_by_dimension_policies(
                 return None;
             }
             let concept_item = crate::tag_identity::concept_from_code_or_alias(&tag.code)?;
-            crate::emotion_opposition::opposing_emotion(concept_item)
-                .map(|_| (concept_item, tag.confidence))
+            (!opposition
+                .counterparts(crate::concept_opposition::RelationKind::Antonym, concept_item)
+                .is_empty())
+            .then_some((concept_item, tag.confidence))
         })
         .collect();
-    let dropped_emotion_idx =
-        crate::emotion_opposition::resolve_opposing_emotion_conflicts(&emotion_faces);
+    let dropped_opposition_idx = opposition.resolve_conflicts(&opposition_faces);
 
     // 第二遍：组装胜出标签列表
     let mut result = Vec::with_capacity(tags.len());
     let mut seen_codes = std::collections::HashSet::new();
 
     for (idx, tag) in tags.into_iter().enumerate() {
-        if dropped_emotion_idx.contains(&idx) {
+        if dropped_opposition_idx.contains(&idx) {
             tracing::debug!(
-                "[维度裁决:情绪对立互斥淘汰] tag={} code={} conf={:.3}",
+                "[维度裁决:语义对立互斥淘汰] tag={} code={} conf={:.3}",
                 tag.name, tag.code, tag.confidence
             );
             continue;
