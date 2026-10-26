@@ -750,10 +750,10 @@ pub async fn batch_embed_text_handler(
     }
 
     let profile = req.profile.clone().unwrap_or_default();
-    let is_gemma = profile == "gemma_unified"
+    let is_gemma = profile.to_ascii_lowercase().contains("gemma")
         || req.dim == Some(256)
         || req.dim == Some(512)
-        || req.dim == Some(1024);
+        || req.dim == Some(768);
 
     let active_profile = if is_gemma {
         "gemma_unified".to_string()
@@ -762,7 +762,9 @@ pub async fn batch_embed_text_handler(
     };
 
     let target_dim = if is_gemma {
-        req.dim.unwrap_or(512)
+        req.dim
+            .filter(|d| matches!(d, 256 | 512 | 768))
+            .unwrap_or_else(omni_pro::OmniVisionEngine::gemma_mrl_dimension)
     } else {
         384
     };
