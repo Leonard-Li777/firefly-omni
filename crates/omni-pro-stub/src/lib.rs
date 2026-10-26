@@ -1207,12 +1207,33 @@ pub mod text {
         pub slot_summary_ms: u64,
     }
 
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct FusionPerfBreakdown {
+        pub global_anchor_ms: u64,
+        pub candidate_pool_ms: u64,
+        pub candidate_pool_count: usize,
+        pub score_initial_ms: u64,
+        pub prune_ms: u64,
+        pub fused_tags_count: usize,
+        pub slots_name_ms: u64,
+        pub name_slots_count: usize,
+        pub slots_desc_ms: u64,
+        pub desc_slots_count: usize,
+        pub gen_hypotheses_ms: u64,
+        pub candidates_count: usize,
+        pub arbitrate_embed_ms: u64,
+        pub finalize_ms: u64,
+        pub total_ms: u64,
+        pub embed_calls_est: usize,
+    }
+
     #[derive(Debug, Clone, Default)]
     pub struct FusedPerceptionOutcome {
         pub smart_name: Option<String>,
         pub content_description: Option<String>,
         pub fused_tags: Vec<omni_core::TagChainItem>,
         pub candidate_hypotheses: Vec<omni_core::CandidateHypothesisItem>,
+        pub perf_breakdown: Option<FusionPerfBreakdown>,
     }
 
     pub struct OmniMultimodalFusionEngine;
@@ -1223,6 +1244,7 @@ pub mod text {
                 content_description: None,
                 fused_tags: ctx.visual_tags.clone(),
                 candidate_hypotheses: Vec::new(),
+                perf_breakdown: None,
             }
         }
 

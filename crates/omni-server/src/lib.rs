@@ -2859,10 +2859,23 @@ async fn perceive_file_handler(
             content_description: None,
             fused_tags: Vec::new(),
             candidate_hypotheses: Vec::new(),
+            perf_breakdown: None,
         }
     };
     let fusion_ms = t_fusion.elapsed().as_millis() as u64;
     benchmark.record("fusion_ms", fusion_ms);
+    if let Some(ref perf) = fusion_outcome.perf_breakdown {
+        benchmark.record("fusion_anchor_ms", perf.global_anchor_ms);
+        benchmark.record("fusion_pool_ms", perf.candidate_pool_ms);
+        benchmark.record("fusion_score_ms", perf.score_initial_ms);
+        benchmark.record("fusion_prune_ms", perf.prune_ms);
+        benchmark.record("fusion_slots_name_ms", perf.slots_name_ms);
+        benchmark.record("fusion_slots_desc_ms", perf.slots_desc_ms);
+        benchmark.record("fusion_gen_hypo_ms", perf.gen_hypotheses_ms);
+        benchmark.record("fusion_arbitrate_embed_ms", perf.arbitrate_embed_ms);
+        benchmark.record("fusion_finalize_ms", perf.finalize_ms);
+        benchmark.record("fusion_embed_calls", perf.embed_calls_est as u64);
+    }
 
     let candidate_hypotheses = if !fusion_outcome.candidate_hypotheses.is_empty() {
         fusion_outcome.candidate_hypotheses
