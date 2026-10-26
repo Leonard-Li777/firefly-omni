@@ -2816,7 +2816,7 @@ mod tests {
 
         // 1. 内容标签根节点下绝不能包含摄影照片细分或文字密度
         if let Some(content_root) = resp.root_nodes.iter().find(|n| n.code == "builtin.content_tags") {
-            assert!(!content_root.children.iter().any(|c| c.code == "builtin.photography_categories"));
+            assert!(!content_root.children.iter().any(|c| c.code == "builtin.photo_categories" || c.code == "builtin.photography_categories"));
             assert!(!content_root.children.iter().any(|c| c.code == "builtin.text_density"));
         }
 
@@ -2828,7 +2828,7 @@ mod tests {
             .expect("missing builtin.file_type");
 
         let has_healed_subdim = file_type_root.children.iter().any(|c| {
-            c.code == "builtin.photography_categories" || c.code == "builtin.text_density"
+            c.code == "builtin.photo_categories" || c.code == "builtin.photography_categories" || c.code == "builtin.text_density"
         });
         assert!(has_healed_subdim, "摄影照片细分或文字密度必须成功自愈至文件类型根节点下");
     }

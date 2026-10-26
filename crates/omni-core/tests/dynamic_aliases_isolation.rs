@@ -130,8 +130,8 @@ fn dynamic_aliases_lifecycle_all_in_one() {
     assert_eq!(resolve_controlled_tag_code("R-18"), Some("builtin.r_18"));
     assert_eq!(resolve_controlled_tag_code("R-18G"), Some("builtin.r_18g"));
     assert_eq!(resolve_controlled_tag_code("软色情"), Some("builtin.soft_porn"));
-    assert_eq!(resolve_controlled_tag_code("半肉"), Some("builtin.half_meat"));
-    assert_eq!(resolve_controlled_tag_code("纯肉"), Some("builtin.pure_meat"));
+    assert_eq!(resolve_controlled_tag_code("半肉"), Some("builtin.semi_explicit"));
+    assert_eq!(resolve_controlled_tag_code("纯肉"), Some("builtin.fully_explicit"));
     assert_eq!(resolve_controlled_tag_code("特殊XP"), Some("builtin.special_xp"));
     assert_eq!(resolve_controlled_tag_code("重度猎奇"), Some("builtin.extreme_grotesque"));
     assert_eq!(resolve_controlled_tag_code("车震"), Some("builtin.car_sex"));
