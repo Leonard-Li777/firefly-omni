@@ -1388,8 +1388,16 @@ pub mod search {
     #[serde(rename_all = "camelCase")]
     pub struct ClusterTreeResult {
         pub clusters: Vec<ClusterGroup>,
-        pub other_files: Vec<String>,
+        #[serde(rename = "unclassifiedFiles", alias = "otherFiles")]
+        pub unclassified_files: Vec<String>,
         pub duration_ms: u64,
+    }
+
+    impl ClusterTreeResult {
+        #[inline]
+        pub fn other_files(&self) -> &[String] {
+            &self.unclassified_files
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1400,6 +1408,8 @@ pub mod search {
         pub max_subdirectories: usize,
         pub distance_threshold: f32,
         pub max_leaf_size: usize,
+        pub similarity_floor: f32,
+        pub similarity_step: f32,
     }
 
     impl Default for ClusterTreeOptions {
@@ -1410,6 +1420,8 @@ pub mod search {
                 max_subdirectories: 5,
                 distance_threshold: 0.40,
                 max_leaf_size: 50,
+                similarity_floor: 0.20,
+                similarity_step: 0.10,
             }
         }
     }
@@ -1422,7 +1434,7 @@ pub mod search {
     ) -> anyhow::Result<ClusterTreeResult> {
         Ok(ClusterTreeResult {
             clusters: Vec::new(),
-            other_files: Vec::new(),
+            unclassified_files: Vec::new(),
             duration_ms: 0,
         })
     }
@@ -1434,7 +1446,7 @@ pub mod search {
     ) -> anyhow::Result<ClusterTreeResult> {
         Ok(ClusterTreeResult {
             clusters: Vec::new(),
-            other_files: Vec::new(),
+            unclassified_files: Vec::new(),
             duration_ms: 0,
         })
     }
@@ -1477,7 +1489,7 @@ pub mod search {
         ) -> anyhow::Result<ClusterTreeResult> {
             Ok(ClusterTreeResult {
                 clusters: Vec::new(),
-                other_files: Vec::new(),
+                unclassified_files: Vec::new(),
                 duration_ms: 0,
             })
         }
@@ -1489,7 +1501,7 @@ pub mod search {
         ) -> anyhow::Result<ClusterTreeResult> {
             Ok(ClusterTreeResult {
                 clusters: Vec::new(),
-                other_files: Vec::new(),
+                unclassified_files: Vec::new(),
                 duration_ms: 0,
             })
         }
