@@ -598,6 +598,9 @@ pub struct OmniVideoChunk {
     /// 否则「切片跨度是否过期」的判据会拿错误基线误判。
     #[serde(default)]
     pub sampling_interval_seconds: f32,
+    /// 代表帧/选美峰值帧精确物理时间戳（秒）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rep_pts_sec: Option<f32>,
 }
 
 /// 级联提示词候选假设项 (用于 CLIP 文本向量仲裁)
@@ -1032,6 +1035,45 @@ mod tests {
             resolve_effective_text("# 合同\n条款正文", Some("封面文字"), Some("旁白")),
             "# 合同\n条款正文"
         );
+    }
+
+    #[test]
+    fn test_omni_video_chunk_rep_pts_sec_serde() {
+        let chunk_with_rep = OmniVideoChunk {
+            chunk_index: 0,
+            start_sec: 10.0,
+            end_sec: 15.0,
+            vector: vec![0.1, 0.2],
+            encoder_id: 4,
+            asr_text: Some("sample".to_string()),
+            sampling_interval_seconds: 1.0,
+            rep_pts_sec: Some(12.5),
+        };
+        let json = serde_json::to_string(&chunk_with_rep).expect("serialize chunk");
+        assert!(json.contains("\"rep_pts_sec\":12.5"));
+        let de: OmniVideoChunk = serde_json::from_str(&json).expect("deserialize chunk");
+        assert_eq!(de.rep_pts_sec, Some(12.5));
+
+        // When rep_pts_sec is None, it should skip serialization
+        let chunk_without_rep = OmniVideoChunk {
+            chunk_index: 1,
+            start_sec: 0.0,
+            end_sec: 5.0,
+            vector: vec![],
+            encoder_id: 4,
+            asr_text: None,
+            sampling_interval_seconds: 1.0,
+            rep_pts_sec: None,
+        };
+        let json_none = serde_json::to_string(&chunk_without_rep).expect("serialize none");
+        assert!(!json_none.contains("rep_pts_sec"));
+        let de_none: OmniVideoChunk = serde_json::from_str(&json_none).expect("deserialize none");
+        assert_eq!(de_none.rep_pts_sec, None);
+
+        // Deserializing legacy JSON without rep_pts_sec should yield None
+        let legacy_json = r#"{"chunk_index":2,"start_sec":0.0,"end_sec":4.0,"vector":[]}"#;
+        let de_legacy: OmniVideoChunk = serde_json::from_str(legacy_json).expect("deserialize legacy");
+        assert_eq!(de_legacy.rep_pts_sec, None);
     }
 }
 

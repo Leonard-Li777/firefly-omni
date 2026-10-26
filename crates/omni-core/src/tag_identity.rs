@@ -1024,6 +1024,7 @@ pub const GATE_CODES: &[&str] = &[
     crate::concepts::Concept::安全等级.code(),
     crate::concepts::Concept::全年龄.code(),
     crate::concepts::Concept::违规.code(),
+    "builtin.violation", // locale-invariant-ok: 别名表 Violation 兼容
     crate::concepts::Concept::敏感内容.code(),
     "builtin.safe", // locale-invariant-ok: 别名表 Safe 兼容
     // ── 内容尺度 / 评级（维度「内容尺度」与「内容分级」）─────────────────────
@@ -1040,8 +1041,11 @@ pub const GATE_CODES: &[&str] = &[
     crate::concepts::Concept::有码.code(),
     // ── 文件质量（维度「文件质量」id 27）─────────────────────────────────────
     crate::concepts::Concept::高质量.code(),
+    "builtin.high_quality", // locale-invariant-ok: 别名表 High Quality 兼容
     crate::concepts::Concept::中等质量.code(),
+    "builtin.medium_quality", // locale-invariant-ok: 别名表 Medium Quality 兼容
     crate::concepts::Concept::低质量.code(),
+    "builtin.low_quality", // locale-invariant-ok: 别名表 Low Quality 兼容
     // ── 水印程度（维度「水印程度」id 125）────────────────────────────────────
     crate::concepts::Concept::无水印.code(),
     crate::concepts::Concept::有水印.code(),
@@ -1057,6 +1061,7 @@ pub const GATE_CODES: &[&str] = &[
     // ── 文字密度 / 版面（维度「文字密度」id 146 /「版面」id 141）───────────────
     crate::concepts::Concept::纯文字.code(),
     crate::concepts::Concept::纯文本.code(),
+    "builtin.plain_text", // locale-invariant-ok: 别名表 Plain Text 兼容
     crate::concepts::Concept::微量文本.code(),
     crate::concepts::Concept::有字图.code(),
     crate::concepts::Concept::无字图.code(),
