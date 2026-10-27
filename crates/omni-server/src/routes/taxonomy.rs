@@ -908,6 +908,28 @@ pub fn query_taxonomy_tree_fast(
             code_segs[0] = code_file_type.to_string();
         }
 
+        // 历史兼并副码自愈归一（ISS-01）：将历史 omw.06367879.n 直接归入正统受控码 omw.03833065.n
+        for seg in &mut code_segs {
+            if seg == "omw.06367879.n" {
+                *seg = "omw.03833065.n".to_string();
+            }
+        }
+
+        // 拓扑防环（ISS-01）：若路径中出现重复节点（如 A/.../A 隔代同码回环），截除回环冗余段
+        let mut seen_codes = HashSet::new();
+        let mut dedup_code_segs = Vec::new();
+        let mut dedup_name_segs = Vec::new();
+        for (idx, seg) in code_segs.into_iter().enumerate() {
+            if seen_codes.insert(seg.clone()) {
+                dedup_code_segs.push(seg);
+                if idx < name_segs.len() {
+                    dedup_name_segs.push(name_segs[idx].clone());
+                }
+            }
+        }
+        code_segs = dedup_code_segs;
+        name_segs = dedup_name_segs;
+
         // 历史存量数据自愈：若前缀误被包装为 /{code_content_tags}/<subdim>/... 或 /{code_content_tags}/<root_dim>/...，
         // 门禁：只要第二段为受控维度代码（如摄影照片细分、文字密度、语言细分等）或一级根维度代码，绝对严禁作为 content_tags 的子节点，直接剥除伪 content_tags 前缀！
         if code_segs.len() > 1 && code_segs[0] == code_content_tags {
@@ -1477,6 +1499,32 @@ pub fn query_taxonomy_tree_fast(
                         }
                     }
                 }
+
+                // 【加固点 3：同父同名兄弟节点自愈合并 (Sibling Deduplication Axiom / ISS-01)】
+                let mut sibling_map: BTreeMap<String, TaxonomyNode> = BTreeMap::new();
+                for child in current_children {
+                    let key = if !child.name.trim().is_empty() {
+                        child.name.trim().to_string()
+                    } else {
+                        child.code.clone()
+                    };
+                    if let Some(existing) = sibling_map.get_mut(&key) {
+                        let mut merged_files: HashSet<String> = existing.files.iter().cloned().collect();
+                        merged_files.extend(child.files);
+                        existing.file_count = merged_files.len();
+                        if include_files {
+                            let mut sorted_files: Vec<String> = merged_files.into_iter().collect();
+                            sorted_files.sort();
+                            existing.files = sorted_files;
+                        } else {
+                            existing.files.clear();
+                        }
+                        existing.children.extend(child.children);
+                    } else {
+                        sibling_map.insert(key, child);
+                    }
+                }
+                current_children = sibling_map.into_values().collect();
 
                 // 子节点排序：sort_order > 0 升序优先，相同按 code 字典序
                 current_children.sort_by(|a, b| {
@@ -3958,5 +4006,72 @@ mod tests {
         assert_eq!(money.file_count, 1);
         assert_eq!(money.files, vec!["fp_money"]);
         assert_eq!(money.parent_code.as_deref(), Some("omw.13353607.n"), "孙节点的父级指针必须对齐提升后的父节点");
+    }
+
+    /// 断言 11【小说多码兼并自愈与防环回归测试 (Task 4 验收标准)】
+    #[test]
+    fn test_taxonomy_tree_single_novel_deduplication_and_loop_prevention() {
+        let (pack_conn, master_conn) = setup_test_master_and_pack_conns();
+
+        // 构造语义包词表与标签
+        pack_conn.execute_batch(
+            "INSERT INTO file_tags (code, pos, lexfile) VALUES
+                ('builtin.e_book', 'n', 'noun.communication'),
+                ('builtin.e_book_segmentation', 'n', 'noun.communication'),
+                ('builtin.theme', 'n', 'noun.cognition'),
+                ('omw.03833065.n', 'n', 'noun.artifact'),
+                ('omw.06367879.n', 'n', 'noun.communication');
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical, count) VALUES
+                ('builtin.e_book', '电子书', 1, 100),
+                ('builtin.e_book_segmentation', '电子书细分', 1, 100),
+                ('builtin.theme', '题材', 1, 100),
+                ('omw.03833065.n', '小说', 1, 10000),
+                ('omw.06367879.n', '小说', 0, 0);"
+        ).unwrap();
+
+        // 模拟三个小说历史数据场景：
+        // 1. fp_novel_legacy: 挂在历史副码 omw.06367879.n
+        // 2. fp_novel_canonical: 挂在正统码 omw.03833065.n
+        // 3. fp_novel_loop: 挂在回环路径 /电子书/电子书细分/小说/题材/小说
+        master_conn.execute_batch(
+            "INSERT INTO workspace_files (file_fingerprint, path) VALUES
+                ('fp_novel_legacy', 'D:\\files\\novel1.txt'),
+                ('fp_novel_canonical', 'D:\\files\\novel2.txt'),
+                ('fp_novel_loop', 'D:\\files\\novel3.txt');
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_novel_legacy', 'omw.06367879.n', '/builtin.e_book/builtin.e_book_segmentation/omw.06367879.n', '/电子书/电子书细分/小说'),
+                ('fp_novel_canonical', 'omw.03833065.n', '/builtin.e_book/builtin.e_book_segmentation/omw.03833065.n', '/电子书/电子书细分/小说'),
+                ('fp_novel_loop', 'omw.03833065.n', '/builtin.e_book/builtin.e_book_segmentation/omw.03833065.n/builtin.theme/omw.03833065.n', '/电子书/电子书细分/小说/题材/小说');"
+        ).unwrap();
+
+        let resp = query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None).unwrap();
+        
+        // 辅助递归函数：收集整棵树中所有名为“小说”的节点
+        fn collect_novel_nodes<'a>(node: &'a TaxonomyNode, acc: &mut Vec<&'a TaxonomyNode>) {
+            if node.name == "小说" {
+                acc.push(node);
+            }
+            for child in &node.children {
+                collect_novel_nodes(child, acc);
+            }
+        }
+
+        let mut all_novel_nodes = Vec::new();
+        for root in &resp.root_nodes {
+            collect_novel_nodes(root, &mut all_novel_nodes);
+        }
+
+        // 核心验收断言：整棵分类树上全局【仅有 1 个】“小说”节点！
+        assert_eq!(all_novel_nodes.len(), 1, "整棵分类树上必须仅存在 1 个小说节点，实际找到了 {} 个", all_novel_nodes.len());
+        
+        let novel_node = all_novel_nodes[0];
+        // 断言：该节点为权威受控码 omw.03833065.n
+        assert_eq!(novel_node.code, "omw.03833065.n");
+        // 断言：聚合了全部 3 份文件（fp_novel_legacy, fp_novel_canonical, fp_novel_loop）
+        assert_eq!(novel_node.file_count, 3);
+        assert_eq!(novel_node.files, vec!["fp_novel_canonical", "fp_novel_legacy", "fp_novel_loop"]);
+        
+        // 断言：小说节点自身不应包含自身（无回环冗余子节点）
+        assert!(!novel_node.children.iter().any(|c| c.name == "小说"));
     }
 }
