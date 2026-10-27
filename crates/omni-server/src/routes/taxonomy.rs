@@ -503,36 +503,215 @@ pub fn inspect_tags_batch(
         .collect())
 }
 
-/// 从语义包 `file_tags` 按需读取指定受控 codes 的 `sort_order > 0` 映射（受控域排序值唯一事实源）。
-///
-/// - 利用 `PRIMARY KEY (code)` B-Tree 索引批量点查，单批次 <= 200 个，耗时仅 ~0.05ms，彻底杜绝 40,000+ 行全表扫描；
-/// - 表不存在或测试夹具未提供 `file_tags` 时安全返回空映射，节点保留兜底序值。
-fn load_pack_sort_orders_for_codes(conn: &Connection, codes: &[String]) -> HashMap<String, i64> {
-    if codes.is_empty() {
+/// 树节点折叠与过滤策略 (Spec §3.1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaxonomyFoldPolicy {
+    /// 正常保留当前层级（名词实体、合法文件管理维度）
+    Keep,
+    /// 抽象壳词/过渡虚层：抹除自身目录抽屉，子节点穿透上提挂父
+    BypassAndHoist,
+    /// 动词体系扁平化：抹平中间学术链，有效命中标签直接提升至动作根
+    FlattenToActionRoot,
+    /// 语法虚词/相对时序：一票否决，整枝丢弃
+    RejectSubtree,
+}
+
+/// 语义节点轻量判定元数据 (Spec §3.1)
+#[derive(Debug, Clone)]
+pub struct NodeEvaluationContext<'a> {
+    pub code: &'a str,
+    pub pos: Option<&'a str>,
+    pub lexfile: Option<&'a str>,
+    pub sememe_category: Option<u8>,
+    pub is_root: bool,
+    pub in_action_branch: bool,
+}
+
+/// 受控抽象空洞壳名词 Codes 静态白名单 (Spec §2.3 / ISS-02)
+pub static SHELL_NOUN_CODES: &[&str] = &[
+    "omw.00024720.n", // 状态 (state, status)
+    "omw.00026367.n", // 过程 (process)
+    "omw.00027167.n", // 方式 (manner, way)
+    "omw.00028119.n", // 原因 (reason, cause)
+    "omw.00029378.n", // 方法 (method)
+    "omw.00024073.n", // 条件 (condition)
+    "omw.13941407.n", // 情况 (situation)
+    "omw.00026788.n", // 问题 (problem)
+    "omw.05834839.n", // 问题
+    "omw.05835747.n", // 类型 (type)
+    "omw.13939634.n", // 阶段 (phase, stage)
+    "omw.05836885.n", // 形式 (form)
+    "omw.05837265.n", // 模式 (mode, pattern)
+    "builtin.category.abstract_entity",
+    "builtin.status",
+    "builtin.state",
+    "builtin.process",
+    "builtin.way",
+    "builtin.reason",
+    "builtin.method",
+    "builtin.condition",
+    "builtin.situation",
+    "builtin.problem",
+    "builtin.type",
+    "builtin.stage",
+    "builtin.pattern",
+];
+
+/// 判定是否为抽象壳词代码
+pub fn is_shell_noun_code(code: &str) -> bool {
+    SHELL_NOUN_CODES.contains(&code)
+}
+
+/// 判定是否为动词或修饰词 (动词分支向下传染核心依据)
+pub fn is_real_verb_or_modifier(pos: Option<&str>, lexfile: Option<&str>, code: &str) -> bool {
+    if let Some(p) = pos {
+        let p_lower = p.trim().to_lowercase();
+        if p_lower == "v" || p_lower == "a" || p_lower == "s" || p_lower == "r" {
+            return true;
+        }
+    }
+    if let Some(lex) = lexfile {
+        if lex.trim().starts_with("verb.") {
+            return true;
+        }
+    }
+    if code.starts_with("omw.")
+        && (code.ends_with(".v") || code.ends_with(".a") || code.ends_with(".r") || code.ends_with(".s"))
+    {
+        return true;
+    }
+    false
+}
+
+/// 核心后置树策略评估器 (Spec §3.2 四维规则短路判定)
+pub fn evaluate_node_policy(ctx: &NodeEvaluationContext) -> TaxonomyFoldPolicy {
+    // 虚词/相对时序根代码
+    let is_function_word_root = ctx.code == "builtin.category.function_word" || ctx.code == "builtin.category.relational_time";
+
+    // P0: 根维度豁免（非虚词根；若根节点自身为动作大类或动词，触发 FlattenToActionRoot）
+    if ctx.is_root && !is_function_word_root {
+        if ctx.code == "builtin.category.action" || is_real_verb_or_modifier(ctx.pos, ctx.lexfile, ctx.code) {
+            return TaxonomyFoldPolicy::FlattenToActionRoot;
+        }
+        return TaxonomyFoldPolicy::Keep;
+    }
+
+    // P1: 一票否决 (RejectSubtree)
+    if is_function_word_root {
+        return TaxonomyFoldPolicy::RejectSubtree;
+    }
+    if let Some(p) = ctx.pos {
+        let p_trimmed = p.trim();
+        if matches!(p_trimmed, "m" | "q" | "p" | "c" | "u" | "y" | "o" | "h" | "w" | "b" | "x")
+            || omni_core::tag_admissibility::is_tag_pos_rejected(p_trimmed)
+        {
+            return TaxonomyFoldPolicy::RejectSubtree;
+        }
+    }
+    if let Some(lex) = ctx.lexfile {
+        if omni_core::tag_admissibility::is_banned_lexfile(lex) {
+            return TaxonomyFoldPolicy::RejectSubtree;
+        }
+    }
+
+    // P2: 动作分支向下传染 (FlattenToActionRoot)
+    if ctx.in_action_branch
+        || ctx.code == "builtin.category.action"
+        || is_real_verb_or_modifier(ctx.pos, ctx.lexfile, ctx.code)
+    {
+        return TaxonomyFoldPolicy::FlattenToActionRoot;
+    }
+
+    // P3: 抽象壳词穿透 (BypassAndHoist)
+    if is_shell_noun_code(ctx.code)
+        || ctx.code == "builtin.category.abstract_entity"
+        || ctx.sememe_category == Some(4)
+    {
+        return TaxonomyFoldPolicy::BypassAndHoist;
+    }
+
+    // P4: 名词实体默认展开 (Keep)
+    TaxonomyFoldPolicy::Keep
+}
+
+/// 节点语义元数据
+#[derive(Debug, Clone, Default)]
+pub struct NodeSemanticMeta {
+    pub sort_order: i64,
+    pub pos: Option<String>,
+    pub lexfile: Option<String>,
+    pub sememe_category: Option<u8>,
+}
+
+/// 批量查取语义包中节点的元数据（sort_order, pos, lexfile, sememe_category）
+pub fn load_pack_semantic_meta_for_codes(conn: &Connection, codes: &[String]) -> HashMap<String, NodeSemanticMeta> {
+    if codes.is_empty() || !table_exists(conn, "file_tags") {
         return HashMap::new();
     }
-    if !table_exists(conn, "file_tags") {
-        return HashMap::new();
+
+    // 动态探测列，确保兼容轻量测试夹具或只读 pack
+    let mut has_sort_order = false;
+    let mut has_pos = false;
+    let mut has_lexfile = false;
+    let mut has_sememe_category = false;
+
+    if let Ok(mut info_stmt) = conn.prepare("PRAGMA table_info(file_tags)") {
+        if let Ok(rows) = info_stmt.query_map([], |r| r.get::<_, String>(1)) {
+            for col in rows.flatten() {
+                match col.as_str() {
+                    "sort_order" => has_sort_order = true,
+                    "pos" => has_pos = true,
+                    "lexfile" => has_lexfile = true,
+                    "sememe_category" => has_sememe_category = true,
+                    _ => {}
+                }
+            }
+        }
     }
+
+    let sort_expr = if has_sort_order { "sort_order" } else { "0 AS sort_order" };
+    let pos_expr = if has_pos { "pos" } else { "NULL AS pos" };
+    let lex_expr = if has_lexfile { "lexfile" } else { "NULL AS lexfile" };
+    let sem_expr = if has_sememe_category { "sememe_category" } else { "NULL AS sememe_category" };
 
     let mut map = HashMap::new();
     for chunk in codes.chunks(200) {
         let placeholders = vec!["?"; chunk.len()].join(",");
         let sql = format!(
-            "SELECT code, sort_order FROM file_tags WHERE code IN ({placeholders}) AND sort_order > 0"
+            "SELECT code, {sort_expr}, {pos_expr}, {lex_expr}, {sem_expr} FROM file_tags WHERE code IN ({placeholders})"
         );
         if let Ok(mut stmt) = conn.prepare(&sql) {
             let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
             if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                let code: String = row.get(0)?;
+                let sort_order: i64 = row.get(1).unwrap_or(0);
+                let pos: Option<String> = row.get(2).ok();
+                let lexfile: Option<String> = row.get(3).ok();
+                let sememe_category: Option<u8> = row.get(4).ok();
+                Ok((code, NodeSemanticMeta {
+                    sort_order,
+                    pos,
+                    lexfile,
+                    sememe_category,
+                }))
             }) {
-                for (code, sort_order) in rows.flatten() {
-                    map.insert(code, sort_order);
+                for (code, meta) in rows.flatten() {
+                    map.insert(code, meta);
                 }
             }
         }
     }
     map
+}
+
+/// 从语义包 `file_tags` 按需读取指定受控 codes 的 `sort_order > 0` 映射（受控域排序值唯一事实源）。
+///
+/// - 利用 `PRIMARY KEY (code)` B-Tree 索引批量点查，单批次 <= 200 个，耗时仅 ~0.05ms，彻底杜绝 40,000+ 行全表扫描；
+/// - 表不存在或测试夹具未提供 `file_tags` 时安全返回空映射，节点保留兜底序值。
+#[allow(dead_code)]
+fn load_pack_sort_orders_for_codes(conn: &Connection, codes: &[String]) -> HashMap<String, i64> {
+    let meta_map = load_pack_semantic_meta_for_codes(conn, codes);
+    meta_map.into_iter().filter(|(_, m)| m.sort_order > 0).map(|(c, m)| (c, m.sort_order)).collect()
 }
 
 /// 倒排 Trie 极速分类树构建引擎 (ADR-0038 / ADR-0053 / P95 <= 5ms)
@@ -667,6 +846,9 @@ pub fn query_taxonomy_tree_fast(
         sort_order: i64,
         direct_files: HashSet<String>,
         children_paths: Vec<String>,
+        pos: Option<String>,
+        lexfile: Option<String>,
+        sememe_category: Option<u8>,
     }
 
     let mut node_map: HashMap<String, TrieNode> = HashMap::new();
@@ -734,8 +916,11 @@ pub fn query_taxonomy_tree_fast(
                 || omni_core::tag_identity::concept_from_code(&code_segs[1])
                     .map_or(false, |c_concept| omni_core::get_dimension_policy(c_concept.code()).is_some())
                 || code_segs[1] == code_lang_seg
+                || code_segs[1] == "builtin.language_segmentation"
                 || code_segs[1] == code_sec_level
+                || code_segs[1] == "builtin.security_level"
                 || code_segs[1] == code_proc_status
+                || code_segs[1] == "builtin.processing_status"
                 || code_segs[1] == code_photo_cat
                 || code_segs[1] == code_text_density;
             if is_subdim_or_root {
@@ -760,15 +945,19 @@ pub fn query_taxonomy_tree_fast(
         }
 
         // 历史截断短路径自愈：子维度若缺失顶层祖先，自动根据本体拓扑补齐真实父级路径
-        if code_segs[0] == code_lang_seg {
+        if code_segs[0] == code_lang_seg || code_segs[0] == "builtin.language_segmentation" {
             // 语言细分属于 文件类型 -> 文档
-            code_segs.insert(0, omni_core::concepts::Concept::文档.code().to_string());
+            code_segs.insert(0, "builtin.document".to_string());
             code_segs.insert(0, code_file_type.to_string());
             if !name_segs.is_empty() {
                 name_segs.insert(0, name_document.to_string());
                 name_segs.insert(0, name_file_type.to_string());
             }
-        } else if code_segs[0] == code_sec_level || code_segs[0] == code_proc_status {
+        } else if code_segs[0] == code_sec_level
+            || code_segs[0] == "builtin.security_level"
+            || code_segs[0] == code_proc_status
+            || code_segs[0] == "builtin.processing_status"
+        {
             // 安全等级 / 处理状态属于 文件用途 -> 工作文档
             code_segs.insert(0, omni_core::concepts::Concept::工作文档.code().to_string());
             code_segs.insert(0, omni_core::concepts::Concept::文件用途.code().to_string());
@@ -852,6 +1041,9 @@ pub fn query_taxonomy_tree_fast(
                         sort_order,
                         direct_files: HashSet::new(),
                         children_paths: Vec::new(),
+                        pos: None,
+                        lexfile: None,
+                        sememe_category: None,
                     },
                 );
             }
@@ -892,18 +1084,33 @@ pub fn query_taxonomy_tree_fast(
         s.into_iter().collect()
     };
 
-    // 2.5 按需回填语义包 file_tags.sort_order（根 + 子节点）：
-    // fast path 只倒排主库 file_tag_relations，不读 pack，节点序值仅有硬编码兜底；
-    // 性能优化：仅对当前树出现的 all_codes 通过 PRIMARY KEY B-Tree 索引批量点查，耗时 < 0.1ms，消灭 40,000+ 行全表扫描；
+    // 2.5 按需回填语义包 file_tags 元数据（sort_order, pos, lexfile, sememe_category）：
+    // 性能优化：仅对当前树出现的 all_codes 通过 PRIMARY KEY B-Tree 索引批量点查，耗时 < 0.1ms；
     // 特例：builtin.content_tags 维持硬编码 9999 恒定垫底，不被 pack 值覆盖。
-    let pack_sort_orders = load_pack_sort_orders_for_codes(conn, &all_codes);
-    if !pack_sort_orders.is_empty() {
-        for node in node_map.values_mut() {
-            if node.code == omni_core::concepts::Concept::内容标签.code() {
-                continue;
+    let pack_semantic_meta = load_pack_semantic_meta_for_codes(conn, &all_codes);
+    for node in node_map.values_mut() {
+        if let Some(meta) = pack_semantic_meta.get(&node.code) {
+            if node.code != omni_core::concepts::Concept::内容标签.code() && meta.sort_order > 0 {
+                node.sort_order = meta.sort_order;
             }
-            if let Some(&sort_order) = pack_sort_orders.get(&node.code) {
-                node.sort_order = sort_order;
+            node.pos = meta.pos.clone();
+            node.lexfile = meta.lexfile.clone();
+            node.sememe_category = meta.sememe_category;
+        }
+        // 若数据库未直接提供 pos，从 code 后缀做权威词性推导
+        if node.pos.is_none() {
+            if node.code.starts_with("omw.") {
+                if node.code.ends_with(".v") {
+                    node.pos = Some("v".to_string());
+                } else if node.code.ends_with(".n") {
+                    node.pos = Some("n".to_string());
+                } else if node.code.ends_with(".a") || node.code.ends_with(".s") {
+                    node.pos = Some("a".to_string());
+                } else if node.code.ends_with(".r") {
+                    node.pos = Some("r".to_string());
+                }
+            } else if node.code.starts_with("hownet.") && node.code.ends_with(".n") {
+                node.pos = Some("n".to_string());
             }
         }
     }
@@ -932,54 +1139,18 @@ pub fn query_taxonomy_tree_fast(
         }
     }
 
-    // 4. 后序后代文件汇聚 (真实父与逻辑父一视同仁)
-    fn build_trie_subtree(
-        path: &str,
+    // 4.1 节点结构转换辅助函数
+    fn convert_trie_node_to_taxonomy_node(
+        node: &TrieNode,
         node_map: &HashMap<String, TrieNode>,
         resolved_names: &HashMap<String, String>,
         lang: &str,
         include_files: bool,
-        visited: &mut HashSet<String>,
-    ) -> Option<(TaxonomyNode, HashSet<String>)> {
-        if visited.contains(path) {
-            return None; // 防环保护
-        }
-        visited.insert(path.to_string());
-
-        let node = node_map.get(path)?;
-        let mut aggregate_files = node.direct_files.clone();
-        let mut children_nodes = Vec::new();
-
-        for child_path in &node.children_paths {
-            if let Some((child_node, child_files)) = build_trie_subtree(
-                child_path,
-                node_map,
-                resolved_names,
-                lang,
-                include_files,
-                visited,
-            ) {
-                aggregate_files.extend(child_files);
-                children_nodes.push(child_node);
-            }
-        }
-
-        // 子节点按 sort_order 升序优先 (sort_order > 0)，相同或未标注时按 code 稳定排序
-        children_nodes.sort_by(|a, b| {
-            let order_a = if a.sort_order > 0 { a.sort_order } else { i64::MAX };
-            let order_b = if b.sort_order > 0 { b.sort_order } else { i64::MAX };
-            if order_a != order_b {
-                order_a.cmp(&order_b)
-            } else {
-                a.code.cmp(&b.code)
-            }
-        });
-
-        visited.remove(path);
-
-        let file_count = aggregate_files.len();
+        files_set: &HashSet<String>,
+    ) -> TaxonomyNode {
+        let file_count = files_set.len();
         let files = if include_files {
-            let mut list: Vec<String> = aggregate_files.iter().cloned().collect();
+            let mut list: Vec<String> = files_set.iter().cloned().collect();
             list.sort();
             list
         } else {
@@ -990,7 +1161,6 @@ pub fn query_taxonomy_tree_fast(
             n.clone()
         } else if omni_core::is_root_dimension(&node.code) || node.code.starts_with("builtin.") {
             let td = omni_core::tag_identity::tag_display(&node.code, lang);
-            // 中文环境防击穿：若 tag_display 回退为了裸英文 slug，而 node.name 本身包含合法的非 ASCII 中文字符，优先保留 node.name
             if lang.starts_with("zh") && td.is_ascii() && !node.name.is_empty() && !node.name.is_ascii() && node.name != node.code {
                 node.name.clone()
             } else {
@@ -1008,7 +1178,7 @@ pub fn query_taxonomy_tree_fast(
             .and_then(|p| node_map.get(p).map(|pn| pn.code.clone()));
         let parent_codes = parent_code.as_ref().map(|p| vec![p.clone()]).unwrap_or_default();
 
-        let tax_node = TaxonomyNode {
+        TaxonomyNode {
             code: node.code.clone(),
             name: display_name,
             parent_code,
@@ -1017,12 +1187,276 @@ pub fn query_taxonomy_tree_fast(
             sort_order: node.sort_order,
             file_count,
             files,
-            children: children_nodes,
+            children: Vec::new(),
             code_path: Some(node.code_path.clone()),
             name_path: Some(node.name_path.clone()),
+        }
+    }
+
+    // 4.2 动词分支扁平化子孙收集器 (Spec §3.3)
+    fn collect_action_flattened_children(
+        node_path: &str,
+        action_root_code: &str,
+        node_map: &HashMap<String, TrieNode>,
+        resolved_names: &HashMap<String, String>,
+        lang: &str,
+        include_files: bool,
+        visited: &mut HashSet<String>,
+    ) -> (Vec<TaxonomyNode>, HashSet<String>) {
+        let mut result_nodes = Vec::new();
+        let mut aggregate_files = HashSet::new();
+
+        // 细节 1：防死循环防护
+        if !visited.insert(node_path.to_string()) {
+            return (result_nodes, aggregate_files);
+        }
+
+        let node = match node_map.get(node_path) {
+            Some(n) => n,
+            None => return (result_nodes, aggregate_files),
         };
 
-        Some((tax_node, aggregate_files))
+        // 细节 2：即使在动作分支内部，遇到 P1 级语法虚词/禁用 lexfile 仍优先整枝截断
+        let ctx = NodeEvaluationContext {
+            code: &node.code,
+            pos: node.pos.as_deref(),
+            lexfile: node.lexfile.as_deref(),
+            sememe_category: node.sememe_category,
+            is_root: false,
+            in_action_branch: true,
+        };
+        if evaluate_node_policy(&ctx) == TaxonomyFoldPolicy::RejectSubtree {
+            return (result_nodes, aggregate_files);
+        }
+
+        aggregate_files.extend(node.direct_files.clone());
+
+        // 递归下钻收集子孙
+        for child_path in &node.children_paths {
+            let (sub_nodes, sub_files) = collect_action_flattened_children(
+                child_path,
+                action_root_code,
+                node_map,
+                resolved_names,
+                lang,
+                include_files,
+                visited,
+            );
+            aggregate_files.extend(sub_files);
+            result_nodes.extend(sub_nodes);
+        }
+
+        // 公理 2：若当前动词节点自身有直接文件命中 (direct_files > 0)，
+        // 自身作为一个独立的平铺叶节点被返回（抽离原有 children）
+        if !node.direct_files.is_empty() {
+            let mut cloned = convert_trie_node_to_taxonomy_node(
+                node,
+                node_map,
+                resolved_names,
+                lang,
+                include_files,
+                &node.direct_files,
+            );
+            cloned.children.clear(); // 抹平子级嵌套
+            cloned.file_count = node.direct_files.len();
+            // 细节 3：显式将其父级指针修正为当前动作根，避免指向已被抹除的悬空中间父级
+            cloned.parent_code = Some(action_root_code.to_string());
+            cloned.parent_codes = vec![action_root_code.to_string()];
+            result_nodes.push(cloned);
+        }
+
+        (result_nodes, aggregate_files)
+    }
+
+    // 4.3 动作分支平铺子节点按同 code 归并与稳定排序 (ISS-01 & ISS-03)
+    fn merge_and_sort_flattened_nodes(
+        nodes: Vec<TaxonomyNode>,
+        action_root_code: &str,
+        include_files: bool,
+    ) -> Vec<TaxonomyNode> {
+        let mut map: BTreeMap<String, TaxonomyNode> = BTreeMap::new();
+        for mut node in nodes {
+            node.parent_code = Some(action_root_code.to_string());
+            node.parent_codes = vec![action_root_code.to_string()];
+            if let Some(existing) = map.get_mut(&node.code) {
+                let mut file_set: HashSet<String> = existing.files.iter().cloned().collect();
+                file_set.extend(node.files);
+                existing.file_count = file_set.len();
+                if include_files {
+                    let mut sorted_files: Vec<String> = file_set.into_iter().collect();
+                    sorted_files.sort();
+                    existing.files = sorted_files;
+                } else {
+                    existing.files.clear();
+                }
+            } else {
+                map.insert(node.code.clone(), node);
+            }
+        }
+        let mut result: Vec<TaxonomyNode> = map.into_values().collect();
+        result.sort_by(|a, b| {
+            let order_a = if a.sort_order > 0 { a.sort_order } else { i64::MAX };
+            let order_b = if b.sort_order > 0 { b.sort_order } else { i64::MAX };
+            if order_a != order_b {
+                order_a.cmp(&order_b)
+            } else {
+                a.code.cmp(&b.code)
+            }
+        });
+        result
+    }
+
+    // 4.4 递归装配 Trie 子树 (四维策略分流)
+    fn build_trie_subtree(
+        path: &str,
+        node_map: &HashMap<String, TrieNode>,
+        resolved_names: &HashMap<String, String>,
+        lang: &str,
+        include_files: bool,
+        in_action_branch: bool,
+        is_root: bool,
+        visited: &mut HashSet<String>,
+    ) -> Option<(Vec<TaxonomyNode>, HashSet<String>)> {
+        if !visited.insert(path.to_string()) {
+            return None; // 防环保护
+        }
+
+        let node = match node_map.get(path) {
+            Some(n) => n,
+            None => {
+                visited.remove(path);
+                return None;
+            }
+        };
+
+        // 策略评估
+        let ctx = NodeEvaluationContext {
+            code: &node.code,
+            pos: node.pos.as_deref(),
+            lexfile: node.lexfile.as_deref(),
+            sememe_category: node.sememe_category,
+            is_root,
+            in_action_branch,
+        };
+        let policy = evaluate_node_policy(&ctx);
+
+        match policy {
+            TaxonomyFoldPolicy::RejectSubtree => {
+                visited.remove(path);
+                None
+            }
+            TaxonomyFoldPolicy::FlattenToActionRoot => {
+                // 当前节点作为动作根节点，执行二级扁平化
+                let mut aggregate_files = node.direct_files.clone();
+                let mut unmerged_children = Vec::new();
+                let mut action_visited = HashSet::new();
+                action_visited.insert(path.to_string());
+
+                for child_path in &node.children_paths {
+                    let (child_nodes, child_files) = collect_action_flattened_children(
+                        child_path,
+                        &node.code,
+                        node_map,
+                        resolved_names,
+                        lang,
+                        include_files,
+                        &mut action_visited,
+                    );
+                    aggregate_files.extend(child_files);
+                    unmerged_children.extend(child_nodes);
+                }
+
+                let flattened_children = merge_and_sort_flattened_nodes(unmerged_children, &node.code, include_files);
+                let mut tax_node = convert_trie_node_to_taxonomy_node(
+                    node,
+                    node_map,
+                    resolved_names,
+                    lang,
+                    include_files,
+                    &aggregate_files,
+                );
+                tax_node.children = flattened_children;
+                visited.remove(path);
+                Some((vec![tax_node], aggregate_files))
+            }
+            TaxonomyFoldPolicy::BypassAndHoist => {
+                // 抽象壳词：抹除自身抽屉，子节点穿透上提
+                let mut aggregate_files = node.direct_files.clone();
+                let mut hoisted_nodes = Vec::new();
+
+                for child_path in &node.children_paths {
+                    if let Some((child_nodes, child_files)) = build_trie_subtree(
+                        child_path,
+                        node_map,
+                        resolved_names,
+                        lang,
+                        include_files,
+                        in_action_branch,
+                        false,
+                        visited,
+                    ) {
+                        aggregate_files.extend(child_files);
+                        hoisted_nodes.extend(child_nodes);
+                    }
+                }
+                visited.remove(path);
+                Some((hoisted_nodes, aggregate_files))
+            }
+            TaxonomyFoldPolicy::Keep => {
+                // 正常保留当前层级（名词实体、根维度等）
+                let mut aggregate_files = node.direct_files.clone();
+                let mut children_nodes = Vec::new();
+
+                // 向下传染 action 分支状态（用户微调提醒：包含真实动词/修饰词）
+                let next_in_action_branch = in_action_branch
+                    || node.code == "builtin.category.action"
+                    || is_real_verb_or_modifier(node.pos.as_deref(), node.lexfile.as_deref(), &node.code);
+
+                for child_path in &node.children_paths {
+                    if let Some((child_nodes, child_files)) = build_trie_subtree(
+                        child_path,
+                        node_map,
+                        resolved_names,
+                        lang,
+                        include_files,
+                        next_in_action_branch,
+                        false,
+                        visited,
+                    ) {
+                        aggregate_files.extend(child_files);
+                        for mut cn in child_nodes {
+                            // 若子节点来自 BypassAndHoist 上提，其 parent_code 修正为当前节点
+                            cn.parent_code = Some(node.code.clone());
+                            cn.parent_codes = vec![node.code.clone()];
+                            children_nodes.push(cn);
+                        }
+                    }
+                }
+
+                // 子节点排序：sort_order > 0 升序优先，相同按 code 字典序
+                children_nodes.sort_by(|a, b| {
+                    let order_a = if a.sort_order > 0 { a.sort_order } else { i64::MAX };
+                    let order_b = if b.sort_order > 0 { b.sort_order } else { i64::MAX };
+                    if order_a != order_b {
+                        order_a.cmp(&order_b)
+                    } else {
+                        a.code.cmp(&b.code)
+                    }
+                });
+
+                let mut tax_node = convert_trie_node_to_taxonomy_node(
+                    node,
+                    node_map,
+                    resolved_names,
+                    lang,
+                    include_files,
+                    &aggregate_files,
+                );
+                tax_node.children = children_nodes;
+                visited.remove(path);
+                Some((vec![tax_node], aggregate_files))
+            }
+        }
     }
 
     // 5. 顶层根节点过滤与排序输出
@@ -1044,16 +1478,20 @@ pub fn query_taxonomy_tree_fast(
         for r_path in &root_paths {
             if let Some(r_node) = node_map.get(r_path) {
                 if r_node.code == target_root || r_node.code_path == target_norm {
-                    if let Some((root_node, _)) = build_trie_subtree(
+                    if let Some((root_nodes, _)) = build_trie_subtree(
                         r_path,
                         &node_map,
                         &resolved_names,
                         lang,
                         include_files,
+                        false,
+                        true, // is_root = true
                         &mut visited,
                     ) {
-                        if !root_node.children.is_empty() || root_node.file_count > 0 {
-                            roots.push(root_node);
+                        for root_node in root_nodes {
+                            if !root_node.children.is_empty() || root_node.file_count > 0 {
+                                roots.push(root_node);
+                            }
                         }
                     }
                 }
@@ -1074,19 +1512,24 @@ pub fn query_taxonomy_tree_fast(
         });
 
         for r_path in sorted_root_paths {
-            if let Some((root_node, _)) = build_trie_subtree(
+            if let Some((root_nodes, _)) = build_trie_subtree(
                 &r_path,
                 &node_map,
                 &resolved_names,
                 lang,
                 include_files,
+                false,
+                true, // is_root = true
                 &mut visited,
             ) {
-                if !root_node.children.is_empty() || root_node.file_count > 0 {
-                    roots.push(root_node);
+                for root_node in root_nodes {
+                    if !root_node.children.is_empty() || root_node.file_count > 0 {
+                        roots.push(root_node);
+                    }
                 }
             }
         }
+    }
 
         // 顶层根节点排序：sort_order (>0 升序) 为主判据，其次 ROOT_DIMENSION_CONCEPTS 规范概念序，再次 code 字典序。
         // 主判据与回退路径 (L1300 一带) 及 desktop 服务端 (TagTreeQuery) 的 `order > 0` 语义保持一致。
@@ -1111,7 +1554,6 @@ pub fn query_taxonomy_tree_fast(
                 }
             }
         });
-    }
 
     fn count_nodes(nodes: &[TaxonomyNode]) -> usize {
         let mut count = nodes.len();
@@ -2920,6 +3362,464 @@ mod tests {
         assert!(batch_res[1].matched_parent);
         assert!(!batch_res[2].matched_parent);
         assert!(!batch_res[3].is_controlled);
+    }
+
+    // =========================================================================
+    // 八大核销断言 (Spec §4.2 / AC-1 ~ AC-8)
+    // =========================================================================
+
+    #[test]
+    fn test_evaluate_node_policy_precedence() {
+        // P0: 根维度豁免
+        let ctx_root_keep = NodeEvaluationContext {
+            code: "builtin.domain",
+            pos: Some("n"),
+            lexfile: None,
+            sememe_category: None,
+            is_root: true,
+            in_action_branch: false,
+        };
+        assert_eq!(evaluate_node_policy(&ctx_root_keep), TaxonomyFoldPolicy::Keep);
+
+        let ctx_root_action = NodeEvaluationContext {
+            code: "builtin.category.action",
+            pos: Some("n"),
+            lexfile: None,
+            sememe_category: Some(1),
+            is_root: true,
+            in_action_branch: false,
+        };
+        assert_eq!(evaluate_node_policy(&ctx_root_action), TaxonomyFoldPolicy::FlattenToActionRoot);
+
+        // P1: 一票否决
+        let ctx_p1_function_word = NodeEvaluationContext {
+            code: "builtin.category.function_word",
+            pos: None,
+            lexfile: None,
+            sememe_category: Some(7),
+            is_root: true,
+            in_action_branch: false,
+        };
+        assert_eq!(evaluate_node_policy(&ctx_p1_function_word), TaxonomyFoldPolicy::RejectSubtree);
+
+        let ctx_p1_pos = NodeEvaluationContext {
+            code: "some.word",
+            pos: Some("u"),
+            lexfile: None,
+            sememe_category: None,
+            is_root: false,
+            in_action_branch: false,
+        };
+        assert_eq!(evaluate_node_policy(&ctx_p1_pos), TaxonomyFoldPolicy::RejectSubtree);
+
+        let ctx_p1_lexfile = NodeEvaluationContext {
+            code: "some.adv",
+            pos: None,
+            lexfile: Some("adv.all"),
+            sememe_category: None,
+            is_root: false,
+            in_action_branch: false,
+        };
+        assert_eq!(evaluate_node_policy(&ctx_p1_lexfile), TaxonomyFoldPolicy::RejectSubtree);
+
+        // P2: 动作分支向下传染
+        let ctx_p2_in_action = NodeEvaluationContext {
+            code: "hownet.step.n",
+            pos: Some("n"), // HowNet 义原骨架的 'n' 占位符
+            lexfile: None,
+            sememe_category: None,
+            is_root: false,
+            in_action_branch: true,
+        };
+        assert_eq!(evaluate_node_policy(&ctx_p2_in_action), TaxonomyFoldPolicy::FlattenToActionRoot);
+
+        let ctx_p2_verb = NodeEvaluationContext {
+            code: "omw.00109535.v",
+            pos: Some("v"),
+            lexfile: Some("verb.change"),
+            sememe_category: None,
+            is_root: false,
+            in_action_branch: false,
+        };
+        assert_eq!(evaluate_node_policy(&ctx_p2_verb), TaxonomyFoldPolicy::FlattenToActionRoot);
+
+        // P3: 抽象壳词穿透
+        let ctx_p3_shell = NodeEvaluationContext {
+            code: "omw.00024720.n", // 状态
+            pos: Some("n"),
+            lexfile: None,
+            sememe_category: None,
+            is_root: false,
+            in_action_branch: false,
+        };
+        assert_eq!(evaluate_node_policy(&ctx_p3_shell), TaxonomyFoldPolicy::BypassAndHoist);
+
+        // P4: 名词实体默认展开
+        let ctx_p4_noun = NodeEvaluationContext {
+            code: "omw.00000001.n",
+            pos: Some("n"),
+            lexfile: Some("noun.animal"),
+            sememe_category: Some(3),
+            is_root: false,
+            in_action_branch: false,
+        };
+        assert_eq!(evaluate_node_policy(&ctx_p4_noun), TaxonomyFoldPolicy::Keep);
+    }
+
+    /// 辅助构建模拟主库与语义库连接
+    fn setup_test_master_and_pack_conns() -> (Connection, Connection) {
+        let pack_conn = Connection::open_in_memory().unwrap();
+        pack_conn
+            .execute_batch(
+                "CREATE TABLE file_tags (
+                    code TEXT PRIMARY KEY,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    pos TEXT,
+                    lexfile TEXT,
+                    sememe_category INTEGER
+                );
+                CREATE TABLE tag_aliases_zh_CN (
+                    tag_code TEXT NOT NULL,
+                    lemma TEXT NOT NULL,
+                    is_canonical INTEGER NOT NULL DEFAULT 1,
+                    n INTEGER DEFAULT 0,
+                    count INTEGER DEFAULT 0,
+                    PRIMARY KEY (tag_code, lemma)
+                );",
+            )
+            .unwrap();
+
+        let master_conn = Connection::open_in_memory().unwrap();
+        master_conn
+            .execute_batch(
+                "CREATE TABLE workspace_files (
+                    file_fingerprint TEXT PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    workspace_id INTEGER NOT NULL DEFAULT 1,
+                    status INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE file_tag_relations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_fingerprint TEXT NOT NULL,
+                    tag_code TEXT NOT NULL,
+                    code_path TEXT,
+                    name_path TEXT
+                );",
+            )
+            .unwrap();
+
+        (pack_conn, master_conn)
+    }
+
+    /// 断言 1【图 1 动作链扁平化断言 (AC-1)】
+    #[test]
+    fn test_taxonomy_tree_action_flattening_ac1() {
+        let (pack_conn, master_conn) = setup_test_master_and_pack_conns();
+
+        pack_conn.execute_batch(
+            "INSERT INTO file_tags (code, pos, sememe_category) VALUES
+                ('builtin.category.action', 'n', 1),
+                ('action.replace', 'n', 1),
+                ('action.change', 'n', 1),
+                ('action.modify', 'n', 1),
+                ('action.delete', 'v', 1),
+                ('action.research', 'n', 1),
+                ('action.deep_research', 'n', 1),
+                ('action.discover', 'n', 1),
+                ('action.search', 'v', 1);
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma) VALUES
+                ('builtin.category.action', '动作生产'),
+                ('action.delete', '删除'),
+                ('action.search', '搜索');"
+        ).unwrap();
+
+        master_conn.execute_batch(
+            "INSERT INTO workspace_files (file_fingerprint, path) VALUES
+                ('fp_1', 'D:\\files\\f1.txt'),
+                ('fp_2', 'D:\\files\\f2.txt');
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_1', 'action.delete', '/builtin.category.action/action.replace/action.change/action.modify/action.delete', '/动作生产/更换/改变/修改/删除'),
+                ('fp_2', 'action.search', '/builtin.category.action/action.research/action.deep_research/action.discover/action.search', '/动作生产/研究/深入研究/发掘/搜索');"
+        ).unwrap();
+
+        let resp = query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None).unwrap();
+        assert_eq!(resp.root_nodes.len(), 1);
+        assert_eq!(resp.root_nodes[0].code, "builtin.content_tags");
+        let action_root = &resp.root_nodes[0].children[0];
+        assert_eq!(action_root.code, "builtin.category.action");
+        assert_eq!(action_root.name, "动作生产");
+        assert_eq!(action_root.file_count, 2);
+
+        // 断言：直接子节点严格只有“删除”与“搜索”，中间层被彻底抹平（深度为 2）
+        let child_codes: Vec<String> = action_root.children.iter().map(|c| c.code.clone()).collect();
+        assert_eq!(child_codes, vec!["action.delete", "action.search"]);
+        for child in &action_root.children {
+            assert!(child.children.is_empty(), "二级平铺动作节点不应再有子节点嵌套");
+            assert_eq!(child.parent_code.as_deref(), Some("builtin.category.action"));
+        }
+    }
+
+    /// 断言 2【图 2 OMW 动词上位链扁平化断言 (AC-2)】
+    #[test]
+    fn test_taxonomy_tree_omw_verb_flattening_ac2() {
+        let (pack_conn, master_conn) = setup_test_master_and_pack_conns();
+
+        pack_conn.execute_batch(
+            "INSERT INTO file_tags (code, pos) VALUES
+                ('omw.00109535.v', 'v'),
+                ('hownet.skeleton.anti', 'n'),
+                ('action.debug_test', 'v');
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma) VALUES
+                ('omw.00109535.v', '改变'),
+                ('hownet.skeleton.anti', '反'),
+                ('action.debug_test', '调测');"
+        ).unwrap();
+
+        master_conn.execute_batch(
+            "INSERT INTO workspace_files (file_fingerprint, path) VALUES
+                ('fp_1', 'D:\\files\\code.rs');
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_1', 'action.debug_test', '/omw.00109535.v/hownet.skeleton.anti/action.debug_test', '/改变/反/调测');"
+        ).unwrap();
+
+        let resp = query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None).unwrap();
+        assert_eq!(resp.root_nodes.len(), 1);
+        assert_eq!(resp.root_nodes[0].code, "builtin.content_tags");
+        let root = &resp.root_nodes[0].children[0];
+        assert_eq!(root.code, "omw.00109535.v");
+        // 断言：“调测”直接平铺为顶级动词根的直接子节点，中间“反”被彻底抹除
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].code, "action.debug_test");
+        assert_eq!(root.children[0].name, "调测");
+        assert_eq!(root.children[0].parent_code.as_deref(), Some("omw.00109535.v"));
+    }
+
+    /// 断言 3【图 3 名词实体树形深度保全断言 (AC-3)】
+    #[test]
+    fn test_taxonomy_tree_noun_hierarchy_preservation_ac3() {
+        let (pack_conn, master_conn) = setup_test_master_and_pack_conns();
+
+        pack_conn.execute_batch(
+            "INSERT INTO file_tags (code, pos) VALUES
+                ('domain.study', 'n'),
+                ('domain.discipline', 'n'),
+                ('domain.biology', 'n'),
+                ('domain.organism', 'n'),
+                ('domain.person', 'n'),
+                ('domain.villain', 'n');
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma) VALUES
+                ('domain.study', '学习资料'),
+                ('domain.discipline', '学科领域'),
+                ('domain.biology', '生物'),
+                ('domain.organism', '有机体'),
+                ('domain.person', '个人'),
+                ('domain.villain', '坏人');"
+        ).unwrap();
+
+        master_conn.execute_batch(
+            "INSERT INTO workspace_files (file_fingerprint, path) VALUES
+                ('fp_1', 'D:\\files\\bio.pdf');
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_1', 'domain.villain', '/domain.study/domain.discipline/domain.biology/domain.organism/domain.person/domain.villain', '/学习资料/学科领域/生物/有机体/个人/坏人');"
+        ).unwrap();
+
+        let resp = query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None).unwrap();
+        assert_eq!(resp.root_nodes.len(), 1);
+        assert_eq!(resp.root_nodes[0].code, "builtin.content_tags");
+
+        // 验证完整 6 级层级树形结构保持展开
+        let l1 = &resp.root_nodes[0].children[0];
+        assert_eq!(l1.name, "学习资料");
+        assert_eq!(l1.children.len(), 1);
+        let l2 = &l1.children[0];
+        assert_eq!(l2.name, "学科领域");
+        assert_eq!(l2.children.len(), 1);
+        let l3 = &l2.children[0];
+        assert_eq!(l3.name, "生物");
+        assert_eq!(l3.children.len(), 1);
+        let l4 = &l3.children[0];
+        assert_eq!(l4.name, "有机体");
+        assert_eq!(l4.children.len(), 1);
+        let l5 = &l4.children[0];
+        assert_eq!(l5.name, "个人");
+        assert_eq!(l5.children.len(), 1);
+        let l6 = &l5.children[0];
+        assert_eq!(l6.name, "坏人");
+        assert_eq!(l6.children.len(), 0);
+        assert_eq!(l6.file_count, 1);
+    }
+
+    /// 断言 4【HowNet 义原骨架 'n' 占位符防逃逸断言 (AC-4, ISS-08)】
+    #[test]
+    fn test_taxonomy_tree_hownet_skeleton_noun_action_flattening_ac4() {
+        let (pack_conn, master_conn) = setup_test_master_and_pack_conns();
+
+        pack_conn.execute_batch(
+            "INSERT INTO file_tags (code, pos, sememe_category) VALUES
+                ('builtin.category.action', 'n', 1),
+                ('hownet.act', 'n', 1),
+                ('hownet.do', 'n', 1),
+                ('action.recreate', 'n', 1),
+                ('action.render', 'v', 1);
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma) VALUES
+                ('builtin.category.action', '动作生产'),
+                ('hownet.act', '行动'),
+                ('hownet.do', '作'),
+                ('action.recreate', '再造'),
+                ('action.render', '渲染');"
+        ).unwrap();
+
+        master_conn.execute_batch(
+            "INSERT INTO workspace_files (file_fingerprint, path) VALUES
+                ('fp_1', 'D:\\files\\3d.blend');
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_1', 'action.render', '/builtin.category.action/hownet.act/hownet.do/action.recreate/action.render', '/动作生产/行动/作/再造/渲染');"
+        ).unwrap();
+
+        let resp = query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None).unwrap();
+        assert_eq!(resp.root_nodes[0].code, "builtin.content_tags");
+        let root = &resp.root_nodes[0].children[0];
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].code, "action.render");
+        assert_eq!(root.children[0].name, "渲染");
+        // 绝不因行动、作、再造标注为 pos='n' 而逃逸为名词实体多级树展开
+        assert!(root.children[0].children.is_empty());
+    }
+
+    /// 断言 5【动词自身直接命中文件保全断言 (AC-5, ISS-03)】
+    #[test]
+    fn test_taxonomy_tree_verb_direct_file_preservation_ac5() {
+        let (pack_conn, master_conn) = setup_test_master_and_pack_conns();
+
+        pack_conn.execute_batch(
+            "INSERT INTO file_tags (code, pos, sememe_category) VALUES
+                ('builtin.category.action', 'n', 1),
+                ('action.modify', 'v', 1),
+                ('action.delete', 'v', 1);
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma) VALUES
+                ('builtin.category.action', '动作生产'),
+                ('action.modify', '修改'),
+                ('action.delete', '删除');"
+        ).unwrap();
+
+        master_conn.execute_batch(
+            "INSERT INTO workspace_files (file_fingerprint, path) VALUES
+                ('fp_1', 'D:\\files\\f1.txt'),
+                ('fp_2', 'D:\\files\\f2.txt');
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_1', 'action.delete', '/builtin.category.action/action.modify/action.delete', '/动作生产/修改/删除'),
+                ('fp_2', 'action.modify', '/builtin.category.action/action.modify', '/动作生产/修改');"
+        ).unwrap();
+
+        let resp = query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None).unwrap();
+        assert_eq!(resp.root_nodes[0].code, "builtin.content_tags");
+        let root = &resp.root_nodes[0].children[0];
+        // 断言：“动作生产”下平级并列存在“修改 (1)”与“删除 (1)”，F2 独立入口完好无损，且总深度依然为 2
+        assert_eq!(root.children.len(), 2);
+        let names: Vec<String> = root.children.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(names, vec!["删除", "修改"]);
+        assert_eq!(root.children[0].file_count, 1);
+        assert_eq!(root.children[1].file_count, 1);
+        assert!(root.children[0].children.is_empty());
+        assert!(root.children[1].children.is_empty());
+    }
+
+    /// 断言 6【多分支同 Code 碰撞文件计数公理断言 (AC-6, ISS-01)】
+    #[test]
+    fn test_taxonomy_tree_multi_branch_collision_file_count_axiom_ac6() {
+        let (pack_conn, master_conn) = setup_test_master_and_pack_conns();
+
+        pack_conn.execute_batch(
+            "INSERT INTO file_tags (code, pos, sememe_category) VALUES
+                ('builtin.category.action', 'n', 1),
+                ('action.branch_a', 'n', 1),
+                ('action.branch_b', 'n', 1),
+                ('action.sync', 'v', 1);
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma) VALUES
+                ('builtin.category.action', '动作生产'),
+                ('action.sync', '同步');"
+        ).unwrap();
+
+        master_conn.execute_batch(
+            "INSERT INTO workspace_files (file_fingerprint, path) VALUES
+                ('fp_1', 'D:\\files\\f1.txt'),
+                ('fp_2', 'D:\\files\\f2.txt');
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_1', 'action.sync', '/builtin.category.action/action.branch_a/action.sync', '/动作生产/分支A/同步'),
+                ('fp_2', 'action.sync', '/builtin.category.action/action.branch_b/action.sync', '/动作生产/分支B/同步');"
+        ).unwrap();
+
+        let resp = query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None).unwrap();
+        assert_eq!(resp.root_nodes[0].code, "builtin.content_tags");
+        let root = &resp.root_nodes[0].children[0];
+        // 断言：提升至动作根下合并为一个“同步”节点，其 file_count 严格为 2，files 并集为 {fp_1, fp_2}
+        assert_eq!(root.children.len(), 1);
+        let sync_node = &root.children[0];
+        assert_eq!(sync_node.code, "action.sync");
+        assert_eq!(sync_node.name, "同步");
+        assert_eq!(sync_node.file_count, 2);
+        assert_eq!(sync_node.files, vec!["fp_1", "fp_2"]);
+    }
+
+    /// 断言 7【抽象壳名词穿透断言 (AC-7, ISS-02)】
+    #[test]
+    fn test_taxonomy_tree_shell_noun_bypass_ac7() {
+        let (pack_conn, master_conn) = setup_test_master_and_pack_conns();
+
+        pack_conn.execute_batch(
+            "INSERT INTO file_tags (code, pos) VALUES
+                ('doc.work', 'n'),
+                ('omw.00024720.n', 'n'), -- 状态 (命中标量白名单 SHELL_NOUN_CODES)
+                ('status.done', 'n');
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma) VALUES
+                ('doc.work', '工作文档'),
+                ('omw.00024720.n', '状态'),
+                ('status.done', '处理完毕');"
+        ).unwrap();
+
+        master_conn.execute_batch(
+            "INSERT INTO workspace_files (file_fingerprint, path) VALUES
+                ('fp_1', 'D:\\files\\doc.docx');
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_1', 'status.done', '/doc.work/omw.00024720.n/status.done', '/工作文档/状态/处理完毕');"
+        ).unwrap();
+
+        let resp = query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None).unwrap();
+        assert_eq!(resp.root_nodes.len(), 1);
+        assert_eq!(resp.root_nodes[0].code, "builtin.content_tags");
+        let work_doc = &resp.root_nodes[0].children[0];
+        assert_eq!(work_doc.name, "工作文档");
+        // 断言：“状态”抽屉被抹除，“处理完毕”直接上提至“工作文档”下一级
+        assert_eq!(work_doc.children.len(), 1);
+        assert_eq!(work_doc.children[0].code, "status.done");
+        assert_eq!(work_doc.children[0].name, "处理完毕");
+        assert_eq!(work_doc.children[0].parent_code.as_deref(), Some("doc.work"));
+    }
+
+    /// 断言 8【虚词与时序大类一票否决断言 (AC-8, ISS-11)】
+    #[test]
+    fn test_taxonomy_tree_function_word_rejection_ac8() {
+        let (pack_conn, master_conn) = setup_test_master_and_pack_conns();
+
+        pack_conn.execute_batch(
+            "INSERT INTO file_tags (code, pos) VALUES
+                ('builtin.category.function_word', 'u'),
+                ('func.some_particle', 'u');
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma) VALUES
+                ('builtin.category.function_word', '虚词'),
+                ('func.some_particle', '的');"
+        ).unwrap();
+
+        master_conn.execute_batch(
+            "INSERT INTO workspace_files (file_fingerprint, path) VALUES
+                ('fp_1', 'D:\\files\\f1.txt');
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_1', 'func.some_particle', '/builtin.category.function_word/func.some_particle', '/虚词/的');"
+        ).unwrap();
+
+        let resp = query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None).unwrap();
+        // 断言：返回的根节点列表中不含虚词分类，整枝被过滤
+        assert_eq!(resp.root_nodes.len(), 0);
     }
 }
 
