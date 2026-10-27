@@ -622,10 +622,10 @@ pub fn evaluate_node_policy(ctx: &NodeEvaluationContext) -> TaxonomyFoldPolicy {
         return TaxonomyFoldPolicy::FlattenToActionRoot;
     }
 
-    // P3: 抽象壳词穿透 (BypassAndHoist)
+    // P3: 抽象壳词穿透 (BypassAndHoist) - 包含受控抽象代码、抽象实体大类与 WordNet 哲学顶层壳 (noun.Tops)
     if is_shell_noun_code(ctx.code)
         || ctx.code == "builtin.category.abstract_entity"
-        || ctx.sememe_category == Some(4)
+        || ctx.lexfile == Some("noun.Tops")
     {
         return TaxonomyFoldPolicy::BypassAndHoist;
     }
@@ -1433,8 +1433,53 @@ pub fn query_taxonomy_tree_fast(
                     }
                 }
 
+                let mut tax_node = convert_trie_node_to_taxonomy_node(
+                    node,
+                    node_map,
+                    resolved_names,
+                    lang,
+                    include_files,
+                    &aggregate_files,
+                );
+
+                // 【加固点 2：父子同名自愈折叠 (Deduplication Axiom & Child Hoisting)】
+                // 若子节点的展示名与当前父节点展示名完全相同（如跨语种撞译导致的“资本 -> 资本”），
+                // 抹平同名子抽屉，将子节点的直接文件合并至父节点，并将孙辈节点提升为当前父节点的直接子节点。
+                // 采用 loop 迭代展开，天然免疫 A -> A -> A 连续多重撞名嵌套。
+                let mut current_children = children_nodes;
+                if !tax_node.name.trim().is_empty() {
+                    loop {
+                        let mut has_duplicate = false;
+                        let mut next_children = Vec::new();
+                        for child in current_children {
+                            if child.name.trim() == tax_node.name.trim() {
+                                has_duplicate = true;
+                                if include_files {
+                                    let mut merged_files: HashSet<String> = tax_node.files.into_iter().collect();
+                                    merged_files.extend(child.files);
+                                    tax_node.file_count = merged_files.len();
+                                    let mut sorted_files: Vec<String> = merged_files.into_iter().collect();
+                                    sorted_files.sort();
+                                    tax_node.files = sorted_files;
+                                }
+                                for mut grand_child in child.children {
+                                    grand_child.parent_code = Some(node.code.clone());
+                                    grand_child.parent_codes = vec![node.code.clone()];
+                                    next_children.push(grand_child);
+                                }
+                            } else {
+                                next_children.push(child);
+                            }
+                        }
+                        current_children = next_children;
+                        if !has_duplicate {
+                            break;
+                        }
+                    }
+                }
+
                 // 子节点排序：sort_order > 0 升序优先，相同按 code 字典序
-                children_nodes.sort_by(|a, b| {
+                current_children.sort_by(|a, b| {
                     let order_a = if a.sort_order > 0 { a.sort_order } else { i64::MAX };
                     let order_b = if b.sort_order > 0 { b.sort_order } else { i64::MAX };
                     if order_a != order_b {
@@ -1444,15 +1489,7 @@ pub fn query_taxonomy_tree_fast(
                     }
                 });
 
-                let mut tax_node = convert_trie_node_to_taxonomy_node(
-                    node,
-                    node_map,
-                    resolved_names,
-                    lang,
-                    include_files,
-                    &aggregate_files,
-                );
-                tax_node.children = children_nodes;
+                tax_node.children = current_children;
                 visited.remove(path);
                 Some((vec![tax_node], aggregate_files))
             }
@@ -3454,6 +3491,17 @@ mod tests {
         };
         assert_eq!(evaluate_node_policy(&ctx_p3_shell), TaxonomyFoldPolicy::BypassAndHoist);
 
+        // WordNet 顶层哲学壳 (noun.Tops) 穿透
+        let ctx_p3_tops = NodeEvaluationContext {
+            code: "omw.00032613.n", // possession (所有)
+            pos: Some("n"),
+            lexfile: Some("noun.Tops"),
+            sememe_category: None,
+            is_root: false,
+            in_action_branch: false,
+        };
+        assert_eq!(evaluate_node_policy(&ctx_p3_tops), TaxonomyFoldPolicy::BypassAndHoist);
+
         // P4: 名词实体默认展开
         let ctx_p4_noun = NodeEvaluationContext {
             code: "omw.00000001.n",
@@ -3821,8 +3869,94 @@ mod tests {
         // 断言：返回的根节点列表中不含虚词分类，整枝被过滤
         assert_eq!(resp.root_nodes.len(), 0);
     }
+    /// 断言 9【WordNet 顶层哲学壳 noun.Tops 批量穿透断言 (AC-9)】
+    #[test]
+    fn test_taxonomy_tree_noun_tops_bypass_ac9() {
+        let (pack_conn, master_conn) = setup_test_master_and_pack_conns();
+
+        pack_conn.execute_batch(
+            "INSERT INTO file_tags (code, pos, lexfile) VALUES
+                ('omw.00032613.n', 'n', 'noun.Tops'), -- 所有 (possession, 哲学顶层壳)
+                ('omw.13329641.n', 'n', 'noun.possession'), -- 财产 (具象分类抽屉)
+                ('tag.contract', 'n', 'noun.communication');
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma) VALUES
+                ('omw.00032613.n', '所有'),
+                ('omw.13329641.n', '财产'),
+                ('tag.contract', '转让合同');"
+        ).unwrap();
+
+        master_conn.execute_batch(
+            "INSERT INTO workspace_files (file_fingerprint, path) VALUES
+                ('fp_1', 'D:\\files\\contract.pdf');
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_1', 'tag.contract', '/omw.00032613.n/omw.13329641.n/tag.contract', '/所有/财产/转让合同');"
+        ).unwrap();
+
+        let resp = query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None).unwrap();
+        assert_eq!(resp.root_nodes.len(), 1);
+        assert_eq!(resp.root_nodes[0].code, "builtin.content_tags");
+        let content_tags = &resp.root_nodes[0];
+        
+        // 断言：顶层哲学壳“所有 (omw.00032613.n)”被 BypassAndHoist 穿透抹除，
+        // “财产 (omw.13329641.n)”直接提升为内容标签的第一级子节点！
+        assert!(!content_tags.children.iter().any(|c| c.code == "omw.00032613.n" || c.name == "所有"));
+        let property_node = content_tags.children.iter().find(|c| c.code == "omw.13329641.n");
+        assert!(property_node.is_some(), "财产必须作为合法分类抽屉直接挂在内容标签下");
+        let property_node = property_node.unwrap();
+        assert_eq!(property_node.name, "财产");
+        assert_eq!(property_node.children.len(), 1);
+        assert_eq!(property_node.children[0].code, "tag.contract");
+        assert_eq!(property_node.children[0].name, "转让合同");
+        assert_eq!(property_node.children[0].parent_code.as_deref(), Some("omw.13329641.n"));
+    }
+
+    /// 断言 10【父子同名自愈折叠与孙辈提升断言 (AC-10)】
+    #[test]
+    fn test_taxonomy_tree_parent_child_duplicate_name_folding_ac10() {
+        let (pack_conn, master_conn) = setup_test_master_and_pack_conns();
+
+        // 模拟跨语种撞译场景：omw.13353607.n 与 omw.13353858.n 在中文库中均被映射为“资本”
+        pack_conn.execute_batch(
+            "INSERT INTO file_tags (code, pos, lexfile) VALUES
+                ('omw.13353607.n', 'n', 'noun.possession'),
+                ('omw.13353858.n', 'n', 'noun.possession'),
+                ('omw.13354154.n', 'n', 'noun.possession');
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma) VALUES
+                ('omw.13353607.n', '资本'),
+                ('omw.13353858.n', '资本'),
+                ('omw.13354154.n', '钱财');"
+        ).unwrap();
+
+        master_conn.execute_batch(
+            "INSERT INTO workspace_files (file_fingerprint, path) VALUES
+                ('fp_cap_direct', 'D:\\files\\capital.txt'),
+                ('fp_money', 'D:\\files\\money.txt');
+            -- 路径：/资本(A)/资本(B)/钱财(C)，其中资本(A)有直接文件，钱财(C)有直接文件
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                ('fp_cap_direct', 'omw.13353858.n', '/omw.13353607.n/omw.13353858.n', '/资本/资本'),
+                ('fp_money', 'omw.13354154.n', '/omw.13353607.n/omw.13353858.n/omw.13354154.n', '/资本/资本/钱财');"
+        ).unwrap();
+
+        let resp = query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None).unwrap();
+        assert_eq!(resp.root_nodes.len(), 1);
+        let content_tags = &resp.root_nodes[0];
+        
+        // 断言 1：内容标签下只有 1 个“资本”节点（绝不能出现 2 个）
+        let capital_nodes: Vec<_> = content_tags.children.iter().filter(|c| c.name == "资本").collect();
+        assert_eq!(capital_nodes.len(), 1);
+        let capital = capital_nodes[0];
+        
+        // 断言 2：顶层“资本”节点聚合了直接文件与子树文件，file_count 严格为 2
+        assert_eq!(capital.file_count, 2);
+        assert_eq!(capital.files, vec!["fp_cap_direct", "fp_money"]);
+        
+        // 断言 3：同名子节点被抹平，其下的孙节点“钱财”被直接提升为“资本”的直接子节点！
+        assert_eq!(capital.children.len(), 1);
+        let money = &capital.children[0];
+        assert_eq!(money.code, "omw.13354154.n");
+        assert_eq!(money.name, "钱财");
+        assert_eq!(money.file_count, 1);
+        assert_eq!(money.files, vec!["fp_money"]);
+        assert_eq!(money.parent_code.as_deref(), Some("omw.13353607.n"), "孙节点的父级指针必须对齐提升后的父节点");
+    }
 }
-
-
-
-
