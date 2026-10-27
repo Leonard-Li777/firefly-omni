@@ -72,6 +72,8 @@ pub struct AppState {
     pub vector: Arc<VectorEngine>,
     /// 桌面端 SQLite 业务主库路径（只读访问 file_tag_relations 等主库表）
     pub master_db_path: Arc<Mutex<Option<PathBuf>>>,
+    /// 向量存储目录实际物理路径（用于多 Worktree 隔离校验，防止盲目复用造成跨库污染）
+    pub target_vectors_dir: Option<PathBuf>,
     /// 动态维度执行策略（由本地主库 system_config.DIMENSION_POLICIES 动态驱动，缺省回退内置）
     pub dimension_policies: Arc<std::sync::RwLock<std::collections::HashMap<String, omni_core::DimensionExecutionPolicy>>>,
     /// Sherpa-ONNX 全栈音频 AI 管理引擎 (SenseVoice ASR / Silero VAD / GTCRN 降噪 / CED-mini 打标)
@@ -236,6 +238,17 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
     } else {
         false
     };
+    let master_db_path = state
+        .master_db_path
+        .lock()
+        .ok()
+        .and_then(|p| p.clone())
+        .map(|p| p.to_string_lossy().to_string());
+    let target_vectors_dir = state
+        .target_vectors_dir
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .or_else(|| Some(state.vector.dir().to_string_lossy().to_string()));
     Json(serde_json::json!({
         "status": "ok",
         "profile": profile,
@@ -245,6 +258,8 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
         "idleTimeoutSeconds": 300,
         "isPro": is_pro,
         "version": env!("CARGO_PKG_VERSION"),
+        "masterDbPath": master_db_path,
+        "targetVectorsDir": target_vectors_dir,
     }))
 }
 
@@ -507,6 +522,12 @@ async fn reconnect_omw_handler(
         .and_then(|p| p.clone())
         .map(|p| p.to_string_lossy().to_string());
 
+    let target_vectors_dir = state
+        .target_vectors_dir
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .or_else(|| Some(state.vector.dir().to_string_lossy().to_string()));
+
     Json(serde_json::json!({
         "status": "ok",
         // 数据源能力位：本端点不再改变 OmwDb，故此处恒等于当前真实数据源
@@ -515,6 +536,7 @@ async fn reconnect_omw_handler(
         "graphReady": state.omw.semantic_graph().is_some(),
         "policiesReloaded": policies_reloaded,
         "dbPath": master_db,
+        "targetVectorsDir": target_vectors_dir,
         "reason": null
     }))
 }
@@ -985,6 +1007,7 @@ pub async fn start_server(
         );
     }
     let moss = Arc::new(MossTtsManager::new());
+    let vectors_dir_opt = Some(vector.dir().to_path_buf());
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),
         geo,
@@ -993,6 +1016,7 @@ pub async fn start_server(
         omw,
         vector,
         master_db_path: Arc::new(Mutex::new(db_path)),
+        target_vectors_dir: vectors_dir_opt,
         dimension_policies: Arc::new(std::sync::RwLock::new(initial_policies)),
         sherpa,
         moss,
