@@ -11,6 +11,13 @@ pub mod concepts;
 pub mod concept_opposition;
 pub mod emotion_opposition;
 
+/// 受控「敏感内容」子树封闭清单（130 / 123 / 134 叶子全集，视觉零样本与全年龄纯净闸唯一判据）
+pub mod sensitive_subtree;
+pub use sensitive_subtree::{
+    is_sensitive_subtree_code, is_sensitive_subtree_concept, is_sensitive_subtree_tag,
+    SENSITIVE_SUBTREE_CONCEPTS,
+};
+
 /// AOT 自动生成的受控标签别名常量表（SSOT 来自 file-dimension-source.ts）
 pub mod builtin_aliases_generated;
 

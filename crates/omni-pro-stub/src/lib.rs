@@ -433,12 +433,20 @@ pub mod perceive {
 pub mod vision {
     use std::path::Path;
 
-    pub fn is_nsfw_or_restricted_tag(_word: &str) -> bool {
-        false
+    /// 无 pro 资产构建下的降级实现。
+    ///
+    /// 虽然 CLIP 词表层与 NSFW 模型层不可用，但**「敏感内容」子树判据纯词表/受控码，
+    /// 不依赖任何 pro 资产**，故必须委托 `omni_core::is_sensitive_subtree_tag`。
+    /// 早期此处恒返回 `false`（静默放行全部敏感叶子），一旦以 stub 构建，
+    /// 全年龄纯净闸与词表闸会同时失效且无任何告警——属 AGENTS §2.9 禁止的静默降级。
+    pub fn is_nsfw_or_restricted_tag(word: &str) -> bool {
+        omni_core::is_sensitive_subtree_tag(word)
     }
 
-    pub fn is_vocab_layer_blocked(_word: &str) -> bool {
-        false
+    /// 签名必须与 pro 版 `omni_vision::is_vocab_layer_blocked(word, is_zh)` **完全一致**，
+    /// 否则 feature 切换（pro 资产缺失 ⇒ 走 stub）时调用方无法共用同一调用点、直接编译失败。
+    pub fn is_vocab_layer_blocked(word: &str, _is_zh: bool) -> bool {
+        omni_core::is_sensitive_subtree_tag(word)
     }
 
     #[derive(Debug, Clone)]
@@ -1986,8 +1994,11 @@ mod tests {
 
     #[test]
     fn test_ce_stub_nsfw_and_vocab_blocked() {
+        // 敏感子树判据纯受控码/词表，不依赖 pro 资产 ⇒ stub 构建下也必须拦下
         assert!(!is_nsfw_or_restricted_tag("any_word"));
-        assert!(!is_vocab_layer_blocked("any_word"));
+        assert!(is_nsfw_or_restricted_tag("师生情色"));
+        assert!(!is_vocab_layer_blocked("any_word", true));
+        assert!(is_vocab_layer_blocked("师生情色", true));
     }
 
     #[test]
