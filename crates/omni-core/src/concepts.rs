@@ -1,7 +1,7 @@
 // =====================================================================
 // Omni 受控概念强类型枚举 (Controlled Concepts Generated)
 // 由 scripts/taxonomy/generate-controlled-concepts.ts 自动生成，请勿手动编辑！
-// 事实源: fileDimension_zh-CN.json (1108 个全量核心受控词汇)
+// 事实源: fileDimension_zh-CN.json (1109 个全量核心受控词汇)
 // =====================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -105,6 +105,8 @@ pub enum Concept {
     播客,
     /// 概念: 擦边诱惑 | 代码: builtin.temptation_on_the_edge
     擦边诱惑,
+    /// 概念: 财务档案 | 代码: builtin.financial_archives
+    财务档案,
     /// 概念: 财务类型 | 代码: builtin.financial_type
     财务类型,
     /// 概念: 采购订单 | 代码: builtin.purchase_order
@@ -2280,6 +2282,7 @@ impl Concept {
             Concept::播放列表 => "builtin.playlist",
             Concept::播客 => "hownet.000000147907.n",
             Concept::擦边诱惑 => "builtin.temptation_on_the_edge",
+            Concept::财务档案 => "builtin.financial_archives",
             Concept::财务类型 => "builtin.financial_type",
             Concept::采购订单 => "builtin.purchase_order",
             Concept::草稿 => "omw.06390962.n",
@@ -3395,6 +3398,7 @@ impl Concept {
             Concept::播放列表 => "播放列表",
             Concept::播客 => "播客",
             Concept::擦边诱惑 => "擦边诱惑",
+            Concept::财务档案 => "财务档案",
             Concept::财务类型 => "财务类型",
             Concept::采购订单 => "采购订单",
             Concept::草稿 => "草稿",
@@ -4510,6 +4514,7 @@ impl Concept {
             Concept::播放列表 => "Playlist",
             Concept::播客 => "Podcast",
             Concept::擦边诱惑 => "Temptation on the Edge",
+            Concept::财务档案 => "Financial archives",
             Concept::财务类型 => "Financial Type",
             Concept::采购订单 => "Purchase Order",
             Concept::草稿 => "Draft",
@@ -5624,6 +5629,7 @@ impl Concept {
             "播放列表" => Some(Concept::播放列表),
             "播客" => Some(Concept::播客),
             "擦边诱惑" => Some(Concept::擦边诱惑),
+            "财务档案" => Some(Concept::财务档案),
             "财务类型" => Some(Concept::财务类型),
             "采购订单" => Some(Concept::采购订单),
             "草稿" => Some(Concept::草稿),
@@ -6739,6 +6745,7 @@ impl Concept {
             "builtin.playlist" => Some(Concept::播放列表),
             "hownet.000000147907.n" => Some(Concept::播客),
             "builtin.temptation_on_the_edge" => Some(Concept::擦边诱惑),
+            "builtin.financial_archives" => Some(Concept::财务档案),
             "builtin.financial_type" => Some(Concept::财务类型),
             "builtin.purchase_order" => Some(Concept::采购订单),
             "omw.06390962.n" => Some(Concept::草稿),
@@ -7797,9 +7804,7 @@ impl Concept {
             "builtin.yml" => Some(Concept::yml),
             "builtin.zig" => Some(Concept::zig),
             "builtin.zip" => Some(Concept::zip),
-            "builtin.image_segmentation" => Some(Concept::图片细分),
             "builtin.security_level" => Some(Concept::安全等级),
-            "builtin.pornography_rating" => Some(Concept::色情分级),
             "builtin.illumination" => Some(Concept::光照),
             "builtin.background" => Some(Concept::背景),
             "builtin.perspective" => Some(Concept::视角),
@@ -8051,6 +8056,8 @@ impl Concept {
             "hownet.000000265705.n" => Some(Concept::身份证),
             "hownet.000000265706.n" => Some(Concept::身份证),
             "hownet.000000265707.n" => Some(Concept::身份证),
+            "builtin.image_segmentation" => Some(Concept::图片细分),
+            "builtin.pornography_rating" => Some(Concept::色情分级),
             "hownet.000000195815.n" => Some(Concept::演示文稿),
             "hownet.000000195816.n" => Some(Concept::演示文稿),
             "hownet.000000231419.n" => Some(Concept::编程语言),
