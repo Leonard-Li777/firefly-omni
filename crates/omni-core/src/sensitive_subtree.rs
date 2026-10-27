@@ -24,12 +24,15 @@
 //!
 //! ## 事实源与维护纪律
 //!
-//! 清单 = 创世维度 `fileDimension_zh-CN.json` 中三个合规审查维度的**全部叶子**：
+//! 清单 = 创世维度 `fileDimension_zh-CN.json` 中六个合规审查维度的**全部叶子**：
 //!
 //! | 维度 | 受控代码 | 叶子数 |
 //! | :--- | :--- | :--- |
 //! | 130 敏感内容 | `builtin.sensitive_content` | 6 |
 //! | 123 色情分级 | `builtin.erotic_scale` | 5 |
+//! | 131 血腥细分 | `builtin.bloody_segmentation` | 9 |
+//! | 132 涉政细分 | `builtin.political_subcategories` | 8 |
+//! | 133 违规细分 | `builtin.violation_categories` | 10 |
 //! | 134 色情细分 | `builtin.pornography_subgenres` | 12 |
 //!
 //! 表成员一律用 [`Concept`] 权威枚举表达（PRD-0058：严禁业务层自然语言词串比对），
@@ -42,7 +45,7 @@
 use crate::concepts::Concept;
 use crate::tag_identity::{concept_from_code, concept_from_code_or_alias};
 
-/// 受控「敏感内容」子树叶子全集（130 敏感内容 + 123 色情分级 + 134 色情细分）
+/// 受控「敏感内容」子树叶子全集（130 敏感内容 + 123 色情分级 + 131 血腥细分 + 132 涉政细分 + 133 违规细分 + 134 色情细分）
 ///
 /// ⚠ 该常量是合规审查标签的**唯一封闭判据**，新增维度叶子必须同步登记。
 pub const SENSITIVE_SUBTREE_CONCEPTS: &[Concept] = &[
@@ -59,6 +62,36 @@ pub const SENSITIVE_SUBTREE_CONCEPTS: &[Concept] = &[
     Concept::纯肉,       // builtin.fully_explicit
     Concept::特殊XP,     // builtin.special_xp
     Concept::重度猎奇,   // builtin.extreme_grotesque
+    // ── 维度 131「血腥细分」(`builtin.bloody_segmentation`) 9 叶子 ─────────────
+    Concept::断头斩首,   // builtin.beheading
+    Concept::肢解碎尸,   // builtin.dismemberment_and_dismantling_of_a_corpse
+    Concept::血腥虐杀,   // builtin.bloody_massacre
+    Concept::尸体残骸,   // builtin.corpse_remains
+    Concept::酷刑折磨,   // builtin.torture
+    Concept::血肉模糊,   // hownet.000000250538.a / builtin.flesh_mutilation
+    Concept::重口猎奇,   // builtin.hardcore_grotesque
+    Concept::暴恐惨案,   // builtin.terror_tragedy
+    Concept::自残放血,   // builtin.self_harm_bleeding
+    // ── 维度 132「涉政细分」(`builtin.political_subcategories`) 8 叶子 ──────────
+    Concept::反党反政,   // builtin.anti_party_and_anti_government
+    Concept::颠覆政权,   // hownet.000000292078.n / builtin.overthrow_the_government
+    Concept::分裂国家,   // builtin.secession
+    Concept::恐怖主义,   // omw.00759694.n / builtin.terrorism
+    Concept::邪教组织,   // builtin.cult_organizations
+    Concept::暴乱动乱,   // builtin.riots_and_unrest
+    Concept::宗教极端,   // builtin.religious_extremism
+    Concept::极端思潮,   // builtin.extremist_ideologies
+    // ── 维度 133「违规细分」(`builtin.violation_categories`) 10 叶子 ───────────
+    Concept::毒品交易,   // builtin.drug_trafficking
+    Concept::走私贩私,   // hownet.000000263362.v / builtin.smuggling
+    Concept::枪支弹药,   // builtin.firearms_and_ammunition
+    Concept::洗钱黑产,   // builtin.money_laundering_and_illegal_activities
+    Concept::电信诈骗,   // hownet.000000207620.n
+    Concept::暗网交易,   // builtin.dark_web_transactions
+    Concept::网络赌博,   // builtin.online_gambling
+    Concept::假冒伪劣,   // omw.01908539.s
+    Concept::侵害未成年, // builtin.abuse_of_minors
+    Concept::违禁物品,   // hownet.000000270144.n
     // ── 维度 134「色情细分」(`builtin.pornography_subgenres`) 12 叶子 ─────────
     Concept::家庭乱伦,       // builtin.family_incest
     Concept::婚外情欲,       // builtin.extramarital_lust
@@ -115,19 +148,42 @@ pub fn is_sensitive_subtree_tag(word: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// 叶子数量锁：130(6) + 123(5) + 134(12) = 23
+    /// 叶子数量锁：130(6) + 123(5) + 131(9) + 132(8) + 133(10) + 134(12) = 50
     /// 维度叶子增删必须同步本表，否则此断言立即失败（防再次静默漂移）
     #[test]
     fn sensitive_subtree_covers_all_controlled_leaves() {
         assert_eq!(
             SENSITIVE_SUBTREE_CONCEPTS.len(),
-            23,
-            "敏感内容子树叶子数量与创世维度事实源不符：130(6) + 123(5) + 134(12) = 23"
+            50,
+            "敏感内容子树叶子数量与创世维度事实源不符：130(6) + 123(5) + 131(9) + 132(8) + 133(10) + 134(12) = 50"
         );
         let mut codes: Vec<&str> = SENSITIVE_SUBTREE_CONCEPTS.iter().map(|cpt| cpt.code()).collect();
         codes.sort_unstable();
         codes.dedup();
-        assert_eq!(codes.len(), 23, "子树清单存在重复 code");
+        assert_eq!(codes.len(), 50, "子树清单存在重复 code");
+    }
+
+    /// 真实事故回归：视频缩略图被打上血腥细分 8 个叶子
+    #[test]
+    fn bloody_subdivision_leaves_must_be_covered() {
+        for (zh, code) in [
+            ("断头斩首", "builtin.beheading"),
+            ("肢解碎尸", "builtin.dismemberment_and_dismantling_of_a_corpse"),
+            ("血腥虐杀", "builtin.bloody_massacre"),
+            ("尸体残骸", "builtin.corpse_remains"),
+            ("酷刑折磨", "builtin.torture"),
+            ("血肉模糊", "builtin.flesh_mutilation"),
+            ("重口猎奇", "builtin.hardcore_grotesque"),
+            ("暴恐惨案", "builtin.terror_tragedy"),
+            ("自残放血", "builtin.self_harm_bleeding"),
+        ] {
+            assert!(is_sensitive_subtree_tag(zh), "中文名未命中: {zh}");
+            assert!(is_sensitive_subtree_code(code), "受控 code 未命中: {code}");
+            assert!(
+                is_sensitive_subtree_tag(code),
+                "code 形态经 tag 入口未命中: {code}"
+            );
+        }
     }
 
     /// 真实事故回归：这两个叶子此前双闸皆漏判
@@ -158,6 +214,10 @@ mod tests {
         assert!(is_sensitive_subtree_tag("Teacher-Student Erotica"));
         assert!(is_sensitive_subtree_tag("Diverse Sexual Orientations"));
         assert!(is_sensitive_subtree_tag("Workplace Erotica"));
+        assert!(is_sensitive_subtree_tag("Beheading"));
+        assert!(is_sensitive_subtree_tag("Bloody Massacre"));
+        assert!(is_sensitive_subtree_tag("Telecom Fraud"));
+        assert!(is_sensitive_subtree_tag("Drug Trafficking"));
     }
 
     /// 中性生活工作词汇严禁误杀（历史白名单护栏）
