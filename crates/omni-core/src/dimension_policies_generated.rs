@@ -435,7 +435,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "omw.14428404.n": {
+  "builtin.security_level": {
     "id": 17,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1412,7 +1412,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "omw.03769397.n": {
+  "builtin.illumination": {
     "id": 138,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1431,7 +1431,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "omw.02768864.n": {
+  "hownet.000000237195.n": {
     "id": 139,
     "threshold": 0.6,
     "applicableFileTypes": [
@@ -1450,7 +1450,7 @@ pub static DEFAULT_DIMENSION_POLICIES_JSON: &str = r##"{
       }
     }
   },
-  "omw.13919059.n": {
+  "builtin.perspective": {
     "id": 140,
     "threshold": 0.6,
     "applicableFileTypes": [
