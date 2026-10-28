@@ -27,6 +27,7 @@ fn setup_test_app() -> Router {
         dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
         sherpa: Arc::new(omni_server::SherpaManager::new()),
         moss: Arc::new(omni_server::MossTtsManager::new()),
+        target_vectors_dir: None,
     };
     create_app_router(state)
 }
@@ -155,6 +156,27 @@ async fn test_perceive_real_pe_binary_metadata_and_dual_tags() {
     assert!(
         dev_tag.parent_codes.contains(&omni_core::concepts::Concept::工具应用.code().to_string()),
         "开发工具的 parent_codes 必须包含 tagImplications 蕴涵的目标父级 (工具应用)"
+    );
+
+    // 6. AC-4 & AC-6: 验证文件来源溯源产出「本地创建」（builtin.created_locally），且严禁产出「原创」（omw.01687586.s）
+    assert_eq!(
+        res.file_source_code.as_deref(),
+        Some(omni_core::concepts::Concept::本地创建.code()),
+        "file_source_code 必须为 builtin.created_locally"
+    );
+    assert_eq!(res.file_source.as_deref(), Some("本地创建"));
+
+    let has_created_locally = res.fact_tags.iter().any(|t| t.code == omni_core::concepts::Concept::本地创建.code());
+    assert!(
+        has_created_locally,
+        "fact_tags 必须包含「本地创建」受控代码 (builtin.created_locally)，实际 fact_tags: {:?}",
+        res.fact_tags.iter().map(|t| (&t.name, &t.code)).collect::<Vec<_>>()
+    );
+
+    let has_original_work = res.fused_tags.iter().chain(res.fact_tags.iter()).any(|t| t.code == omni_core::concepts::Concept::原创.code() || t.name == "原创");
+    assert!(
+        !has_original_work,
+        "fused_tags 与 fact_tags 严禁包含「原创」标签 (omw.01687586.s)"
     );
 }
 
