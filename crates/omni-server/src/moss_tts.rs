@@ -572,15 +572,18 @@ pub struct MossTtsEngine {
     tokenizer: Tokenizer,
 }
 
-/// Codec 解码器启动期 Warmup 闭包：构造 64 帧基准输入预热 DirectML D3D12 PSO 编译
+/// Codec 解码器启动期 Warmup 闭包：构造 64/256/384 静态三桶基准输入，预先编译 DirectML D3D12 PSO 并驻留驱动缓存
 fn warmup_codec_decoder(session: &Session) -> Result<(), ort::Error> {
-    let dummy_codes = Array3::<i32>::zeros((1, 64, 16));
-    let dummy_lengths = Array1::<i32>::from_vec(vec![64]);
-    let inputs = ort::inputs![
-        "audio_codes" => dummy_codes,
-        "audio_code_lengths" => dummy_lengths,
-    ]?;
-    session.run(inputs).map(|_| ())
+    for &frames in &[64, 256, 384] {
+        let dummy_codes = Array3::<i32>::zeros((1, frames, 16));
+        let dummy_lengths = Array1::<i32>::from_vec(vec![frames as i32]);
+        let inputs = ort::inputs![
+            "audio_codes" => dummy_codes,
+            "audio_code_lengths" => dummy_lengths,
+        ]?;
+        session.run(inputs)?;
+    }
+    Ok(())
 }
 
 impl MossTtsEngine {
@@ -826,7 +829,10 @@ impl MossTtsEngine {
         let local_fixed_sess = self.local_fixed_session.lock().unwrap();
         let decode_sess = self.decode_session.lock().unwrap();
 
-        let max_frames = 375;
+        // 动态单句安全帧数上限：基于文本 token 长度计算宽松上界，严防模型在短句尾部发生自回归跑飞死循环
+        // 1 秒 = 12.5 帧。中文平均 1 字符 ~ 3.5 帧，给予 2.5 倍宽松冗余 (8 帧/token) + 80 帧基础余量
+        let dynamic_max = text_tokens.len() * 8 + 80;
+        let max_frames = dynamic_max.min(375);
         let mut local_ms_acc = 0.0f64;
         let mut step_decode_ms_acc = 0.0f64;
         let t_decode = Instant::now();
@@ -978,7 +984,7 @@ impl MossTtsEngine {
             return Err("MOSS-TTS 未生成任何有效音频帧".to_string());
         }
 
-        // 5. Codec 解码为 48kHz 立体声 PCM (Static Double-Bucket: 64/256 静态双桶规避 DirectML PSO 重编译)
+        // 5. Codec 解码为 48kHz 立体声 PCM (Static Triple-Bucket: 64/256/384 静态三桶彻底杜绝 DirectML PSO 动态重编译)
         let t_codec = Instant::now();
         let total_frames = generated_frames.len();
 
@@ -986,6 +992,8 @@ impl MossTtsEngine {
             (64, true)
         } else if total_frames <= 256 {
             (256, true)
+        } else if total_frames <= 384 {
+            (384, true)
         } else {
             (total_frames, false)
         };
