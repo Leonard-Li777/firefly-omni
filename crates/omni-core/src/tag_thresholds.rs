@@ -39,18 +39,18 @@ pub const GEMMA_ABS_FLOOR: f32 = 0.28;
 /// Gemma 视觉零样本 Top-1 侧向抑制 margin：与第一名差距超过该值的候选被滤除
 pub const GEMMA_TOP_MARGIN: f32 = 0.065;
 
-/// Gemma 峰值-中位落差门限（替代不可用的 μ + kσ 口径，见
-/// docs/specs/gemma-visual-vocab-anisotropy-and-hub-domination-fix-spec.md §4.2）
+/// Gemma 峰值-中位落差门限（峰值相对 150 词背景噪声的最小落差，见
+/// docs/specs/gemma-visual-vocab-anisotropy-and-hub-domination-fix-spec.md §4.2 / §14.1）
 ///
-/// ⚠ provisional：图文跨模态分布尚未标定（缺 vision_gate 夹具集），
-/// TASK-02 夹具跑完后覆写。当前值不参与生产判定。
+/// 严禁写为 top1-top2，必须是 peak-to-median：允许非互斥标签同时过线，
+/// 拦截平坦噪声背景上的假阳性。
 pub const GEMMA_MIN_PROMINENCE: f32 = 0.08;
 
 /// Gemma 标定线性起步分（sim = GEMMA_ABS_FLOOR 映射到 conf 下限）
 pub const GEMMA_CALIBRATE_FLOOR: f32 = 0.60;
 
-/// Gemma 标定线性斜率
-pub const GEMMA_CALIBRATE_SLOPE: f32 = 2.0;
+/// Gemma 标定线性斜率（TASK-02 去饱和修复：从 2.0 降至 1.2，使置信度在 [0.60, 0.95] 呈单调连续分布）
+pub const GEMMA_CALIBRATE_SLOPE: f32 = 1.2;
 
 /// Gemma 标定 conf 上限（饱和值，详见事故规格 §4.4：全库 visual 组该通道恒等于此值）
 pub const GEMMA_CALIBRATE_CAP: f32 = 0.95;
