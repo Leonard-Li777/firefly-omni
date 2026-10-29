@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use std::sync::{Arc, Mutex};
-use ndarray::{Array1, Array2, Array3, Array4};
+use ndarray::{Array1, Array2, Array3};
 use omni_core::{ModelTier, OmniOrtRuntime};
 use ort::session::Session;
 use tokio::sync::RwLock;
@@ -40,6 +40,17 @@ const AUDIO_END_TOKEN_ID: i32 = 7;
 const AUDIO_USER_SLOT_TOKEN_ID: i32 = 8;
 const AUDIO_ASSISTANT_SLOT_TOKEN_ID: i32 = 9;
 
+const PAST_KEY_NAMES: [&str; 12] = [
+    "past_key_0", "past_key_1", "past_key_2", "past_key_3",
+    "past_key_4", "past_key_5", "past_key_6", "past_key_7",
+    "past_key_8", "past_key_9", "past_key_10", "past_key_11",
+];
+const PAST_VALUE_NAMES: [&str; 12] = [
+    "past_value_0", "past_value_1", "past_value_2", "past_value_3",
+    "past_value_4", "past_value_5", "past_value_6", "past_value_7",
+    "past_value_8", "past_value_9", "past_value_10", "past_value_11",
+];
+
 // MOSS-TTS 提示模板硬编码常数
 const USER_PROMPT_PREFIX_TOKEN_IDS: &[i32] = &[
     600, 289, 10356, 13, 10356, 10425, 1860, 4546, 12907, 10363, 13325, 11492,
@@ -66,6 +77,14 @@ pub struct VoicePromptData {
     pub frames: usize,
     /// 形状: [frames, 16]，包含 16 个码本离散特征值 (int16)
     pub codes: Vec<Vec<i16>>,
+}
+
+/// MOSS-TTS 合成结果与端到端截断状态传递契约 (PRD-0058 / MOSS-TTS Low Latency Spec §4.1)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SynthResult {
+    pub wav_bytes: Vec<u8>,
+    pub hit_cap: bool,
+    pub steps: usize,
 }
 
 /// 预置音色库 JSON Schema 单项描述
@@ -608,7 +627,7 @@ impl MossTtsEngine {
     }
 
     /// 执行单句 48kHz 离线语音合成
-    pub fn synthesize(&self, text: &str, prompt_codes: &[Vec<i16>], speed: f32) -> Result<Vec<u8>, String> {
+    pub fn synthesize(&self, text: &str, prompt_codes: &[Vec<i16>], speed: f32) -> Result<SynthResult, String> {
         // 分段耗时打点：prefill / decode 循环 / codec / 尾部后处理，用于定位首发音瓶颈段位
         let call_seq = SYNTH_CALL_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         let t_enter = Instant::now();
@@ -727,13 +746,8 @@ impl MossTtsEngine {
             .map_err(|e| format!("Prefill run error: {}", e))?;
 
         let mut global_hidden: Array2<f32>;
-        let mut past_keys: Vec<Array4<f32>> = Vec::with_capacity(12);
-        let mut past_values: Vec<Array4<f32>> = Vec::with_capacity(12);
-
-        for _ in 0..12 {
-            past_keys.push(Array4::zeros((1, 0, 12, 64)));
-            past_values.push(Array4::zeros((1, 0, 12, 64)));
-        }
+        let mut past_keys: Vec<Option<ort::value::DynValue>> = (0..12).map(|_| None).collect();
+        let mut past_values: Vec<Option<ort::value::DynValue>> = (0..12).map(|_| None).collect();
 
         let mut extracted_global_hidden = None;
         for (name, val) in prefill_outputs.into_iter() {
@@ -749,29 +763,13 @@ impl MossTtsEngine {
             } else if let Some(stripped) = name.strip_prefix("present_key_") {
                 if let Ok(idx) = stripped.parse::<usize>() {
                     if idx < 12 {
-                        if let Ok(t) = val.try_extract_tensor::<f32>() {
-                            let s = t.shape();
-                            let arr = Array4::from_shape_vec(
-                                (s[0], s[1], s[2], s[3]),
-                                t.as_slice().unwrap().to_vec(),
-                            )
-                            .map_err(|e| e.to_string())?;
-                            past_keys[idx] = arr;
-                        }
+                        past_keys[idx] = Some(val);
                     }
                 }
             } else if let Some(stripped) = name.strip_prefix("present_value_") {
                 if let Ok(idx) = stripped.parse::<usize>() {
                     if idx < 12 {
-                        if let Ok(t) = val.try_extract_tensor::<f32>() {
-                            let s = t.shape();
-                            let arr = Array4::from_shape_vec(
-                                (s[0], s[1], s[2], s[3]),
-                                t.as_slice().unwrap().to_vec(),
-                            )
-                            .map_err(|e| e.to_string())?;
-                            past_values[idx] = arr;
-                        }
+                        past_values[idx] = Some(val);
                     }
                 }
             }
@@ -782,10 +780,18 @@ impl MossTtsEngine {
         global_hidden = extracted_global_hidden
             .ok_or_else(|| "Failed to extract global_hidden from prefill".to_string())?;
 
-        // prefill 耗时含 KV 缓存张量回搬（present_key_* / present_value_* -> ndarray）
+        for i in 0..12 {
+            if past_keys[i].is_none() || past_values[i].is_none() {
+                return Err(format!("Prefill missing KV cache tensor at layer {}", i));
+            }
+        }
+        let mut past_keys: Vec<ort::value::DynValue> = past_keys.into_iter().map(|opt| opt.unwrap()).collect();
+        let mut past_values: Vec<ort::value::DynValue> = past_values.into_iter().map(|opt| opt.unwrap()).collect();
+
+        // prefill 耗时含 KV 缓存张量句柄提取
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
 
-        // 4. 自回归单步解码生成
+        // 4. 自回归单步解码生成 (零堆分配借用与 DynValue 原生所有权流转)
         let mut past_valid_length = seq_len as i32;
         let mut repetition_seen_mask = Array3::<i32>::zeros((1, 16, 1024));
         let mut generated_frames: Vec<Vec<i32>> = Vec::new();
@@ -815,8 +821,8 @@ impl MossTtsEngine {
 
             let t_local = Instant::now();
             let local_inputs = ort::inputs![
-                "global_hidden" => global_hidden.clone(),
-                "repetition_seen_mask" => repetition_seen_mask.clone(),
+                "global_hidden" => global_hidden.view(),
+                "repetition_seen_mask" => repetition_seen_mask.view(),
                 "assistant_random_u" => assistant_random_u,
                 "audio_random_u" => audio_random_u,
             ]
@@ -854,6 +860,8 @@ impl MossTtsEngine {
             for (cb, &tok) in frame_tokens.iter().enumerate() {
                 if tok >= 0 && (tok as usize) < 1024 {
                     repetition_seen_mask[[0, cb, tok as usize]] = 1;
+                } else if tok >= 1024 {
+                    tracing::warn!("[MossTts] Token ID {} exceeds seen mask bound 1024", tok);
                 }
             }
 
@@ -868,35 +876,32 @@ impl MossTtsEngine {
             let past_valid_array = Array1::from_vec(vec![past_valid_length]);
             let t_step = Instant::now();
 
-            let decode_inputs = ort::inputs![
-                "input_ids" => next_row,
-                "past_valid_lengths" => past_valid_array,
-                "past_key_0" => past_keys[0].clone(),
-                "past_value_0" => past_values[0].clone(),
-                "past_key_1" => past_keys[1].clone(),
-                "past_value_1" => past_values[1].clone(),
-                "past_key_2" => past_keys[2].clone(),
-                "past_value_2" => past_values[2].clone(),
-                "past_key_3" => past_keys[3].clone(),
-                "past_value_3" => past_values[3].clone(),
-                "past_key_4" => past_keys[4].clone(),
-                "past_value_4" => past_values[4].clone(),
-                "past_key_5" => past_keys[5].clone(),
-                "past_value_5" => past_values[5].clone(),
-                "past_key_6" => past_keys[6].clone(),
-                "past_value_6" => past_values[6].clone(),
-                "past_key_7" => past_keys[7].clone(),
-                "past_value_7" => past_values[7].clone(),
-                "past_key_8" => past_keys[8].clone(),
-                "past_value_8" => past_values[8].clone(),
-                "past_key_9" => past_keys[9].clone(),
-                "past_value_9" => past_values[9].clone(),
-                "past_key_10" => past_keys[10].clone(),
-                "past_value_10" => past_values[10].clone(),
-                "past_key_11" => past_keys[11].clone(),
-                "past_value_11" => past_values[11].clone(),
-            ]
-            .map_err(|e| format!("Decode inputs error: {}", e))?;
+            let mut decode_inputs: Vec<(&str, ort::session::SessionInputValue<'_>)> =
+                Vec::with_capacity(26);
+            decode_inputs.push((
+                "input_ids",
+                ort::session::SessionInputValue::from(
+                    ort::value::Tensor::from_array(next_row)
+                        .map_err(|e| format!("Decode input_ids error: {}", e))?,
+                ),
+            ));
+            decode_inputs.push((
+                "past_valid_lengths",
+                ort::session::SessionInputValue::from(
+                    ort::value::Tensor::from_array(past_valid_array)
+                        .map_err(|e| format!("Decode past_valid_lengths error: {}", e))?,
+                ),
+            ));
+            for i in 0..12 {
+                decode_inputs.push((
+                    PAST_KEY_NAMES[i],
+                    ort::session::SessionInputValue::from(past_keys[i].view()),
+                ));
+                decode_inputs.push((
+                    PAST_VALUE_NAMES[i],
+                    ort::session::SessionInputValue::from(past_values[i].view()),
+                ));
+            }
 
             let decode_outputs = decode_sess
                 .run(decode_inputs)
@@ -912,29 +917,13 @@ impl MossTtsEngine {
                 } else if let Some(stripped) = name.strip_prefix("present_key_") {
                     if let Ok(idx) = stripped.parse::<usize>() {
                         if idx < 12 {
-                            if let Ok(t) = val.try_extract_tensor::<f32>() {
-                                let s = t.shape();
-                                let arr = Array4::from_shape_vec(
-                                    (s[0], s[1], s[2], s[3]),
-                                    t.as_slice().unwrap().to_vec(),
-                                )
-                                .map_err(|e| e.to_string())?;
-                                past_keys[idx] = arr;
-                            }
+                            past_keys[idx] = val;
                         }
                     }
                 } else if let Some(stripped) = name.strip_prefix("present_value_") {
                     if let Ok(idx) = stripped.parse::<usize>() {
                         if idx < 12 {
-                            if let Ok(t) = val.try_extract_tensor::<f32>() {
-                                let s = t.shape();
-                                let arr = Array4::from_shape_vec(
-                                    (s[0], s[1], s[2], s[3]),
-                                    t.as_slice().unwrap().to_vec(),
-                                )
-                                .map_err(|e| e.to_string())?;
-                                past_values[idx] = arr;
-                            }
+                            past_values[idx] = val;
                         }
                     }
                 }
@@ -1042,7 +1031,11 @@ impl MossTtsEngine {
             wav_bytes.len()
         );
 
-        Ok(wav_bytes)
+        Ok(SynthResult {
+            wav_bytes,
+            hit_cap: hit_frame_cap,
+            steps,
+        })
     }
 
     /// 将 16kHz 单声道样本重采样为 48kHz Planar 双声道张量 [1, 2, num_samples_48k]
@@ -1353,7 +1346,7 @@ impl MossTtsManager {
     }
 
     /// 执行 48kHz 原生离线语音合成
-    pub fn synthesize(&self, text: &str, voice: &VoicePromptData, speed: f32) -> Result<Vec<u8>, String> {
+    pub fn synthesize(&self, text: &str, voice: &VoicePromptData, speed: f32) -> Result<SynthResult, String> {
         let engine = self
             .engine
             .as_ref()
@@ -1514,8 +1507,10 @@ mod tests {
         }
 
         let yunxi = manager.get_voice("preset_azure_yunxi").await.expect("Should find preset_azure_yunxi");
-        let wav_bytes = manager.synthesize("你好，欢迎使用下一代文件管理系统", &yunxi, 1.0)
+        let synth_res = manager.synthesize("你好，欢迎使用下一代文件管理系统", &yunxi, 1.0)
             .expect("MOSS-TTS 48kHz 端到端合成应成功");
+        let wav_bytes = synth_res.wav_bytes;
+        assert!(!synth_res.hit_cap);
 
         println!("Synthesized wav_bytes len: {}", wav_bytes.len());
         assert!(wav_bytes.len() > 44, "WAV output must be longer than 44-byte header");
