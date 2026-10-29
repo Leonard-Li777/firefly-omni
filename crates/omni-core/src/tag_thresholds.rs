@@ -20,6 +20,35 @@ pub const CLIP_CALIBRATE_SLOPE: f32 = 1.5;
 /// CLIP 标定 conf 上限
 pub const CLIP_CALIBRATE_CAP: f32 = 0.97;
 
+// ============ EmbeddingGemma 视觉零样本（omni-vision gemma.rs） ============
+//
+// 本组常量是 `scripts/bake-gemma-embeddings.py` 的**跨语言单一事实源**：
+// 烘焙脚本用 `load_rust_threshold()` 正则解析本文件，禁止在 Python 侧另写一份。
+// 改动任一数值必须同步重烤 150 词视觉词表与 OMW 消歧表，否则烘焙侧门禁护栏
+// （assert_visual_vocab_gate_width）会按新 margin 判出与实际闸门不一致的结论。
+
+/// Gemma 视觉零样本绝对候选下限（余弦）
+pub const GEMMA_ABS_FLOOR: f32 = 0.28;
+
+/// Gemma 视觉零样本 Top-1 侧向抑制 margin：与第一名差距超过该值的候选被滤除
+pub const GEMMA_TOP_MARGIN: f32 = 0.065;
+
+/// Gemma 峰值-中位落差门限（替代不可用的 μ + kσ 口径，见
+/// docs/specs/gemma-visual-vocab-anisotropy-and-hub-domination-fix-spec.md §4.2）
+///
+/// ⚠ provisional：图文跨模态分布尚未标定（缺 vision_gate 夹具集），
+/// TASK-02 夹具跑完后覆写。当前值不参与生产判定。
+pub const GEMMA_MIN_PROMINENCE: f32 = 0.08;
+
+/// Gemma 标定线性起步分（sim = GEMMA_ABS_FLOOR 映射到 conf 下限）
+pub const GEMMA_CALIBRATE_FLOOR: f32 = 0.60;
+
+/// Gemma 标定线性斜率
+pub const GEMMA_CALIBRATE_SLOPE: f32 = 2.0;
+
+/// Gemma 标定 conf 上限（饱和值，详见事故规格 §4.4：全库 visual 组该通道恒等于此值）
+pub const GEMMA_CALIBRATE_CAP: f32 = 0.95;
+
 // ============ RAM（omni-vision extract_ram_tags*） ============
 
 /// RAM ONNX 主路径概率阈值
