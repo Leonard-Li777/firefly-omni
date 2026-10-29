@@ -35,6 +35,9 @@ fn setup_test_app(profile: &str) -> axum::Router {
         dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
         sherpa: Arc::new(omni_server::SherpaManager::new()),
         moss: Arc::new(omni_server::MossTtsManager::new()),
+        // AppState 新增字段后本夹具未同步，导致本文件整份编译失败；
+        // 与 binary_file_perceive_test.rs 保持同一写法（None = 不落盘向量目录）。
+        target_vectors_dir: None,
     };
     create_app_router(state)
 }
