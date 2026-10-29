@@ -572,6 +572,17 @@ pub struct MossTtsEngine {
     tokenizer: Tokenizer,
 }
 
+/// Codec 解码器启动期 Warmup 闭包：构造 64 帧基准输入预热 DirectML D3D12 PSO 编译
+fn warmup_codec_decoder(session: &Session) -> Result<(), ort::Error> {
+    let dummy_codes = Array3::<i32>::zeros((1, 64, 16));
+    let dummy_lengths = Array1::<i32>::from_vec(vec![64]);
+    let inputs = ort::inputs![
+        "audio_codes" => dummy_codes,
+        "audio_code_lengths" => dummy_lengths,
+    ]?;
+    session.run(inputs).map(|_| ())
+}
+
 impl MossTtsEngine {
     /// 尝试从指定模型目录加载全套 MOSS-TTS ONNX 模型与分词器
     pub fn try_load(model_dir: &Path) -> Result<Self, String> {
@@ -603,8 +614,13 @@ impl MossTtsEngine {
             .map_err(|e| format!("加载 moss_tts_decode_step 失败: {}", e))?;
         let local_fixed_session = OmniOrtRuntime::build_session(&local_fixed_path, ModelTier::Tier2)
             .map_err(|e| format!("加载 moss_tts_local_fixed 失败: {}", e))?;
-        let codec_decode_session = OmniOrtRuntime::build_session(&codec_decode_path, ModelTier::Tier2)
-            .map_err(|e| format!("加载 moss_audio_tokenizer_decode_full 失败: {}", e))?;
+        let codec_decode_session = OmniOrtRuntime::build_session_verified(
+            &codec_decode_path,
+            ModelTier::Tier2,
+            omni_core::ort_runtime::EpPolicy::DmlAllowlist,
+            warmup_codec_decoder,
+        )
+        .map_err(|e| format!("加载 moss_audio_tokenizer_decode_full 失败: {}", e))?;
         let codec_encode_session = OmniOrtRuntime::build_session(&codec_encode_path, ModelTier::Tier2)
             .map_err(|e| format!("加载 moss_audio_tokenizer_encode 失败: {}", e))?;
 
@@ -628,6 +644,17 @@ impl MossTtsEngine {
 
     /// 执行单句 48kHz 离线语音合成
     pub fn synthesize(&self, text: &str, prompt_codes: &[Vec<i16>], speed: f32) -> Result<SynthResult, String> {
+        self.synthesize_with_cancel(text, prompt_codes, speed, None)
+    }
+
+    /// 执行单句 48kHz 离线语音合成（支持协作式取消）
+    pub fn synthesize_with_cancel(
+        &self,
+        text: &str,
+        prompt_codes: &[Vec<i16>],
+        speed: f32,
+        cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> Result<SynthResult, String> {
         // 分段耗时打点：prefill / decode 循环 / codec / 尾部后处理，用于定位首发音瓶颈段位
         let call_seq = SYNTH_CALL_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         let t_enter = Instant::now();
@@ -811,6 +838,12 @@ impl MossTtsEngine {
         );
 
         for _step in 0..max_frames {
+            if let Some(cancel) = &cancel_flag {
+                if cancel.load(Ordering::Relaxed) {
+                    tracing::info!("[MossTts] 收到协作式中断信号，在 step={} 释放锁优雅退出", _step);
+                    return Err("MOSS-TTS 任务已由客户端取消".to_string());
+                }
+            }
             let assistant_random_u = Array1::from_vec(vec![rng.next_f32()]);
             let mut u2_vals = Vec::with_capacity(16);
             for _ in 0..16 {
@@ -945,17 +978,29 @@ impl MossTtsEngine {
             return Err("MOSS-TTS 未生成任何有效音频帧".to_string());
         }
 
-        // 5. Codec 解码为 48kHz 立体声 PCM
+        // 5. Codec 解码为 48kHz 立体声 PCM (Static Double-Bucket: 64/256 静态双桶规避 DirectML PSO 重编译)
         let t_codec = Instant::now();
         let total_frames = generated_frames.len();
-        let mut flat_codes = Vec::with_capacity(total_frames * 16);
+
+        let (bucket_frames, need_bucket_pad) = if total_frames <= 64 {
+            (64, true)
+        } else if total_frames <= 256 {
+            (256, true)
+        } else {
+            (total_frames, false)
+        };
+
+        let mut flat_codes = Vec::with_capacity(bucket_frames * 16);
         for frame in &generated_frames {
             flat_codes.extend_from_slice(frame);
         }
+        if need_bucket_pad && bucket_frames > total_frames {
+            flat_codes.resize(bucket_frames * 16, 0);
+        }
 
-        let audio_codes = Array3::from_shape_vec((1, total_frames, 16), flat_codes)
+        let audio_codes = Array3::from_shape_vec((1, bucket_frames, 16), flat_codes)
             .map_err(|e| e.to_string())?;
-        let audio_code_lengths = Array1::from_vec(vec![total_frames as i32]);
+        let audio_code_lengths = Array1::from_vec(vec![bucket_frames as i32]);
 
         let codec_sess = self.codec_decode_session.lock().unwrap();
         let codec_inputs = ort::inputs![
@@ -975,10 +1020,12 @@ impl MossTtsEngine {
             if name == "audio" {
                 if let Ok(t) = val.try_extract_tensor::<f32>() {
                     let shape = t.shape();
-                    let num_samples = shape[2];
+                    let bucket_samples = shape[2];
+                    let samples_per_frame = bucket_samples / bucket_frames;
+                    let valid_samples = (total_frames * samples_per_frame).min(bucket_samples);
                     let slice = t.as_slice().unwrap();
-                    samples_left = slice[0..num_samples].to_vec();
-                    samples_right = slice[num_samples..num_samples * 2].to_vec();
+                    samples_left = slice[0..valid_samples].to_vec();
+                    samples_right = slice[bucket_samples..bucket_samples + valid_samples].to_vec();
                 }
             }
         }
@@ -1347,12 +1394,23 @@ impl MossTtsManager {
 
     /// 执行 48kHz 原生离线语音合成
     pub fn synthesize(&self, text: &str, voice: &VoicePromptData, speed: f32) -> Result<SynthResult, String> {
+        self.synthesize_with_cancel(text, voice, speed, None)
+    }
+
+    /// 执行 48kHz 原生离线语音合成（支持协作式取消）
+    pub fn synthesize_with_cancel(
+        &self,
+        text: &str,
+        voice: &VoicePromptData,
+        speed: f32,
+        cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> Result<SynthResult, String> {
         let engine = self
             .engine
             .as_ref()
             .ok_or_else(|| "MOSS-TTS 原生 ONNX 引擎未就绪或模型文件缺失".to_string())?;
 
-        engine.synthesize(text, &voice.codes, speed)
+        engine.synthesize_with_cancel(text, &voice.codes, speed, cancel_flag)
     }
 
     /// 内存热注册音色特征码 (支持用户自定义音色零盘刷更新与自愈重放)

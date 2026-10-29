@@ -4471,10 +4471,22 @@ async fn audio_tts_chunk_handler(
     let permit = state.moss.semaphore().acquire_owned().await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire tts lock: {}", e)))?;
 
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_clone = cancel_flag.clone();
+
+    // RAII 守卫：当客户端断开连接或超时 Future 提早 Drop 时，自动触发协作式中断并释放锁
+    struct CancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _cancel_guard = CancelOnDrop(cancel_flag);
+
     let moss = state.moss.clone();
     let synth_res = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        moss.synthesize(&clean_text, &target_voice, speed)
+        moss.synthesize_with_cancel(&clean_text, &target_voice, speed, Some(cancel_clone))
     })
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TTS task panicked: {}", e)))?
