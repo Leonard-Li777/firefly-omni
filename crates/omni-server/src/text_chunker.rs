@@ -14,8 +14,22 @@ use unicode_segmentation::UnicodeSegmentation;
 /// 全局静态预热 Jieba 单例
 static JIEBA: OnceLock<Jieba> = OnceLock::new();
 
-/// 并列连词列表（不适合在前方断开换气）
+/// 并列与顺承连词列表（不适合在前方断开换气，亦不适合在弱标点后立即断片将其孤立在下一句开头）
 const PARALLEL_CONJUNCTIONS: &[&str] = &["和", "与", "同", "跟", "及", "以及"];
+const TIGHT_CONTINUING_CONJUNCTIONS: &[&str] = &["而且", "然后", "并且", "于是", "但是", "然而", "从而", "所以"];
+
+/// MOSS-TTS 阶梯扩容切片参数 (PRD-0058 / MOSS-TTS Low Latency Spec §3.1)
+pub const HEAD_CHUNK_MIN_LEN: usize = 8;
+pub const HEAD_CHUNK_TARGET_LEN: usize = 12;
+pub const HEAD_CHUNK_MAX_LEN: usize = 18;
+
+pub const SECOND_CHUNK_MIN_LEN: usize = 20;
+pub const SECOND_CHUNK_TARGET_LEN: usize = 26;
+pub const SECOND_CHUNK_MAX_LEN: usize = 32;
+
+pub const BODY_CHUNK_MIN_LEN: usize = 35;
+pub const BODY_CHUNK_TARGET_LEN: usize = 50;
+pub const BODY_CHUNK_MAX_LEN: usize = 65; // 物理绝对红线，严防 375 帧截断
 
 /// 获取或惰性初始化全局 Jieba 实例（多线程零锁并发借用）
 pub fn get_jieba() -> &'static Jieba {
@@ -72,6 +86,7 @@ fn find_pos_split_char_idx(text: &str, max_len: usize, min_safe_len: usize, is_z
 
         let mut char_offset = 0;
         let mut best_split_char = 0;
+        let mut last_safe_word_boundary = 0;
 
         for tag_token in tags {
             let word_chars = tag_token.word.chars().count();
@@ -79,15 +94,22 @@ fn find_pos_split_char_idx(text: &str, max_len: usize, min_safe_len: usize, is_z
             let end_char = char_offset + word_chars;
             let tag = tag_token.tag.to_lowercase();
 
+            // 记录安全区间内的合法词边界（避免截断在专有名词或汉字词素中间）
+            if end_char >= min_safe_len && end_char <= safe_end_chars {
+                last_safe_word_boundary = end_char;
+            }
+
             // 1. 语气词（y 如 呢/吧/啊）与时态助词（ule 了、uguo 过）：允许在其后方截断
             let is_post_particle = tag == "y" || tag == "ule" || tag == "uguo";
             if is_post_particle && end_char >= min_safe_len && end_char <= safe_end_chars {
                 best_split_char = end_char;
             }
 
-            // 2. 复句/转折/因果连词（c 如 但是/然而/因此/所以/或者/并且，排除并列连词“和/与/同/跟”）：
-            //    在连词前方断开（切成 "...，但是..."，符合人类发音呼吸）
-            let is_conjunction = tag == "c" && !PARALLEL_CONJUNCTIONS.contains(&tag_token.word);
+            // 2. 复句/转折/因果连词（排除并列连词“和/与/同/跟”及紧密顺承连词“而且/然后/并且/于是/但是/然而/从而/所以”）：
+            //    在非紧密连词前方断开
+            let is_conjunction = tag == "c"
+                && !PARALLEL_CONJUNCTIONS.contains(&tag_token.word)
+                && !TIGHT_CONTINUING_CONJUNCTIONS.contains(&tag_token.word);
             if is_conjunction && start_char >= min_safe_len && start_char <= safe_end_chars {
                 best_split_char = start_char;
             }
@@ -100,14 +122,21 @@ fn find_pos_split_char_idx(text: &str, max_len: usize, min_safe_len: usize, is_z
         if best_split_char > 0 {
             return best_split_char;
         }
+        if last_safe_word_boundary > 0 {
+            return last_safe_word_boundary;
+        }
     } else {
         // 多语言/西文环境：基于 unicode-segmentation 扫描完整单词边界
         let mut char_offset = 0;
         let mut best_split_char = 0;
+        let mut last_word_boundary = 0;
 
         for word in search_slice.split_word_bounds() {
             let word_chars = word.chars().count();
             let end_char = char_offset + word_chars;
+            if end_char >= min_safe_len && end_char <= safe_end_chars {
+                last_word_boundary = end_char;
+            }
             // 优先在单词间隔的空白处截断
             if end_char >= min_safe_len && end_char <= safe_end_chars && word.chars().all(|c| c.is_whitespace() || c == '-') {
                 best_split_char = end_char;
@@ -117,6 +146,9 @@ fn find_pos_split_char_idx(text: &str, max_len: usize, min_safe_len: usize, is_z
 
         if best_split_char > 0 {
             return best_split_char;
+        }
+        if last_word_boundary > 0 {
+            return last_word_boundary;
         }
     }
 
@@ -167,12 +199,25 @@ pub fn split_text_chunks(
     }
 
     // 健壮参数范围保护：防 max_length 为 0 或过小引发死循环
-    let max_len = max_length.unwrap_or(200).max(20);
-    let min_len = min_length.unwrap_or(40).clamp(1, max_len);
-    let target_len = target_length.unwrap_or(100).clamp(min_len, max_len);
+    let is_ladder_mode = target_length.is_none() && min_length.is_none() && max_length.is_none();
+    let static_max_len = max_length.unwrap_or(200).max(20);
+    let static_min_len = min_length.unwrap_or(40).clamp(1, static_max_len);
+    let static_target_len = target_length.unwrap_or(100).clamp(static_min_len, static_max_len);
     let lang = language.unwrap_or("zh");
     let is_zh = lang.starts_with("zh") || contains_cjk(trimmed);
-    let min_safe_len = min_len.max((target_len as f32 * 0.7) as usize);
+
+    // 动态阶梯状态机阈值求解闭包 (PRD-0058 / MOSS-TTS Low Latency Spec §3.1)
+    let get_thresholds = |chunk_count: usize| -> (usize, usize, usize) {
+        if is_ladder_mode {
+            match chunk_count {
+                0 => (HEAD_CHUNK_MIN_LEN, HEAD_CHUNK_TARGET_LEN, HEAD_CHUNK_MAX_LEN),
+                1 => (SECOND_CHUNK_MIN_LEN, SECOND_CHUNK_TARGET_LEN, SECOND_CHUNK_MAX_LEN),
+                _ => (BODY_CHUNK_MIN_LEN, BODY_CHUNK_TARGET_LEN, BODY_CHUNK_MAX_LEN),
+            }
+        } else {
+            (static_min_len, static_target_len, static_max_len)
+        }
+    };
 
     // 1. 初次原子划分：按标点与换行提取 AtomicClause，保留原始标点与换行信息
     let mut clauses: Vec<AtomicClause> = Vec::new();
@@ -222,24 +267,40 @@ pub fn split_text_chunks(
     let mut chunks: Vec<String> = Vec::new();
     let mut current_buffer = String::new();
 
-    for clause_item in clauses {
-        let clause_str = clause_item.text;
+    for clause_idx in 0..clauses.len() {
+        let (min_len, target_len, max_len) = get_thresholds(chunks.len());
+        let min_safe_len = min_len.max((target_len as f32 * 0.7) as usize);
+
+        let clause_item = &clauses[clause_idx];
+        let clause_str = clause_item.text.as_str();
         let clause_chars = clause_str.chars().count();
         let tail_punct = clause_item.tail_punct;
 
-        // A. 极端情况：单个原子段落直接突破 max_len（连续 > 200 字符完全无任何标点）
-        if clause_chars > max_len {
+        // 后视紧密连词探测（避免在弱标点后截断并将“而且/然后/并且/于是/但是/然而/从而/所以”孤立在下一句句首）
+        let next_starts_with_tight_conjunction = if let Some(next_item) = clauses.get(clause_idx + 1) {
+            let next_trimmed = next_item.text.trim_start();
+            TIGHT_CONTINUING_CONJUNCTIONS.iter().any(|&conj| next_trimmed.starts_with(conj))
+        } else {
+            false
+        };
+
+        // A. 极端情况：单个原子段落直接突破 max_len（连续无标点长串）
+        // 首句弹性延展保护：若前 18 字无自然停顿，通过词法边界弹性延展至 22~25 字，严禁在专有名词或英文单词内部硬切补逗号
+        let elastic_clause_max = if is_ladder_mode && chunks.is_empty() { 25 } else { max_len };
+        if clause_chars > elastic_clause_max {
             if !current_buffer.trim().is_empty() {
                 chunks.push(current_buffer.trim().to_string());
                 current_buffer.clear();
             }
 
-            let mut remaining = clause_str;
-            while remaining.chars().count() > max_len {
-                let split_char_idx = find_pos_split_char_idx(&remaining, max_len, min_safe_len, is_zh);
+            let mut remaining = clause_str.to_string();
+            while remaining.chars().count() > get_thresholds(chunks.len()).2 {
+                let (cur_min, cur_target, cur_max) = get_thresholds(chunks.len());
+                let cur_min_safe = cur_min.max((cur_target as f32 * 0.7) as usize);
+                let split_char_idx = find_pos_split_char_idx(&remaining, cur_max, cur_min_safe, is_zh);
                 // 强制保底单步推进，杜绝 0 长度死循环
                 let effective_split = if split_char_idx == 0 || split_char_idx >= remaining.chars().count() {
-                    max_len.min(remaining.chars().count()).max(1)
+                    cur_max.min(remaining.chars().count()).max(1)
                 } else {
                     split_char_idx
                 };
@@ -271,41 +332,97 @@ pub fn split_text_chunks(
         // B. 常规智能聚合
         let prospective_chars = current_buffer.chars().count() + clause_chars;
 
-        // 未达最小长度阈值（如 < 40 字符），强制吸纳后续两字一行、短歌词
+        // 1. 未达最小长度阈值且无标点截断诉求，强制吸纳后续两字一行、短歌词
         if prospective_chars < min_len {
-            append_clause_to_buffer(&mut current_buffer, &clause_str, is_zh);
+            append_clause_to_buffer(&mut current_buffer, clause_str, is_zh);
             continue;
         }
 
-        // 达到目标长度（~100 字符）且当前短句遇强句末标点（。！？.!? 或换行 \n），优雅成片
+        // 2. 标点特征提取与连词护栏
         let is_strong_stop = tail_punct.map(|p| matches!(p, '。' | '！' | '？' | '.' | '!' | '?' | '\n')).unwrap_or(false);
+        let is_medium_stop = tail_punct.map(|p| matches!(p, '；' | ';' | '：' | ':')).unwrap_or(false);
+        let is_weak_stop = tail_punct.map(|p| matches!(p, '，' | ',' | '、')).unwrap_or(false);
+        let can_split_at_weak_punct = is_weak_stop && !next_starts_with_tight_conjunction;
+
+        // 3. 首句极速起播结算：在首句模式下，满足 min_len (>=8) 且遇任意非粘连标点，或达到目标长度 (>=12)，立即结算出片
+        if is_ladder_mode && chunks.is_empty() {
+            let reached_head_target = prospective_chars >= target_len;
+            let reached_head_min_with_punct = prospective_chars >= min_len && (is_strong_stop || is_medium_stop || can_split_at_weak_punct);
+            if reached_head_target || reached_head_min_with_punct {
+                append_clause_to_buffer(&mut current_buffer, clause_str, is_zh);
+                chunks.push(current_buffer.trim().to_string());
+                current_buffer.clear();
+                continue;
+            }
+        }
+
+        // 4. 强句末标点（。！？.!? 或换行 \n）达到目标长度，优雅出片
         if prospective_chars >= target_len && is_strong_stop {
-            append_clause_to_buffer(&mut current_buffer, &clause_str, is_zh);
+            append_clause_to_buffer(&mut current_buffer, clause_str, is_zh);
             chunks.push(current_buffer.trim().to_string());
             current_buffer.clear();
             continue;
         }
 
-        // 即将突破最大硬上限（200 字符），必须切断出片
+        // 5. 即将突破最大硬上限，必须切断出片
         if prospective_chars > max_len {
             if !current_buffer.trim().is_empty() {
                 chunks.push(current_buffer.trim().to_string());
                 current_buffer.clear();
             }
-            current_buffer = clause_str;
+            let (_, _, new_max) = get_thresholds(chunks.len());
+            let elastic_limit = if is_ladder_mode && chunks.is_empty() { 25 } else { new_max };
+            if clause_chars > elastic_limit {
+                let mut remaining = clause_str.to_string();
+                while remaining.chars().count() > get_thresholds(chunks.len()).2 {
+                    let (cur_min, cur_target, cur_max) = get_thresholds(chunks.len());
+                    let cur_min_safe = cur_min.max((cur_target as f32 * 0.7) as usize);
+                    let split_char_idx = find_pos_split_char_idx(&remaining, cur_max, cur_min_safe, is_zh);
+                    let effective_split = if split_char_idx == 0 || split_char_idx >= remaining.chars().count() {
+                        cur_max.min(remaining.chars().count()).max(1)
+                    } else {
+                        split_char_idx
+                    };
+                    let split_byte = char_to_byte_index(&remaining, effective_split);
+                    let mut piece = remaining[..split_byte].trim().to_string();
+                    let last_c = piece.chars().last();
+                    let has_tail_punct = last_c.map(|c| split_punct.contains(&c)).unwrap_or(false);
+                    if !has_tail_punct {
+                        if is_zh {
+                            piece.push('，');
+                        } else {
+                            piece.push_str(", ");
+                        }
+                    }
+                    chunks.push(piece);
+                    remaining = remaining[split_byte..].trim().to_string();
+                }
+                if !remaining.is_empty() {
+                    current_buffer = remaining;
+                }
+            } else {
+                current_buffer = clause_str.to_string();
+            }
             continue;
         }
 
-        // 处于 100 ~ 200 字符之间，若遇次级标点（分号、冒号），亦优雅出片
-        let is_medium_stop = tail_punct.map(|p| matches!(p, '；' | ';' | '：' | ':')).unwrap_or(false);
+        // 6. 次级标点（分号、冒号）达到目标长度，优雅出片
         if prospective_chars >= target_len && is_medium_stop {
-            append_clause_to_buffer(&mut current_buffer, &clause_str, is_zh);
+            append_clause_to_buffer(&mut current_buffer, clause_str, is_zh);
             chunks.push(current_buffer.trim().to_string());
             current_buffer.clear();
             continue;
         }
 
-        append_clause_to_buffer(&mut current_buffer, &clause_str, is_zh);
+        // 7. 阶梯模式下次句与常规句在达到目标长度遇逗号切分（且无连词粘连）
+        if is_ladder_mode && prospective_chars >= target_len && can_split_at_weak_punct {
+            append_clause_to_buffer(&mut current_buffer, clause_str, is_zh);
+            chunks.push(current_buffer.trim().to_string());
+            current_buffer.clear();
+            continue;
+        }
+
+        append_clause_to_buffer(&mut current_buffer, clause_str, is_zh);
     }
 
     // 刷新末尾残留缓冲区
@@ -316,8 +433,9 @@ pub fn split_text_chunks(
         // 若末尾只剩极短片段（< 15 字符）且前一切片未满，无缝合入前一切片
         if buf_chars < 15 && !chunks.is_empty() {
             let last_idx = chunks.len() - 1;
+            let (_, _, prev_max) = get_thresholds(last_idx);
             let combined_chars = chunks[last_idx].chars().count() + buf_chars;
-            if combined_chars <= max_len {
+            if combined_chars <= prev_max {
                 append_clause_to_buffer(&mut chunks[last_idx], &trimmed_buf, is_zh);
                 return chunks;
             }
