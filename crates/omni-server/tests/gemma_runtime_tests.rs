@@ -1551,3 +1551,95 @@ async fn test_task05_reprocess_35_affected_files_evaluation() {
 
 }
 
+#[tokio::test]
+async fn test_ram_engine_status_ready_and_perceive_ram_tags() {
+    let app = setup_test_app("gemma_unified");
+
+    // 1. 验证 /api/v1/engine/status 下 ram 引擎状态必须为 "ready"
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/engine/status")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let status_body: Value = serde_json::from_slice(&bytes).unwrap();
+    println!("Engine status: {}", serde_json::to_string_pretty(&status_body).unwrap());
+
+    let ram_status = status_body["vision_engines_available"]["ram"]
+        .as_str()
+        .expect("ram 状态必须存在且为字符串");
+    assert_eq!(
+        ram_status, "ready",
+        "RAM++ 核心资产补齐后，engine/status 中 ram 状态必须转为 'ready'，当前为: {}",
+        ram_status
+    );
+
+    // 2. 验证 POST /api/perceive 端到端提取 RAM++ 实体标签
+    let landscape_path = resolve_test_landscape_path();
+    let raw_path = landscape_path.to_str().unwrap();
+    let clean_path = raw_path.strip_prefix(r"\\?\").unwrap_or(raw_path);
+
+    let img = image::open(&landscape_path).expect("加载风景测试图失败");
+    let direct_ram_tags = omni_pro::OmniVisionEngine::extract_ram_tags(&img, Some("zh"), 10);
+    println!("=== Direct extract_ram_tags results (count: {}) ===", direct_ram_tags.len());
+    for item in &direct_ram_tags {
+        println!("   Tag: code={}, name={}, conf={}, parents={:?}, via={:?}",
+            item.code, item.name, item.confidence, item.parent_codes, item.via_parent_code);
+    }
+
+    let perceive_req = serde_json::json!({
+        "file_path": clean_path,
+        "language": "zh",
+        "enable_visual_tags": true
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/perceive")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&perceive_req).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let perceive_body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    println!("Perceive ram_tags: {:?}", perceive_body["ram_tags"]);
+
+    // 断言 ram_tags 字段存在且为数组
+    let ram_tags = perceive_body["ram_tags"]
+        .as_array()
+        .expect("ram_tags 必须为数组");
+    assert!(
+        !ram_tags.is_empty(),
+        "金标风景图在 CLIP 向量检索降级或 ONNX 下必须提取出非空 RAM++ 实体标签"
+    );
+
+    // 断言 visual_tags 中包含经由 RAM++ 提取并打标的条目 (engine == 'ram')
+    let visual_tags = perceive_body["visual_tags"]
+        .as_array()
+        .expect("visual_tags 必须为数组");
+    let ram_visual_items: Vec<&Value> = visual_tags
+        .iter()
+        .filter(|t| t["engine"].as_str() == Some("ram"))
+        .collect();
+    assert!(
+        !ram_visual_items.is_empty(),
+        "visual_tags 中必须包含至少一个 engine == 'ram' 的标签项"
+    );
+
+    for item in &ram_visual_items {
+        let code = item["code"].as_str().unwrap_or("");
+        let name = item["name"].as_str().unwrap_or("");
+        let conf = item["confidence"].as_f64().unwrap_or(0.0);
+        println!("RAM tag in visual_tags: code={}, name={}, conf={}, parent={:?}", code, name, conf, item["parent_codes"]);
+        assert!(!code.is_empty(), "RAM 标签项 code 不能为空");
+        assert!(!name.is_empty(), "RAM 标签项 name 不能为空");
+        assert!(conf >= 0.20, "RAM 标签置信度必须合理 (>= 0.20)");
+    }
+}
+
+
