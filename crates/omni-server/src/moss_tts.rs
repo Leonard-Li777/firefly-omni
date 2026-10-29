@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 use std::sync::{Arc, Mutex};
 use ndarray::{Array1, Array2, Array3, Array4};
 use omni_core::{ModelTier, OmniOrtRuntime};
@@ -538,6 +539,10 @@ pub fn time_scale_stereo_pcm(
     (res_left, res_right)
 }
 
+/// 合成调用序号：用于区分冷启动（首包含 ORT 首跑 / 权重页首次触成本）与稳态耗时。
+/// 仅作可观测性计数器，不参与任何判定。
+static SYNTH_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// MOSS-TTS 原生 ONNX 自回归推理器
 pub struct MossTtsEngine {
     prefill_session: Mutex<Session>,
@@ -604,6 +609,10 @@ impl MossTtsEngine {
 
     /// 执行单句 48kHz 离线语音合成
     pub fn synthesize(&self, text: &str, prompt_codes: &[Vec<i16>], speed: f32) -> Result<Vec<u8>, String> {
+        // 分段耗时打点：prefill / decode 循环 / codec / 尾部后处理，用于定位首发音瓶颈段位
+        let call_seq = SYNTH_CALL_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        let t_enter = Instant::now();
+
         let mut clean_text = text.trim().to_string();
         if clean_text.is_empty() {
             return Err("Text is empty".to_string());
@@ -702,7 +711,10 @@ impl MossTtsEngine {
         let attention_mask_array = Array2::from_shape_vec((1, seq_len), vec![1i32; seq_len])
             .map_err(|e| e.to_string())?;
 
+        let prompt_ms = t_enter.elapsed().as_secs_f64() * 1000.0;
+
         // 3. Prefill
+        let t_prefill = Instant::now();
         let prefill_sess = self.prefill_session.lock().unwrap();
         let prefill_inputs = ort::inputs![
             "input_ids" => input_ids_array,
@@ -770,6 +782,9 @@ impl MossTtsEngine {
         global_hidden = extracted_global_hidden
             .ok_or_else(|| "Failed to extract global_hidden from prefill".to_string())?;
 
+        // prefill 耗时含 KV 缓存张量回搬（present_key_* / present_value_* -> ndarray）
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+
         // 4. 自回归单步解码生成
         let mut past_valid_length = seq_len as i32;
         let mut repetition_seen_mask = Array3::<i32>::zeros((1, 16, 1024));
@@ -779,6 +794,9 @@ impl MossTtsEngine {
         let decode_sess = self.decode_session.lock().unwrap();
 
         let max_frames = 375;
+        let mut local_ms_acc = 0.0f64;
+        let mut step_decode_ms_acc = 0.0f64;
+        let t_decode = Instant::now();
         let mut rng = FastRng::new(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -795,6 +813,7 @@ impl MossTtsEngine {
             let audio_random_u = Array2::from_shape_vec((1, 16), u2_vals)
                 .map_err(|e| e.to_string())?;
 
+            let t_local = Instant::now();
             let local_inputs = ort::inputs![
                 "global_hidden" => global_hidden.clone(),
                 "repetition_seen_mask" => repetition_seen_mask.clone(),
@@ -826,6 +845,8 @@ impl MossTtsEngine {
                 }
             }
 
+            local_ms_acc += t_local.elapsed().as_secs_f64() * 1000.0;
+
             if !should_continue || frame_tokens.len() < 16 {
                 break;
             }
@@ -845,6 +866,7 @@ impl MossTtsEngine {
             generated_frames.push(frame_tokens);
 
             let past_valid_array = Array1::from_vec(vec![past_valid_length]);
+            let t_step = Instant::now();
 
             let decode_inputs = ort::inputs![
                 "input_ids" => next_row,
@@ -918,8 +940,14 @@ impl MossTtsEngine {
                 }
             }
 
+            step_decode_ms_acc += t_step.elapsed().as_secs_f64() * 1000.0;
+
             past_valid_length += 1;
         }
+
+        let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+        // 帧数触及 max_frames 上限即为静默截断：此时 decode 很快但音频被切断，必须与正常收尾区分
+        let hit_frame_cap = generated_frames.len() >= max_frames;
 
         drop(local_fixed_sess);
         drop(decode_sess);
@@ -929,6 +957,7 @@ impl MossTtsEngine {
         }
 
         // 5. Codec 解码为 48kHz 立体声 PCM
+        let t_codec = Instant::now();
         let total_frames = generated_frames.len();
         let mut flat_codes = Vec::with_capacity(total_frames * 16);
         for frame in &generated_frames {
@@ -971,7 +1000,11 @@ impl MossTtsEngine {
             return Err("Codec 解码音频数据为空".to_string());
         }
 
+        // codec 耗时含离散码张量编组与 PCM 回搬
+        let codec_ms = t_codec.elapsed().as_secs_f64() * 1000.0;
+
         // 6. 原生倍率声学调速 (WSOLA 纯 Rust 变速不变调，彻底废除 FFmpeg 外部进程调用)
+        let t_post = Instant::now();
         let (left_final, right_final) = if (speed - 1.0).abs() >= 0.01 {
             time_scale_stereo_pcm(&samples_left, &samples_right, speed, 48000)
         } else {
@@ -979,6 +1012,36 @@ impl MossTtsEngine {
         };
 
         let wav_bytes = encode_stereo_f32_to_wav(&left_final, &right_final, 48000);
+        let post_ms = t_post.elapsed().as_secs_f64() * 1000.0;
+
+        // 分段耗时汇总：rtf = 总耗时 / 音频时长，用于判断该句是否快于实时消耗
+        let audio_sec = left_final.len() as f64 / 48000.0;
+        let total_ms = t_enter.elapsed().as_secs_f64() * 1000.0;
+        let rtf = if audio_sec > 0.0 { total_ms / 1000.0 / audio_sec } else { 0.0 };
+        let steps = generated_frames.len();
+        let avg_step_ms = if steps > 0 { (local_ms_acc + step_decode_ms_acc) / steps as f64 } else { 0.0 };
+        tracing::info!(
+            "[MossTtsPerf] call={} chars={} seq_len={} steps={} hit_cap={} | prompt={:.1}ms prefill={:.1}ms decode={:.1}ms[local={:.1} decode={:.1} avg={:.2}/step] codec={:.1}ms post={:.1}ms | total={:.1}ms audio={:.2}s rtf={:.2} speed={:.2} wav={}B",
+            call_seq,
+            clean_text.chars().count(),
+            seq_len,
+            steps,
+            hit_frame_cap,
+            prompt_ms,
+            prefill_ms,
+            decode_ms,
+            local_ms_acc,
+            step_decode_ms_acc,
+            avg_step_ms,
+            codec_ms,
+            post_ms,
+            total_ms,
+            audio_sec,
+            rtf,
+            speed,
+            wav_bytes.len()
+        );
+
         Ok(wav_bytes)
     }
 
