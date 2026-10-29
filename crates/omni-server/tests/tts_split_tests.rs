@@ -91,3 +91,53 @@ fn test_zero_max_length_loop_defense() {
     assert!(!chunks.is_empty());
 }
 
+#[test]
+fn test_moss_ladder_expansion_default() {
+    // 针对 MOSS-TTS 的阶梯扩容测试：
+    // 首句 8~18 字（目标 12），次句 20~32 字（目标 26），常规句 <= 65 字（目标 50）
+    let text = "大家好，欢迎使用萤核语音助手！在今天的演示中，我们将深入了解多模态大模型的自回归端侧推理架构与异构并行设计。通过这一套全自研的高性能计算引擎，我们可以实现极低的首发音延迟，并在复杂的长文本场景下彻底消灭截断断流问题，为用户带来如丝般顺滑的沉浸式语音体验。";
+    let chunks = split_text_chunks(text, None, None, None, Some("zh"));
+    
+    assert!(chunks.len() >= 3, "Expected at least 3 chunks, got {}", chunks.len());
+    
+    // Chunk 0 (Head): 首句极速起播切片，目标 10~18 字
+    let head_chars = chunks[0].chars().count();
+    assert!(head_chars >= 8 && head_chars <= 25, "Head chunk out of expected bounds: {} (text: '{}')", head_chars, chunks[0]);
+    
+    // Chunk 1 (Second): 次句平滑过渡，目标 20~32 字
+    let second_chars = chunks[1].chars().count();
+    assert!(second_chars >= 15 && second_chars <= 40, "Second chunk out of bounds: {} (text: '{}')", second_chars, chunks[1]);
+    
+    // Chunk 2+ (Body): 常规句严守物理安全红线 <= 65 字，绝对杜绝 375 帧截断
+    for (idx, chunk) in chunks.iter().enumerate().skip(2) {
+        let chars = chunk.chars().count();
+        assert!(chars <= 65, "Body chunk {} exceeds hard cap 65 chars: {} (text: '{}')", idx, chars, chunk);
+    }
+}
+
+#[test]
+fn test_tight_conjunction_lookahead_guard() {
+    // 弱标点后视连词护栏：遇“而且/然后/并且/于是/但是”等紧密顺承/转折词，不应在逗号处生硬断开
+    let text = "这项技术的研发周期非常漫长，而且在早期测试中遇到过大量的内存拷贝与缓存抖动瓶颈，因此团队进行了多轮红队对抗审查。";
+    let chunks = split_text_chunks(text, None, None, None, Some("zh"));
+    
+    // 验证没有任何一个切片以孤立的“而且”或“并且”开头
+    for (i, chunk) in chunks.iter().enumerate() {
+        let trimmed = chunk.trim_start();
+        assert!(!trimmed.starts_with("而且"), "Chunk {} should not start with isolated '而且': '{}'", i, chunk);
+        assert!(!trimmed.starts_with("并且"), "Chunk {} should not start with isolated '并且': '{}'", i, chunk);
+    }
+}
+
+#[test]
+fn test_proper_noun_and_english_word_protection() {
+    // 专有名词与英文单词不被生硬切断
+    let text = "DeepSeek和Anthropic以及OpenAI都在探索下一代端侧智能体架构，并且在性能优化方面投入了巨大的研发资源。";
+    let chunks = split_text_chunks(text, None, None, None, Some("zh"));
+    
+    for chunk in &chunks {
+        assert!(!chunk.contains("Deep,Seek") && !chunk.contains("Deep，Seek"));
+        assert!(!chunk.contains("Open,AI") && !chunk.contains("Open，AI"));
+    }
+}
+
