@@ -714,6 +714,25 @@ fn load_pack_sort_orders_for_codes(conn: &Connection, codes: &[String]) -> HashM
     meta_map.into_iter().filter(|(_, m)| m.sort_order > 0).map(|(c, m)| (c, m.sort_order)).collect()
 }
 
+/// 以绝对只读 + WAL 防阻塞 + 内存临时表安全模式打开桌面端业务主库 (Spec §3.1.1)
+pub fn open_omni_readonly_connection<P: AsRef<std::path::Path>>(db_path: P) -> anyhow::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    // 1. 设置 5 秒 busy 超时，防止 Node 主进程写入时直接抛出 SQLITE_BUSY
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    // 2. 强制只读，杜绝任何意外写操作
+    conn.pragma_update(None, "query_only", "ON")?;
+    // 3. 分配专用内存缓存页 (64MB)
+    conn.pragma_update(None, "cache_size", -65536)?;
+    // 4. 将临时表强制存放在内存中，禁止生成磁盘临时文件
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    Ok(conn)
+}
+
 /// 倒排 Trie 极速分类树构建引擎 (ADR-0038 / ADR-0053 / P95 <= 5ms)
 pub fn query_taxonomy_tree_fast(
     conn: &Connection,
@@ -791,15 +810,16 @@ pub fn query_taxonomy_tree_fast(
             let sep = if norm_prefix.contains('\\') { "\\" } else { "/" };
             let base = norm_prefix.trim_end_matches(['/', '\\']);
             let base_with_sep = format!("{}{}", base, sep);
+            // 安全转义：使用 | 作为转义符，原样保留原生反斜杠 \ (Spec §3.1.1)
             let escaped_prefix = base_with_sep
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
+                .replace('|', "||")
+                .replace('%', "|%")
+                .replace('_', "|_");
             let prefix_pattern = format!("{}%", escaped_prefix);
 
-            where_clauses.push("(wf.path LIKE ? ESCAPE '\\' OR wf.path = ?)".to_string());
-            params.push(rusqlite::types::Value::Text(prefix_pattern));
+            where_clauses.push("(wf.path = ? OR wf.path LIKE ? ESCAPE '|')".to_string());
             params.push(rusqlite::types::Value::Text(base.to_string()));
+            params.push(rusqlite::types::Value::Text(prefix_pattern));
         }
     }
 
@@ -808,7 +828,7 @@ pub fn query_taxonomy_tree_fast(
 
     let select_sql = if has_wf && !where_clauses.is_empty() {
         format!(
-            "SELECT DISTINCT ftr.file_fingerprint, ftr.tag_code, {}, {} \
+            "SELECT DISTINCT wf.rowid, ftr.file_fingerprint, ftr.tag_code, {}, {} \
              FROM file_tag_relations ftr \
              JOIN workspace_files wf ON wf.file_fingerprint = ftr.file_fingerprint \
              WHERE {}",
@@ -816,11 +836,19 @@ pub fn query_taxonomy_tree_fast(
             col_name_expr,
             where_clauses.join(" AND ")
         )
+    } else if has_wf {
+        format!(
+            "SELECT DISTINCT wf.rowid, ftr.file_fingerprint, ftr.tag_code, {}, {} \
+             FROM file_tag_relations ftr \
+             JOIN workspace_files wf ON wf.file_fingerprint = ftr.file_fingerprint",
+            col_code_expr,
+            col_name_expr
+        )
     } else {
         let col_name_raw = if has_name_path { "name_path" } else { "''" };
         let col_code_raw = if has_code_path { "code_path" } else { "''" };
         format!(
-            "SELECT file_fingerprint, tag_code, {}, {} FROM file_tag_relations",
+            "SELECT ftr.rowid, ftr.file_fingerprint, ftr.tag_code, {}, {} FROM file_tag_relations ftr",
             col_code_raw, col_name_raw
         )
     };
@@ -828,11 +856,12 @@ pub fn query_taxonomy_tree_fast(
     let mut stmt = master_conn.prepare(&select_sql)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
-        let fp: String = row.get(0)?;
-        let tag_code: String = row.get(1)?;
-        let code_path: String = row.get(2).unwrap_or_default();
-        let name_path: String = row.get(3).unwrap_or_default();
-        Ok((fp, tag_code, code_path, name_path))
+        let raw_id: i64 = row.get(0)?;
+        let fp: String = row.get(1)?;
+        let tag_code: String = row.get(2)?;
+        let code_path: String = row.get(3).unwrap_or_default();
+        let name_path: String = row.get(4).unwrap_or_default();
+        Ok((raw_id, fp, tag_code, code_path, name_path))
     })?;
 
     // Trie 节点结构：唯一键为从根到该节点的物化完整路径 (current_code_path)，捍卫前缀树分支隔离性
@@ -845,6 +874,7 @@ pub fn query_taxonomy_tree_fast(
         source: String,
         sort_order: i64,
         direct_files: HashSet<String>,
+        direct_bitmap: roaring::RoaringBitmap,
         children_paths: Vec<String>,
         pos: Option<String>,
         lexfile: Option<String>,
@@ -855,7 +885,7 @@ pub fn query_taxonomy_tree_fast(
 
     // 2. 遍历活跃记录，自顶向下构建前缀树 Trie
     for r in rows.flatten() {
-        let (fp, tag_code, raw_code_path, raw_name_path) = r;
+        let (raw_id, fp, tag_code, raw_code_path, raw_name_path) = r;
         if fp.trim().is_empty() || tag_code.trim().is_empty() {
             continue;
         }
@@ -1062,6 +1092,7 @@ pub fn query_taxonomy_tree_fast(
                         source,
                         sort_order,
                         direct_files: HashSet::new(),
+                        direct_bitmap: roaring::RoaringBitmap::new(),
                         children_paths: Vec::new(),
                         pos: None,
                         lexfile: None,
@@ -1084,7 +1115,14 @@ pub fn query_taxonomy_tree_fast(
             // 唯有路径末级命中节点才累加 direct_files
             if i == seg_len - 1 {
                 if let Some(target_node) = node_map.get_mut(&curr_code_path) {
-                    target_node.direct_files.insert(fp.clone());
+                    if raw_id >= 0 && raw_id <= (u32::MAX as i64) {
+                        target_node.direct_bitmap.insert(raw_id as u32);
+                    } else {
+                        tracing::error!("[Omni] 检测到非法文件整型 ID: {}", raw_id);
+                    }
+                    if include_files {
+                        target_node.direct_files.insert(fp.clone());
+                    }
                 }
             }
         }
@@ -1168,9 +1206,9 @@ pub fn query_taxonomy_tree_fast(
         resolved_names: &HashMap<String, String>,
         lang: &str,
         include_files: bool,
+        file_count: usize,
         files_set: &HashSet<String>,
     ) -> TaxonomyNode {
-        let file_count = files_set.len();
         let files = if include_files {
             let mut list: Vec<String> = files_set.iter().cloned().collect();
             list.sort();
@@ -1224,18 +1262,19 @@ pub fn query_taxonomy_tree_fast(
         lang: &str,
         include_files: bool,
         visited: &mut HashSet<String>,
-    ) -> (Vec<TaxonomyNode>, HashSet<String>) {
+    ) -> (Vec<(TaxonomyNode, roaring::RoaringBitmap)>, roaring::RoaringBitmap, HashSet<String>) {
         let mut result_nodes = Vec::new();
+        let mut aggregate_bitmap = roaring::RoaringBitmap::new();
         let mut aggregate_files = HashSet::new();
 
         // 细节 1：防死循环防护
         if !visited.insert(node_path.to_string()) {
-            return (result_nodes, aggregate_files);
+            return (result_nodes, aggregate_bitmap, aggregate_files);
         }
 
         let node = match node_map.get(node_path) {
             Some(n) => n,
-            None => return (result_nodes, aggregate_files),
+            None => return (result_nodes, aggregate_bitmap, aggregate_files),
         };
 
         // 细节 2：即使在动作分支内部，遇到 P1 级语法虚词/禁用 lexfile 仍优先整枝截断
@@ -1248,14 +1287,17 @@ pub fn query_taxonomy_tree_fast(
             in_action_branch: true,
         };
         if evaluate_node_policy(&ctx) == TaxonomyFoldPolicy::RejectSubtree {
-            return (result_nodes, aggregate_files);
+            return (result_nodes, aggregate_bitmap, aggregate_files);
         }
 
-        aggregate_files.extend(node.direct_files.clone());
+        aggregate_bitmap |= &node.direct_bitmap;
+        if include_files {
+            aggregate_files.extend(node.direct_files.clone());
+        }
 
         // 递归下钻收集子孙
         for child_path in &node.children_paths {
-            let (sub_nodes, sub_files) = collect_action_flattened_children(
+            let (sub_nodes, sub_bitmap, sub_files) = collect_action_flattened_children(
                 child_path,
                 action_root_code,
                 node_map,
@@ -1264,58 +1306,63 @@ pub fn query_taxonomy_tree_fast(
                 include_files,
                 visited,
             );
-            aggregate_files.extend(sub_files);
+            aggregate_bitmap |= &sub_bitmap;
+            if include_files {
+                aggregate_files.extend(sub_files);
+            }
             result_nodes.extend(sub_nodes);
         }
 
-        // 公理 2：若当前动词节点自身有直接文件命中 (direct_files > 0)，
+        // 公理 2：若当前动词节点自身有直接文件命中 (direct_bitmap > 0)，
         // 自身作为一个独立的平铺叶节点被返回（抽离原有 children）
-        if !node.direct_files.is_empty() {
+        if !node.direct_bitmap.is_empty() {
             let mut cloned = convert_trie_node_to_taxonomy_node(
                 node,
                 node_map,
                 resolved_names,
                 lang,
                 include_files,
+                node.direct_bitmap.len() as usize,
                 &node.direct_files,
             );
             cloned.children.clear(); // 抹平子级嵌套
-            cloned.file_count = node.direct_files.len();
+            cloned.file_count = node.direct_bitmap.len() as usize;
             // 细节 3：显式将其父级指针修正为当前动作根，避免指向已被抹除的悬空中间父级
             cloned.parent_code = Some(action_root_code.to_string());
             cloned.parent_codes = vec![action_root_code.to_string()];
-            result_nodes.push(cloned);
+            result_nodes.push((cloned, node.direct_bitmap.clone()));
         }
 
-        (result_nodes, aggregate_files)
+        (result_nodes, aggregate_bitmap, aggregate_files)
     }
 
     // 4.3 动作分支平铺子节点按同 code 归并与稳定排序 (ISS-01 & ISS-03)
     fn merge_and_sort_flattened_nodes(
-        nodes: Vec<TaxonomyNode>,
+        nodes: Vec<(TaxonomyNode, roaring::RoaringBitmap)>,
         action_root_code: &str,
         include_files: bool,
     ) -> Vec<TaxonomyNode> {
-        let mut map: BTreeMap<String, TaxonomyNode> = BTreeMap::new();
-        for mut node in nodes {
+        let mut map: BTreeMap<String, (TaxonomyNode, roaring::RoaringBitmap)> = BTreeMap::new();
+        for (mut node, bm) in nodes {
             node.parent_code = Some(action_root_code.to_string());
             node.parent_codes = vec![action_root_code.to_string()];
             if let Some(existing) = map.get_mut(&node.code) {
-                let mut file_set: HashSet<String> = existing.files.iter().cloned().collect();
-                file_set.extend(node.files);
-                existing.file_count = file_set.len();
+                existing.1 |= &bm;
+                existing.0.file_count = existing.1.len() as usize;
                 if include_files {
+                    let mut file_set: HashSet<String> = existing.0.files.iter().cloned().collect();
+                    file_set.extend(node.files);
                     let mut sorted_files: Vec<String> = file_set.into_iter().collect();
                     sorted_files.sort();
-                    existing.files = sorted_files;
+                    existing.0.files = sorted_files;
                 } else {
-                    existing.files.clear();
+                    existing.0.files.clear();
                 }
             } else {
-                map.insert(node.code.clone(), node);
+                map.insert(node.code.clone(), (node, bm));
             }
         }
-        let mut result: Vec<TaxonomyNode> = map.into_values().collect();
+        let mut result: Vec<TaxonomyNode> = map.into_values().map(|(n, _)| n).collect();
         result.sort_by(|a, b| {
             let order_a = if a.sort_order > 0 { a.sort_order } else { i64::MAX };
             let order_b = if b.sort_order > 0 { b.sort_order } else { i64::MAX };
@@ -1338,7 +1385,7 @@ pub fn query_taxonomy_tree_fast(
         in_action_branch: bool,
         is_root: bool,
         visited: &mut HashSet<String>,
-    ) -> Option<(Vec<TaxonomyNode>, HashSet<String>)> {
+    ) -> Option<(Vec<(TaxonomyNode, roaring::RoaringBitmap)>, roaring::RoaringBitmap, HashSet<String>)> {
         if !visited.insert(path.to_string()) {
             return None; // 防环保护
         }
@@ -1369,13 +1416,14 @@ pub fn query_taxonomy_tree_fast(
             }
             TaxonomyFoldPolicy::FlattenToActionRoot => {
                 // 当前节点作为动作根节点，执行二级扁平化
-                let mut aggregate_files = node.direct_files.clone();
+                let mut aggregate_bitmap = node.direct_bitmap.clone();
+                let mut aggregate_files = if include_files { node.direct_files.clone() } else { HashSet::new() };
                 let mut unmerged_children = Vec::new();
                 let mut action_visited = HashSet::new();
                 action_visited.insert(path.to_string());
 
                 for child_path in &node.children_paths {
-                    let (child_nodes, child_files) = collect_action_flattened_children(
+                    let (child_nodes, child_bm, child_files) = collect_action_flattened_children(
                         child_path,
                         &node.code,
                         node_map,
@@ -1384,7 +1432,10 @@ pub fn query_taxonomy_tree_fast(
                         include_files,
                         &mut action_visited,
                     );
-                    aggregate_files.extend(child_files);
+                    aggregate_bitmap |= &child_bm;
+                    if include_files {
+                        aggregate_files.extend(child_files);
+                    }
                     unmerged_children.extend(child_nodes);
                 }
 
@@ -1395,19 +1446,21 @@ pub fn query_taxonomy_tree_fast(
                     resolved_names,
                     lang,
                     include_files,
+                    aggregate_bitmap.len() as usize,
                     &aggregate_files,
                 );
                 tax_node.children = flattened_children;
                 visited.remove(path);
-                Some((vec![tax_node], aggregate_files))
+                Some((vec![(tax_node, aggregate_bitmap.clone())], aggregate_bitmap, aggregate_files))
             }
             TaxonomyFoldPolicy::BypassAndHoist => {
                 // 抽象壳词：抹除自身抽屉，子节点穿透上提
-                let mut aggregate_files = node.direct_files.clone();
+                let mut aggregate_bitmap = node.direct_bitmap.clone();
+                let mut aggregate_files = if include_files { node.direct_files.clone() } else { HashSet::new() };
                 let mut hoisted_nodes = Vec::new();
 
                 for child_path in &node.children_paths {
-                    if let Some((child_nodes, child_files)) = build_trie_subtree(
+                    if let Some((child_nodes, child_bm, child_files)) = build_trie_subtree(
                         child_path,
                         node_map,
                         resolved_names,
@@ -1417,17 +1470,21 @@ pub fn query_taxonomy_tree_fast(
                         false,
                         visited,
                     ) {
-                        aggregate_files.extend(child_files);
+                        aggregate_bitmap |= &child_bm;
+                        if include_files {
+                            aggregate_files.extend(child_files);
+                        }
                         hoisted_nodes.extend(child_nodes);
                     }
                 }
                 visited.remove(path);
-                Some((hoisted_nodes, aggregate_files))
+                Some((hoisted_nodes, aggregate_bitmap, aggregate_files))
             }
             TaxonomyFoldPolicy::Keep => {
                 // 正常保留当前层级（名词实体、根维度等）
-                let mut aggregate_files = node.direct_files.clone();
-                let mut children_nodes = Vec::new();
+                let mut aggregate_bitmap = node.direct_bitmap.clone();
+                let mut aggregate_files = if include_files { node.direct_files.clone() } else { HashSet::new() };
+                let mut children_nodes: Vec<(TaxonomyNode, roaring::RoaringBitmap)> = Vec::new();
 
                 // 向下传染 action 分支状态（用户微调提醒：包含真实动词/修饰词）
                 let next_in_action_branch = in_action_branch
@@ -1435,7 +1492,7 @@ pub fn query_taxonomy_tree_fast(
                     || is_real_verb_or_modifier(node.pos.as_deref(), node.lexfile.as_deref(), &node.code);
 
                 for child_path in &node.children_paths {
-                    if let Some((child_nodes, child_files)) = build_trie_subtree(
+                    if let Some((child_nodes, child_bm, child_files)) = build_trie_subtree(
                         child_path,
                         node_map,
                         resolved_names,
@@ -1445,11 +1502,14 @@ pub fn query_taxonomy_tree_fast(
                         false,
                         visited,
                     ) {
-                        aggregate_files.extend(child_files);
+                        aggregate_bitmap |= &child_bm;
+                        if include_files {
+                            aggregate_files.extend(child_files);
+                        }
                         for mut cn in child_nodes {
                             // 若子节点来自 BypassAndHoist 上提，其 parent_code 修正为当前节点
-                            cn.parent_code = Some(node.code.clone());
-                            cn.parent_codes = vec![node.code.clone()];
+                            cn.0.parent_code = Some(node.code.clone());
+                            cn.0.parent_codes = vec![node.code.clone()];
                             children_nodes.push(cn);
                         }
                     }
@@ -1461,6 +1521,7 @@ pub fn query_taxonomy_tree_fast(
                     resolved_names,
                     lang,
                     include_files,
+                    aggregate_bitmap.len() as usize,
                     &aggregate_files,
                 );
 
@@ -1473,13 +1534,12 @@ pub fn query_taxonomy_tree_fast(
                     loop {
                         let mut has_duplicate = false;
                         let mut next_children = Vec::new();
-                        for child in current_children {
+                        for (child, child_bm) in current_children {
                             if child.name.trim() == tax_node.name.trim() {
                                 has_duplicate = true;
                                 if include_files {
                                     let mut merged_files: HashSet<String> = tax_node.files.into_iter().collect();
                                     merged_files.extend(child.files);
-                                    tax_node.file_count = merged_files.len();
                                     let mut sorted_files: Vec<String> = merged_files.into_iter().collect();
                                     sorted_files.sort();
                                     tax_node.files = sorted_files;
@@ -1487,10 +1547,11 @@ pub fn query_taxonomy_tree_fast(
                                 for mut grand_child in child.children {
                                     grand_child.parent_code = Some(node.code.clone());
                                     grand_child.parent_codes = vec![node.code.clone()];
-                                    next_children.push(grand_child);
+                                    let g_bm = roaring::RoaringBitmap::new();
+                                    next_children.push((grand_child, g_bm));
                                 }
                             } else {
-                                next_children.push(child);
+                                next_children.push((child, child_bm));
                             }
                         }
                         current_children = next_children;
@@ -1501,33 +1562,36 @@ pub fn query_taxonomy_tree_fast(
                 }
 
                 // 【加固点 3：同父同名兄弟节点自愈合并 (Sibling Deduplication Axiom / ISS-01)】
-                let mut sibling_map: BTreeMap<String, TaxonomyNode> = BTreeMap::new();
-                for child in current_children {
+                // 采用 RoaringBitmap 并在合并时执行按位或 (|=)，在 !include_files 模式下依然保持亚毫秒精确计数
+                let mut sibling_map: BTreeMap<String, (TaxonomyNode, roaring::RoaringBitmap)> = BTreeMap::new();
+                for (child, child_bm) in current_children {
                     let key = if !child.name.trim().is_empty() {
                         child.name.trim().to_string()
                     } else {
                         child.code.clone()
                     };
                     if let Some(existing) = sibling_map.get_mut(&key) {
-                        let mut merged_files: HashSet<String> = existing.files.iter().cloned().collect();
-                        merged_files.extend(child.files);
-                        existing.file_count = merged_files.len();
+                        existing.1 |= &child_bm;
+                        existing.0.file_count = existing.1.len() as usize;
                         if include_files {
+                            let mut merged_files: HashSet<String> = existing.0.files.iter().cloned().collect();
+                            merged_files.extend(child.files);
+                            existing.0.file_count = merged_files.len();
                             let mut sorted_files: Vec<String> = merged_files.into_iter().collect();
                             sorted_files.sort();
-                            existing.files = sorted_files;
+                            existing.0.files = sorted_files;
                         } else {
-                            existing.files.clear();
+                            existing.0.files.clear();
                         }
-                        existing.children.extend(child.children);
+                        existing.0.children.extend(child.children);
                     } else {
-                        sibling_map.insert(key, child);
+                        sibling_map.insert(key, (child, child_bm));
                     }
                 }
-                current_children = sibling_map.into_values().collect();
+                let mut current_children_clean: Vec<TaxonomyNode> = sibling_map.into_values().map(|(n, _)| n).collect();
 
                 // 子节点排序：sort_order > 0 升序优先，相同按 code 字典序
-                current_children.sort_by(|a, b| {
+                current_children_clean.sort_by(|a, b| {
                     let order_a = if a.sort_order > 0 { a.sort_order } else { i64::MAX };
                     let order_b = if b.sort_order > 0 { b.sort_order } else { i64::MAX };
                     if order_a != order_b {
@@ -1537,9 +1601,9 @@ pub fn query_taxonomy_tree_fast(
                     }
                 });
 
-                tax_node.children = current_children;
+                tax_node.children = current_children_clean;
                 visited.remove(path);
-                Some((vec![tax_node], aggregate_files))
+                Some((vec![(tax_node, aggregate_bitmap.clone())], aggregate_bitmap, aggregate_files))
             }
         }
     }
@@ -1563,7 +1627,7 @@ pub fn query_taxonomy_tree_fast(
         for r_path in &root_paths {
             if let Some(r_node) = node_map.get(r_path) {
                 if r_node.code == target_root || r_node.code_path == target_norm {
-                    if let Some((root_nodes, _)) = build_trie_subtree(
+                    if let Some((root_nodes, _, _)) = build_trie_subtree(
                         r_path,
                         &node_map,
                         &resolved_names,
@@ -1573,7 +1637,7 @@ pub fn query_taxonomy_tree_fast(
                         true, // is_root = true
                         &mut visited,
                     ) {
-                        for root_node in root_nodes {
+                        for (root_node, _) in root_nodes {
                             if !root_node.children.is_empty() || root_node.file_count > 0 {
                                 roots.push(root_node);
                             }
@@ -1597,7 +1661,7 @@ pub fn query_taxonomy_tree_fast(
         });
 
         for r_path in sorted_root_paths {
-            if let Some((root_nodes, _)) = build_trie_subtree(
+            if let Some((root_nodes, _, _)) = build_trie_subtree(
                 &r_path,
                 &node_map,
                 &resolved_names,
@@ -1607,7 +1671,7 @@ pub fn query_taxonomy_tree_fast(
                 true, // is_root = true
                 &mut visited,
             ) {
-                for root_node in root_nodes {
+                for (root_node, _) in root_nodes {
                     if !root_node.children.is_empty() || root_node.file_count > 0 {
                         roots.push(root_node);
                     }
@@ -1677,7 +1741,7 @@ pub fn query_taxonomy_tree(
     // 若提供业务主库路径且有效，优先且强制走倒排 Trie 极速分类树引擎 (ADR-0038 / ADR-0053 / P95 <= 5ms)
     if let Some(path) = master_db_path {
         if path.exists() {
-            if let Ok(master_conn) = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            if let Ok(master_conn) = open_omni_readonly_connection(path) {
                 return query_taxonomy_tree_fast(
                     conn,
                     locale,
@@ -4073,5 +4137,55 @@ mod tests {
         
         // 断言：小说节点自身不应包含自身（无回环冗余子节点）
         assert!(!novel_node.children.iter().any(|c| c.name == "小说"));
+    }
+
+    /// 断言 12【AC-1: RoaringBitmap 10万文件子树去重计数耗时 < 5ms】
+    #[test]
+    fn test_roaring_bitmap_massive_files_dedup_perf() {
+        use roaring::RoaringBitmap;
+        use std::time::Instant;
+
+        let mut child1 = RoaringBitmap::new();
+        let mut child2 = RoaringBitmap::new();
+        // 构造 100,000 个文件，其中 40,000 个文件同时命中 child1 与 child2
+        for id in 1..=70_000u32 {
+            child1.insert(id);
+        }
+        for id in 30_001..=100_000u32 {
+            child2.insert(id);
+        }
+
+        let start = Instant::now();
+        let mut parent = RoaringBitmap::new();
+        parent |= &child1;
+        parent |= &child2;
+        let count = parent.len();
+        let elapsed = start.elapsed();
+
+        assert_eq!(count, 100_000);
+        // SIMD 位图聚合耗时必须 < 5ms (通常在 100微秒 以内)
+        assert!(elapsed.as_millis() < 5, "RoaringBitmap 10万去重耗时超标: {:?}", elapsed);
+    }
+
+    /// 断言 13【只读连接安全配置验证 (Spec §3.1.1)】
+    #[test]
+    fn test_open_omni_readonly_connection_pragmas() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test_readonly.db");
+        {
+            let init_conn = Connection::open(&db_path).unwrap();
+            init_conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", []).unwrap();
+        }
+
+        let ro_conn = open_omni_readonly_connection(&db_path).expect("open_omni_readonly_connection failed");
+        let query_only: i64 = ro_conn.query_row("PRAGMA query_only", [], |r| r.get(0)).unwrap();
+        assert_eq!(query_only, 1, "query_only 必须开启");
+
+        let temp_store: i64 = ro_conn.query_row("PRAGMA temp_store", [], |r| r.get(0)).unwrap();
+        assert_eq!(temp_store, 2, "temp_store 必须为 MEMORY (2)");
+
+        // 尝试写入必须被拦截阻断
+        let write_res = ro_conn.execute("INSERT INTO test (id) VALUES (1)", []);
+        assert!(write_res.is_err(), "只读连接严禁写入");
     }
 }
