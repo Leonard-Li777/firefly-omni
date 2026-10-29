@@ -344,11 +344,10 @@ pub fn split_text_chunks(
         let is_weak_stop = tail_punct.map(|p| matches!(p, '，' | ',' | '、')).unwrap_or(false);
         let can_split_at_weak_punct = is_weak_stop && !next_starts_with_tight_conjunction;
 
-        // 3. 首句极速起播结算：在首句模式下，满足 min_len (>=8) 且遇任意非粘连标点，或达到目标长度 (>=12)，立即结算出片
+        // 3. 首句极速起播结算：在首句模式下，若遇到标点且无连词粘连，满足 min_len (>=8) 即可结算出片
         if is_ladder_mode && chunks.is_empty() {
-            let reached_head_target = prospective_chars >= target_len;
-            let reached_head_min_with_punct = prospective_chars >= min_len && (is_strong_stop || is_medium_stop || can_split_at_weak_punct);
-            if reached_head_target || reached_head_min_with_punct {
+            let can_head_split = is_strong_stop || is_medium_stop || can_split_at_weak_punct;
+            if can_head_split && prospective_chars >= min_len {
                 append_clause_to_buffer(&mut current_buffer, clause_str, is_zh);
                 chunks.push(current_buffer.trim().to_string());
                 current_buffer.clear();
@@ -366,14 +365,24 @@ pub fn split_text_chunks(
 
         // 5. 即将突破最大硬上限，必须切断出片
         if prospective_chars > max_len {
-            if !current_buffer.trim().is_empty() {
-                chunks.push(current_buffer.trim().to_string());
+            // 若当前缓冲区非空，且当前子句以紧密连词开头（如“而且/然后/并且”），
+            // 坚决不可将前缓冲区直接独立出片而将连词孤立在下一句句首；应合并后在安全词法边界断开
+            let current_starts_with_tight_conj = TIGHT_CONTINUING_CONJUNCTIONS.iter().any(|&conj| clause_str.starts_with(conj));
+            let mut remaining = if !current_buffer.trim().is_empty() && current_starts_with_tight_conj {
+                let combined = format!("{}{}", current_buffer, clause_str);
                 current_buffer.clear();
-            }
+                combined
+            } else {
+                if !current_buffer.trim().is_empty() {
+                    chunks.push(current_buffer.trim().to_string());
+                    current_buffer.clear();
+                }
+                clause_str.to_string()
+            };
+
             let (_, _, new_max) = get_thresholds(chunks.len());
             let elastic_limit = if is_ladder_mode && chunks.is_empty() { 25 } else { new_max };
-            if clause_chars > elastic_limit {
-                let mut remaining = clause_str.to_string();
+            if remaining.chars().count() > elastic_limit {
                 while remaining.chars().count() > get_thresholds(chunks.len()).2 {
                     let (cur_min, cur_target, cur_max) = get_thresholds(chunks.len());
                     let cur_min_safe = cur_min.max((cur_target as f32 * 0.7) as usize);
@@ -401,7 +410,7 @@ pub fn split_text_chunks(
                     current_buffer = remaining;
                 }
             } else {
-                current_buffer = clause_str.to_string();
+                current_buffer = remaining;
             }
             continue;
         }
