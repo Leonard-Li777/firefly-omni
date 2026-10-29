@@ -127,7 +127,7 @@ pub fn reset_directml_gate_for_test() {
 ///
 /// 扩档铁律：任何模型加入此表必须附同 harness 实测数据（同形状 CPU/DML ≥1.5x 且数值偏差
 /// ≤1e-4 相对量级），禁止凭直觉扩档。v1 仅 Gemma 视觉塔（文本塔实测中位 ~1.3x 且方差极大，维持 CPU）。
-pub const DML_ALLOWLIST_MODELS: &[&str] = &["gemma.vision_encoder"];
+pub const DML_ALLOWLIST_MODELS: &[&str] = &["gemma.vision_encoder", "moss.codec_decoder"];
 
 /// EP 策略档位：与 `ModelTier`（内存驻留分级）**正交**，严禁合并成同一枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1295,7 +1295,9 @@ impl OmniOrtRuntime {
         let mut policy = policy;
         if policy == EpPolicy::DmlAllowlist {
             let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-            let is_allowed = file_name.starts_with("vision_encoder") || file_name.starts_with("vision_model");
+            let is_allowed = file_name.starts_with("vision_encoder")
+                || file_name.starts_with("vision_model")
+                || file_name.starts_with("moss_audio_tokenizer_decode");
             if !is_allowed {
                 tracing::warn!(
                     "OmniOrtRuntime: 模型 {:?} 不在 DML_ALLOWLIST_MODELS 白名单中，强制打回纯 CPU 策略",
