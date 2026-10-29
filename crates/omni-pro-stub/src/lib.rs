@@ -601,6 +601,10 @@ pub mod vision {
             "uninitialized".to_string()
         }
 
+        pub fn ram_vision_status() -> String {
+            "disabled: pro_stub".to_string()
+        }
+
         pub fn evict_gemma_vision() {}
 
         pub fn is_gemma_vision_resident() -> bool {

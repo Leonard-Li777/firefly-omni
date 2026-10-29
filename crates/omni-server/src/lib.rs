@@ -233,6 +233,11 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
     } else {
         "uninitialized".to_string()
     };
+    let ram_status = if is_pro {
+        omni_pro::OmniVisionEngine::ram_vision_status()
+    } else {
+        "disabled: pro_disabled".to_string()
+    };
     let vision_resident = if is_pro {
         omni_pro::OmniVisionEngine::is_gemma_vision_resident()
     } else {
@@ -255,6 +260,14 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
         "mrlDimension": mrl_dim,
         "visionStatus": vision_status,
         "visionSessionResident": vision_resident,
+        "vision_engines_available": {
+            "gemma": vision_status.clone(),
+            "ram": ram_status.clone(),
+        },
+        "visionEnginesAvailable": {
+            "gemma": vision_status.clone(),
+            "ram": ram_status.clone(),
+        },
         "idleTimeoutSeconds": 300,
         "isPro": is_pro,
         "version": env!("CARGO_PKG_VERSION"),
