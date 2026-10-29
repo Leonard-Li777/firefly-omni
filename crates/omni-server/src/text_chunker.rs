@@ -94,14 +94,22 @@ fn find_pos_split_char_idx(text: &str, max_len: usize, min_safe_len: usize, is_z
             let end_char = char_offset + word_chars;
             let tag = tag_token.tag.to_lowercase();
 
+            let next_byte = char_to_byte_index(text, end_char);
+            let next_slice = &text[next_byte..];
+            let next_is_tight_conj = TIGHT_CONTINUING_CONJUNCTIONS
+                .iter()
+                .any(|&conj| next_slice.trim_start().starts_with(conj));
+
             // 记录安全区间内的合法词边界（避免截断在专有名词或汉字词素中间）
-            if end_char >= min_safe_len && end_char <= safe_end_chars {
+            // 护栏：若该边界紧邻后方的词是顺承连词（如“而且/然后/并且/于是/但是/然而/从而/所以”），
+            // 禁止在此断开，否则会将连词孤立在下一句句首
+            if end_char >= min_safe_len && end_char <= safe_end_chars && !next_is_tight_conj {
                 last_safe_word_boundary = end_char;
             }
 
-            // 1. 语气词（y 如 呢/吧/啊）与时态助词（ule 了、uguo 过）：允许在其后方截断
+            // 1. 语气词（y 如 呢/吧/啊）与时态助词（ule 了、uguo 过）：允许在其后方截断（同样受连词护栏约束）
             let is_post_particle = tag == "y" || tag == "ule" || tag == "uguo";
-            if is_post_particle && end_char >= min_safe_len && end_char <= safe_end_chars {
+            if is_post_particle && end_char >= min_safe_len && end_char <= safe_end_chars && !next_is_tight_conj {
                 best_split_char = end_char;
             }
 
@@ -269,7 +277,7 @@ pub fn split_text_chunks(
 
     for clause_idx in 0..clauses.len() {
         let (min_len, target_len, max_len) = get_thresholds(chunks.len());
-        let min_safe_len = min_len.max((target_len as f32 * 0.7) as usize);
+        let _min_safe_len = min_len.max((target_len as f32 * 0.7) as usize);
 
         let clause_item = &clauses[clause_idx];
         let clause_str = clause_item.text.as_str();
@@ -288,19 +296,30 @@ pub fn split_text_chunks(
         // 首句弹性延展保护：若前 18 字无自然停顿，通过词法边界弹性延展至 22~25 字，严禁在专有名词或英文单词内部硬切补逗号
         let elastic_clause_max = if is_ladder_mode && chunks.is_empty() { 25 } else { max_len };
         if clause_chars > elastic_clause_max {
-            if !current_buffer.trim().is_empty() {
-                chunks.push(current_buffer.trim().to_string());
-                current_buffer.clear();
-            }
+            let current_starts_with_tight_conj = TIGHT_CONTINUING_CONJUNCTIONS
+                .iter()
+                .any(|&conj| clause_str.starts_with(conj));
 
-            let mut remaining = clause_str.to_string();
-            while remaining.chars().count() > get_thresholds(chunks.len()).2 {
+            let mut remaining = if !current_buffer.trim().is_empty() && current_starts_with_tight_conj {
+                let combined = format!("{}{}", current_buffer, clause_str);
+                current_buffer.clear();
+                combined
+            } else {
+                if !current_buffer.trim().is_empty() {
+                    chunks.push(current_buffer.trim().to_string());
+                    current_buffer.clear();
+                }
+                clause_str.to_string()
+            };
+
+            while remaining.chars().count() > (if is_ladder_mode && chunks.is_empty() { 25 } else { get_thresholds(chunks.len()).2 }) {
                 let (cur_min, cur_target, cur_max) = get_thresholds(chunks.len());
+                let cur_elastic_max = if is_ladder_mode && chunks.is_empty() { 25 } else { cur_max };
                 let cur_min_safe = cur_min.max((cur_target as f32 * 0.7) as usize);
-                let split_char_idx = find_pos_split_char_idx(&remaining, cur_max, cur_min_safe, is_zh);
+                let split_char_idx = find_pos_split_char_idx(&remaining, cur_elastic_max, cur_min_safe, is_zh);
                 // 强制保底单步推进，杜绝 0 长度死循环
                 let effective_split = if split_char_idx == 0 || split_char_idx >= remaining.chars().count() {
-                    cur_max.min(remaining.chars().count()).max(1)
+                    cur_elastic_max.min(remaining.chars().count()).max(1)
                 } else {
                     split_char_idx
                 };
@@ -383,12 +402,13 @@ pub fn split_text_chunks(
             let (_, _, new_max) = get_thresholds(chunks.len());
             let elastic_limit = if is_ladder_mode && chunks.is_empty() { 25 } else { new_max };
             if remaining.chars().count() > elastic_limit {
-                while remaining.chars().count() > get_thresholds(chunks.len()).2 {
+                while remaining.chars().count() > (if is_ladder_mode && chunks.is_empty() { 25 } else { get_thresholds(chunks.len()).2 }) {
                     let (cur_min, cur_target, cur_max) = get_thresholds(chunks.len());
+                    let cur_elastic_max = if is_ladder_mode && chunks.is_empty() { 25 } else { cur_max };
                     let cur_min_safe = cur_min.max((cur_target as f32 * 0.7) as usize);
-                    let split_char_idx = find_pos_split_char_idx(&remaining, cur_max, cur_min_safe, is_zh);
+                    let split_char_idx = find_pos_split_char_idx(&remaining, cur_elastic_max, cur_min_safe, is_zh);
                     let effective_split = if split_char_idx == 0 || split_char_idx >= remaining.chars().count() {
-                        cur_max.min(remaining.chars().count()).max(1)
+                        cur_elastic_max.min(remaining.chars().count()).max(1)
                     } else {
                         split_char_idx
                     };

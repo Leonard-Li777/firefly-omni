@@ -4472,7 +4472,7 @@ async fn audio_tts_chunk_handler(
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire tts lock: {}", e)))?;
 
     let moss = state.moss.clone();
-    let wav_bytes = tokio::task::spawn_blocking(move || {
+    let synth_res = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         moss.synthesize(&clean_text, &target_voice, speed)
     })
@@ -4483,8 +4483,10 @@ async fn audio_tts_chunk_handler(
     let response = axum::response::Response::builder()
         .status(axum::http::StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, "audio/wav")
-        .header(axum::http::header::CONTENT_LENGTH, wav_bytes.len().to_string())
-        .body(axum::body::Body::from(wav_bytes))
+        .header(axum::http::header::CONTENT_LENGTH, synth_res.wav_bytes.len().to_string())
+        .header("X-Moss-Hit-Cap", synth_res.hit_cap.to_string())
+        .header("X-Moss-Steps", synth_res.steps.to_string())
+        .body(axum::body::Body::from(synth_res.wav_bytes))
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(response)
