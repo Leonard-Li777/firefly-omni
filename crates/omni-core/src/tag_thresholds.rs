@@ -28,6 +28,12 @@ pub const CLIP_CALIBRATE_CAP: f32 = 0.97;
 // （assert_visual_vocab_gate_width）会按新 margin 判出与实际闸门不一致的结论。
 
 /// Gemma 视觉零样本绝对候选下限（余弦）
+///
+/// 该值按**旧坍缩空间**（词表取 `sentence_embedding`，偏置项把 raw 整体抬到 0.85 量级）标定。
+/// 烘焙侧改 content_mask 池化后 raw 分整体下移，但 2026-10-30 用金标图端到端复测
+/// （`omni-server/tests/gemma_runtime_tests.rs::test_ac3_2_and_3_3_gold_landscape_image_inference`）
+/// 确认 Top-1 仍为风景照、raw ≥ 0.305，本值仍有约 0.025 余量，暂不下调。
+/// 扩到多图夹具后（TASK-02）需随 `GEMMA_MIN_PROMINENCE` 一起重新标定。
 pub const GEMMA_ABS_FLOOR: f32 = 0.28;
 
 /// Gemma 视觉零样本 Top-1 侧向抑制 margin：与第一名差距超过该值的候选被滤除
