@@ -1079,6 +1079,17 @@ impl OmniOrtRuntime {
             .unwrap_or(4)
     }
 
+    /// TTS (MOSS-TTS 自回归小算子与 Codec) 线程配额：锁定 4 线程
+    ///
+    /// 实测 benchmark 表明：自回归步进小算子 (768 dim / 12 heads) 在 CPU 上超额多线程
+    /// (如 6/8 线程) 会因核间上下文切换与调度竞争严重劣化 (8 线程 RTF 0.935 vs 4 线程 RTF 0.370)，
+    /// 4 线程为系统全局最佳拐点。
+    pub fn recommended_tts_threads() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 4))
+            .unwrap_or(4)
+    }
+
     /// 启动时显式盘点当前 DLL 的 EP 能力落点，杜绝「Session 构建成功但实跑 CPU」的静默回退不可观测
     pub fn log_execution_provider_capability() {
         use ort::execution_providers::ExecutionProvider;
@@ -1239,6 +1250,16 @@ impl OmniOrtRuntime {
         Self::build_session_verified(model_path, tier, EpPolicy::CpuOnly, |_| Ok(()))
     }
 
+    /// 执行提供商 (EP) 两阶段降级路由工厂（支持指定 intra_threads，如 TTS 锁定 4 线程）
+    pub fn build_session_with_threads<P: AsRef<Path>>(
+        model_path: P,
+        tier: ModelTier,
+        ep_policy: EpPolicy,
+        intra_threads: usize,
+    ) -> Result<ort::session::Session, ort::Error> {
+        Self::build_session_verified_with_threads(model_path, tier, ep_policy, intra_threads, |_| Ok(()))
+    }
+
     /// 三段回退主入口（构建期 → warmup → 纯 CPU 重建）
     ///
     /// - 构建期：按 `ep_policy` 阶梯构建，DML 分支显式关闭 memory pattern 与并行执行；
@@ -1256,12 +1277,32 @@ impl OmniOrtRuntime {
         P: AsRef<Path>,
         W: Fn(&ort::session::Session) -> Result<(), ort::Error>,
     {
+        Self::build_session_verified_with_threads(
+            model_path,
+            tier,
+            ep_policy,
+            Self::recommended_intra_threads(),
+            warmup,
+        )
+    }
+
+    /// 三段回退主入口（指定 intra_threads 配额）
+    pub fn build_session_verified_with_threads<P, W>(
+        model_path: P,
+        tier: ModelTier,
+        ep_policy: EpPolicy,
+        intra_threads: usize,
+        warmup: W,
+    ) -> Result<ort::session::Session, ort::Error>
+    where
+        P: AsRef<Path>,
+        W: Fn(&ort::session::Session) -> Result<(), ort::Error>,
+    {
         // 运行时未绑定时必须返回 Err：`Session::builder()` 在 DLL 缺席时是 panic
         // （ort rc.9 `lib_handle()` unwrap_or_else panic），release 档 `panic = "abort"`
         // 会直接终止进程，绝不能让「静默降级」演变成进程崩溃。
         Self::ensure_bound_for_session()?;
         let path = model_path.as_ref();
-        let intra_threads = Self::recommended_intra_threads();
         let (session, used_dml) = Self::build_with_policy(path, tier, ep_policy, intra_threads)?;
         finalize_warmup_with_fallback(
             session,

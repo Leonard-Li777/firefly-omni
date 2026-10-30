@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Extract { file }) => {
             let config = omni_core::OmniConfig::default();
             println!("🔍 [firefly-omni] 正在提取文件: {}", file);
-            let result = omni_extract::OmniExtractor::extract(file, &config).await?;
+            let result: omni_core::OmniExtractionResult = omni_extract::OmniExtractor::extract(file, &config).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             omni_extract::shutdown_exiftool_daemon();
             std::process::exit(0);
