@@ -1392,6 +1392,15 @@ pub fn run_vision_pipeline_on_image(
         // (WP2b) 分数快照与标签名拆分：clip_tags 保持 Vec<String> 兼容既有门禁/消歧流程
         out.clip_tag_confs = ct_scored.iter().cloned().collect();
         out.clip_tags = ct_scored.into_iter().map(|(t, _)| t).collect();
+        // gemma_unified 档位：补齐组内单选互斥（2026-10-30 风景照误标事故修复）。
+        // 该档位此前被整体旁路（图像嵌入来自 Gemma 塔，无法与 CLIP 文本锚空间做余弦竞争），
+        // 导致同维度多标签并存（风景照+宠物照）流出。改为对按生点积降序的标签序列
+        // 做纯序数 Top-1 过滤，不需要任何嵌入向量，与档位天然解耦。
+        if embedding_profile == "gemma_unified" && enable_visual_tags {
+            out.clip_tags = omni_pro::OmniVisionEngine::filter_mutual_groups_top1(
+                std::mem::take(&mut out.clip_tags),
+            );
+        }
         out.clip_ms = ct_ms;
         out.nsfw_probs = np;
         out.nsfw_ms = np_ms;
@@ -2335,8 +2344,11 @@ async fn perceive_file_handler(
             }
         };
         for t in &clip_tags {
-            // CLIP：提取层标定分 (calibrate_clip_score)，无分回退 0.55 起步值
-            register(t, "clip", 2, clip_tag_confs.get(t).copied());
+            // CLIP/Gemma：提取层标定分 (calibrate_clip_score / gemma 线性标定)，无分回退 0.55 起步值。
+            // 引擎名按档位如实登记：gemma_unified 档位的标签物理上由 EmbeddingGemma 产出，
+            // 此前恒登记为 "clip"（历史坏账），误导日志归因与桌面端溯源映射。
+            let engine: &'static str = if cfg.embedding_profile == "gemma_unified" { "gemma" } else { "clip" };
+            register(t, engine, 2, clip_tag_confs.get(t).copied());
         }
         for t in &morphology_tags {
             // 物理规则推导：无模型分数，分层回退 0.90

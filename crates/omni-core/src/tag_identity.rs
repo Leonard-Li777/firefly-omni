@@ -155,6 +155,14 @@ pub fn detect_tag_language(raw: &str) -> &'static str {
 
 /// 按语言分表载入动态别名与权威展示名 (lemma, tag_code, is_canonical)
 ///
+/// 语义包侧职责是「枚举每个 tag_aliases_{lang} 分表并按语种灌入对应的语言分表 HashMap」，
+/// 而非一次性拉入全量别名。两层事实：
+///  - 内存：sqlite3_deserialize 已把 10 个分表的页都镜像进同一个共享内存库，语言分表「休眠」
+///    在本层物理不成立（见 research/semantic-pack-tag-aliases-lang）。
+///  - 热载：这是把展示/识别走得更快的缓冲层（HashMap lemma→code），省略了每次都穿透 SQLite
+///    分表点查。按当前 UI 语言进一步裁热载会破坏异语识别与语言切换后的即时展示，真的该省的
+///    内存在整库多副本/raw_bytes 上，不在这条动态轨里。
+///
 /// 冲突规则：同一 lemma 同时命中 `omw.*` 与 `builtin.*` 时 **omw.* 优先**。
 /// 全局表（`dynamic_aliases`，供 `resolve_controlled_tag_code` 等旧接口读取）
 /// 与语言分表采用同一 omw.* 优先冲突规则，避免多语言分表热载顺序不同

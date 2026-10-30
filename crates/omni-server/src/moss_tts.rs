@@ -570,9 +570,13 @@ pub struct MossTtsEngine {
     codec_decode_session: Mutex<Session>,
     codec_encode_session: Mutex<Session>,
     tokenizer: Tokenizer,
+    /// 近似 greedy 解码模式（由 OMNI_MOSS_GREEDY_MODE=1 环境变量启用，仅供测试）
+    /// 将随机采样输入全部置零，使 Gumbel/Uniform 采样退化为近似 argmax，省去随机数生成开销
+    greedy_mode: bool,
 }
 
-/// Codec 解码器启动期 Warmup 闭包：构造 64/256/384 静态三桶基准输入，预先编译 DirectML D3D12 PSO 并驻留驱动缓存
+/// Codec 解码器启动期 Warmup 闭包（历史 DML 留存）：构造 64/256/384 静态三桶基准输入，预先编译 DirectML D3D12 PSO 并驻留驱动缓存
+#[allow(dead_code)]
 fn warmup_codec_decoder(session: &Session) -> Result<(), ort::Error> {
     for &frames in &[64, 256, 384] {
         let dummy_codes = Array3::<i32>::zeros((1, frames, 16));
@@ -593,7 +597,26 @@ impl MossTtsEngine {
 
         let prefill_path = model_dir.join("moss_tts_prefill.onnx");
         let decode_path = model_dir.join("moss_tts_decode_step.onnx");
-        let local_fixed_path = model_dir.join("moss_tts_local_fixed_sampled_frame.onnx");
+        // 支持通过环境变量 OMNI_MOSS_LOCAL_MODEL_OVERRIDE 覆盖 local 采样模型路径（仅供临时测试）
+        let local_fixed_path = if let Ok(override_path) = std::env::var("OMNI_MOSS_LOCAL_MODEL_OVERRIDE") {
+            let p = std::path::PathBuf::from(&override_path);
+            tracing::warn!(
+                "[MossTtsEngine] ⚠️  OMNI_MOSS_LOCAL_MODEL_OVERRIDE 已设置，使用覆盖模型路径: {:?}（仅供测试）",
+                p
+            );
+            p
+        } else {
+            model_dir.join("moss_tts_local_fixed_sampled_frame.onnx")
+        };
+        // 读取 greedy 模式开关（OMNI_MOSS_GREEDY_MODE=1 启用近似 greedy 解码）
+        let greedy_mode = std::env::var("OMNI_MOSS_GREEDY_MODE")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        if greedy_mode {
+            tracing::warn!(
+                "[MossTtsEngine] ⚠️  OMNI_MOSS_GREEDY_MODE=1，已启用近似 greedy 解码（随机数置零），仅供 RTF 测试"
+            );
+        }
         let codec_decode_path = model_dir.join("moss_audio_tokenizer_decode_full.onnx");
         let codec_encode_path = model_dir.join("moss_audio_tokenizer_encode.onnx");
         let tokenizer_path = model_dir.join("tokenizer.json");
@@ -611,21 +634,52 @@ impl MossTtsEngine {
             ));
         }
 
-        let prefill_session = OmniOrtRuntime::build_session(&prefill_path, ModelTier::Tier2)
-            .map_err(|e| format!("加载 moss_tts_prefill 失败: {}", e))?;
-        let decode_session = OmniOrtRuntime::build_session(&decode_path, ModelTier::Tier2)
-            .map_err(|e| format!("加载 moss_tts_decode_step 失败: {}", e))?;
-        let local_fixed_session = OmniOrtRuntime::build_session(&local_fixed_path, ModelTier::Tier2)
-            .map_err(|e| format!("加载 moss_tts_local_fixed 失败: {}", e))?;
-        let codec_decode_session = OmniOrtRuntime::build_session_verified(
+        let tts_threads = OmniOrtRuntime::recommended_tts_threads();
+        tracing::info!(
+            "[MossTtsEngine] 采用 CPU 高效拓扑，锁定 intra_threads={} 构建 MOSS-TTS ONNX 会话",
+            tts_threads
+        );
+
+        let prefill_session = OmniOrtRuntime::build_session_with_threads(
+            &prefill_path,
+            ModelTier::Tier2,
+            omni_core::ort_runtime::EpPolicy::CpuOnly,
+            tts_threads,
+        )
+        .map_err(|e| format!("加载 moss_tts_prefill 失败: {}", e))?;
+
+        let decode_session = OmniOrtRuntime::build_session_with_threads(
+            &decode_path,
+            ModelTier::Tier2,
+            omni_core::ort_runtime::EpPolicy::CpuOnly,
+            tts_threads,
+        )
+        .map_err(|e| format!("加载 moss_tts_decode_step 失败: {}", e))?;
+
+        let local_fixed_session = OmniOrtRuntime::build_session_with_threads(
+            &local_fixed_path,
+            ModelTier::Tier2,
+            omni_core::ort_runtime::EpPolicy::CpuOnly,
+            tts_threads,
+        )
+        .map_err(|e| format!("加载 moss_tts_local_fixed 失败: {}", e))?;
+
+        // Codec 解码器在 CPU 4线程下性能极高 (~160ms)，且完全免疫 DirectML PSO 动态重编译卡死
+        let codec_decode_session = OmniOrtRuntime::build_session_with_threads(
             &codec_decode_path,
             ModelTier::Tier2,
-            omni_core::ort_runtime::EpPolicy::DmlAllowlist,
-            warmup_codec_decoder,
+            omni_core::ort_runtime::EpPolicy::CpuOnly,
+            tts_threads,
         )
         .map_err(|e| format!("加载 moss_audio_tokenizer_decode_full 失败: {}", e))?;
-        let codec_encode_session = OmniOrtRuntime::build_session(&codec_encode_path, ModelTier::Tier2)
-            .map_err(|e| format!("加载 moss_audio_tokenizer_encode 失败: {}", e))?;
+
+        let codec_encode_session = OmniOrtRuntime::build_session_with_threads(
+            &codec_encode_path,
+            ModelTier::Tier2,
+            omni_core::ort_runtime::EpPolicy::CpuOnly,
+            tts_threads,
+        )
+        .map_err(|e| format!("加载 moss_audio_tokenizer_encode 失败: {}", e))?;
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| format!("加载 tokenizer.json 失败: {}", e))?;
@@ -642,6 +696,7 @@ impl MossTtsEngine {
             codec_decode_session: Mutex::new(codec_decode_session),
             codec_encode_session: Mutex::new(codec_encode_session),
             tokenizer,
+            greedy_mode,
         })
     }
 
@@ -833,9 +888,13 @@ impl MossTtsEngine {
         // 1 秒 = 12.5 帧。中文平均 1 字符 ~ 3.5 帧，给予 2.5 倍宽松冗余 (8 帧/token) + 80 帧基础余量
         let dynamic_max = text_tokens.len() * 8 + 80;
         let max_frames = dynamic_max.min(375);
+        // 最小帧数保底保护：中文汉字通常不少于 0.25s/字 (即 12.5fps * 0.25 ≈ 3帧/字)，
+        // 防止采样初期偶发性 EOS 早停导致只发音半个音节
+        let min_frames = (text.chars().count() * 2).clamp(4, 40);
         let mut local_ms_acc = 0.0f64;
         let mut step_decode_ms_acc = 0.0f64;
         let t_decode = Instant::now();
+        // greedy 模式下不使用随机数，rng 仅在标准采样路径中使用
         let mut rng = FastRng::new(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -850,13 +909,23 @@ impl MossTtsEngine {
                     return Err("MOSS-TTS 任务已由客户端取消".to_string());
                 }
             }
-            let assistant_random_u = Array1::from_vec(vec![rng.next_f32()]);
-            let mut u2_vals = Vec::with_capacity(16);
-            for _ in 0..16 {
-                u2_vals.push(rng.next_f32());
-            }
-            let audio_random_u = Array2::from_shape_vec((1, 16), u2_vals)
-                .map_err(|e| e.to_string())?;
+            // greedy 模式：将随机数置零，使 Gumbel/Uniform 采样退化为近似 argmax（不需要新 ONNX）
+            // 标准模式：使用 FastRng 生成 Uniform(0,1) 随机数驱动采样多样性
+            let (assistant_random_u, audio_random_u) = if self.greedy_mode {
+                let a = Array1::from_vec(vec![0.0f32]);
+                let b = Array2::from_shape_vec((1, 16), vec![0.0f32; 16])
+                    .map_err(|e| e.to_string())?;
+                (a, b)
+            } else {
+                let a = Array1::from_vec(vec![rng.next_f32()]);
+                let mut u2_vals = Vec::with_capacity(16);
+                for _ in 0..16 {
+                    u2_vals.push(rng.next_f32());
+                }
+                let b = Array2::from_shape_vec((1, 16), u2_vals)
+                    .map_err(|e| e.to_string())?;
+                (a, b)
+            };
 
             let t_local = Instant::now();
             let local_inputs = ort::inputs![
@@ -878,7 +947,8 @@ impl MossTtsEngine {
                 if name == "should_continue" {
                     if let Ok(t) = val.try_extract_tensor::<i32>() {
                         if let Some(&flag) = t.as_slice().unwrap_or(&[]).first() {
-                            if flag <= 0 {
+                            // 未达保底最小帧数时强行放行，防止早停
+                            if flag <= 0 && _step >= min_frames {
                                 should_continue = false;
                             }
                         }
@@ -984,31 +1054,20 @@ impl MossTtsEngine {
             return Err("MOSS-TTS 未生成任何有效音频帧".to_string());
         }
 
-        // 5. Codec 解码为 48kHz 立体声 PCM (Static Triple-Bucket: 64/256/384 静态三桶彻底杜绝 DirectML PSO 动态重编译)
+        // 5. Codec 解码为 48kHz 立体声 PCM
+        // 纯 CPU 模式下无需抵抗 DirectML PSO 动态重编译抖动，直接按真实有效帧数零填充推入，
+        // 杜绝 CPU 计算数百帧 Pad 静音的大开销转置卷积与冗余显存搬运
         let t_codec = Instant::now();
         let total_frames = generated_frames.len();
 
-        let (bucket_frames, need_bucket_pad) = if total_frames <= 64 {
-            (64, true)
-        } else if total_frames <= 256 {
-            (256, true)
-        } else if total_frames <= 384 {
-            (384, true)
-        } else {
-            (total_frames, false)
-        };
-
-        let mut flat_codes = Vec::with_capacity(bucket_frames * 16);
+        let mut flat_codes = Vec::with_capacity(total_frames * 16);
         for frame in &generated_frames {
             flat_codes.extend_from_slice(frame);
         }
-        if need_bucket_pad && bucket_frames > total_frames {
-            flat_codes.resize(bucket_frames * 16, 0);
-        }
 
-        let audio_codes = Array3::from_shape_vec((1, bucket_frames, 16), flat_codes)
+        let audio_codes = Array3::from_shape_vec((1, total_frames, 16), flat_codes)
             .map_err(|e| e.to_string())?;
-        let audio_code_lengths = Array1::from_vec(vec![bucket_frames as i32]);
+        let audio_code_lengths = Array1::from_vec(vec![total_frames as i32]);
 
         let codec_sess = self.codec_decode_session.lock().unwrap();
         let codec_inputs = ort::inputs![
@@ -1028,12 +1087,10 @@ impl MossTtsEngine {
             if name == "audio" {
                 if let Ok(t) = val.try_extract_tensor::<f32>() {
                     let shape = t.shape();
-                    let bucket_samples = shape[2];
-                    let samples_per_frame = bucket_samples / bucket_frames;
-                    let valid_samples = (total_frames * samples_per_frame).min(bucket_samples);
+                    let total_samples = shape[2];
                     let slice = t.as_slice().unwrap();
-                    samples_left = slice[0..valid_samples].to_vec();
-                    samples_right = slice[bucket_samples..bucket_samples + valid_samples].to_vec();
+                    samples_left = slice[0..total_samples].to_vec();
+                    samples_right = slice[total_samples..total_samples * 2].to_vec();
                 }
             }
         }
