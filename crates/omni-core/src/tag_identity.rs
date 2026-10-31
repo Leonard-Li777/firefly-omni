@@ -94,9 +94,11 @@ use std::sync::{Arc, RwLock};
 
 /// 热载构建期的可变缓冲（PRD 07）。
 ///
-/// 只在 `load_aliases_for_lang` 与 `commit_alias_index` 之间短暂存在；`finish` 之后立即置空，
-/// 稳态只保留 [`crate::tag_alias_index::installed`] 那份不可变索引，**不留第二事实源**
-/// （用户故事 34）。构建期内部的 `HashMap` 键是临时脚手架，不进入常驻。
+/// 只在 `load_aliases_for_lang` 与 `commit_alias_index` / `seal_alias_builder` 之间短暂存在；
+/// 封存之后立即置空，稳态只保留 [`crate::tag_alias_index::installed`] 那份不可变索引，
+/// **不留第二事实源**（用户故事 34）。构建器内部就是 Arena + 三张紧凑表本身，没有
+/// `HashMap<String, _>` 仲裁暂存层 —— 否则热载峰值会是「构建期 70 MB + 已装索引 30 MB」，
+/// 小内存机器上比优化前更糟。
 static ALIAS_BUILDER: OnceLock<RwLock<Option<crate::tag_alias_index::TagAliasBuilder>>> =
     OnceLock::new();
 
@@ -126,14 +128,23 @@ pub fn commit_alias_index() {
     ALIAS_BUILDER_DIRTY.store(false, Ordering::Release);
 }
 
-/// 封存构建期容器：确保最新增量已提交，然后释放构建期 `HashMap`。
+/// 封存构建期容器：产出不可变索引并原子替换，随后释放构建期容器。
 ///
 /// 语义包全量热载（10 张分表灌完）后调用一次，稳态只留不可变双索引；之后若再
 /// `load_aliases_for_lang`，会从空容器重新累积（与断开重连语义一致）。
+///
+/// **走消费式 `finish()` 而不是 `snapshot()`**：生产热载只有一次构建，消费式移交让
+/// 「构建器 + 索引」不会同时存在两份（30 MB 量级的索引克隆在热载峰值上是纯浪费）。
 pub fn seal_alias_builder() {
-    commit_alias_index();
-    if let Ok(mut guard) = alias_builder_slot().write() {
-        guard.take();
+    let builder = {
+        let mut guard = match alias_builder_slot().write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.take()
+    };
+    if let Some(builder) = builder {
+        crate::tag_alias_index::install(Arc::new(builder.finish()));
     }
     ALIAS_BUILDER_DIRTY.store(false, Ordering::Release);
 }

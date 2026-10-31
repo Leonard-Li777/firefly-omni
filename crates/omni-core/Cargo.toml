@@ -28,3 +28,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_Storage_FileSystem",
 ] }
 
+[dev-dependencies]
+# PRD 07 Slice 4/5：等价性基线与内存实测必须读**真实** semantic.raw.db
+# （生产热载路径 = 未加密库镜像；脚本模拟已被 Slice 0 证伪，见 PRD §5）。
+rusqlite.workspace = true
