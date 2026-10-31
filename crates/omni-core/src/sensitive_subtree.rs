@@ -132,10 +132,15 @@ pub fn is_sensitive_subtree_code(code: &str) -> bool {
 /// ## 为什么是「一次解析」而不是「逐叶子比对」
 ///
 /// 早期实现为 `SENSITIVE_SUBTREE_CONCEPTS.iter().any(|cpt| tag_matches_concept(..))`，
-/// 单次判定最多触发 46 次 `builtin_tag_code`（每次含 `dynamic_aliases()` RwLock 读）。
-/// 该函数处于热路径：CLIP 全词表循环与 omni-server 六通道 `retain` 会把它放大到
-/// 每图数千~数万次锁读。改为 `concept_from_code_or_alias` 一次收口（GH #729 D4 唯一入口）
-/// 后，锁读次数降为常数 1~2 次，判定语义等价。
+/// 单次判定最多触发 46 次 `builtin_tag_code`（每次含 `normalize_lemma` 词形还原、全局别名
+/// 索引探测，以及经进程级 code intern `Mutex` 取文本）。该函数处于热路径：CLIP 全词表循环与
+/// omni-server 六通道 `retain` 会把它放大到每图数千~数万次解析。改为
+/// `concept_from_code_or_alias` 一次收口（GH #729 D4 唯一入口）后，解析次数降为常数 1~2 次，
+/// 判定语义等价。
+///
+/// 注：这里的「46 次 vs 1 次」结论不随存储形态变化。PRD 07 把三张 `RwLock<HashMap>` 缓冲换成
+/// `tag_alias_index` 的紧凑双索引后，单次解析已从锁争用主导变为归一化主导，但「一次收口」
+/// 仍是本函数成立的唯一理由，不得改回逐叶子比对。
 pub fn is_sensitive_subtree_tag(word: &str) -> bool {
     let clean = word.trim();
     if clean.is_empty() {
