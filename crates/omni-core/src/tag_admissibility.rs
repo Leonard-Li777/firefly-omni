@@ -581,10 +581,20 @@ pub fn is_shell_noun(tag: &str) -> bool {
 }
 
 /// 判定 jieba 分词的 POS 标注是否为非实体/非主题词（助词、连词、介词、代词、副词、语气词、叹词、纯标点、未知残渣碎片等闭类虚词）
+///
+/// **`eng` 例外（`e*` 前缀碰撞修复）**：jieba 的 `eng` 是**英文实体词**标注（并非叹词 `e*`），
+/// 与 [`is_jieba_tag_compound_prefix`] / [`is_jieba_tag_compound_suffix`] 已把 `eng` 视作
+/// 合法实体词性一致。若不排除，`t.starts_with('e')` 会把**全部纯 ASCII 长词**（如 `Kubernetes`）
+/// 在抽词器阶段整词丢弃，使其根本进不了候选池——这是「文本源 ASCII 标签召回缺口」的真实根因
+/// （`docs/specs/text-source-tag-recall-recovery-spec.md` §1.2）。
 pub fn is_jieba_tag_non_entity(tag: &str) -> bool {
     let t = tag.trim();
     if t.is_empty() {
         return true;
+    }
+    // 英文实体词标注 `eng` 必须先于 `starts_with('e')`（叹词 e*）排除，防前缀碰撞误杀纯 ASCII 词
+    if t == "eng" {
+        return false;
     }
     // 助词 u*、连词 c*、介词 p*、代词 r*、副词 d*、语气词 y*、叹词 e*、拟声词 o*、标点 w*、非语素/未知 x*
     // 数词 m*、量词 q*、方位词 f*
@@ -1441,6 +1451,8 @@ mod tests {
         assert!(!is_jieba_tag_non_entity("nz")); // 专名
         assert!(!is_jieba_tag_non_entity("vn")); // 动名词
         assert!(!is_jieba_tag_non_entity("i")); // 成语
+        assert!(!is_jieba_tag_non_entity("eng")); // jieba 英文实体词标注：非叹词 e*，严禁被 'e' 前缀碰撞误杀
+        assert!(is_jieba_tag_non_entity("e")); // 叹词 e* 仍须拦截（与 eng 区分）
 
         // 二元拼接前缀与后缀
         assert!(is_jieba_tag_compound_prefix("n"));

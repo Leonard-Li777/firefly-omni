@@ -85,6 +85,18 @@ pub const MUTUAL_GROUP_MARGIN: f32 = 0.03;
 /// 出口置信度门限：低于该值的候选标签严禁透出到接口返回结果
 pub const EXIT_CONFIDENCE_THRESHOLD: f32 = 0.60;
 
+// ============ 文本源准入「分级放行」（omni-text `fusion.rs` 双锚点融合） ============
+
+/// 文本源 ASCII 候选放行所需的**全局锚点原始余弦**阈值 `cos(e_term, e_global)`。
+///
+/// 受众：非受控（`!is_controlled_code`）+ 展示名纯 ASCII + 命中文本源
+/// （`Ocr` / `Document` / `Asr` / `Lrc`）的候选；与「跨源共现（`sources` 规模 ≥ 2）」
+/// 构成**逻辑或**放行判据。
+///
+/// **口径**：作用于归一化映射之前的原始余弦，**非** `(sim + 1) * 0.5`。
+/// 单一事实源见 `docs/specs/text-source-tag-recall-recovery-spec.md` §2.1。
+pub const ANCHOR_COSINE_PASS_THRESHOLD: f32 = 0.55;
+
 // ============ 分层回退置信（tag_engine_map 缺分时按引擎回退） ============
 
 /// OCR 事实层回退分
