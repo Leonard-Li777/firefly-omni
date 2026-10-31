@@ -1017,7 +1017,12 @@ pub mod text {
         }
     }
 
-    pub const ASR_UNCONTROLLED_CONFIDENCE: f32 = 0.65;
+    /// 非 Pro 存根的开放词先验常量：必须与 Pro 侧
+    /// `omni_text::ASR_UNCONTROLLED_CONFIDENCE` 同值同源
+    /// （`omni_core::tag_thresholds::OBJECTIVE_TEXT_PRIOR_CONFIDENCE` = `0.90`）。
+    /// 存根与被替代实现同口径，避免非 Pro 构建下出现第二份先验值。
+    pub const ASR_UNCONTROLLED_CONFIDENCE: f32 =
+        omni_core::tag_thresholds::OBJECTIVE_TEXT_PRIOR_CONFIDENCE;
     pub const CONTROLLED_TEXT_TAG_CONFIDENCE: f32 = 0.90;
 
     /// 全文本打标器存根 (Ticket 01)

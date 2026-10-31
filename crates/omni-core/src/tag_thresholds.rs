@@ -97,6 +97,19 @@ pub const EXIT_CONFIDENCE_THRESHOLD: f32 = 0.60;
 /// 单一事实源见 `docs/specs/text-source-tag-recall-recovery-spec.md` §2.1。
 pub const ANCHOR_COSINE_PASS_THRESHOLD: f32 = 0.55;
 
+// ============ 客观文本事实源先验置信（跨路径单一事实源） ============
+
+/// 未命中受控词库的**客观文本开放词**（`_ext.*`）初始先验置信度。
+///
+/// 受众：来自 OCR / 文档正文 / ASR / LRC 的开放词。该值是**跨路径单一事实源**——
+/// 融合引擎候选池（`fusion.rs`）与全文本打标器（`tagger.rs` 的 `_ext.*` 铸码）
+/// 必须同取本常量，**严禁**任一路径私设 `0.65` 等第二份字面量。
+///
+/// 依据：[受控概念指南 §8.3](../../../../docs/developer/standards/controlled-concepts-guide.md)
+/// 与 [文本源标签召回修复规格 §2.1](../../../../docs/specs/text-source-tag-recall-recovery-spec.md)
+/// （原强制 `0.65` 已裁定抬升至 `0.90`，消除同一事实类别内的先验口径分裂）。
+pub const OBJECTIVE_TEXT_PRIOR_CONFIDENCE: f32 = 0.90;
+
 // ============ 分层回退置信（tag_engine_map 缺分时按引擎回退） ============
 
 /// OCR 事实层回退分
