@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 pub mod tag_identity;
 pub use tag_identity::is_controlled_code;
 
+/// 标签别名热载的紧凑索引表示（PRD 07：Arena + 全局/按语言双索引 + 进程级 code intern）
+pub mod tag_alias_index;
+
 /// AOT 受控概念强类型枚举（PRD-0050）
 pub mod concepts;
 
