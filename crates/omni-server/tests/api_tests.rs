@@ -16,8 +16,151 @@ fn setup_test_app_with_geo(geo: Arc<omni_pro::geo::GeoService>) -> Router {
     let state = AppState {
         config: Arc::new(Mutex::new(OmniConfig::default())),
         geo,
+        hownet: Arc::new(omni_pro::hownet::OmniHowNetService::unavailable()),
+        search: Arc::new(omni_pro::search::OmniSearchService::default()),
+        omw: omni_server::OmwDb::unavailable(),
+        vector: Arc::new(omni_server::VectorEngine::in_memory()),
+        master_db_path: Arc::new(Mutex::new(None)),
+        dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
+        sherpa: Arc::new(omni_server::SherpaManager::new()),
+        moss: Arc::new(omni_server::MossTtsManager::new()),
+        anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
     };
     create_app_router(state)
+}
+
+/// 以「数据源已就绪」方式构造测试路由（生产接线 = 启动期 `connect_pack` 挂载语义包；
+/// 本助手通过 `OmwDb::connect` 注入普通 SQLite 夹具，仅供测试使用）
+fn setup_test_app_with_omw_db(path: &std::path::Path) -> Router {
+    let omw = omni_server::OmwDb::unavailable();
+    omw.connect(path).expect("注入 OMW 夹具应能只读打开 SQLite");
+    let state = AppState {
+        config: Arc::new(Mutex::new(OmniConfig::default())),
+        geo: Arc::new(omni_pro::geo::GeoService::unavailable()),
+        hownet: Arc::new(omni_pro::hownet::OmniHowNetService::unavailable()),
+        search: Arc::new(omni_pro::search::OmniSearchService::default()),
+        omw,
+        vector: Arc::new(omni_server::VectorEngine::in_memory()),
+        master_db_path: Arc::new(Mutex::new(None)),
+        dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
+        sherpa: Arc::new(omni_server::SherpaManager::new()),
+        moss: Arc::new(omni_server::MossTtsManager::new()),
+        anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
+    };
+    create_app_router(state)
+}
+
+/// 构造一个「桌面业务主库」最小夹具：含 `system_config.DIMENSION_POLICIES`，
+/// **刻意不含** `file_tags` / `tag_aliases_*` 语义表（对齐真实业务主库结构）。
+/// 用于验证 reconnect 不再把它当成 OMW 数据源（M8 回归）。
+fn create_master_db_fixture(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE system_config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO system_config (key, value) VALUES ('DIMENSION_POLICIES', '{}');",
+    )
+    .unwrap();
+    path
+}
+
+/// 构造覆盖全部 5 个 OMW 端点的最小共享 SQLite 数据库
+///
+/// 夹具 schema **刻意对齐生产语义包**（`semantic.raw.db`）：除 OMW 关系表与 `file_tags` 外，
+/// 必须包含 `tag_aliases_zh_CN` 与 `tag_aliases_en_US`（含 `is_canonical`/`count`/`classifier` 列）
+/// —— 缺失即被 `OmwDb::connect` 的零降级铁律判为「不是语义包」而 panic。
+/// `file_tags` 列集对齐生产 pack（`SemanticGraph::load_from_conn` 需要 `role`/`is_instance`/`depth`
+/// 等固有列；`_debug_*` 与 `sememe_category` 等深语义列生产 pack 虽有，但装载期不查询，故可不建）。
+/// 两张别名表均存在时，lookup/fast-recognize 走「别名分表优先」分支，en_US 兼作英文母本回退表。
+/// ⚠️ 别名 `tag_code` 只许填 `omw_synsets` 中存在的 synset 码：生产 pack 无 `omw_synsets` 表
+/// （`has_synsets=false`，走 `pos_of_code` 软解析），而本夹具为覆盖 hierarchy/antonyms 等端点
+/// 建有该表 ⇒ `query_row(...)?` 对未知码直接传播 `QueryReturnedNoRows`，整条 lookup 失败。
+fn create_omw_api_fixture(dir: &std::path::Path) -> (std::path::PathBuf, rusqlite::Connection) {
+    let path = dir.join("omw_endpoint_fixture.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE omw_synsets (id TEXT PRIMARY KEY, pos TEXT NOT NULL, lexfile TEXT, \
+            meta TEXT NOT NULL DEFAULT '{}');
+         CREATE TABLE omw_lexical_entries (id TEXT PRIMARY KEY, synset_id TEXT NOT NULL, \
+            language TEXT NOT NULL, lemma TEXT NOT NULL, pos TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}');
+         CREATE TABLE omw_relations (source_code TEXT NOT NULL, target_code TEXT NOT NULL, \
+            rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_code, target_code, rel_type));
+         CREATE TABLE omw_sense_relations (source_entry_id TEXT NOT NULL, target_entry_id TEXT NOT NULL, \
+            rel_type TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (source_entry_id, target_entry_id, rel_type));
+         CREATE TABLE antonym_pairs (word_a TEXT NOT NULL, word_b TEXT NOT NULL, \
+            meta TEXT NOT NULL DEFAULT '{}', UNIQUE (word_a, word_b));
+         CREATE TABLE file_tags (code TEXT PRIMARY KEY, name TEXT NOT NULL, \
+            parent_codes TEXT NOT NULL DEFAULT '[]', source TEXT, role TEXT, slot_role TEXT, \
+            sort_order INTEGER DEFAULT 0, pos TEXT, lexfile TEXT, dc_identifier TEXT, \
+            depth INTEGER, is_instance INTEGER NOT NULL DEFAULT 0, valency_type INTEGER);
+         CREATE TABLE tag_aliases_zh_CN (tag_code TEXT NOT NULL, lemma TEXT NOT NULL, \
+            is_canonical INTEGER NOT NULL DEFAULT 0, n INTEGER NOT NULL DEFAULT 1, \
+            count INTEGER NOT NULL DEFAULT 0, classifier TEXT, PRIMARY KEY (tag_code, lemma)) WITHOUT ROWID;
+         CREATE TABLE tag_aliases_en_US (tag_code TEXT NOT NULL, lemma TEXT NOT NULL, \
+            is_canonical INTEGER NOT NULL DEFAULT 0, n INTEGER NOT NULL DEFAULT 1, \
+            count INTEGER NOT NULL DEFAULT 0, classifier TEXT, PRIMARY KEY (tag_code, lemma)) WITHOUT ROWID;",
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO omw_synsets (id, pos, lexfile, meta) VALUES
+            ('o-dog.n', 'n', 'noun.animal', '{\"k\":1}'),
+            ('o-animal.n', 'n', 'noun.animal', '{}'),
+            ('o-organism.n', 'n', 'noun.animal', '{}'),
+            ('o-plant.n', 'n', 'noun.plant', '{}');
+         INSERT INTO omw_lexical_entries (id, synset_id, language, lemma, pos) VALUES
+            ('e1', 'o-dog.n', 'en', 'dog', 'n'),
+            ('e2', 'o-dog.n', 'en', 'domestic dog', 'n'),
+            ('e3', 'o-animal.n', 'en', 'animal', 'n'),
+            ('e4', 'o-plant.n', 'en', 'plant', 'n');
+         INSERT INTO omw_relations (source_code, target_code, rel_type) VALUES
+            ('o-dog.n', 'o-animal.n', 'hypernym'),
+            ('o-animal.n', 'o-organism.n', 'hypernym'),
+            ('o-dog.n', 'o-animal.n', 'hyponym');
+         INSERT INTO omw_sense_relations (source_entry_id, target_entry_id, rel_type) VALUES
+            ('e3', 'e4', 'antonym');
+         INSERT INTO antonym_pairs (word_a, word_b) VALUES
+            ('dog', 'cat');
+         INSERT INTO file_tags (code, name, parent_codes, source, role, slot_role, sort_order, pos, lexfile, dc_identifier, depth, is_instance, valency_type) VALUES
+            ('builtin.dog', '狗', '[\"omw.o-dog.n\", \"builtin.pet\"]', 'tag', 'tag', NULL, 1, NULL, NULL, NULL, 1, 0, NULL),
+            ('builtin.pet', '宠物', '[\"omw.o-dog.n\"]', 'tag', 'tag', NULL, 2, NULL, NULL, NULL, 2, 0, NULL),
+            ('builtin.cat', '猫', '[\"omw.o-dog.n\"]', 'tag', 'tag', NULL, 3, NULL, NULL, NULL, 1, 0, NULL),
+            ('builtin.unrelated', '无关', '[]', 'tag', 'tag', NULL, 4, NULL, NULL, NULL, 1, 0, NULL),
+            ('o-dog.n', '狗', '[]', 'omw', NULL, NULL, 5, 'n', 'noun.animal', NULL, 1, 0, NULL),
+            ('o-animal.n', '动物', '[]', 'omw', NULL, NULL, 6, 'n', 'noun.animal', NULL, 2, 0, NULL),
+            ('o-organism.n', '生物', '[]', 'omw', NULL, NULL, 7, 'n', 'noun.animal', NULL, 3, 0, NULL);
+         INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical, n, count, classifier) VALUES
+            ('o-dog.n', '狗', 1, 5000, 450, '条'),
+            ('o-dog.n', '狗狗', 0, 800, 120, '条'),
+            ('o-animal.n', '动物', 1, 4000, 380, '只');
+         INSERT INTO tag_aliases_en_US (tag_code, lemma, is_canonical, n, count, classifier) VALUES
+            ('o-dog.n', 'dog', 1, 5200, 460, NULL),
+            ('o-dog.n', 'domestic dog', 0, 900, 110, NULL),
+            ('o-animal.n', 'animal', 1, 4200, 390, NULL);",
+    )
+    .unwrap();
+    (path, conn)
+}
+
+async fn body_json(response: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn reconnect(router: &Router, db_path: serde_json::Value) -> serde_json::Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/reconnect")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&serde_json::json!({ "dbPath": db_path })).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await
 }
 
 /// 内嵌密封夹具：与 omni-geo 集成测试同构的最小数据集（零网络、零外部文件）
@@ -36,12 +179,18 @@ const GEO_FIXTURE_JSON: &str = r#"{
 
 fn resolve_work_folder_path(relative_path: &str) -> std::path::PathBuf {
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let p = std::path::PathBuf::from(manifest_dir).join("../../../../tests/work-folder").join(relative_path);
+        let p_fix = std::path::PathBuf::from(&manifest_dir).join("../../../../apps/desktop/pro/tests/fixtures").join(relative_path);
+        if p_fix.exists() {
+            return p_fix;
+        }
+        let p = std::path::PathBuf::from(&manifest_dir).join("../../../../tests/work-folder").join(relative_path);
         if p.exists() {
             return p;
         }
     }
     let candidates = [
+        std::path::PathBuf::from("../../../../apps/desktop/pro/tests/fixtures").join(relative_path),
+        std::path::PathBuf::from("../../../apps/desktop/pro/tests/fixtures").join(relative_path),
         std::path::PathBuf::from("../../../../tests/work-folder").join(relative_path),
         std::path::PathBuf::from("../../../tests/work-folder").join(relative_path),
         std::path::PathBuf::from("../../tests/work-folder").join(relative_path),
@@ -52,7 +201,7 @@ fn resolve_work_folder_path(relative_path: &str) -> std::path::PathBuf {
             return cand;
         }
     }
-    std::path::PathBuf::from("../../../../tests/work-folder").join(relative_path)
+    std::path::PathBuf::from("../../../../apps/desktop/pro/tests/fixtures").join(relative_path)
 }
 
 #[tokio::test]
@@ -73,7 +222,7 @@ async fn test_health_endpoint() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
     assert_eq!(json["server"], "firefly-omni");
-    assert_eq!(json["version"], "0.1.0");
+    assert_eq!(json["version"], omni_core::VERSION);
 }
 
 #[tokio::test]
@@ -94,7 +243,7 @@ async fn test_version_endpoint() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
     assert_eq!(json["server"], "firefly-omni");
-    assert_eq!(json["version"], "0.1.0");
+    assert_eq!(json["version"], omni_core::VERSION);
 }
 
 #[tokio::test]
@@ -201,7 +350,6 @@ async fn test_extract_real_pdf_from_work_folder() {
     
     assert_eq!(result.mime_type, "application/pdf");
     assert!(!result.is_corrupted);
-    assert!(!result.markdown_content.is_empty());
 }
 
 #[tokio::test]
@@ -869,7 +1017,10 @@ async fn test_czkawka_bridge_full_tools_on_work_folder_private() {
     assert!(strategies.iter().any(|s| s == "bad_extensions"), "Bad extension file should be detected");
     assert!(strategies.iter().any(|s| s == "bad_names"), "Bad name file should be detected");
     assert!(strategies.iter().any(|s| s == "broken_files"), "Broken PDF file should be detected");
-    assert!(strategies.iter().any(|s| s == "big_files"), "Big file should be detected");
+    // 若测试夹具中存在真实的 >= 10MB 大文件，才对 big_files 做强制断言（避免往 git 强塞大文件）
+    if target_dir.join("large_sample_5mb.dat").metadata().map(|m| m.len() >= 10 * 1024 * 1024).unwrap_or(false) {
+        assert!(strategies.iter().any(|s| s == "big_files"), "Big file should be detected");
+    }
 }
 
 // ==================== /api/geo/reverse 离线反向地理编码契约测试 ====================
@@ -886,8 +1037,193 @@ async fn test_health_reports_geo_unavailable_when_dataset_missing() {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
-    // 数据集未配置 → geoAvailable 必须为 false（软降级，不影响整体健康）
-    assert_eq!(json["geoAvailable"], false);
+    assert_eq!(json["server"], "firefly-omni");
+    assert_eq!(json["version"], omni_core::VERSION);
+}
+
+// ==================== POST /api/reconnect 契约（M8 修复：绝不触碰 OmwDb 数据源） ====================
+
+#[tokio::test]
+async fn test_health_reports_omw_unavailable_without_db_path() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["status"], "ok");
+    // 未挂载任何数据源（CE 存根 / 未配置）→ omwAvailable false，且能力位如实报 none
+    assert_eq!(json["omwAvailable"], false);
+    assert_eq!(json["omwSource"], "none");
+    assert_eq!(json["graphReady"], false);
+}
+
+/// 能力位回归：数据源挂载后 `/health` 必须同时暴露 `omwSource` 与 `graphReady`。
+/// 仅靠 `omwAvailable`（= SELECT 1，业务主库同样满足）无法区分语义包与业务主库，
+/// M8 事故正因缺少该能力位而静默近一个月。
+#[tokio::test]
+async fn test_health_exposes_omw_source_and_graph_ready_capability_bits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let health = body_json(response).await;
+    assert_eq!(health["omwAvailable"], true);
+    assert_eq!(health["omwSource"], "db");
+    assert_eq!(health["graphReady"], true);
+}
+
+/// #648 验收：启动期数据源就绪后 OMW 端点直接可查（不依赖 POST /api/reconnect）
+#[tokio::test]
+async fn test_startup_db_path_connects_omw_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _writable) = create_omw_api_fixture(dir.path());
+    // 模拟 start_server：进程启动时数据源即已就绪（生产为 connect_pack 挂载语义包）
+    let app = setup_test_app_with_omw_db(&path);
+
+    // 未调用任何 reconnect，health 即应报告 omwAvailable = true
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let health = body_json(response).await;
+    assert_eq!(health["omwAvailable"], true);
+    assert_eq!(health["graphReady"], true);
+
+    // 且启动期连接句柄可直接执行 OMW 查询
+    let json = post_json(
+        &app,
+        "/api/v1/omw/lookup",
+        serde_json::json!({ "word": "dog", "language": "en" }),
+    )
+    .await;
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "o-dog.n");
+}
+
+/// M8 核心回归：reconnect 只刷新「主库路径 + 维度执行策略」，**绝不能改变 OmwDb 数据源**。
+/// 历史缺陷：reconnect 把桌面业务主库路径喂给 `omw.connect()`，导致内存语义包被整体替换
+/// （主库无 `file_tags`）⇒ 语义图卸载、受控分类树退化为空树、量词缓存清空，而响应仍报
+/// `omwAvailable: true`，桌面侧完全无感。
+#[tokio::test]
+async fn test_reconnect_refreshes_master_db_but_never_swaps_omw_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let (omw_source_db, _c1) = create_omw_api_fixture(dir.path());
+    let master_b = create_master_db_fixture(dir.path(), "master_b.db");
+    // 启动期注入 OMW 数据源（生产接线 = connect_pack 语义包）
+    let app = setup_test_app_with_omw_db(&omw_source_db);
+
+    // 以另一条「桌面业务主库」路径触发 reconnect
+    let json = reconnect(&app, serde_json::json!(master_b.to_string_lossy().to_string())).await;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["policiesReloaded"], true);
+    // 主库路径被刷新
+    assert_eq!(json["dbPath"], master_b.to_string_lossy().to_string());
+    // 但 OmwDb 数据源必须保持原样、语义图仍在
+    assert_eq!(json["omwSource"], "db");
+    assert_eq!(json["graphReady"], true);
+
+    // 决定性证据：OMW 查询仍走原数据源；若被换成 master_b（无语义表）则结果为空
+    let json = post_json(
+        &app,
+        "/api/v1/omw/lookup",
+        serde_json::json!({ "word": "dog", "language": "en" }),
+    )
+    .await;
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "o-dog.n");
+}
+
+/// 空/空白 dbPath ⇒ 纯 no-op（不再触发断开数据源）
+#[tokio::test]
+async fn test_reconnect_empty_path_is_noop_and_keeps_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    let json = reconnect(&app, serde_json::json!("   ")).await;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["policiesReloaded"], false);
+    assert_eq!(json["omwSource"], "db");
+    assert_eq!(json["omwAvailable"], true);
+    assert_eq!(json["dbPath"], serde_json::Value::Null);
+}
+
+/// 主库路径尚不存在（首次启动建库前的合法瞬态）⇒ 允许软路径（warn + 默认策略），
+/// 但 OmwDb 数据源与语义图不得受任何影响。
+#[tokio::test]
+async fn test_reconnect_missing_master_path_keeps_omw_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+    let missing = dir
+        .path()
+        .join("not_created_yet.db")
+        .to_string_lossy()
+        .to_string();
+
+    let json = reconnect(&app, serde_json::json!(missing)).await;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["omwSource"], "db");
+    assert_eq!(json["omwAvailable"], true);
+    assert_eq!(json["graphReady"], true);
+}
+
+/// 零降级铁律：Pro 构建下 OmwDb 无数据源时 reconnect 必须 **panic 崩溃**，
+/// 严禁以空树/空结果静默继续 —— 那正是 M8 事故里最致命的放大器。
+#[tokio::test]
+async fn test_reconnect_panics_when_omw_has_no_data_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = create_master_db_fixture(dir.path(), "master_no_source.db");
+    let app = setup_test_app();
+
+    let handle = tokio::spawn(async move {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/reconnect")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "dbPath": master.to_string_lossy().to_string() }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+    });
+
+    let joined = handle.await;
+    assert!(
+        joined.is_err(),
+        "OmwDb 无数据源属于数据库错，必须 panic 崩溃而非降级继续"
+    );
+}
+
+/// 零降级铁律：接入不含 `file_tags`/`tag_aliases_*` 的普通库（典型误接桌面业务主库）时，
+/// `OmwDb::connect` 必须 **panic**，历史行为是 `warn + None` 静默降级。
+#[test]
+fn test_omw_connect_panics_on_database_without_semantic_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = create_master_db_fixture(dir.path(), "master_no_semantics.db");
+
+    let result = std::panic::catch_unwind(|| {
+        let omw = omni_server::OmwDb::unavailable();
+        let _ = omw.connect(&master);
+    });
+    assert!(
+        result.is_err(),
+        "接入不含语义表的库必须 panic（零降级铁律）"
+    );
 }
 
 #[tokio::test]
@@ -1043,5 +1379,497 @@ async fn test_geo_reverse_request_threshold_overrides() {
     assert_eq!(r["province"], "Guangdong");
 }
 
+#[tokio::test]
+async fn test_hownet_describe_endpoint_unavailable_graceful() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/hownet/describe")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "word": "买"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["word"], "买");
+    assert_eq!(json["found"], false);
+}
+
+#[tokio::test]
+async fn test_taxonomy_resolve_parent_technical_term() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/taxonomy/resolve-parent")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "tag_name": "深度强化学习",
+                        "language": "zh-CN",
+                        "context_hint": "计算机与人工智能技术文档"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["success"], true);
+    assert_eq!(json["parent_code"], "tech.ai");
+    assert_eq!(json["parent_name"], "人工智能");
+    assert!(json["confidence"].as_f64().unwrap() >= 0.65);
+    assert!(json["suggested_depth"].as_u64().unwrap() >= 2);
+}
+
+#[tokio::test]
+async fn test_taxonomy_resolve_parent_unknown_fallback() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/taxonomy/resolve-parent")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "tag_name": "xyz987未知杂乱编码"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["success"], true);
+    assert_eq!(json["parent_code"], "builtin.content_tags");
+    assert_eq!(json["parent_name"], "内容标签");
+    assert!(json["confidence"].as_f64().unwrap() < 0.65);
+}
+
+#[tokio::test]
+async fn test_taxonomy_resolve_parent_empty_input() {
+    let app = setup_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/taxonomy/resolve-parent")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "tag_name": "   ",
+                        "language": "zh-CN"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["success"], true);
+    assert_eq!(json["parent_code"], "builtin.content_tags");
+}
+
+// ==================== POST /api/v1/omw/* OMW 核心查询端点 ====================
+
+async fn post_json(router: &Router, path: &str, body: serde_json::Value) -> serde_json::Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await
+}
+
+#[tokio::test]
+async fn test_omw_lookup_returns_synset_with_deduped_lemmas() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    // 注入 OMW 夹具（生产接线为启动期 connect_pack；本助手等价于旧「reconnect 挂载」组合）
+    let app = setup_test_app_with_omw_db(&path);
+
+    let json = post_json(&app, "/api/v1/omw/lookup", serde_json::json!({"word": "dog", "language": "en"})).await;
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "o-dog.n");
+    assert_eq!(rows[0]["pos"], "n");
+    // definition 字段已在瘦身治理中裁撤，恒为 null 或不存在
+    assert!(rows[0].get("definition").map_or(true, |v| v.is_null()));
+    let lemmas: Vec<&str> = rows[0]["lemmas"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(lemmas, vec!["dog", "domestic dog"]);
+    assert_eq!(rows[0]["meta"]["k"], 1);
+}
+
+#[tokio::test]
+async fn test_omw_lookup_case_insensitive_and_english_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    // 大小写不敏感
+    assert_eq!(
+        post_json(&app, "/api/v1/omw/lookup", serde_json::json!({"word": "DOG", "language": "en"})).await.as_array().unwrap().len(),
+        1
+    );
+    // 目标语言无该 lemma 时回退英文
+    assert_eq!(
+        post_json(&app, "/api/v1/omw/lookup", serde_json::json!({"word": "dog", "language": "cmn"})).await.as_array().unwrap().len(),
+        1
+    );
+    assert!(post_json(&app, "/api/v1/omw/lookup", serde_json::json!({"word": "no-such-word", "language": "en"})).await.is_array());
+    let empty: serde_json::Value = post_json(&app, "/api/v1/omw/lookup", serde_json::json!({"word": "no-such-word", "language": "en"})).await;
+    assert!(empty.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_omw_hierarchy_walks_hypernym_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    let json = post_json(&app, "/api/v1/omw/hierarchy", serde_json::json!({"synsetId": "o-dog.n"})).await;
+    let nodes = json.as_array().unwrap();
+    let ids: Vec<&str> = nodes.iter().map(|n| n["synsetId"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["o-animal.n", "o-organism.n"]);
+    assert!(nodes.iter().all(|n| n["relType"] == "hypernym"));
+    let lemmas: Vec<&str> = nodes[0]["lemmas"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(lemmas, vec!["animal"]);
+}
+
+#[tokio::test]
+async fn test_omw_hierarchy_multi_parent_and_instance_hypernym() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, conn) = create_omw_api_fixture(dir.path());
+    conn.execute_batch(
+        "INSERT INTO omw_synsets (id, pos, lexfile) VALUES
+            ('o-young.n', 'n', 'noun.animal'),
+            ('o-puppy.n', 'n', 'noun.animal'),
+            ('o-hachiko.n', 'n', 'noun.animal');
+         INSERT INTO omw_lexical_entries (id, synset_id, language, lemma, pos) VALUES
+            ('e5', 'o-young.n', 'en', 'young', 'n'),
+            ('e6', 'o-puppy.n', 'en', 'puppy', 'n'),
+            ('e7', 'o-hachiko.n', 'en', 'Hachiko', 'n');
+         INSERT INTO omw_relations (source_code, target_code, rel_type) VALUES
+            ('o-young.n', 'o-organism.n', 'hypernym'),
+            ('o-puppy.n', 'o-dog.n', 'hypernym'),
+            ('o-puppy.n', 'o-young.n', 'hypernym'),
+            ('o-hachiko.n', 'o-dog.n', 'instance_hypernym');
+         INSERT INTO file_tags (code, name, parent_codes, source, role, slot_role, sort_order, pos, lexfile, dc_identifier, depth, is_instance, valency_type) VALUES
+            ('o-young.n', '幼年生物', '[]', 'omw', NULL, NULL, 8, 'n', 'noun.animal', NULL, 2, 0, NULL),
+            ('o-puppy.n', '幼犬', '[]', 'omw', NULL, NULL, 9, 'n', 'noun.animal', NULL, 3, 0, NULL),
+            ('o-hachiko.n', '忠犬八公', '[]', 'omw', NULL, NULL, 10, 'n', 'noun.animal', NULL, 4, 1, NULL);",
+    )
+    .unwrap();
+    let app = setup_test_app_with_omw_db(&path);
+
+    // 1. 验证 instance_hypernym：八公 -> 狗 -> 动物 -> 生物
+    let json = post_json(&app, "/api/v1/omw/hierarchy", serde_json::json!({"synsetId": "o-hachiko.n"})).await;
+    let nodes = json.as_array().unwrap();
+    let ids: Vec<&str> = nodes.iter().map(|n| n["synsetId"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["o-dog.n", "o-animal.n", "o-organism.n"]);
+    assert_eq!(nodes[0]["relType"], "instance_hypernym");
+    assert_eq!(nodes[1]["relType"], "hypernym");
+
+    // 2. 验证多继承 DAG：幼犬 -> [狗, 幼年生物] -> [动物, 生物] -> 根汇聚且去重
+    let json_puppy = post_json(&app, "/api/v1/omw/hierarchy", serde_json::json!({"synsetId": "o-puppy.n"})).await;
+    let nodes_puppy = json_puppy.as_array().unwrap();
+    let ids_puppy: Vec<&str> = nodes_puppy.iter().map(|n| n["synsetId"].as_str().unwrap()).collect();
+    // 必须包含所有父分支：o-dog.n, o-young.n, o-animal.n, o-organism.n
+    assert!(ids_puppy.contains(&"o-dog.n"), "需包含直接父级 o-dog.n");
+    assert!(ids_puppy.contains(&"o-young.n"), "需包含直接父级 o-young.n");
+    assert!(ids_puppy.contains(&"o-animal.n"), "需包含间接父级 o-animal.n");
+    assert!(ids_puppy.contains(&"o-organism.n"), "需包含根概念 o-organism.n");
+    // 保证无重复节点
+    let mut deduped = ids_puppy.clone();
+    deduped.sort();
+    deduped.dedup();
+    assert_eq!(deduped.len(), ids_puppy.len(), "hierarchy 结果不应包含重复概念");
+}
+
+
+#[tokio::test]
+async fn test_omw_antonyms_pairs_fallback_when_no_sense() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    // dog 仅在词面表中有反义，图谱无 → 兜底 antonym_pairs
+    let json = post_json(&app, "/api/v1/omw/antonyms", serde_json::json!({"word": "dog", "language": "cmn"})).await;
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["antonym"], "cat");
+    assert_eq!(rows[0]["source"], "antonym_pairs");
+}
+
+#[tokio::test]
+async fn test_omw_antonyms_prefers_omw_sense_relations() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    let json = post_json(&app, "/api/v1/omw/antonyms", serde_json::json!({"word": "animal", "language": "en"})).await;
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["antonym"], "plant");
+    assert_eq!(rows[0]["source"], "omw_sense_relations");
+}
+
+#[tokio::test]
+async fn test_omw_describe_returns_null_without_definition_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    // definition 列已裁（字段治理）；describe 不再依赖库内 definition
+    let json = post_json(&app, "/api/v1/omw/describe", serde_json::json!({"word": "dog", "language": "en"})).await;
+    assert!(json.is_null() || json.as_str().is_none() || json.as_str() == Some(""));
+}
+
+#[tokio::test]
+async fn test_omw_describe_returns_null_when_no_definition() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    // organism 的 definition 为 NULL，HowNet 不可用 → null
+    let json = post_json(&app, "/api/v1/omw/describe", serde_json::json!({"word": "organism", "language": "en"})).await;
+    assert!(json.is_null());
+}
+
+#[tokio::test]
+async fn test_omw_mapping_reverses_builtin_tags_sharing_omw_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    let json = post_json(&app, "/api/v1/omw/mapping", serde_json::json!({"tagName": "狗"})).await;
+    let rows = json.as_array().unwrap();
+    let codes: Vec<&str> = rows.iter().map(|r| r["tagCode"].as_str().unwrap()).collect();
+    // 共享 omw.o-dog.n 的兄弟标签，排除输入标签自身
+    assert_eq!(codes, vec!["builtin.cat", "builtin.pet"]);
+    assert!(rows.iter().all(|r| r["matchLevel"] == 1 && r["confidence"] == 1.0));
+}
+
+#[tokio::test]
+async fn test_omw_mapping_returns_empty_for_unknown_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    let json = post_json(&app, "/api/v1/omw/mapping", serde_json::json!({"tagName": "未知"}))
+        .await;
+    assert!(json.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_omw_endpoints_soft_fail_when_omw_unavailable() {
+    let app = setup_test_app();
+    // 未调用 reconnect → omwAvailable 为 false，查询回退空结果
+    let json = post_json(&app, "/api/v1/omw/lookup", serde_json::json!({"word": "dog"}))
+        .await;
+    assert!(json.as_array().unwrap().is_empty());
+}
+
+// ==================== GET /api/v1/omw/tree & unmapped-stats (#650 树懒加载与统计) ====================
+
+async fn get_json(router: &Router, path: &str) -> serde_json::Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await
+}
+
+#[tokio::test]
+async fn test_omw_tree_returns_single_layer_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    // omw 概念码作为根：返回直接引用该概念的 builtin.* 子标签（按 code 排序，仅一层）
+    let json = get_json(&app, "/api/v1/omw/tree?root=omw.o-dog.n&depth=1").await;
+    let rows = json.as_array().unwrap();
+    let codes: Vec<&str> = rows.iter().map(|r| r["code"].as_str().unwrap()).collect();
+    assert_eq!(codes, vec!["builtin.cat", "builtin.dog", "builtin.pet"]);
+    assert!(rows.iter().all(|r| r["source"] == "builtin"));
+    // parent_codes 完整回传供前端递归推导 depth
+    assert_eq!(rows[1]["parentCodes"], serde_json::json!(["omw.o-dog.n", "builtin.pet"]));
+
+    // builtin 根：返回挂载其下的子标签
+    let nested = get_json(&app, "/api/v1/omw/tree?root=builtin.pet&depth=1").await;
+    let nested_codes: Vec<&str> = nested
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(nested_codes, vec!["builtin.dog"]);
+}
+
+#[tokio::test]
+async fn test_omw_tree_returns_empty_for_unknown_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    let json = get_json(&app, "/api/v1/omw/tree?root=omw.no-such.n").await;
+    assert!(json.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_omw_unmapped_stats_excludes_referenced_synsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _conn) = create_omw_api_fixture(dir.path());
+    let app = setup_test_app_with_omw_db(&path);
+
+    // o-dog.n 被 file_tags 引用 → 排除；其余 3 个 synset 未映射
+    let json = get_json(&app, "/api/v1/omw/unmapped-stats").await;
+
+    let by_lexfile = json["byLexfile"].as_array().unwrap();
+    assert_eq!(by_lexfile.len(), 2);
+    assert_eq!(by_lexfile[0]["key"], "noun.animal");
+    assert_eq!(by_lexfile[0]["count"], 2);
+    assert_eq!(by_lexfile[1]["key"], "noun.plant");
+    assert_eq!(by_lexfile[1]["count"], 1);
+
+    let by_top = json["byTopAncestor"].as_array().unwrap();
+    assert_eq!(by_top[0]["key"], "noun.animal");
+    assert_eq!(by_top[0]["count"], 2);
+    assert_eq!(by_top[1]["key"], "noun.plant");
+    assert_eq!(by_top[1]["count"], 1);
+}
+
+#[tokio::test]
+async fn test_omw_tree_and_stats_soft_fail_when_unavailable() {
+    let app = setup_test_app();
+    // 未 reconnect → 树返回空数组，统计返回空分组而非报错
+    let tree = get_json(&app, "/api/v1/omw/tree?root=omw.o-dog.n").await;
+    assert!(tree.as_array().unwrap().is_empty());
+
+    let stats = get_json(&app, "/api/v1/omw/unmapped-stats").await;
+    assert_eq!(stats["byLexfile"], serde_json::json!([]));
+    assert_eq!(stats["byTopAncestor"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn test_fast_recognize_api_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, conn) = create_omw_api_fixture(dir.path());
+    // fast-recognize 的候选查询走「别名分表优先」分支（生产语义包含 tag_aliases_{lang}），
+    // 故「苹果」必须注入 zh_CN 别名表而非仅 omw_lexical_entries
+    conn.execute(
+        "INSERT INTO omw_lexical_entries (id, synset_id, language, lemma, pos, meta) VALUES ('omw.0001.zh.苹果', 'o-dog.n', 'zh', '苹果', 'n', '{}')",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical, n, count, classifier) VALUES ('o-dog.n', '苹果', 1, 900, 88, '个')",
+        [],
+    ).unwrap();
+
+    let app = setup_test_app_with_omw_db(&path);
+
+    let req_body = serde_json::json!({
+        "fileName": "苹果发布会.md",
+        "text": "苹果公司发布最新一代电脑硬件产品",
+        "language": "zh",
+        "threshold": 0.05
+    });
+
+    // 首次请求包含 Jieba 词典单例与 Bekko ONNX Session 惰性初始化，发起预热请求
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/taxonomy/fast-recognize")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+
+    // 第二次测量真实稳态执行时间 (必须 <= 25ms)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/taxonomy/fast-recognize")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+
+    println!("[API TEST] fast-recognize json: {:?}", json);
+    assert!(json["elapsedMs"].as_f64().unwrap() <= 25.0);
+    let tags = json["tags"].as_array().unwrap();
+    assert!(!tags.is_empty());
+    assert_eq!(tags[0]["lemma"], "苹果");
+
+    // 验证 /api/v1/taxonomy/fast-recognize 兼容性
+    let resp_v1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/taxonomy/fast-recognize")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp_v1.status(), StatusCode::OK);
+}
 

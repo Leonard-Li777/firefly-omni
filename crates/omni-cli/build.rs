@@ -46,6 +46,10 @@ fn main() {
                 if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
                     if ext == "lib" {
+                    let lower = stem.to_lowercase();
+                    if lower.contains("_all") || lower.contains("_combined") {
+                        continue;
+                    }
                         println!("cargo:rustc-link-lib=static={}", stem);
                     } else if ext == "a" {
                         let name = stem.strip_prefix("lib").unwrap_or(stem);

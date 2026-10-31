@@ -1,0 +1,1809 @@
+//! Builtin 受控标签跨语言身份（omni-core）
+//!
+//! Spec: issue-omni-i18n-tag-identity-spec
+//! - 多别名（zh/en/...）→ 同一 code（期望复用）
+//! - code 源为英文规范名：builtin.{en_slug}（方案 B，无 hash；闭环登记 + 别名复用）
+//! - 未命中别名时由调用方派生 _ext，禁止向量模糊还原
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// 与 Desktop `enBuiltinCode` / `contentHash8` 算法对齐（SHA-256 hex 前 8 位）
+pub fn content_hash8(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let hex = format!("{:x}", hasher.finalize());
+    hex[..8.min(hex.len())].to_string()
+}
+
+fn sanitize_en_slug(raw: &str) -> String {
+    let lower = raw.trim().to_lowercase();
+    let mut out = String::with_capacity(lower.len());
+    let mut last_us = false;
+    for ch in lower.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_us = false;
+        } else if !last_us && !out.is_empty() {
+            out.push('_');
+            last_us = true;
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    trimmed
+}
+
+/// 以英文规范名派生 builtin code（方案 B：builtin.{en_slug}，无 hash）
+/// slug 为空时过渡 h_{hash}；唯一性由构建门禁与别名表保证。
+pub fn en_builtin_code(en_name: &str) -> String {
+    let trimmed = en_name.trim();
+    let has_cjk = trimmed.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+    let slug = sanitize_en_slug(trimmed);
+    if has_cjk || slug.is_empty() {
+        let hash = content_hash8(trimmed);
+        format!("builtin.h_{}", &hash[..hash.len().min(10)])
+    } else {
+        format!("builtin.{}", slug)
+    }
+}
+
+/// 开放集扩展标签 code：_ext.{slug}.{hash8(原串)}
+///
+/// **本函数是纯生成器，不做任何准入校验**（G1 词形闸装在**调用方**，见
+/// [`normalize_tag_to_code`] 的范式 —— spec §6.9.3 原文即写「`derive_ext_tag_code` **调用方**」）。
+///
+/// 为什么不把闸装在这里：本函数同时服务**可信的策展资产**——如 RAM++ 离线投影表
+/// `ram_pan_projection.json` 的 `zh` 字段（4585 条中 103 条是多义项 gloss，形如 `胡同/球道`，
+/// 含 `/`）。这些 `zh` 是**词典查找键**而非候选标签词，用 G1 去筛会误删 103 条合法投影。
+/// G1 的适用对象是**来自文件名 / OCR / CLIP / RAM 模型输出的候选词**，不是策展资产。
+///
+/// 新增调用方时，若输入来自不可信来源，**必须先过 G1 闸**再调用本函数。
+pub fn derive_ext_tag_code(tag: &str) -> String {
+    let tag_clean = tag.trim();
+    let hash8 = content_hash8(tag_clean);
+    let slug = sanitize_en_slug(tag_clean);
+    if slug.is_empty() {
+        format!("_ext.{}", &hash8[..hash8.len().min(10)])
+    } else {
+        format!("_ext.{}.{}", slug, hash8)
+    }
+}
+
+/// 规范化 lemma：NFKC + trim + lowercase（与 TS normalizeLemma 对齐）
+pub fn normalize_lemma(lemma: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    lemma.nfkc().collect::<String>().trim().to_lowercase()
+}
+
+/// 判断 code 是否属于严格受控三分区契约 (builtin.* | omw.* | hownet.*)
+/// 开放集扩展标签 _ext.* 以及旧系统 dim.* 不属于受控标签 code
+#[inline]
+pub fn is_controlled_code(code: &str) -> bool {
+    code.starts_with("builtin.") || code.starts_with("omw.") || code.starts_with("hownet.")
+}
+
+/// 未知标签兜底代码
+pub const UNKNOWN_TAG_CODE: &str = "builtin.unknown"; // locale-invariant-ok: 未知兜底代码
+
+/// AOT 自动生成的受控标签别名常量切片（单一事实源自 file-dimension-source.ts + curated-model-aliases.json）
+pub use crate::builtin_aliases_generated::BUILTIN_ALIASES;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+
+/// 热载构建期的可变缓冲（PRD 07）。
+///
+/// 只在 `load_aliases_for_lang` 与 `commit_alias_index` / `seal_alias_builder` 之间短暂存在；
+/// 封存之后立即置空，稳态只保留 [`crate::tag_alias_index::installed`] 那份不可变索引，
+/// **不留第二事实源**（用户故事 34）。构建器内部就是 Arena + 三张紧凑表本身，没有
+/// `HashMap<String, _>` 仲裁暂存层 —— 否则热载峰值会是「构建期 70 MB + 已装索引 30 MB」，
+/// 小内存机器上比优化前更糟。
+static ALIAS_BUILDER: OnceLock<RwLock<Option<crate::tag_alias_index::TagAliasBuilder>>> =
+    OnceLock::new();
+
+/// 是否存在未提交的增量。惰性提交闸：调用方漏调 `commit_alias_index` 时，读取路径也不会
+/// 拿到空索引 —— 静默降级在这里被物理排除（§2.9 禁止静默降级）。
+static ALIAS_BUILDER_DIRTY: AtomicBool = AtomicBool::new(false);
+
+fn alias_builder_slot() -> &'static RwLock<Option<crate::tag_alias_index::TagAliasBuilder>> {
+    ALIAS_BUILDER.get_or_init(|| RwLock::new(None))
+}
+
+/// 提交构建结果：产出不可变快照并原子替换安装槽。
+///
+/// **不取走 builder**：热载是追加式的，取走会让下一批增量从空容器重建并覆盖已安装索引
+/// （实测 `Connected` 退化成 `None`）。构建期容器由 [`seal_alias_builder`] 显式释放。
+pub fn commit_alias_index() {
+    let snapshot = {
+        let guard = match alias_builder_slot().write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.as_ref().map(|builder| builder.snapshot())
+    };
+    if let Some(index) = snapshot {
+        crate::tag_alias_index::install(Arc::new(index));
+    }
+    ALIAS_BUILDER_DIRTY.store(false, Ordering::Release);
+}
+
+/// 封存构建期容器：产出不可变索引并原子替换，随后释放构建期容器。
+///
+/// 语义包全量热载（10 张分表灌完）后调用一次，稳态只留不可变双索引；之后若再
+/// `load_aliases_for_lang`，会从空容器重新累积（与断开重连语义一致）。
+///
+/// **走消费式 `finish()` 而不是 `snapshot()`**：生产热载只有一次构建，消费式移交让
+/// 「构建器 + 索引」不会同时存在两份（30 MB 量级的索引克隆在热载峰值上是纯浪费）。
+pub fn seal_alias_builder() {
+    let builder = {
+        let mut guard = match alias_builder_slot().write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.take()
+    };
+    if let Some(builder) = builder {
+        crate::tag_alias_index::install(Arc::new(builder.finish()));
+    }
+    ALIAS_BUILDER_DIRTY.store(false, Ordering::Release);
+}
+
+/// 取当前索引；存在未提交增量时先提交（惰性闸）
+fn current_alias_index() -> Option<Arc<crate::tag_alias_index::TagAliasIndex>> {
+    if ALIAS_BUILDER_DIRTY.load(Ordering::Acquire) {
+        commit_alias_index();
+    }
+    crate::tag_alias_index::installed()
+}
+
+/// 规约语言标识（支持 "zh-CN", "zh_CN", "zh" -> "zh", "en-US" -> "en" 等）
+pub fn normalize_language_code(lang: &str) -> &'static str {
+    let lower = lang.trim().to_lowercase();
+    if lower.starts_with("zh") {
+        "zh"
+    } else if lower.starts_with("ja") {
+        "ja"
+    } else if lower.starts_with("ko") {
+        "ko"
+    } else if lower.starts_with("fr") {
+        "fr"
+    } else if lower.starts_with("de") {
+        "de"
+    } else if lower.starts_with("es") {
+        "es"
+    } else if lower.starts_with("ru") {
+        "ru"
+    } else if lower.starts_with("pt") {
+        "pt"
+    } else if lower.starts_with("ar") {
+        "ar"
+    } else {
+        "en"
+    }
+}
+
+/// 极速 Unicode 字符集语言识别 (LID)
+/// 对单标签短语执行 100% 确定性零耗时判别 (ADR-0048 / Q1 选项 A)
+pub fn detect_tag_language(raw: &str) -> &'static str {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "en";
+    }
+    for ch in trimmed.chars() {
+        match ch {
+            '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' => return "ja",
+            '\u{AC00}'..='\u{D7AF}' | '\u{1100}'..='\u{11FF}' => return "ko",
+            '\u{0400}'..='\u{04FF}' => return "ru",
+            '\u{0600}'..='\u{06FF}' => return "ar",
+            '\u{4E00}'..='\u{9FFF}' => return "zh",
+            _ => {}
+        }
+    }
+    "en"
+}
+
+/// 按语言分表载入动态别名与权威展示名 (lemma, tag_code, is_canonical)
+///
+/// 语义包侧职责是「枚举每个 tag_aliases_{lang} 分表并按语种灌入对应的语言分表 HashMap」，
+/// 而非一次性拉入全量别名。两层事实：
+///  - 内存：sqlite3_deserialize 已把 10 个分表的页都镜像进同一个共享内存库，语言分表「休眠」
+///    在本层物理不成立（见 research/semantic-pack-tag-aliases-lang）。
+///  - 热载：这是把展示/识别走得更快的缓冲层（HashMap lemma→code），省略了每次都穿透 SQLite
+///    分表点查。按当前 UI 语言进一步裁热载会破坏异语识别与语言切换后的即时展示，真的该省的
+///    内存在整库多副本/raw_bytes 上，不在这条动态轨里。
+///
+/// 冲突规则：同一 lemma 同时命中 `omw.*` 与 `builtin.*` 时 **omw.* 优先**。
+/// 全局表（`dynamic_aliases`，供 `resolve_controlled_tag_code` 等旧接口读取）
+/// 与语言分表采用同一 omw.* 优先冲突规则，避免多语言分表热载顺序不同
+/// 导致同名 lemma 全局解析结果漂移（ADR-0048 评审 HIGH-2）。
+/// 指针复用：同一 (lemma, code) 重复载入时复用已泄漏的 `&'static str`，
+/// 不再追加 `Box::leak`（评审 HIGH-3）。
+pub fn load_aliases_for_lang<I, S1, S2>(lang: &str, entries: I)
+where
+    I: IntoIterator<Item = (S1, S2, bool)>,
+    S1: AsRef<str>,
+    S2: AsRef<str>,
+{
+    let mut guard = match alias_builder_slot().write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let builder = guard.get_or_insert_with(crate::tag_alias_index::TagAliasBuilder::new);
+    builder.push_lang(lang, entries);
+    ALIAS_BUILDER_DIRTY.store(true, Ordering::Release);
+}
+
+/// 动态批量载入受控标签别名（由 SQLite 连接时读取 tag_aliases 表注入，或从 json 载入）
+/// 传入 (lemma, tag_code)
+///
+/// 冲突规则：同一 lemma 同时命中 `omw.*` 与 `builtin.*` 时 **omw.* 优先**。
+pub fn load_aliases_from_entries<I, S1, S2>(entries: I)
+where
+    I: IntoIterator<Item = (S1, S2)>,
+    S1: AsRef<str>,
+    S2: AsRef<str>,
+{
+    let mut batch_by_lang: HashMap<&'static str, Vec<(String, String, bool)>> = HashMap::new();
+    for (lemma, code) in entries {
+        let l_str = lemma.as_ref();
+        let lang = detect_tag_language(l_str);
+        batch_by_lang.entry(lang).or_default().push((l_str.to_string(), code.as_ref().to_string(), true));
+    }
+    for (lang, list) in batch_by_lang {
+        load_aliases_for_lang(lang, list);
+    }
+    // 增量灌完立即提交，避免读取路径依赖惰性闸（显式优于隐式）
+    commit_alias_index();
+}
+
+/// 受控标签 code 反查（运行时单语言/全局归一入口）
+///
+/// 优先级：
+/// 1. 动态别名字典（semantic.pack tag_aliases_{lang} 热载；同 lemma 时 omw.* 已优先）
+/// 2. 静态 builtin 离线字典
+///
+/// 未命中返回 `None`，由调用方派生 `_ext.{slug}.{hash8}`。
+pub fn resolve_controlled_tag_code(tag: &str) -> Option<&'static str> {
+    let key = normalize_lemma(tag);
+    if key.is_empty() {
+        return None;
+    }
+    // 1. 动态轨（含 omw.* / hownet.* / builtin.*），走全局索引（等价原 DYNAMIC_ALIASES）
+    if let Some(index) = current_alias_index() {
+        if let Some(code) = index.global_code(&key) {
+            if is_controlled_code(code) {
+                return Some(code);
+            }
+        }
+        for cand in english_lemma_candidates(&key) {
+            if let Some(code) = index.global_code(&cand) {
+                if is_controlled_code(code) {
+                    return Some(code);
+                }
+            }
+        }
+    }
+    // 2. 静态 builtin 字典
+    lookup_static_with_en_lemmas(&key)
+}
+
+/// 英文形态学词形还原候选词（单复数 s/es/ies 与分词 ed/ing 还原）
+pub fn english_lemma_candidates(key: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let len = key.len();
+
+    // 1. 复数还原
+    if key.ends_with("ies") && len > 4 {
+        candidates.push(format!("{}y", &key[..len - 3]));
+    }
+    if key.ends_with("es") && len > 3 {
+        // boxes -> box, watches -> watch
+        candidates.push(key[..len - 2].to_string());
+        // services -> service, tables -> table (es结尾但本体带e)
+        candidates.push(key[..len - 1].to_string());
+    }
+    if key.ends_with('s') && !key.ends_with("ss") && len > 3 {
+        candidates.push(key[..len - 1].to_string());
+    }
+
+    // 2. 动词分词还原 (ed, ing)
+    if key.ends_with("ied") && len > 4 {
+        candidates.push(format!("{}y", &key[..len - 3]));
+    }
+    if key.ends_with("ed") && len > 4 {
+        // connected -> connect
+        candidates.push(key[..len - 2].to_string());
+        // created -> create
+        candidates.push(key[..len - 1].to_string());
+    }
+    if key.ends_with("ing") && len > 5 {
+        // connecting -> connect
+        candidates.push(key[..len - 3].to_string());
+        // creating -> create, organizing -> organize
+        candidates.push(format!("{}e", &key[..len - 3]));
+    }
+
+    candidates
+}
+
+/// 单语言分表反查（含英文词形还原候选），等价原 `lookup_map_with_en_lemmas`
+fn lang_lookup_with_en_lemmas(
+    index: &crate::tag_alias_index::TagAliasIndex,
+    lang: &str,
+    key: &str,
+) -> Option<&'static str> {
+    if let Some(code) = index.lang_code(lang, key) {
+        if is_controlled_code(code) {
+            return Some(code);
+        }
+    }
+    for cand in english_lemma_candidates(key) {
+        if let Some(code) = index.lang_code(lang, &cand) {
+            if is_controlled_code(code) {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+fn lookup_static_with_en_lemmas(key: &str) -> Option<&'static str> {
+    if let Some(en) = alias_map().get(key) {
+        if let Some(code) = en_to_code().get(en.as_str()) {
+            return Some(code.as_str());
+        }
+    }
+    if let Some(code) = en_to_code().get(key) {
+        return Some(code.as_str());
+    }
+    for cand in english_lemma_candidates(key) {
+        if let Some(en) = alias_map().get(&cand) {
+            if let Some(code) = en_to_code().get(en.as_str()) {
+                return Some(code.as_str());
+            }
+        }
+        if let Some(code) = en_to_code().get(&cand) {
+            return Some(code.as_str());
+        }
+    }
+    None
+}
+
+/// 识别标签两阶段反查入口 (ADR-0048)
+///
+/// 1. 当前语言分表直查 (tag_aliases_{current_lang})
+/// 2. 未命中时执行 Unicode LID 语言识别
+/// 3. 若识别语言与当前语言不同，反查对应异语分表 (tag_aliases_{detected_lang})
+/// 4. 异语命中后，反向解析当前语言的权威规范名进行就地本地化 (Q2 选项 A)
+///
+/// 返回: Option<(tag_code, Option<canonical_name_in_current_lang>)>
+pub fn resolve_controlled_tag_two_stage(
+    tag: &str,
+    current_lang: Option<&str>,
+) -> Option<(&'static str, Option<String>)> {
+    let key = normalize_lemma(tag);
+    if key.is_empty() {
+        return None;
+    }
+    let curr_lang = normalize_language_code(current_lang.unwrap_or("zh"));
+    let detected_lang = detect_tag_language(tag);
+    let index = current_alias_index();
+
+    // 辅助闭包：反查当前系统语言的权威规范展示名 (Q2 选项 A 就地本地化)
+    let resolve_canonical = |code: &str| -> Option<String> {
+        if let Some(idx) = index.as_ref() {
+            if let Some(name) = idx.canonical_name(curr_lang, code) {
+                return Some(name.to_string());
+            }
+        }
+        let fallback_name = tag_display(code, curr_lang);
+        if fallback_name != code {
+            Some(fallback_name)
+        } else {
+            None
+        }
+    };
+
+    // ─── 第一阶段：当前语言分表直查 ───
+    if detected_lang == curr_lang {
+        if let Some(idx) = index.as_ref() {
+            if curr_lang == "en" {
+                if let Some(code) = lang_lookup_with_en_lemmas(idx, curr_lang, &key) {
+                    return Some((code, None));
+                }
+            } else if let Some(code) = idx.lang_code(curr_lang, &key) {
+                if is_controlled_code(code) {
+                    return Some((code, None));
+                }
+            }
+        }
+        // 查当前语言静态底座
+        if curr_lang == "zh" {
+            if let Some(en) = alias_map().get(&key) {
+                if let Some(code) = en_to_code().get(en.as_str()) {
+                    return Some((code.as_str(), None));
+                }
+            }
+        } else if curr_lang == "en" {
+            if let Some(code) = lookup_static_with_en_lemmas(&key) {
+                return Some((code, None));
+            }
+        }
+        // 相同语言未查得，直接判定为未登录词
+        return None;
+    }
+
+    // ─── 异语分表反查 ───
+    let mut matched_code: Option<&'static str> = None;
+    if let Some(idx) = index.as_ref() {
+        if detected_lang == "en" {
+            matched_code = lang_lookup_with_en_lemmas(idx, detected_lang, &key);
+        } else if let Some(code) = idx.lang_code(detected_lang, &key) {
+            if is_controlled_code(code) {
+                matched_code = Some(code);
+            }
+        }
+        if matched_code.is_none() && detected_lang != "en" {
+            matched_code = lang_lookup_with_en_lemmas(idx, "en", &key);
+        }
+    }
+
+    // 异语静态底座兜底
+    if matched_code.is_none() {
+        matched_code = lookup_static_with_en_lemmas(&key);
+    }
+
+    if let Some(code) = matched_code {
+        return Some((code, resolve_canonical(code)));
+    }
+
+    None
+}
+
+/// 清空动态别名字典（用于热切换或断开连接时）
+pub fn clear_dynamic_aliases() {
+    // 清空构建期缓冲与安装槽；`code_intern` 层**不清空**——已发出的 `&'static str`
+    // 一旦悬垂即为 UB（PRD 07 决策 6）。
+    if let Ok(mut guard) = alias_builder_slot().write() {
+        guard.take();
+    }
+    ALIAS_BUILDER_DIRTY.store(false, Ordering::Release);
+    crate::tag_alias_index::uninstall();
+}
+
+fn alias_map() -> &'static HashMap<String, String> {
+    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m = HashMap::new();
+        for (alias, en) in BUILTIN_ALIASES {
+            m.insert(normalize_lemma(alias), (*en).to_string());
+            m.insert(normalize_lemma(en), (*en).to_string());
+        }
+        m
+    })
+}
+
+
+fn code_to_canonical_zh() -> &'static HashMap<String, String> {
+    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m = HashMap::new();
+        for (alias, en) in BUILTIN_ALIASES {
+            // 仅当别名包含 CJK 字符时，才作为对应 code 的中文展示名 (彻底免疫英文别名字典序前置倒灌)
+            if alias.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+                let code = en_builtin_code(en);
+                m.entry(code).or_insert_with(|| (*alias).to_string());
+            }
+        }
+        m
+    })
+}
+
+fn code_to_canonical_en() -> &'static HashMap<String, String> {
+    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m = HashMap::new();
+        for (_, en) in BUILTIN_ALIASES {
+            let code = en_builtin_code(en);
+            m.entry(code).or_insert_with(|| (*en).to_string());
+        }
+        m
+    })
+}
+
+fn en_to_code() -> &'static HashMap<String, String> {
+    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m = HashMap::new();
+        for (_, en) in BUILTIN_ALIASES {
+            m.insert((*en).to_string(), en_builtin_code(en));
+        }
+        m
+    })
+}
+
+/// 展示名解析失败时的规范哨兵（Rust 侧单一事实源）。
+///
+/// 适用面：受控 code 在全部解析轨（AOT Concept 枚举 / semantic.pack 动态规范词典 /
+/// 静态别名表 / 前缀 slug 兜底）均落空、`tag_display` 按既有契约原样回吐裸 code 时，
+/// 调用方词形闸统一降级到本哨兵，**严禁把裸受控 code 当展示名写入用户可见路径**
+/// （name_path / 展示名入场等）。与桌面端 `SENTINEL_NAMES.UNCLASSIFIED` 约定同构。
+pub fn unclassified_display(lang: &str) -> String {
+    if lang.trim().to_lowercase().starts_with("zh") {
+        "未归类".to_string()
+    } else {
+        "Unclassified".to_string()
+    }
+}
+
+/// 将标准 tag_code 反查对应语言的规范展示名称 (若未查到则提取 slug 兜底)
+pub fn tag_display(code: &str, lang: &str) -> String {
+    let clean_code = code.trim();
+    let l = lang.to_lowercase();
+    let is_zh = l.starts_with("zh");
+
+    // 1. 优先查阅 AOT 编译期 Concept 权威枚举字典 (PRD-0058 / 三级本体权威优先)
+    // 零堆分配、常数时间，全量覆盖 OMW / HowNet / Builtin 受控体系
+    if let Some(concept) = crate::concepts::Concept::from_code(clean_code) {
+        if is_zh {
+            return concept.zh_name().to_string();
+        } else {
+            let en = concept.en_name();
+            if !en.is_empty() {
+                return en.to_string();
+            }
+        }
+    }
+
+    // 2. 动态规范词典：omw.*/hownet.* 的母语规范展示名由 semantic.pack 热载入轨写入 canonical 索引
+    //    （原 `dynamic_canonical_by_lang`，PRD 07 后由 `TagAliasIndex::canonical_name` 承载）
+    if let Some(idx) = current_alias_index() {
+        if let Some(name) = idx.canonical_name(normalize_language_code(lang), clean_code) {
+            if !name.is_empty() && name != clean_code {
+                return name.to_string();
+            }
+        }
+    }
+
+    // 3. 别名表权威反查：若 Concept 直查未命中（分层差异如 builtin.screenshot），
+    // 依母语反查中文规范名（带 CJK 防护）或英文规范名
+    if is_zh {
+        if let Some(zh) = code_to_canonical_zh().get(clean_code) {
+            return zh.clone();
+        }
+    } else {
+        if let Some(en) = code_to_canonical_en().get(clean_code) {
+            return en.clone();
+        }
+    }
+
+    // 4. 针对 _ext.slug.hash 或 builtin.slug 提取人类可读部分兜底
+    if let Some(stripped) = clean_code.strip_prefix("builtin.") {
+        if stripped.starts_with("h_") {
+            // 内部过渡态散列代码（未翻译态），若未能在前序解析出展示名，按母语输出规范未归类哨兵，阻断哈希泄漏
+            if let Some(zh) = code_to_canonical_zh().get(clean_code) {
+                return zh.clone();
+            }
+            return unclassified_display(lang);
+        }
+        return stripped.replace('_', " ");
+    }
+    if let Some(stripped) = clean_code.strip_prefix("_ext.") {
+        if let Some(slug) = stripped.split('.').next() {
+            if !slug.is_empty() {
+                return slug.replace('_', " ");
+            }
+        }
+    }
+
+    clean_code.to_string()
+}
+
+/// 展示名解析 + **语言降级（en 兜底）** + 词形闸，用户可见路径的唯一安全入口。
+///
+/// ## 降级链（依 `docs/features/ai/task-omw-display-name-code-leak-and-build-time-en-fallback.md` 裁定）
+///
+/// 裁定原文：「概念在本语言缺词形时，**必须在构建期用英文词形兜底**，严禁把 code 当词形落库」。
+/// 构建期由 `build-semantic-pack.ts::runInsertAlias` 的 R-C 词形红线落实（`lemma === tagCode`
+/// 时回落 `codeToNameEn`），故健康 pack 的 `tag_aliases_zh_CN` 在中文缺词形处存的就是英文词形。
+/// 但构建期只覆盖「有 zh 行但词形退化成 code」，「zh 侧零行」分支（实测 5,892 个 omw/hownet code）
+/// 不会进入 `runInsertAlias`，此时运行时必须自行完成同一降级，否则会回吐裸 code：
+///
+/// 1. 请求语言 canonical（`tag_display`）；
+/// 2. 请求语言缺失（回吐裸 code）→ **英文 canonical 兜底**（en 兜底方向：中文缺词形用英文名）；
+/// 3. 英文亦缺失 → [`unclassified_display`] 哨兵（**严禁回吐裸受控 code**）。
+///
+/// 与 `tag_display` 的分工：`tag_display` 保留「解析不到即回吐 code」的既有契约（fusion.rs
+/// 多处 `canon != code` 词形闸依赖它做「弃用/回落入参词形」判定）；本函数供**必须产出可读串**的
+/// 展示路径（name_path 物化等）使用。
+pub fn tag_display_with_fallback(code: &str, lang: &str) -> String {
+    let clean_code = code.trim();
+    let primary = tag_display(clean_code, lang);
+    if primary != clean_code {
+        return primary;
+    }
+    // en 兜底：仅当请求语言不是 en 时才需要跨语回退（en 自身已在 primary 试过）
+    let norm = normalize_language_code(lang);
+    if norm != "en" {
+        let en = tag_display(clean_code, "en");
+        if en != clean_code {
+            return en;
+        }
+    }
+    unclassified_display(lang)
+}
+
+/// 受控 code → [`crate::concepts::Concept`]（**跨注册表桥接，唯一收口**）。
+///
+/// ## 为什么需要桥接
+///
+/// 本仓存在**两份**受控注册表，对同一中文概念可能给出**不同 code**：
+///
+/// | 注册表 | 位置 | 事实源 |
+/// | :--- | :--- | :--- |
+/// | `Concept` 枚举 | `crates/omni-core/src/concepts.rs`（AOT 生成） | `fileDimension_zh-CN.json` + semantic.pack |
+/// | 别名注册表 | 本文件 `BUILTIN_ALIASES`（手写） | 人工维护 |
+///
+/// 实测共有概念中 **161/316（51%）分歧**（GH [#719]）。后果：
+/// `Concept::from_code(code)` 对其中约一半**静默落空**，于是任何
+/// `from_code(code).or_else(|| from_zh(词面))` 写法都会**退化成词面语言依赖**
+/// （zh 词面命中 `from_zh`、en 词面落空），直接违反 D12 跨语言感知幂等契约。
+///
+/// ## 桥接策略
+///
+/// 1. 先 `Concept::from_code(code)` 直查（零开销主路径）；
+/// 2. 落空时经**别名表**把 code 反查为该概念的 **zh 规范名**（[`tag_display`]），
+///    再走 `Concept::from_zh` —— 该路径**只依赖 code**，与用户传入的词面语言无关。
+///
+/// 这样无论两注册表最终如何统一（方向 A/B/C），调用点都不会退化成语言依赖。
+///
+/// [#719]: https://github.com/Leonard-Li777/firefly-ai-folder/issues/719
+pub fn concept_from_code(code: &str) -> Option<crate::concepts::Concept> {
+    let clean = code.trim();
+    crate::concepts::Concept::from_code(clean).or_else(|| {
+        let canon_zh = tag_display(clean, "zh");
+        if canon_zh != clean {
+            crate::concepts::Concept::from_zh(&canon_zh)
+        } else {
+            None
+        }
+    })
+}
+
+/// 受控 code、双轨多语言别名或中文规范名 → [`crate::concepts::Concept`]（**跨入口唯一收口，GH #729 D4**）。
+///
+/// 优先级：
+/// 1. 已是受控 code → 委托 [`concept_from_code`]；
+/// 2. 命中双轨受控别名表（[`resolve_controlled_tag_code`]）→ 委托 [`concept_from_code`]；
+/// 3. 兜底走 `Concept::from_zh` 精确匹配中文词面。
+pub fn concept_from_code_or_alias(raw: &str) -> Option<crate::concepts::Concept> {
+    let clean = raw.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    if is_controlled_code(clean) {
+        return concept_from_code(clean);
+    }
+    if let Some(code) = resolve_controlled_tag_code(clean) {
+        if let Some(matched_concept) = concept_from_code(code) {
+            return Some(matched_concept);
+        }
+    }
+    crate::concepts::Concept::from_zh(clean)
+}
+
+/// 别名/规范名 → builtin code（精确字典，非向量）
+pub fn builtin_tag_code(tag: &str) -> Option<&'static str> {
+    let key = normalize_lemma(tag);
+    // 1. 优先查动态载入字典（DB/JSON 热载入轨）
+    if let Some(idx) = current_alias_index() {
+        if let Some(code) = idx.global_code(&key) {
+            if is_controlled_code(code) {
+                return Some(code);
+            }
+        }
+    }
+    // 2. 回退查静态内置别名字典（静态底座保底轨）
+    let en = alias_map().get(&key)?;
+    // 再取 code 的 'static 引用
+    en_to_code().get(en.as_str()).map(|s| s.as_str())
+}
+
+/// 判断受控概念是否为纯图片专有维度（截图细分、摄影照片细分等）。
+/// 全媒体排他门禁铁律：非视觉介质（如音频、文档）以及非静态图片介质（如视频）严禁挂载此类概念。
+pub fn is_image_exclusive_concept(concept_item: crate::concepts::Concept) -> bool {
+    use crate::concepts::Concept;
+    matches!(
+        concept_item,
+        Concept::截图
+            | Concept::截图细分
+            | Concept::Windows截图
+            | Concept::macOS截图
+            | Concept::iOS截图
+            | Concept::Android截图
+            | Concept::Linux截图
+            | Concept::网页长截图
+            | Concept::UI界面截图
+            | Concept::聊天截图
+            | Concept::代码截图
+            | Concept::游戏截图
+            | Concept::支付凭证截图
+            | Concept::系统报错截图
+            | Concept::社交动态截图
+            | Concept::影视视频截图
+            | Concept::文档截图
+            | Concept::地图导航截图
+            | Concept::终端控制台截图
+            | Concept::订单物流截图
+            | Concept::桌面全屏截图
+            | Concept::摄影照片
+            | Concept::摄影照片细分
+            | Concept::建筑摄影
+            | Concept::微距摄影
+            | Concept::故障摄影
+            | Concept::风景照
+            | Concept::人物照
+            | Concept::婚纱照
+            | Concept::街拍抓拍
+            | Concept::夜景照
+    )
+}
+
+/// 判断标签字符串（展示名、多语言别名或受控 code）是否属于纯图片专有维度。
+/// 经 `concept_from_code_or_alias` 统一桥接，支持多语言展示名与受控代码。
+pub fn is_image_exclusive_tag(tag: &str) -> bool {
+    let clean = tag.trim();
+    if clean.is_empty() {
+        return false;
+    }
+    if let Some(target_concept) = concept_from_code_or_alias(clean) {
+        return is_image_exclusive_concept(target_concept);
+    }
+    false
+}
+
+/// 基于客观字符分布与语言学特征识别受控语言事实 (Zero False Positive, 宁缺勿错)
+///
+/// 严格守则（对齐 PRD-0058 / ADR-0045）：
+/// 1. 空文本、纯数字、纯标点、纯空白或缺乏显著语种文字特征的文本，严格返回 None；
+/// 2. 只有检出足够的母语字符特征（如汉字、假名、谚文、西里尔文、阿拉伯文、特征拉丁语系虚词）时才返回对应受控 Concept；
+/// 3. 输出类型为 `Concept` 强类型枚举，绝不拼接裸字符串。
+pub fn detect_fact_language(text: &str) -> Option<crate::concepts::Concept> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut cjk_count = 0usize;
+    let mut hiragana_count = 0usize;
+    let mut katakana_count = 0usize;
+    let mut hangul_count = 0usize;
+    let mut cyrillic_count = 0usize;
+    let mut arabic_count = 0usize;
+    let mut thai_count = 0usize;
+    let mut devanagari_count = 0usize;
+    let mut latin_count = 0usize;
+    let mut total_chars = 0usize;
+
+    // 仅统计前 1000 个有效字符（耗时 < 100μs）
+    for ch in trimmed.chars().take(1000) {
+        if ch.is_whitespace() || ch.is_ascii_punctuation() {
+            continue;
+        }
+        // 排除常见 Unicode 标点符号与特殊全角符号
+        match ch as u32 {
+            0x2000..=0x206F | 0x3000..=0x303F | 0xFF00..=0xFF0F | 0xFF1A..=0xFF20 | 0xFF3B..=0xFF40 | 0xFF5B..=0xFF65 => continue,
+            _ => {}
+        }
+        total_chars += 1;
+        match ch as u32 {
+            0x3040..=0x309F => hiragana_count += 1,
+            0x30A0..=0x30FF => katakana_count += 1,
+            0x4E00..=0x9FFF | 0x3400..=0x4DBF => cjk_count += 1,
+            0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F => hangul_count += 1,
+            0x0E00..=0x0E7F => thai_count += 1,
+            0x0900..=0x097F => devanagari_count += 1,
+            0x0400..=0x04FF => cyrillic_count += 1,
+            0x0600..=0x06FF | 0x0750..=0x077F => arabic_count += 1,
+            0x0041..=0x005A | 0x0061..=0x007A | 0x00C0..=0x024F | 0x1E00..=0x1EFF => latin_count += 1,
+            _ => {}
+        }
+    }
+
+    if total_chars < 2 {
+        return None;
+    }
+
+    // 1. 日语：出现平假名或超过 1 个片假名
+    if hiragana_count > 0 || katakana_count > 1 {
+        return Some(crate::concepts::Concept::日语);
+    }
+
+    // 2. 韩语：出现谚文字符
+    if hangul_count > 0 {
+        return Some(crate::concepts::Concept::韩语);
+    }
+
+    // 3. 泰语：出现泰文字符
+    if thai_count > 0 {
+        return Some(crate::concepts::Concept::泰语);
+    }
+
+    // 4. 印地语：出现天城文字符
+    if devanagari_count > 0 {
+        return Some(crate::concepts::Concept::印地语);
+    }
+
+    // 5. 阿拉伯语：阿拉伯字母数量 >= 2 且比例 > 0.30
+    if arabic_count >= 2 && (arabic_count as f32 / total_chars as f32) > 0.30 {
+        return Some(crate::concepts::Concept::阿拉伯语);
+    }
+
+    // 6. 俄语：西里尔字母数量 >= 2 且比例 > 0.30
+    if cyrillic_count >= 2 && (cyrillic_count as f32 / total_chars as f32) > 0.30 {
+        return Some(crate::concepts::Concept::俄语);
+    }
+
+    // 7. 中文：汉字数量 >= 2 且汉字比例 > 0.15
+    if cjk_count >= 2 && (cjk_count as f32 / total_chars as f32) > 0.15 {
+        return Some(crate::concepts::Concept::中文);
+    }
+
+    // 8. 拉丁语系：拉丁字母数量 >= 3 且比例 > 0.30
+    if latin_count >= 3 && (latin_count as f32 / total_chars as f32) > 0.30 {
+        let lower = trimmed.to_lowercase();
+        let words: Vec<&str> = lower
+            .split(|c: char| !c.is_alphabetic())
+            .filter(|w| !w.is_empty())
+            .take(100)
+            .collect();
+
+        // 越南语特殊字母：đ, ă, â, ê, ô, ơ, ư
+        let has_vi = lower.contains('đ')
+            || lower.contains('ơ')
+            || lower.contains('ư')
+            || words.iter().any(|&w| matches!(w, "của" | "và" | "người" | "trong" | "không" | "được"));
+        if has_vi {
+            return Some(crate::concepts::Concept::越南语);
+        }
+
+        let has_de = words.iter().any(|&w| matches!(w, "der" | "die" | "das" | "und" | "nicht" | "ist" | "ein" | "eine" | "für" | "mit"))
+            || lower.contains('ä') || lower.contains('ö') || lower.contains('ü') || lower.contains('ß');
+        let has_fr = words.iter().any(|&w| matches!(w, "les" | "des" | "dans" | "avec" | "pour" | "une" | "est" | "que" | "pas"))
+            || lower.contains('é') || lower.contains('è') || lower.contains('ç') || lower.contains('à');
+        let has_es = words.iter().any(|&w| matches!(w, "los" | "las" | "del" | "para" | "por" | "una" | "con" | "que" | "este"))
+            || lower.contains('ñ') || lower.contains('¿') || lower.contains('¡');
+        let has_pt = words.iter().any(|&w| matches!(w, "não" | "para" | "com" | "uma" | "que" | "por" | "dos" | "das"))
+            || lower.contains('ã') || lower.contains('õ');
+        let has_it = words.iter().any(|&w| matches!(w, "della" | "delle" | "degli" | "sono" | "anche" | "questo" | "con" | "non"));
+        let has_nl = words.iter().any(|&w| matches!(w, "het" | "van" | "een" | "voor" | "met" | "dat" | "niet"));
+
+        if has_de && !has_fr && !has_es {
+            return Some(crate::concepts::Concept::德语);
+        }
+        if has_fr && !has_de && !has_es {
+            return Some(crate::concepts::Concept::法语);
+        }
+        if has_es && !has_de && !has_fr {
+            return Some(crate::concepts::Concept::西班牙语);
+        }
+        if has_pt && !has_es {
+            return Some(crate::concepts::Concept::葡萄牙语);
+        }
+        if has_it {
+            return Some(crate::concepts::Concept::意大利语);
+        }
+        if has_nl {
+            return Some(crate::concepts::Concept::荷兰语);
+        }
+
+        return Some(crate::concepts::Concept::英文);
+    }
+
+    None
+}
+
+/// 将元数据中常见的语言标识字符串归一化为受控 Concept
+pub fn concept_from_language_code(code_str: &str) -> Option<crate::concepts::Concept> {
+    let clean = code_str.trim().to_ascii_lowercase();
+    if clean.is_empty() {
+        return None;
+    }
+
+    if clean.starts_with("zh") || clean.starts_with("chi") || clean.starts_with("zho") || clean.starts_with("cmn") || clean == "chinese" || clean == crate::concepts::Concept::中文.zh_name() {
+        Some(crate::concepts::Concept::中文)
+    } else if clean.starts_with("en") || clean.starts_with("eng") || clean == "english" || clean == crate::concepts::Concept::英文.zh_name() {
+        Some(crate::concepts::Concept::英文)
+    } else if clean.starts_with("ja") || clean.starts_with("jpn") || clean == "japanese" || clean == crate::concepts::Concept::日语.zh_name() {
+        Some(crate::concepts::Concept::日语)
+    } else if clean.starts_with("ko") || clean.starts_with("kor") || clean == "korean" || clean == crate::concepts::Concept::韩语.zh_name() {
+        Some(crate::concepts::Concept::韩语)
+    } else if clean.starts_with("fr") || clean.starts_with("fre") || clean.starts_with("fra") || clean == "french" || clean == crate::concepts::Concept::法语.zh_name() {
+        Some(crate::concepts::Concept::法语)
+    } else if clean.starts_with("de") || clean.starts_with("ger") || clean.starts_with("deu") || clean == "german" || clean == crate::concepts::Concept::德语.zh_name() {
+        Some(crate::concepts::Concept::德语)
+    } else if clean.starts_with("es") || clean.starts_with("spa") || clean == "spanish" || clean == crate::concepts::Concept::西班牙语.zh_name() {
+        Some(crate::concepts::Concept::西班牙语)
+    } else if clean.starts_with("ru") || clean.starts_with("rus") || clean == "russian" || clean == crate::concepts::Concept::俄语.zh_name() {
+        Some(crate::concepts::Concept::俄语)
+    } else if clean.starts_with("ar") || clean.starts_with("ara") || clean == "arabic" || clean == crate::concepts::Concept::阿拉伯语.zh_name() {
+        Some(crate::concepts::Concept::阿拉伯语)
+    } else if clean.starts_with("pt") || clean.starts_with("por") || clean == "portuguese" || clean == crate::concepts::Concept::葡萄牙语.zh_name() {
+        Some(crate::concepts::Concept::葡萄牙语)
+    } else if clean.starts_with("it") || clean.starts_with("ita") || clean == "italian" || clean == crate::concepts::Concept::意大利语.zh_name() {
+        Some(crate::concepts::Concept::意大利语)
+    } else if clean.starts_with("nl") || clean.starts_with("dut") || clean.starts_with("nld") || clean == "dutch" || clean == crate::concepts::Concept::荷兰语.zh_name() {
+        Some(crate::concepts::Concept::荷兰语)
+    } else if clean.starts_with("th") || clean.starts_with("tha") || clean == "thai" || clean == crate::concepts::Concept::泰语.zh_name() {
+        Some(crate::concepts::Concept::泰语)
+    } else if clean.starts_with("vi") || clean.starts_with("vie") || clean == "vietnamese" || clean == crate::concepts::Concept::越南语.zh_name() {
+        Some(crate::concepts::Concept::越南语)
+    } else if clean.starts_with("hi") || clean.starts_with("hin") || clean == "hindi" || clean == crate::concepts::Concept::印地语.zh_name() {
+        Some(crate::concepts::Concept::印地语)
+    } else {
+        None
+    }
+}
+
+/// 是否与规范概念同 code（规则层用）
+///
+/// (#718 R1) code 形态解析通道：受控 code（`builtin.*|omw.*|hownet.*`）输入不再落空。
+/// #718 汇聚侧同源化后，门禁集合内 ram 条目为受控 code 形态，而别名表键全部为词面
+/// （实测 semantic.raw.db `tag_aliases_*` 10 语言分表共 ~72.7 万行、code 形态 lemma = 0），
+/// 词面查询分支对 code 输入恒落空 → 互斥/域矩阵/文字存在性门禁对 ram 条目静默失明
+/// （实测 RAM 词表 ∩ 门控词表 = 25 条：漫画/截图/特写/全景/9 色/证件票据类等）。
+/// 受控 code 直接作为比较键：r.code 与 canonical 的 code 同出 dynamic_aliases 同一词面
+/// 查询（omw.* > hownet.* > builtin.* 仲裁一致，同词面必同 code），无 #719 跨注册表分歧。
+/// 已知假设（R2 复验 nitpick）：动态表载入失败时 canonical 落静态轨而 r.code 来自投影
+/// 产物，可能分属不同注册表 → 残余**漏判**（非误判），属环境退化场景。
+/// 开放集 `_ext.*` / `dim.*` 无受控语义，保持 fallback 串等价旧行为。
+pub fn tag_matches_concept(tag: &str, canonical_zh_or_en: &str) -> bool {
+    // R2 复验 nitpick：入口统一 trim，防止 " builtin.x" 形态漏过 code 通道落回 fallback
+    let tag = tag.trim();
+    let canonical_zh_or_en = canonical_zh_or_en.trim();
+    let tag_code = if is_controlled_code(tag) {
+        Some(tag)
+    } else {
+        builtin_tag_code(tag)
+    };
+    let canon_code = if is_controlled_code(canonical_zh_or_en) {
+        Some(canonical_zh_or_en)
+    } else {
+        builtin_tag_code(canonical_zh_or_en)
+    };
+    match (tag_code, canon_code) {
+        (Some(a), Some(b)) => a == b,
+        _ => tag == canonical_zh_or_en,
+    }
+}
+
+/// 门控 / 评级 / 质量 / 水印 / 曝光 / 文字量类受控 code 集合（**唯一数据源**）。
+///
+/// ## 为什么是「门控」
+///
+/// 这些概念描述的是文件的**安全 / 评级 / 质量 / 技术状态 / 文字量**，而非**艺术风格**或
+/// **具象主体**。它们被感知后只应作为门控信号（过滤、互斥、决策）：
+/// **严禁**写入 style 槽（避免「整体呈安全风格」这类病句），**严禁**作为描述主体
+/// （见 `PRD §7.2` 与 `docs/issues/issue-fusion-rating-gate-language-dependent.md`）。
+///
+/// ## 为什么基于 code 而非词面（`AGENTS.md` 受控本体规范）
+///
+/// `AGENTS.md` 规定内部处理 **100% 仅基于受控 code / 强类型 `Concept` 枚举**，
+/// ❌ 严禁硬编码自然语言字符串匹配。该规则此前以硬编码中文词表实现，
+/// 导致**同一受控概念在 zh / en 词面下判定相反**，违反 D12 跨语言感知幂等契约
+/// （`CONTEXT.md:920-922`）：zh 词面「有字图」被丢弃，en 词面 `Image With Text` 却存活。
+///
+/// ## 词条来源与「受控近似词替换」约定
+///
+/// 每个 code 均取自受控本体（`apps/desktop/src/electron/config/file-dimension-source.ts`
+/// 的门控维度：**文件质量 / 内容尺度 / 打码程度 / 水印程度 / 照片质量 /
+/// 敏感内容 / 文字密度**），经 [`BUILTIN_ALIASES`] 归一为 code。
+/// 历史词表中**不在别名表**的近义/口语词，一律以其**受控近似概念**的 code 替换
+/// （见每条行尾「← 原词」注，及 [`LOOSE_GATE_ALIASES`]），从而彻底消除自然语言词面匹配。
+pub const GATE_CODES: &[&str] = &[
+    // ── 敏感内容 / 安全等级（真实枚举变体）──────────────────────────────
+    crate::concepts::Concept::安全等级.code(),
+    crate::concepts::Concept::全年龄.code(),
+    crate::concepts::Concept::违规.code(),
+    "builtin.violation", // locale-invariant-ok: 别名表 Violation 兼容
+    crate::concepts::Concept::敏感内容.code(),
+    "builtin.safe", // locale-invariant-ok: 别名表 Safe 兼容
+    // ── 内容尺度 / 评级（维度「内容尺度」与「内容分级」）─────────────────────
+    crate::concepts::Concept::色情分级.code(),
+    crate::concepts::Concept::内容分级.code(),
+    crate::concepts::Concept::R_15.code(),
+    crate::concepts::Concept::R_18.code(),
+    crate::concepts::Concept::露骨性行为.code(),
+    "builtin.explicit", // locale-invariant-ok: 别名表 Explicit 兼容
+    "builtin.content_scale", // locale-invariant-ok: 内容尺度维度兼容
+    // ── 打码程度（维度「打码程度」id 124）────────────────────────────────────
+    crate::concepts::Concept::无码.code(),
+    crate::concepts::Concept::薄码.code(),
+    crate::concepts::Concept::有码.code(),
+    // ── 文件质量（维度「文件质量」id 27）─────────────────────────────────────
+    crate::concepts::Concept::高质量.code(),
+    "builtin.high_quality", // locale-invariant-ok: 别名表 High Quality 兼容
+    crate::concepts::Concept::中等质量.code(),
+    "builtin.medium_quality", // locale-invariant-ok: 别名表 Medium Quality 兼容
+    crate::concepts::Concept::低质量.code(),
+    "builtin.low_quality", // locale-invariant-ok: 别名表 Low Quality 兼容
+    // ── 水印程度（维度「水印程度」id 125）────────────────────────────────────
+    crate::concepts::Concept::无水印.code(),
+    crate::concepts::Concept::有水印.code(),
+    // ── 照片质量 / 曝光（维度「照片质量」id 127）──────────────────────────────
+    crate::concepts::Concept::暗光欠曝.code(),
+    crate::concepts::Concept::逆光死白.code(),
+    crate::concepts::Concept::优质精选.code(),
+    crate::concepts::Concept::高ISO噪点.code(),
+    crate::concepts::Concept::模糊废片.code(),
+    crate::concepts::Concept::虚焦.code(),
+    "builtin.good_exposure", // locale-invariant-ok: 别名表 Good Exposure 兼容
+    // ── 文字密度 / 版面（维度「文字密度」id 146 /「版面」id 141）───────────────
+    crate::concepts::Concept::纯文字.code(),
+    crate::concepts::Concept::纯文本.code(),
+    "builtin.plain_text", // locale-invariant-ok: 别名表 Plain Text 兼容
+    crate::concepts::Concept::微量文本.code(),
+    crate::concepts::Concept::有字图.code(),
+    crate::concepts::Concept::无字图.code(),
+];
+
+/// 门控维度的**口语 / 近义词 → 受控规范词**桥接表（**目标词必须已在 [`BUILTIN_ALIASES`] 内**）。
+///
+/// 依据「受控近似词替换」约定：历史词表中**不在别名表**的口语词，
+/// 一律替换为其在别名表中的**受控近似词**（优先取 `file-dimension-source.ts` 门控维度的词），
+/// 从而既保留语义覆盖、又彻底消除自然语言词面匹配。
+///
+/// 左列**仅**用于 [`is_gate_tag`] 的**词面**分支兜底（受控 code 分支不受影响）。
+/// 左列词不得出现在 `BUILTIN_ALIASES`（否则即为冗余，由 `loose_gate_aliases_are_not_in_alias_table` 冻结）。
+pub const LOOSE_GATE_ALIASES: &[(&str, &str)] = &[
+    ("合规", "安全"),      // 敏感内容维度 contextHint「合规安全检测」→ 别名表「安全 / Safe」
+    ("敏感", "违规"),      // 敏感内容维度叶子「违规 / Violation」
+    ("成人向", "露骨"),    // 别名表「露骨 / Explicit」（内容尺度维度的尺度词之一，非其叶子）
+    ("画质高", "高质量"),
+    ("画质中", "中等质量"),
+    ("画质低", "低质量"),
+    ("带水印", "有水印"),
+    ("去水印", "无水印"),
+    ("曝光不足", "暗光欠曝"),
+    ("曝光过度", "逆光死白"),
+    ("无修", "无码"),
+];
+
+/// 判断标签是否为门控 / 评级 / 质量类受控概念（**唯一判定入口**）。
+///
+/// 判定 **100% 基于受控 code**，绝不匹配自然语言词面：
+/// 1. 若已给定受控 `code`，直接按 [`GATE_CODES`] **精确**判定（幂等短路）；
+/// 2. 否则以词面做**受控别名反查**（[`builtin_tag_code`]，zh / en 词面一视同仁），再判定；
+/// 3. 若词面不在别名表，则查 [`LOOSE_GATE_ALIASES`] 口语桥接表取其**受控近似词**再反查
+///    （如「合规」→「安全」、「敏感」→「违规」、「成人向」→「露骨」）。
+///
+/// `omni-text` 侧 `fusion.rs::is_rating_quality_or_gate` 与
+/// `sentence_generator::archetypes::is_non_style_modifier` 均委托本函数，
+/// 使该规则**收敛为单一数据源**（此前是两份独立维护、必然漂移的中文词表副本）。
+pub fn is_gate_tag(name: &str, code: &str) -> bool {
+    if is_controlled_code(code) {
+        return GATE_CODES.contains(&code);
+    }
+    if let Some(c) = builtin_tag_code(name) {
+        return GATE_CODES.contains(&c);
+    }
+    // 词面不在别名表：经口语桥接表取受控近似词再反查。
+    // 归一化口径须与 `builtin_tag_code`（内部 `normalize_lemma`）一致，否则
+    // 「 合规」这类含空白/兼容变体的输入会在分支 2 / 分支 3 得到相反判定。
+    let norm = normalize_lemma(name);
+    LOOSE_GATE_ALIASES
+        .iter()
+        .find(|(loose, _)| norm == *loose)
+        .and_then(|(_, canon)| builtin_tag_code(canon))
+        .map(|c| GATE_CODES.contains(&c))
+        .unwrap_or(false)
+}
+
+/// 标签串归一：命中别名 → builtin code；未命中 → _ext 派生
+///
+/// **G1 词形闸（拒绝先于铸造，spec §6.9.3 / ADR-0052）装在本函数**——它是「候选词 → code」
+/// 的主入口（`omni-server` 的 `detected_visual_tags` 归一即走此路）。不合格词返回空串哨兵
+/// [`crate::tag_admissibility::REJECTED_CODE`]，调用方需按
+/// [`crate::tag_admissibility::is_rejected_code`] 判定并丢弃。
+///
+/// 注意闸门位置：受控别名命中（`builtin.*` / `omw.*`）与「已是合法 code 形态」两个分支
+/// **不**过闸——受控词表本身即白名单，code 形态输入则是幂等短路。
+///
+/// `dim.*` **有意不进**短路列表（GH #717 裁决落地：dim.* 已全量迁移至 builtin.*，见
+/// `tag-admissibility-filter-spec.md` §6.9.6 裁定 1）——流转路径上严禁出现 dim.* 输入；
+/// 若有未预期的残余 dim.* 输入，直接落到 G1 词形闸并派生 _ext 形态作为安全兜底。
+pub fn normalize_tag_to_code(tag: &str) -> String {
+    if let Some(code) = builtin_tag_code(tag) {
+        return code.to_string();
+    }
+    // 已是合法 code 形态则原样返回
+    let t = tag.trim();
+    if t.starts_with("builtin.") || t.starts_with("_ext.") || t.starts_with("omw.") || t.starts_with("hownet.") {
+        return t.to_string();
+    }
+    // G1 词形闸与 G2 禁用黑名单：不合格词与禁用词不派生 `_ext`，返回空串哨兵
+    if crate::tag_admissibility::is_g1_rejected(t) || crate::tag_admissibility::is_banned_lemma(t) {
+        return crate::tag_admissibility::REJECTED_CODE.to_string();
+    }
+    derive_ext_tag_code(t)
+}
+
+/// 将标签列表归一为 code 集合（P0 幂等契约：zh/en 别名输入应产出相同集合）
+///
+/// **G1 拒绝传播**：被词形闸拒绝的词会归一为空串哨兵，此处统一滤除，
+/// 使拒绝沿 `detected_visual_tags` → morphology/clip/ram 回写过滤 → 标签链汇聚全链路自动传播
+/// （这些下游一律用 `contains(&code)` 判定，空串不在集合内即被剔除）。
+pub fn normalize_tag_set_to_codes(tags: &[String]) -> Vec<String> {
+    let mut codes: Vec<String> = tags
+        .iter()
+        .map(|t| normalize_tag_to_code(t))
+        .filter(|c| !crate::tag_admissibility::is_rejected_code(c))
+        .collect();
+    codes.sort();
+    codes.dedup();
+    codes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn en_builtin_code_matches_ts_algorithm_shape() {
+        let code = en_builtin_code("Screenshot");
+        // 方案 B：无 hash
+        assert_eq!(code, "builtin.screenshot");
+        assert_eq!(code, en_builtin_code("Screenshot"));
+        assert_eq!(en_builtin_code("Source Code"), "builtin.source_code");
+    }
+
+    #[test]
+    fn zh_and_en_aliases_share_same_code() {
+        let zh = builtin_tag_code("截图").expect("截图");
+        let en = builtin_tag_code("Screenshot").expect("Screenshot");
+        let en2 = builtin_tag_code("screen capture").expect("screen capture");
+        assert_eq!(zh, en);
+        assert_eq!(en, en2);
+        assert_eq!(zh, en_builtin_code("Screenshot"));
+    }
+
+    /// **别名表键唯一门禁**。
+    ///
+    /// `BUILTIN_ALIASES` 是 `alias_map()` 的事实源，后者用 `HashMap::insert`（**末次胜出**）。
+    /// 同名别名一旦指向**不同的** en 规范名，靠后条目会**静默覆盖**靠前条目 —— 死数据 +
+    /// 隐含行序依赖（改表内行序即静默改语义）。详见
+    /// `docs/issues/issue-builtin-aliases-duplicate-keys.md`（已按方向 B 裁决）。
+    #[test]
+    fn builtin_aliases_have_unique_keys() {
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        let mut dups: Vec<String> = Vec::new();
+        for (alias, en) in BUILTIN_ALIASES {
+            if let Some(prev) = seen.insert(alias, en) {
+                dups.push(format!("{alias}: {prev} / {en}"));
+            }
+        }
+        assert!(
+            dups.is_empty(),
+            "BUILTIN_ALIASES 存在重复别名（末次胜出会静默覆盖）: {dups:?}"
+        );
+    }
+
+    /// **方向 B 回归**：8 个曾重复的别名一律「**裸词 → 裸概念**」，
+    /// 复合概念改由各自**专属**别名承载（未被本裁决波及）。
+    #[test]
+    fn bare_tokens_resolve_to_bare_concepts() {
+        for (alias, expected_code) in [
+            ("设计", "builtin.design"),
+            ("design", "builtin.design"),
+            ("designated", "builtin.design"),
+            ("角色", "builtin.character"),
+            ("character", "builtin.character"),
+            ("露骨性行为", "builtin.explicit_sexual_acts"),
+            ("自慰高潮", "builtin.orgasm_through_masturbation"),
+            ("调教拘束", "builtin.training_and_restraint"),
+        ] {
+            assert_eq!(
+                resolve_controlled_tag_two_stage(alias, Some("zh")).map(|(c, _)| c),
+                Some(expected_code),
+                "别名 {alias:?} 的解析结果与方向 B 裁决不符"
+            );
+        }
+
+        // 复合概念仍可达：专属别名未被方向 B 波及。
+        for (alias, expected_code) in [
+            ("设计稿", "builtin.design_draft"),
+            ("design draft", "builtin.design_draft"),
+            ("人物主体", "builtin.character_subject"),
+            ("人物", "builtin.character_subject"),
+            ("explicit sexual acts", "builtin.explicit_sexual_acts"),
+        ] {
+            assert_eq!(
+                resolve_controlled_tag_two_stage(alias, Some("zh")).map(|(c, _)| c),
+                Some(expected_code),
+                "复合概念 {alias:?} 应仍可达"
+            );
+        }
+    }
+
+    /// **联合键空间歧义门禁**（`alias_map()` 的 `normalize_lemma` 归一后）。
+    ///
+    /// `alias_map()` 把 **别名** 与 **en 规范名** 插入**同一张表**：
+    ///
+    /// ```text
+    /// for (alias, en) in BUILTIN_ALIASES {
+    ///     m.insert(normalize_lemma(alias), en);
+    ///     m.insert(normalize_lemma(en),    en);   // 同一张表
+    /// }
+    /// ```
+    ///
+    /// 当 `normalize_lemma(某别名) == normalize_lemma(另一概念的 en 规范名)` 时，两个概念
+    /// 会争抢同一个键 —— 而 `HashMap::insert` 是**末次胜出**，「谁赢」取决于**表内行序**，
+    /// 属**静默语义**（改行序即改行为）。`builtin_aliases_have_unique_keys` 只覆盖**字面别名**
+    /// 重复，覆盖不到这种「别名 vs en 规范名」的**跨键空间**碰撞。
+    ///
+    /// 历史上曾有 2 处歧义（`landscape` / `portrait`，见
+    /// `docs/issues/issue-alias-map-joint-keyspace-conflicts.md`），已按「**裸词判给画幅**」
+    /// 裁决消除：题材概念的 en 规范名 `"Portrait"` → `"Portrait Photography"`
+    /// （顺带对齐 AOT 概念表 `builtin.portrait_photography`），并删去与画幅组争抢的裸词别名。
+    /// 本用例断言歧义键集合**为空** —— 一旦回退或新增即失败。
+    #[test]
+    fn alias_map_joint_keyspace_has_no_conflicts() {
+        // 复刻 alias_map() 的归一与插入，收集每个键对应的**全部**候选值。
+        let mut vals: HashMap<String, Vec<&'static str>> = HashMap::new();
+        for (alias, en) in BUILTIN_ALIASES {
+            for k in [normalize_lemma(alias), normalize_lemma(en)] {
+                let bucket = vals.entry(k).or_default();
+                if !bucket.contains(en) {
+                    bucket.push(en);
+                }
+            }
+        }
+        let mut conflicts: Vec<String> = vals
+            .iter()
+            .filter(|(_, v)| v.len() > 1)
+            .map(|(k, _)| k.clone())
+            .collect();
+        conflicts.sort();
+
+        assert!(
+            conflicts.is_empty(),
+            "alias_map() 联合键空间出现歧义键（末次胜出 = 隐含行序依赖）: {conflicts:?}。\
+             裸词归属裁决见 docs/issues/issue-alias-map-joint-keyspace-conflicts.md。"
+        );
+
+        // 冻结裁决落点：裸词判给画幅（与桌面端 controlled-tag-resolver.ts:142-145 一致）。
+        assert_eq!(
+            alias_map().get("landscape").map(String::as_str),
+            Some("Horizontal Screen")
+        );
+        assert_eq!(
+            alias_map().get("portrait").map(String::as_str),
+            Some("Vertical Screen")
+        );
+    }
+
+    #[test]
+    fn tag_matches_concept_works_across_languages() {
+        assert!(tag_matches_concept("Screenshot", "截图"));
+        assert!(tag_matches_concept("有字图", "Text-in-Image"));
+        assert!(!tag_matches_concept("Screenshot", "设计稿"));
+    }
+
+    /// D12 跨语言感知幂等：同一门控概念在 zh / en 词面下判定**必须一致**
+    /// （回归 `docs/issues/issue-fusion-rating-gate-language-dependent.md`）。
+    #[test]
+    fn gate_tag_is_language_agnostic_across_zh_and_en() {
+        // (zh 词面, en 词面) 均须判为门控。
+        const PAIRS: &[(&str, &str)] = &[
+            ("有字图", "Text-in-Image"),
+            ("无字图", "Image without Text"),
+            ("纯文字", "Text Only"),
+            ("纯文字", "Plain Text"),
+            ("微量文本", "Microtext"),
+            ("安全", "Safe"),
+            ("全年龄", "All Ages"),
+            ("违规", "Violation"),
+            ("露骨", "Explicit"),
+            ("无码", "Uncensored"),
+            ("有码", "Censored"),
+            ("高质量", "High Quality"),
+            ("中等质量", "Medium Quality"),
+            ("低质量", "Low Quality"),
+            ("无水印", "No watermark"),
+            ("有水印", "Watermarked"),
+            ("曝光良好", "Good Exposure"),
+            ("R-18", "R-18"),
+            ("R-15", "R-15"),
+        ];
+        for (zh, en) in PAIRS {
+            assert!(is_gate_tag(zh, ""), "zh 门控词漏判: {zh}");
+            assert!(is_gate_tag(en, ""), "en 门控词漏判: {en}");
+            // 已给受控 code 时同样成立（幂等短路）。
+            let code = builtin_tag_code(zh).expect("zh 词面应可归一为受控 code");
+            assert!(is_gate_tag("", code), "受控 code 漏判: {code}");
+        }
+
+        // 受控近似词替换：不在别名表的口语/近义词 → 受控概念 code，判定与规范词一致。
+        // （来源 file-dimension-source.ts 门控维度；见 GATE_CODES / LOOSE_GATE_ALIASES 文档。）
+        for (loose, canonical) in LOOSE_GATE_ALIASES {
+            // 口语词本身不在别名表（无法归一）→ 由门控集合内的规范 code 覆盖。
+            assert!(
+                builtin_tag_code(loose).is_none(),
+                "{loose} 不应在别名表内（否则桥接表冗余）"
+            );
+            assert!(is_gate_tag(loose, ""), "口语桥接词漏判: {loose}");
+            assert!(
+                is_gate_tag(canonical, ""),
+                "桥接目标 {canonical} 应判为门控"
+            );
+        }
+
+        // 历史词表（原 `fusion.rs::RATING_NAMES` **32 词**）**逐词**回归，防覆盖回退。
+        // 口语词经 LOOSE_GATE_ALIASES 桥接后必须仍判为门控。
+        for w in [
+            "安全", "全年龄", "合规", "违规", "敏感", "R-18", "R18", "R-15", "R15", "露骨",
+            "成人向", "无码", "有码", "无修", "高质量", "中等质量", "低质量", "画质高", "画质中",
+            "画质低", "无水印", "有水印", "带水印", "去水印", "曝光不足", "曝光过度",
+            "曝光良好", "纯文字", "微量文本", "无字图", "有字图",
+        ] {
+            assert!(is_gate_tag(w, ""), "历史词表覆盖回退: {w}");
+        }
+
+        // 归一化口径一致性：桥接分支须与别名反查分支同口径（`normalize_lemma`）。
+        // 否则「 合规」在分支 2 因别名表无「合规」落空、分支 3 又因未 trim 不匹配 → 漏判。
+        assert!(is_gate_tag("  合规  ", ""), "桥接词含空白应经归一化命中");
+        assert!(is_gate_tag("\t敏感\n", ""), "桥接词含控制空白应经归一化命中");
+
+        // 非门控概念不得误判（风格 / 主体 / 泛形态）。
+        for nongate in ["截图", "设计稿", "人像写真", "自然景观", "写实拟真", "二次元"] {
+            assert!(!is_gate_tag(nongate, ""), "非门控词误判: {nongate}");
+        }
+    }
+
+    /// ③ en 展示名劣化纠偏（scripts/i18n-helper.js TRANSLATION_FIX_MAP）回归：
+    /// 新译名形式与旧劣化形式都必须经别名表解析到**同一冻结 code**。
+    /// code 由 en_builtin_code(规范名) 派生 —— 规范名不动，只补别名行。
+    #[test]
+    fn improved_en_display_forms_resolve_to_frozen_codes() {
+        for (new_form, legacy_form, frozen_code) in [
+            ("Watermarked", "There is watermark", "builtin.watermarked"),
+            (
+                "Underexposed in Low Light",
+                "Underexposure in Low Light",
+                "builtin.underexposed_in_low_light"
+            ),
+            (
+                "Blown Highlights in Backlight",
+                "Blown-out highlights in backlighting",
+                "builtin.blown_highlights_in_backlight"
+            ),
+            ("Certificates and Licenses", "Licenses and Permits", "builtin.certificates_and_licenses"),
+        ] {
+            assert_eq!(
+                builtin_tag_code(new_form),
+                Some(frozen_code),
+                "新 en 展示名 {new_form} 未解析到冻结 code"
+            );
+            assert_eq!(
+                builtin_tag_code(legacy_form),
+                Some(frozen_code),
+                "旧劣化形式 {legacy_form} 应保持可解析（存量数据兼容）"
+            );
+        }
+    }
+
+    /// 跨注册表桥接（GH #719）：`Concept` 注册表与 `BUILTIN_ALIASES` 对同一概念给出不同 code，
+    /// `Concept::from_code` 会静默落空 —— `concept_from_code` 必须仍能解析到同一概念。
+    #[test]
+    fn concept_from_code_bridges_cross_registry_divergence() {
+        // 纯命名分歧已随「②↔③↔① 闭环对齐」而归零：`有字图` 及 #719/#729 纠偏项现在**直查命中**（零开销主路径）。
+        for (code, expected_zh) in [
+            ("builtin.text_in_image", "有字图"),
+            ("builtin.text_only", "纯文字"),
+            ("builtin.hardcore_sex", "粗野性交"),
+            ("builtin.img", "img"),
+            ("omw.00370869.s", "蓝色"),
+            ("builtin.cyan", "青色"),
+            ("builtin.orgy", "群交"),
+            ("builtin.maternal_uncle_and_nephew", "舅甥"),
+            ("builtin.elder_brother_s_wife", "嫂嫂"),
+            ("builtin.defocused", "脱焦"),
+            ("builtin.empty_scene", "无人空镜"),
+            ("builtin.watermarked", "有水印"),
+        ] {
+            assert_eq!(
+                crate::concepts::Concept::from_code(code).map(|it| it.zh_name()),
+                Some(expected_zh),
+                "Concept::from_code({code}) 应直查命中 {expected_zh}"
+            );
+            assert_eq!(
+                concept_from_code(code).map(|it| it.zh_name()),
+                Some(expected_zh)
+            );
+        }
+
+        // 剩余「分层差异」仍靠桥接：别名表 builtin.screenshot vs Concept hownet.000000135085.v
+        let shot = concept_from_code("builtin.screenshot").expect("截图 应经桥接解析到 Concept");
+        assert_eq!(shot.zh_name(), "截图");
+
+        // 桥接**只依赖 code**：同一 code 无论调用方传入何种语言词面，结果一致。
+        // （这是 D12 幂等的前提；若桥接退化成 from_zh(词面) 则 en 侧会落空。）
+        assert_eq!(
+            concept_from_code("builtin.screenshot"),
+            concept_from_code("builtin.screenshot")
+        );
+
+        // 未受控 / 未知 code 必须返回 None，不得误命中。
+        assert!(concept_from_code("_ext.unknown.abc123").is_none());
+        assert!(concept_from_code("").is_none());
+    }
+
+    /// D4 跨入口收口测试（GH #729）：`concept_from_code_or_alias` 同时兼容受控 code、英文/多语言别名与中文词面。
+    #[test]
+    fn concept_from_code_or_alias_handles_code_alias_and_zh() {
+        use crate::concepts::Concept;
+        for (raw, expected) in [
+            ("builtin.soft_porn", Concept::软色情),
+            ("Soft Porn", Concept::软色情),
+            ("soft porn", Concept::软色情),
+            ("软色情", Concept::软色情),
+            ("builtin.image", Concept::图片),
+            ("Image", Concept::图片),
+            ("picture", Concept::图片),
+            ("图片", Concept::图片),
+            ("builtin.img", Concept::img),
+            ("img", Concept::img),
+            ("builtin.text_only", Concept::纯文字),
+            ("Text Only", Concept::纯文字),
+            ("纯文字", Concept::纯文字),
+            ("builtin.sex_training", Concept::性爱调教),
+            ("Sex training", Concept::性爱调教),
+            ("性爱调教", Concept::性爱调教),
+        ] {
+            assert_eq!(
+                concept_from_code_or_alias(raw),
+                Some(expected),
+                "concept_from_code_or_alias({raw:?}) 应解析为 {expected:?}"
+            );
+        }
+        assert!(concept_from_code_or_alias("").is_none());
+        assert!(concept_from_code_or_alias("_ext.unknown.12345678").is_none());
+    }
+
+    /// RAM++ 投影受控命中率量化（GH #718 前置核验 1）：
+    /// `ram_pan_projection.json` 的 `code` 字段不落盘（全空），由 omni-vision
+    /// `get_ram_projections()` OnceLock 运行期派生：`controlled_tag_code(zh)` 命中 →
+    /// 受控码，否则 `_ext.{zh hash}` 回落。
+    ///
+    /// 实测口径（2026-10-04，4,585 条 zh 词表）：
+    /// - 静态 ② 字典命中：**44 条（1.0%）**——RAM 是通用视觉概念词表，② 只策展维度根；
+    /// - 动态轨（semantic.pack `tag_aliases_zh_CN`，116,901 行）合并命中：**3,029（66.1%）**
+    ///   （omw.* 1,755 + hownet.* 1,252 + builtin 22）；
+    /// - `_ext` 回落面：1,556（33.9%），复合词为主（三维CG渲染/动作电影/有氧运动…）。
+    /// 本测试只锁**静态命中收缩**（② 覆盖不得回退），不声明总覆盖率；
+    /// 词表缺失（干净环境）时跳过。
+    #[test]
+    fn ram_tag_list_static_controlled_hit_rate() {
+        let txt_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../apps/desktop/build/presetResources/ram/ram_tag_list_zh.txt");
+        let text = match std::fs::read_to_string(&txt_path) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("[skip] 未找到 {txt_path:?}（RAM 预置词表缺失），跳过命中率量化");
+                return;
+            }
+        };
+        let tags: Vec<&str> = text.lines().map(str::trim).filter(|s| !s.is_empty()).collect();
+        assert!(
+            (4000..=5000).contains(&tags.len()),
+            "RAM zh 词表条数异常: {}（应为 4,585 量级）",
+            tags.len()
+        );
+        let hits = tags.iter().filter(|t| builtin_tag_code(t).is_some()).count();
+        // 收缩报警：静态命中不得低于基线 44 的九成。总覆盖主体在动态轨（66.1%），
+        // 此处数字小是结构性的（RAM 通用词 vs ② 维度根策展表），不是缺陷。
+        assert!(
+            hits >= 40,
+            "RAM zh 词表静态受控命中 {hits}/{} 低于收缩下界 40，② 覆盖疑似回退",
+            tags.len()
+        );
+        eprintln!("[metrics] RAM zh 词表静态受控命中: {hits}/{}（动态轨合并基线 3,029/4,585 = 66.1%）", tags.len());
+    }
+
+    /// ★ 跨注册表一致性门禁（GH #719）：`BUILTIN_ALIASES`（②）与
+    /// `builtin-tag-identity.json`（③，pro `step0` 由 `fileDimension_en-US.json` 派生）
+    /// 对同一 zh 别名必须给出**同一 code**。
+    ///
+    /// 2026-10-04 已把 ② 的 121 条漂移修正为对齐 ③（**仅修分歧、不扩表**，行数保持 537）。
+    /// 本门禁防止再次漂移。③ 文件属 `apps/desktop/build/`（构建产物，可能不存在于干净环境），
+    /// 故文件缺失时**跳过**而非失败。
+    #[test]
+    fn builtin_aliases_agree_with_tag_identity_json() {
+        let json_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../apps/desktop/build/presetResources/taxonomy/builtin-tag-identity.json");
+        let text = match std::fs::read_to_string(&json_path) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("[skip] 未找到 {json_path:?}（构建产物缺失），跳过 ②↔③ 门禁");
+                return;
+            }
+        };
+
+        // 极简提取：从 JSON 里取每个 tags[] 条目的 code 与 aliases["zh-CN"]。
+        // （不引入 serde_json 依赖；③ 的条目字段顺序稳定，按文本匹配足够可靠。）
+        let mut expected: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for cap in text.split("\"code\": \"").skip(1) {
+            let code = cap.split('"').next().unwrap_or("");
+            if !code.starts_with("builtin.") {
+                continue;
+            }
+            if let Some(seg) = cap.split("\"zh-CN\": \"").nth(1) {
+                let zh = seg.split('"').next().unwrap_or("");
+                if !zh.is_empty() {
+                    expected.entry(zh.to_string()).or_insert_with(|| code.to_string());
+                }
+            }
+        }
+        assert!(
+            expected.len() > 500,
+            "③ 解析异常（仅 {} 条 zh 别名），怀疑 JSON 结构变更",
+            expected.len()
+        );
+
+        let mut drift: Vec<String> = Vec::new();
+        // #729 裁决落地：`img` 与 `纯文字` 均已对齐 ③ builtin-tag-identity.json，实现 0 豁免闭环。
+        for zh in expected.keys() {
+            if let Some(actual) = builtin_tag_code(zh) {
+                if actual != expected[zh] {
+                    drift.push(format!("{zh}: ②={actual} ③={}", expected[zh]));
+                }
+            }
+        }
+        drift.sort();
+        assert!(
+            drift.is_empty(),
+            "② BUILTIN_ALIASES 与 ③ builtin-tag-identity.json 漂移（{} 条）:\n{}",
+            drift.len(),
+            drift.join("\n")
+        );
+    }
+
+    /// 桥接表契约：目标词必须已在别名表内且落在 [`GATE_CODES`]；源词必须不在别名表（防冗余）。
+    #[test]
+    fn loose_gate_aliases_are_not_in_alias_table() {
+        for (loose, canonical) in LOOSE_GATE_ALIASES {
+            assert!(
+                builtin_tag_code(loose).is_none(),
+                "桥接源词 {loose} 已在别名表内，属冗余条目"
+            );
+            let code = builtin_tag_code(canonical)
+                .unwrap_or_else(|| panic!("桥接目标 {canonical} 不在别名表内"));
+            assert!(
+                GATE_CODES.contains(&code),
+                "桥接目标 {canonical} → {code} 不在 GATE_CODES 内"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_tag_set_is_idempotent_across_locales() {
+        let zh_set = vec![
+            "截图".to_string(),
+            "设计稿".to_string(),
+            "有字图".to_string(),
+        ];
+        let en_set = vec![
+            "Screenshot".to_string(),
+            "Design Draft".to_string(),
+            "Image With Text".to_string(),
+        ];
+        let a = normalize_tag_set_to_codes(&zh_set);
+        let b = normalize_tag_set_to_codes(&en_set);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 3);
+    }
+
+    #[test]
+    fn unknown_tag_falls_back_to_ext() {
+        let code = normalize_tag_to_code("深度强化学习");
+        assert!(code.starts_with("_ext."));
+        // 不同原串同 slug 时 hash 不同
+        let c2 = normalize_tag_to_code("Deep Reinforcement Learning");
+        assert_ne!(code, c2);
+    }
+
+    #[test]
+    fn p0_vision_gating_concept_matching() {
+        // 英文模型输出与中文规则 canonical 对齐（vision 门控语义）
+        assert!(tag_matches_concept("Screenshot", "截图"));
+        assert!(tag_matches_concept("Portrait Photography", "人像写真"));
+        assert!(tag_matches_concept("Person Photo", "人物照"));
+        assert!(tag_matches_concept("Natural Landscape", "自然景观"));
+        assert!(tag_matches_concept("Image Without Text", "无字图"));
+        assert!(tag_matches_concept("Design Draft", "设计稿"));
+        assert!(!tag_matches_concept("Screenshot", "人像写真"));
+
+        // zh/en 候选集经归一后 code 集合一致（P0）
+        let zh = vec![
+            "截图".to_string(),
+            "人像写真".to_string(),
+            "无字图".to_string(),
+        ];
+        let en = vec![
+            "Screenshot".to_string(),
+            "Portrait Photography".to_string(),
+            "Image Without Text".to_string(),
+        ];
+        assert_eq!(normalize_tag_set_to_codes(&zh), normalize_tag_set_to_codes(&en));
+        assert_eq!(en_builtin_code("Screenshot"), "builtin.screenshot");
+    }
+
+    #[test]
+    fn ext_same_slug_different_raw_are_distinct() {
+        let a = derive_ext_tag_code("Go");
+        let b = derive_ext_tag_code("go");
+        assert_ne!(a, b);
+        assert!(a.starts_with("_ext."));
+    }
+
+    /// G1 词形闸（spec §6.9.3 / 验收 V10）：四类坏名**不得**产出 `_ext.*` 概念。
+    ///
+    /// 闸门位置 = `normalize_tag_to_code`（「候选词 → code」主入口），而非 `derive_ext_tag_code`
+    /// （纯生成器，见其文档注释：策展资产如 RAM 投影表的 `zh` 键含 `/`，不可用 G1 去筛）。
+    #[test]
+    fn g1_rejects_mojibake_before_minting_ext_code() {
+        for bad in [
+            "\u{FFFD}\u{FFFD}\u{FFFD}乱码", // U+FFFD 替换字符
+            "袁浩, 李晓红编著\u{0}",        // NUL 控制字符
+            "Exclude\u{f023}T,",            // 私用区 PUA
+            "\u{80}abc",                    // C1 控制字符（U+0080 PAD，非 White_Space）
+            "ӉӉӉ汉",                        // 单串多脚本混杂（R-G1-11）
+        ] {
+            let code = normalize_tag_to_code(bad);
+            assert!(
+                crate::tag_admissibility::is_rejected_code(&code),
+                "坏名不得铸造 code: {bad:?} → {code}"
+            );
+        }
+    }
+
+    /// 幂等短路：已是合法 code 形态的输入必须**原样返回**，不得再走派生。
+    ///
+    /// 必要性：G1 会拒绝含 `.` 的串（`.` 非白名单文种亦非中性字符），无短路会把
+    /// `_ext.foo.12345678` 这类合法 code 先判「不合格」而返回空哨兵——把合法标签误杀。
+    /// （S1 #705 第 1 轮审查：该短路此前零测试覆盖。）
+    #[test]
+    fn idempotent_short_circuit_returns_code_form_as_is() {
+        for code in [
+            "_ext.foo.12345678",
+            "builtin.invoice",
+            "omw.01846331.n",
+            "hownet.002",
+        ] {
+            assert_eq!(
+                normalize_tag_to_code(code),
+                code,
+                "code 形态输入应原样返回: {code}"
+            );
+        }
+    }
+
+    /// 闸门不得误伤策展资产：RAM++ 投影表的 `zh` 键含 `/`（多义项 gloss），
+    /// 经 `derive_ext_tag_code` 仍须产出合法 `_ext.*`（纯生成器不做准入校验）。
+    #[test]
+    fn derive_ext_tag_code_stays_pure_for_curated_gloss_keys() {
+        for gloss in ["胡同/球道", "检查/支票", "一本/一册"] {
+            let code = derive_ext_tag_code(gloss);
+            assert!(
+                code.starts_with("_ext.") && !code.is_empty(),
+                "策展 gloss 键必须仍能派生 code: {gloss} → {code}"
+            );
+        }
+    }
+
+    /// 正例零误杀：合法词仍正常铸造，且拒绝不污染 code 集合。
+    #[test]
+    fn g1_allows_positive_and_filters_rejected_from_set() {
+        assert!(normalize_tag_to_code("手机照片").starts_with("builtin.") || normalize_tag_to_code("手机照片").starts_with("_ext."));
+        assert!(normalize_tag_to_code("Документы").starts_with("_ext."));
+        let mixed = vec![
+            "手机照片".to_string(),
+            "\u{FFFD}\u{FFFD}乱码".to_string(),
+            "Документы".to_string(),
+        ];
+        let codes = normalize_tag_set_to_codes(&mixed);
+        assert_eq!(codes.len(), 2, "空串哨兵必须被滤除: {codes:?}");
+        assert!(codes.iter().all(|c| !c.is_empty()));
+    }
+
+    #[test]
+    fn test_detect_fact_language_and_metadata_code() {
+        use crate::concepts::Concept;
+
+        // 1. 中文真实 ASR 语音文本测试 (Azure - 云希 样本真实文本)
+        let asr_zh = "陈博演微微有两秒的停顿，没有说什么，只是重新转过头去发动车子。";
+        assert_eq!(detect_fact_language(asr_zh), Some(Concept::中文));
+
+        // 2. 英文 ASR 文本
+        let asr_en = "Welcome to Firefly AI Folder offline multi-modal desktop assistant.";
+        assert_eq!(detect_fact_language(asr_en), Some(Concept::英文));
+
+        // 3. 日文假名
+        let text_ja = "これはローカルで動作するインテリジェントなファイル管理システムです。";
+        assert_eq!(detect_fact_language(text_ja), Some(Concept::日语));
+
+        // 4. 韩文谚文
+        let text_ko = "안녕하세요 파이어플라이 폴더 관리 시스템입니다.";
+        assert_eq!(detect_fact_language(text_ko), Some(Concept::韩语));
+
+        // 5. 纯数字、标点符号、空文本等无语种客观事实场景必须返回 None（宁缺勿错）
+        assert_eq!(detect_fact_language(""), None);
+        assert_eq!(detect_fact_language("   "), None);
+        assert_eq!(detect_fact_language("1234567890"), None);
+        assert_eq!(detect_fact_language("... --- ..."), None);
+        assert_eq!(detect_fact_language("a"), None); // 极短单个字符不推导
+
+        // 6. 音频元数据代码解析
+        assert_eq!(concept_from_language_code("zh-CN"), Some(Concept::中文));
+        assert_eq!(concept_from_language_code("chi"), Some(Concept::中文));
+        assert_eq!(concept_from_language_code("en-US"), Some(Concept::英文));
+        assert_eq!(concept_from_language_code("japanese"), Some(Concept::日语));
+        assert_eq!(concept_from_language_code("unknown_code"), None);
+    }
+
+    #[test]
+    fn test_is_image_exclusive_tag_coverage() {
+        // 1. 截图家族：涵盖多语言别名、中文名与受控 code
+        assert!(is_image_exclusive_tag("截图"));
+        assert!(is_image_exclusive_tag("Screenshot"));
+        assert!(is_image_exclusive_tag("hownet.000000135085.v"));
+        assert!(is_image_exclusive_tag("Windows截图"));
+        assert!(is_image_exclusive_tag("builtin.windows_screenshot"));
+        assert!(is_image_exclusive_tag("游戏截图"));
+        assert!(is_image_exclusive_tag("builtin.game_screenshot"));
+        assert!(is_image_exclusive_tag("UI界面截图"));
+        assert!(is_image_exclusive_tag("聊天截图"));
+
+        // 2. 摄影照片家族：涵盖摄影题材细分
+        assert!(is_image_exclusive_tag("摄影照片"));
+        assert!(is_image_exclusive_tag("builtin.photography"));
+        assert!(is_image_exclusive_tag("风景照"));
+        assert!(is_image_exclusive_tag("builtin.landscape_photos"));
+        assert!(is_image_exclusive_tag("人物照"));
+        assert!(is_image_exclusive_tag("婚纱照"));
+        assert!(is_image_exclusive_tag("夜景照"));
+        assert!(is_image_exclusive_tag("建筑摄影"));
+        assert!(is_image_exclusive_tag("微距摄影"));
+
+        // 3. 负例：通用多模态或视频适用的内容标签不得被误杀
+        assert!(!is_image_exclusive_tag("猫"));
+        assert!(!is_image_exclusive_tag("黄昏"));
+        assert!(!is_image_exclusive_tag("实拍"));
+        assert!(!is_image_exclusive_tag("全彩"));
+        assert!(!is_image_exclusive_tag("有字图"));
+        assert!(!is_image_exclusive_tag(""));
+    }
+
+    #[test]
+    fn test_tag_display_content_rating_and_root_dimensions() {
+        // 核心受控根维度及二级分级维度中英文展示验证 (杜绝中文环境下误退化为英文 slug)
+        assert_eq!(tag_display("builtin.content_rating", "zh"), "内容分级");
+        assert_eq!(tag_display("builtin.content_rating", "en"), "Content Rating");
+
+        // 色情分级虽未在 BUILTIN_ALIASES 登记，但在中文环境下经 Concept 权威兜底稳定输出 "色情分级"
+        assert_eq!(tag_display("builtin.erotic_scale", "zh"), "色情分级");
+
+        assert_eq!(tag_display("builtin.file_type", "zh"), "文件类型");
+        assert_eq!(tag_display("builtin.file_type", "en"), "File Type");
+
+        assert_eq!(tag_display("builtin.file_purpose", "zh"), "文件用途");
+        assert_eq!(tag_display("builtin.file_purpose", "en"), "File Purpose");
+    }
+
+    // GH #724：依赖动态别名字典（进程级 static RwLock）的用例已移入独立集成测试
+    // 二进制 `crates/omni-core/tests/dynamic_aliases_isolation.rs`——它们会 clear/load
+    // 该全局字典，与同进程并行读取该字典的用例互踩（ADR-0048 评审 BLOCKER-1）。
+    // 进程隔离后，本文件不再有任何全局字典写入，读取方天然确定。
+}

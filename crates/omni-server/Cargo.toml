@@ -5,9 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "0.22"
 omni-core = { path = "../omni-core" }
 omni-extract = { path = "../omni-extract" }
-omni-vision = { path = "../omni-vision" }
 omni-pro = { path = "../../omni-pro", package = "omni-pro" }
 axum.workspace = true
 tower-http.workspace = true
@@ -16,9 +16,34 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+image.workspace = true
+chrono.workspace = true
 tokio-stream = "0.1"
 futures-util = "0.3"
+rusqlite = { workspace = true }
+zstd = { workspace = true }
+aes-gcm = { workspace = true }
+crc32fast = { workspace = true }
+rand = { workspace = true }
+ignore = "0.4"
+sherpa-onnx = { workspace = true }
+ort = { workspace = true }
+ndarray = "0.16"
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+jieba-rs = { workspace = true }
+unicode-segmentation = { workspace = true }
+roaring = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Foundation",
+  "Win32_System_DataExchange",
+  "Win32_System_LibraryLoader",
+  "Win32_Graphics_Gdi",
+] }
 
 [dev-dependencies]
 tower = { workspace = true }
-image = { workspace = true }
+tempfile = "3"
+urlencoding = "2.1"

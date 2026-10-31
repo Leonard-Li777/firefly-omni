@@ -10,10 +10,21 @@ pub fn is_pro_enabled() -> bool {
 pub mod geo {
     use super::*;
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct GeoQueryPoint {
-        pub lat: f64,
-        pub lng: f64,
+        pub latitude: f64,
+        pub longitude: f64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct GeoPlaceResult {
+        pub found: bool,
+        pub country: Option<String>,
+        pub province: Option<String>,
+        pub city: Option<String>,
+        pub distance_km: Option<f64>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,7 +34,7 @@ pub mod geo {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub dataset_version: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub results: Option<Vec<serde_json::Value>>,
+        pub results: Option<Vec<GeoPlaceResult>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub reason: Option<String>,
     }
@@ -141,3 +152,1940 @@ pub mod cover {
 }
 
 pub use cover::{raw_to_webp, CoverRenderer};
+
+
+pub mod representative {
+    use image::RgbImage;
+
+    #[derive(Clone, Debug)]
+    pub struct RepresentativeFrameCandidate {
+        pub score: f32,
+        pub timestamp_sec: f64,
+        pub scan_index: usize,
+        pub frame: RgbImage,
+    }
+
+    pub struct RepresentativeFrameSelector {
+        _total_duration_sec: f64,
+        _total_planned_frames: usize,
+    }
+
+    impl RepresentativeFrameSelector {
+        pub fn new(total_duration_sec: f64, total_planned_frames: usize) -> Self {
+            Self {
+                _total_duration_sec: total_duration_sec,
+                _total_planned_frames: total_planned_frames,
+            }
+        }
+        pub fn observe(&mut self, _frame: &RgbImage, _timestamp_sec: f64, _scan_index: usize) {}
+        pub fn finish(self) -> Option<RgbImage> {
+            None
+        }
+        pub fn finish_with_candidate(self) -> Option<RepresentativeFrameCandidate> {
+            None
+        }
+    }
+}
+pub use representative::*;
+
+pub mod perceive {
+    use std::path::Path;
+
+    pub fn detect_watermark_level(_img: &image::DynamicImage) -> u8 {
+        0
+    }
+
+    pub fn detect_watermark_status(_img: &image::DynamicImage) -> &'static str {
+        "none"
+    }
+
+    pub fn detect_mosaic_level(_img: &image::DynamicImage) -> u8 {
+        0
+    }
+
+    pub fn detect_mosaic_status(_img: &image::DynamicImage) -> &'static str {
+        "none"
+    }
+
+    pub fn detect_exif_orientation_fast<P: AsRef<Path>>(_path: P) -> Option<String> {
+        None
+    }
+
+    pub fn detect_ntfs_zone_identifier<P: AsRef<Path>>(_path: P) -> (Option<String>, Option<String>, Option<String>) {
+        (None, None, None)
+    }
+
+    pub fn detect_ntfs_zone_identifier_with_lang<P: AsRef<Path>>(_path: P, _lang: Option<&str>) -> (Option<String>, Option<String>, Option<String>) {
+        (None, None, None)
+    }
+
+    pub fn detect_workflow_state(_path_str: &str, _metadata: &serde_json::Value) -> String {
+        "unarchived".to_string()
+    }
+
+    pub fn detect_security_level(_path_str: &str, _content_preview: &str) -> String {
+        "public".to_string()
+    }
+
+    pub fn evaluate_image_aesthetic_and_quality(_img: &image::DynamicImage, _exif_orientation: Option<&str>) -> (f32, Vec<String>) {
+        (7.5, Vec::new())
+    }
+
+    pub fn infer_image_modal_type(
+        _img: &image::DynamicImage,
+        _morphology_tags: &[String],
+        _clip_tags: &[String],
+        _nsfw_tags: &[String],
+        _has_text: bool,
+        _file_name: &str,
+    ) -> String {
+        "摄影照片".to_string()
+    }
+
+    /// 事实标签提取存根 (Task 2)：开源构建下不发生原生事实标签抽取
+    ///
+    /// 与 `omni-extract::fact_tags::OmniFactTagExtractor` 保持 API 形制一致，
+    /// 开源模式恒返回空集合（Pro 版由真实 omni-extract 实现）。
+    pub fn extract_fact_tags(_metadata: &serde_json::Value) -> Vec<omni_core::TagChainItem> {
+        Vec::new()
+    }
+
+    pub fn detect_video_dynamic_watermark(_video_path: &Path) -> (u8, &'static str) {
+        (0, "none")
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct VideoProcessTimings {
+        pub ffmpeg_ms: u64,
+        pub decode_ms: u64,
+        pub vision_ms: u64,
+        /// 本次实际分析的时长上限（镜像私有版契约）；桩恒为 `None`
+        pub analysis_duration_sec: Option<f64>,
+        pub visual_analysis_duration_sec: Option<f64>,
+        pub audio_analysis_duration_sec: Option<f64>,
+        pub video_truncated: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct VideoDecoupledBudget {
+        pub video_duration_sec: f64,
+        pub audio_duration_sec: f64,
+        pub effective_interval_sec: f64,
+        pub estimated_frames: usize,
+        pub audio_truncated: bool,
+        pub video_truncated: bool,
+    }
+
+    /// 纯音频管线综合 RTF（镜像私有版契约）
+    pub const AUDIO_PIPELINE_REALTIME_FACTOR: f64 = 0.20;
+
+    /// 单文件「向量化 + ASR」预算（镜像私有版契约：总 120s − AI 阶段预留 30s）
+    pub const VIDEO_ANALYSIS_BUDGET_SEC: f64 = 90.0;
+
+    /// 预算内预留的固定开销（镜像私有版契约）
+    pub const VIDEO_ANALYSIS_FIXED_OVERHEAD_SEC: f64 = 5.0;
+
+    /// 纯音频在单文件预算内可分析的最大时长（镜像私有版契约，公式同私有版）
+    pub fn max_audio_analysis_duration_sec() -> f64 {
+        (VIDEO_ANALYSIS_BUDGET_SEC - VIDEO_ANALYSIS_FIXED_OVERHEAD_SEC)
+            / AUDIO_PIPELINE_REALTIME_FACTOR
+    }
+
+    /// 视频帧视觉软 token 预算下界（开源桩镜像私有版契约，保证调用方 API 一致）
+    ///
+    /// 2026-10-24 D3 裁决：70 档由 48 档替换（两者检索一致性相同，48 快 35%）
+    pub const VIDEO_SOFT_TOKEN_BUDGET_MIN: usize = 48;
+
+    /// 视频帧视觉软 token 预算上界
+    pub const VIDEO_SOFT_TOKEN_BUDGET_MAX: usize = 140;
+
+    /// 视频帧视觉软 token 预算缺省值
+    pub const VIDEO_SOFT_TOKEN_BUDGET_DEFAULT: usize = VIDEO_SOFT_TOKEN_BUDGET_MAX;
+
+    /// 将软 token 预算收敛到受支持区间（镜像私有版行为）
+    pub fn normalize_video_soft_token_budget(budget: usize) -> usize {
+        budget.clamp(VIDEO_SOFT_TOKEN_BUDGET_MIN, VIDEO_SOFT_TOKEN_BUDGET_MAX)
+    }
+
+    /// 按执行后端归一软 token 预算（镜像私有版签名）
+    ///
+    /// 开源桩不含视觉塔与执行后端，故 `has_accelerator` 分支无实际作用，
+    /// 保留同签名只为让调用方代码在两种构建下都能编译。
+    pub fn resolve_video_soft_token_budget(requested: usize, _has_accelerator: bool) -> usize {
+        normalize_video_soft_token_budget(requested)
+    }
+
+    pub fn solve_video_analysis_budget_decoupled_with_asr(
+        duration_sec: f64,
+        _soft_token_budget: usize,
+        min_interval_sec: f64,
+        _asr_cap_sec: f64,
+        _skip_decode_rate: f64,
+    ) -> VideoDecoupledBudget {
+        VideoDecoupledBudget {
+            video_duration_sec: duration_sec,
+            audio_duration_sec: duration_sec.min(30.0),
+            effective_interval_sec: min_interval_sec.max(1.0),
+            estimated_frames: 1,
+            audio_truncated: false,
+            video_truncated: false,
+        }
+    }
+
+    /// 开源桩无硬件加速后端
+    pub fn video_accelerator_available() -> bool {
+        false
+    }
+
+    pub fn process_video_time_chunks(
+        _video_path: &Path,
+        _sampling_interval_seconds: f32,
+        _asr_text: Option<&str>,
+    ) -> Vec<omni_core::OmniVideoChunk> {
+        Vec::new()
+    }
+
+    pub fn process_video_time_chunks_with_timings(
+        _video_path: &Path,
+        _sampling_interval_seconds: f32,
+        _asr_text: Option<&str>,
+        _soft_token_budget: usize,
+        _audio_analysis_duration_sec: Option<f64>,
+    ) -> (Vec<omni_core::OmniVideoChunk>, VideoProcessTimings) {
+        (Vec::new(), VideoProcessTimings::default())
+    }
+
+    pub fn process_video_time_chunks_with_representative(
+        _video_path: &Path,
+        _sampling_interval_seconds: f32,
+        _asr_text: Option<&str>,
+        _soft_token_budget: usize,
+        _audio_analysis_duration_sec: Option<f64>,
+    ) -> (Vec<omni_core::OmniVideoChunk>, VideoProcessTimings, Option<image::RgbImage>) {
+        (Vec::new(), VideoProcessTimings::default(), None)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ShotDetectDegrade {
+        FilterUnavailable,
+        InvocationFailed,
+        EmptyOutput,
+    }
+
+    impl ShotDetectDegrade {
+        pub fn is_expected(&self) -> bool {
+            matches!(self, Self::FilterUnavailable)
+        }
+    }
+
+    pub const MAX_SCDET_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+    pub const SCDET_DEFAULT_THRESHOLD: f64 = 10.0;
+
+    pub fn parse_scdet_cuts(_output: &str) -> Result<Vec<f64>, ShotDetectDegrade> {
+        Ok(Vec::new())
+    }
+
+    pub fn split_video_by_shots(
+        _total_duration_sec: f32,
+        _cuts: &[f64],
+        _max_chunk_sec: f32,
+    ) -> Vec<(usize, f32, f32)> {
+        Vec::new()
+    }
+
+    pub fn detect_shot_cuts(_ffmpeg_path: &Path, _video_path: &Path) -> Result<Vec<f64>, ShotDetectDegrade> {
+        Err(ShotDetectDegrade::FilterUnavailable)
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct VideoShotBudget {
+        pub selected_shots: Vec<(usize, f32, f32)>,
+        pub analysis_duration_sec: f64,
+        pub truncated: bool,
+        pub estimated_cost_sec: f64,
+    }
+
+    pub fn solve_video_shots_budget(
+        _total_duration_sec: f64,
+        _raw_cuts: &[f64],
+        _soft_token_budget: usize,
+        _asr_cap_sec: f64,
+    ) -> VideoShotBudget {
+        VideoShotBudget {
+            selected_shots: Vec::new(),
+            analysis_duration_sec: 0.0,
+            truncated: false,
+            estimated_cost_sec: 0.0,
+        }
+    }
+
+    pub fn detect_shot_cuts_with_options(
+        _ffmpeg_path: &Path,
+        _video_path: &Path,
+        _threshold: f64,
+        _duration_sec: Option<f64>,
+        _max_probe_sec: Option<f64>,
+    ) -> Result<Vec<f64>, ShotDetectDegrade> {
+        Err(ShotDetectDegrade::FilterUnavailable)
+    }
+}
+
+pub mod vision {
+    use std::path::Path;
+
+    /// 无 pro 资产构建下的降级实现。
+    ///
+    /// 虽然 CLIP 词表层与 NSFW 模型层不可用，但**「敏感内容」子树判据纯词表/受控码，
+    /// 不依赖任何 pro 资产**，故必须委托 `omni_core::is_sensitive_subtree_tag`。
+    /// 早期此处恒返回 `false`（静默放行全部敏感叶子），一旦以 stub 构建，
+    /// 全年龄纯净闸与词表闸会同时失效且无任何告警——属 AGENTS §2.9 禁止的静默降级。
+    pub fn is_nsfw_or_restricted_tag(word: &str) -> bool {
+        omni_core::is_sensitive_subtree_tag(word)
+    }
+
+    /// 签名必须与 pro 版 `omni_vision::is_vocab_layer_blocked(word, is_zh)` **完全一致**，
+    /// 否则 feature 切换（pro 资产缺失 ⇒ 走 stub）时调用方无法共用同一调用点、直接编译失败。
+    pub fn is_vocab_layer_blocked(word: &str, _is_zh: bool) -> bool {
+        omni_core::is_sensitive_subtree_tag(word)
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct OCRBoxResult {
+        pub box_rect: [u32; 4],
+        pub text: String,
+        pub confidence: f32,
+    }
+
+    pub struct OmniVisionEngine;
+
+    impl OmniVisionEngine {
+        pub fn detect_mime_type<P: AsRef<Path>>(path: P) -> anyhow::Result<String> {
+            let p = path.as_ref();
+            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                let mime = match ext.to_lowercase().as_str() {
+                    "png" => "image/png",
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    "bmp" => "image/bmp",
+                    "pdf" => "application/pdf",
+                    "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "mp3" => "audio/mpeg",
+                    "mp4" => "video/mp4",
+                    "json" => "application/json",
+                    "txt" | "md" => "text/plain",
+                    _ => "application/octet-stream",
+                };
+                return Ok(mime.to_string());
+            }
+            Ok("application/octet-stream".to_string())
+        }
+
+        pub fn group_boxes_into_lines(_boxes: Vec<OCRBoxResult>) -> String {
+            String::new()
+        }
+
+        pub fn ctc_decode(_preds: &[f32], _char_list: &[&str], _seq_len: usize, _num_classes: usize) -> (String, f32) {
+            (String::new(), 0.0)
+        }
+
+        pub fn fast_detect_has_text(_img: &image::DynamicImage) -> bool {
+            true
+        }
+
+        pub fn recognize_ocr_text_with_size<P: AsRef<Path>>(_image_path: P, _model_size: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        pub fn recognize_ocr_text<P: AsRef<Path>>(_image_path: P) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        pub fn recognize_ocr_dynamic_image(_img: &image::DynamicImage, _model_size: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        pub fn recognize_ocr_image_bytes(_bytes: &[u8], _model_size: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        pub fn extract_clip_visual_tags_from_image(
+            _img: &image::DynamicImage,
+            _lang: Option<&str>,
+            _top_k: usize,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn extract_ram_tags(
+            _img: &image::DynamicImage,
+            _lang: Option<&str>,
+            _top_k: usize,
+        ) -> Vec<omni_core::TagChainItem> {
+            Vec::new()
+        }
+
+        pub fn resolve_tag_to_chain_item(tag: &str, confidence: f32) -> omni_core::TagChainItem {
+            // G1 词形闸（拒绝先于铸造）：开源兜底同样不得为不合格词产出 code。
+            // 闸与铸造**必须同源取自修剪后串**（S1 #705 第 1 轮 P2-5）：若闸判 trim 串、
+            // 铸造用原串，`"\u{85}abc"` 会产出 `builtin.\u{85}abc`——C1 控制字符直入 code/name。
+            // 与 `omni_core::tag_identity::normalize_tag_to_code` 的「trim 一次、两处同用」保持一致。
+            let tag_clean = tag.trim();
+            if omni_core::tag_admissibility::is_g1_rejected(tag_clean) {
+                return omni_core::TagChainItem {
+                    code: String::new(),
+                    name: String::new(),
+                    confidence,
+                    ..Default::default()
+                };
+            }
+            omni_core::TagChainItem {
+                code: format!("builtin.{}", tag_clean),
+                name: tag_clean.to_string(),
+                confidence,
+                ..Default::default()
+            }
+        }
+
+        pub fn resolve_tag_to_chain_item_with_lang(
+            tag: &str,
+            confidence: f32,
+            _current_lang: Option<&str>,
+        ) -> omni_core::TagChainItem {
+            Self::resolve_tag_to_chain_item(tag, confidence)
+        }
+
+        pub fn calibrate_clip_score(sim: f32) -> f32 {
+            sim
+        }
+
+        pub fn apply_domain_matrix_gating(
+            _tags: &mut Vec<String>,
+            _clip_mutual_tags: &[(String, f32, &'static str)],
+            _photo_type: Option<&str>,
+            _engine_lookup: &std::collections::HashMap<String, String>,
+        ) {}
+
+        pub fn extract_clip_visual_tags_scored_from_image(
+            _img: &image::DynamicImage,
+            _lang: Option<&str>,
+            _top_k: usize,
+        ) -> Vec<(String, f32)> {
+            Vec::new()
+        }
+
+        pub fn extract_gemma_visual_tags_scored_from_image(
+            _img: &image::DynamicImage,
+            _top_k: usize,
+        ) -> Vec<(String, f32)> {
+            Vec::new()
+        }
+
+        pub fn set_gemma_mrl_dimension(_dim: usize) {}
+
+        pub fn gemma_mrl_dimension() -> usize {
+            512
+        }
+
+        pub fn encode_gemma_text(_text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+
+        pub fn encode_gemma_image(_img: &image::DynamicImage) -> anyhow::Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+
+        pub fn gemma_vision_status() -> String {
+            "uninitialized".to_string()
+        }
+
+        pub fn ram_vision_status() -> String {
+            "disabled: pro_stub".to_string()
+        }
+
+        pub fn evict_gemma_vision() {}
+
+        pub fn is_gemma_vision_resident() -> bool {
+            false
+        }
+
+        pub fn extract_clip_visual_tags_from_image_with_hint(
+            _img: &image::DynamicImage,
+            _path_hint: Option<&str>,
+            _lang: Option<&str>,
+            _top_k: usize,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn extract_clip_visual_tags<P: AsRef<Path>>(
+            _image_path: P,
+            _lang: Option<&str>,
+            _top_k: usize,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn extract_clip_high_confidence_tags(
+            _img: &image::DynamicImage,
+            _path_hint: Option<&str>,
+            _lang: Option<&str>,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn extract_morphology_tags(
+            _img: &image::DynamicImage,
+            _has_text: bool,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn extract_morphology_high_confidence_tags(
+            _img: &image::DynamicImage,
+            _has_text: bool,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn detect_nsfw_tags_and_rating(
+            _img: &image::DynamicImage,
+            _ocr_text: &str,
+            _clip_tags: &[String],
+        ) -> (Vec<String>, Vec<String>, Option<String>) {
+            (Vec::new(), Vec::new(), None)
+        }
+
+        pub fn detect_is_black_and_white(_img: &image::DynamicImage) -> bool {
+            false
+        }
+
+        pub fn detect_resolution_quality(_width: u32, _height: u32) -> Option<omni_core::concepts::Concept> {
+            None
+        }
+
+        pub fn detect_background_type(_img: &image::DynamicImage) -> omni_core::concepts::Concept {
+            omni_core::concepts::Concept::实景背景
+        }
+
+        pub fn detect_aspect_ratio_type(_width: u32, _height: u32) -> omni_core::concepts::Concept {
+            omni_core::concepts::Concept::正方形
+        }
+
+        pub fn detect_text_density(_ocr_char_count: usize, _has_large_title: bool) -> Option<omni_core::concepts::Concept> {
+            None
+        }
+
+        pub fn detect_main_color_and_series(_img: &image::DynamicImage) -> (Option<omni_core::concepts::Concept>, Option<omni_core::concepts::Concept>) {
+            (Some(omni_core::concepts::Concept::中性黑白灰), Some(omni_core::concepts::Concept::黑色))
+        }
+
+        pub fn derive_morphology_tags(
+            _aspect_ratio: f32,
+            _has_text: bool,
+            _is_bw: bool,
+        ) -> (Vec<String>, Vec<String>) {
+            (Vec::new(), Vec::new())
+        }
+
+        pub fn run_nsfw_model(_img: &image::DynamicImage) -> Option<[f32; 5]> {
+            None
+        }
+
+        pub fn derive_nsfw_tags_and_rating_from_probs(
+            _probs_opt: Option<[f32; 5]>,
+            _ocr_text: &str,
+            _clip_tags: &[String],
+        ) -> (Vec<String>, Vec<String>, Option<String>) {
+            (vec!["全年龄".to_string()], Vec::new(), Some("safe".to_string()))
+        }
+
+        pub fn derive_nsfw_tags_and_rating_full(
+            _probs_opt: Option<[f32; 5]>,
+            _ocr_text: &str,
+            _clip_tags: &[String],
+            _lang: Option<&str>,
+            _path_hint: Option<&str>,
+        ) -> (Vec<String>, Vec<String>, Option<String>) {
+            (vec!["全年龄".to_string()], Vec::new(), Some("safe".to_string()))
+        }
+
+        pub fn extract_clip_image_embedding(
+            _img: &image::DynamicImage,
+            _lang: Option<&str>,
+        ) -> Option<(Vec<f32>, u8)> {
+            None
+        }
+
+        pub fn classify_mutual_exclusive_groups(
+            _image_embedding: &[f32],
+            _lang: Option<&str>,
+        ) -> Vec<(String, f32, &'static str)> {
+            Vec::new()
+        }
+
+        pub fn apply_mutual_exclusion_gating(
+            _tags: &mut Vec<String>,
+            _clip_mutual_tags: &[(String, f32, &'static str)],
+            _content_rating: Option<&str>,
+            _sensitive_types: &[String],
+            _quality_score: Option<f32>,
+        ) {}
+
+        pub fn synthesize_cascade_hypotheses_and_arbitrate(
+            _file_path: &str,
+            _system_dimension_tags: &[String],
+            _ram_tags: &[omni_core::TagChainItem],
+            _morphology_tags: &[String],
+            _nsfw_tags: &[String],
+            _image_embedding: Option<&[f32]>,
+            _lang: Option<&str>,
+        ) -> (
+            Vec<omni_core::CandidateHypothesisItem>,
+            Option<omni_core::WinningHypothesisItem>,
+            Vec<omni_core::TagChainItem>,
+            Option<String>,
+            Option<String>,
+            Vec<String>,
+        ) {
+            (Vec::new(), None, Vec::new(), None, None, Vec::new())
+        }
+
+        pub fn derive_nsfw_high_confidence_tags(
+            _tags: &[String],
+            _rating: Option<&str>,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+    }
+}
+
+pub use vision::{is_nsfw_or_restricted_tag, is_vocab_layer_blocked, OCRBoxResult, OmniVisionEngine};
+
+pub mod hownet {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HowNetEntry {
+        pub id: i64,
+        pub wc: String,
+        pub we: String,
+        pub gc: Option<String>,
+        pub ge: Option<String>,
+        pub rmk: Option<String>,
+        pub is_common: bool,
+        pub rmk_category: Option<String>,
+        pub def: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct WordSlot {
+        pub slot_name: String,
+        pub zh: String,
+        pub target_value: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct RamAlignmentInfo {
+        pub ram_word: String,
+        pub level: i32,
+        pub hownet_entry_id: i64,
+        pub we_alias: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HowNetDescribeResult {
+        pub word: String,
+        pub found: bool,
+        pub is_aligned: bool,
+        pub alignment_level: Option<i32>,
+        pub top_concept: Option<String>,
+        pub slots: Vec<WordSlot>,
+        pub synonyms: Vec<String>,
+        pub antonyms: Vec<String>,
+        pub description: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HowNetDescribeRequest {
+        pub word: String,
+    }
+
+    pub struct OmniHowNetService;
+
+    impl OmniHowNetService {
+        pub fn unavailable() -> Self {
+            Self
+        }
+        pub fn open<P: AsRef<Path>>(_path: P) -> anyhow::Result<Self> {
+            Ok(Self)
+        }
+        pub fn is_available(&self) -> bool {
+            false
+        }
+        pub fn lookup_word(&self, _word: &str) -> anyhow::Result<Option<HowNetEntry>> {
+            Ok(None)
+        }
+        pub fn lookup_by_we(&self, _we: &str) -> anyhow::Result<Option<HowNetEntry>> {
+            Ok(None)
+        }
+        pub fn get_slots(&self, _word: &str) -> anyhow::Result<Vec<WordSlot>> {
+            Ok(Vec::new())
+        }
+        pub fn get_synonyms(&self, _tag: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        pub fn get_antonyms(&self, _word: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        pub fn get_alignment(&self, _ram_word: &str) -> anyhow::Result<Option<RamAlignmentInfo>> {
+            Ok(None)
+        }
+        pub fn describe(&self, word: &str) -> anyhow::Result<HowNetDescribeResult> {
+            Ok(HowNetDescribeResult {
+                word: word.to_string(),
+                found: false,
+                is_aligned: false,
+                alignment_level: None,
+                top_concept: None,
+                slots: Vec::new(),
+                synonyms: Vec::new(),
+                antonyms: Vec::new(),
+                description: format!("Open-core mode: hownet not available for '{}'", word),
+            })
+        }
+    }
+
+    pub fn discover_hownet_db_path() -> Option<PathBuf> {
+        None
+    }
+}
+
+pub mod text {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use std::collections::HashMap;
+
+    /// 量词接线存根（GH #710 S9）：CE 开源版无 semantic.pack classifier 数据源，
+    /// API 面与 `omni-pro::text::classifier_lookup` 对齐以保证 omni-server 双版本可编译。
+    pub mod classifier_lookup {
+        /// 存根恒 miss：无可消费量词数据（造句直接落无量词名词）
+        pub fn clf_for(_lemma: &str) -> Option<String> {
+            None
+        }
+
+        /// 存根复位（no-op：缓存从未灌入）
+        pub fn reset_classifier_map() {}
+
+        /// 存根恒 `Ok(0)`：与真版 API 面对齐的等价空表契约（CE 下调用方经
+        /// `is_available()` 早退先行，此为防御性兜底，避免 warn 噪音）
+        pub fn hydrate_from_conn(_conn: &rusqlite::Connection) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    pub const EMBEDDING_DIM: usize = 384;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    pub struct DocumentChunk {
+        pub index: usize,
+        pub title: Option<String>,
+        pub content: String,
+        pub char_count: usize,
+        pub has_inlined_ocr: bool,
+    }
+
+    pub struct DocumentChunker;
+    impl DocumentChunker {
+        pub fn extract_leading_core_chunk(markdown: &str, _max_chars: usize) -> String {
+            markdown.to_string()
+        }
+        pub fn chunk_document(markdown: &str, _chunk_size_chars: usize) -> Vec<DocumentChunk> {
+            vec![DocumentChunk {
+                index: 0,
+                title: None,
+                content: markdown.to_string(),
+                char_count: markdown.chars().count(),
+                has_inlined_ocr: false,
+            }]
+        }
+    }
+
+    pub fn format_inlined_ocr(ocr_text: &str) -> String {
+        ocr_text.to_string()
+    }
+
+    pub fn replace_image_placeholders(markdown: &str, _ocr_map: &HashMap<String, String>) -> String {
+        markdown.to_string()
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct LanguageDetectionResult {
+        pub lang: String,
+        pub confidence: f32,
+        pub duration_us: u64,
+    }
+
+    pub struct LanguageDetector;
+    impl LanguageDetector {
+        pub fn detect(_text: &str) -> LanguageDetectionResult {
+            LanguageDetectionResult {
+                lang: "zh".to_string(),
+                confidence: 0.5,
+                duration_us: 0,
+            }
+        }
+    }
+
+    pub struct TextTokenizer;
+    impl TextTokenizer {
+        pub fn extract_candidate_keywords(_text: &str, _lang: &str) -> Vec<String> {
+            Vec::new()
+        }
+        pub fn tokenize(_text: &str) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    pub struct BekkoEmbedder;
+    impl BekkoEmbedder {
+        pub fn new() -> Self {
+            Self
+        }
+        pub fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0f32; EMBEDDING_DIM])
+        }
+        pub fn batch_embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![0.0f32; EMBEDDING_DIM]; texts.len()])
+        }
+        pub fn cosine_similarity(_a: &[f32], _b: &[f32]) -> f32 {
+            0.0
+        }
+    }
+
+    /// 快速识别输入上下文 (对齐 MultimodalContext)
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FastRecognizeContext {
+        pub file_name: Option<String>,
+        pub text: Option<String>,
+        pub ocr: Option<String>,
+        pub language: Option<String>,
+        pub threshold: Option<f32>,
+        pub max_candidates: Option<usize>,
+        pub top_k: Option<usize>,
+    }
+
+    /// 识别命中的标签项
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct RecognizedTagItem {
+        pub tag_code: String,
+        pub lemma: String,
+        pub score: f32,
+        pub confidence: f64,
+        pub source: String,
+    }
+
+    /// 快速识别标准化响应
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FastRecognizeResponse {
+        pub tags: Vec<RecognizedTagItem>,
+        pub elapsed_ms: f64,
+        pub total_candidates: usize,
+    }
+
+    /// 预固化向量表存根
+    #[derive(Debug, Clone, Default)]
+    pub struct PrecomputedVectorTable;
+
+    impl PrecomputedVectorTable {
+        pub fn discover_table_path() -> Option<std::path::PathBuf> {
+            None
+        }
+        pub fn load_from_file<P: AsRef<std::path::Path>>(_path: P) -> anyhow::Result<Self> {
+            Ok(Self)
+        }
+    }
+
+    /// 非 Pro 存根的开放词先验常量：必须与 Pro 侧
+    /// `omni_text::ASR_UNCONTROLLED_CONFIDENCE` 同值同源
+    /// （`omni_core::tag_thresholds::OBJECTIVE_TEXT_PRIOR_CONFIDENCE` = `0.90`）。
+    /// 存根与被替代实现同口径，避免非 Pro 构建下出现第二份先验值。
+    pub const ASR_UNCONTROLLED_CONFIDENCE: f32 =
+        omni_core::tag_thresholds::OBJECTIVE_TEXT_PRIOR_CONFIDENCE;
+    pub const CONTROLLED_TEXT_TAG_CONFIDENCE: f32 = 0.90;
+
+    /// 全文本打标器存根 (Ticket 01)
+    pub struct TextTagger;
+
+    impl TextTagger {
+        pub fn tag_text(
+            _text: &str,
+            _source_kind: Option<&str>,
+            _vector_table: Option<&PrecomputedVectorTable>,
+        ) -> Vec<omni_core::TagChainItem> {
+            Vec::new()
+        }
+
+        pub fn tag_asr_or_lrc(
+            _asr: Option<&str>,
+            _lrc: Option<&str>,
+            _vector_table: Option<&PrecomputedVectorTable>,
+        ) -> Vec<omni_core::TagChainItem> {
+            Vec::new()
+        }
+
+        /// 批 B 打标入口存根（spec §2.2.1）：开源构建无受控词表与编码器，恒空
+        pub fn tag_text_with_anchor(
+            _text: &str,
+            _source_kind: Option<&str>,
+            _vector_table: Option<&PrecomputedVectorTable>,
+            _allow_new_tags: bool,
+            _exclude_names: &[String],
+            _anchor: Option<(&BekkoEmbedder, &[f32])>,
+        ) -> Vec<omni_core::TagChainItem> {
+            Vec::new()
+        }
+    }
+
+    /// 两阶段快速标签识别编排器存根
+    pub struct FastTagRecognizer;
+
+    impl FastTagRecognizer {
+        pub fn recognize(
+            _ctx: &FastRecognizeContext,
+            _conn: Option<&rusqlite::Connection>,
+            _vector_table: Option<&PrecomputedVectorTable>,
+            _embedder: &BekkoEmbedder,
+        ) -> FastRecognizeResponse {
+            FastRecognizeResponse {
+                tags: Vec::new(),
+                elapsed_ms: 0.0,
+                total_candidates: 0,
+            }
+        }
+    }
+
+    pub struct KeyBertExtractor;
+    impl KeyBertExtractor {
+        pub fn extract_keywords(
+            _doc_text: &str,
+            candidates: &[String],
+            _embedder: &BekkoEmbedder,
+            top_k: usize,
+            _diversity: f32,
+        ) -> Vec<String> {
+            candidates.iter().take(top_k).cloned().collect()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExtractedEntity {
+        pub category: String,
+        pub value: String,
+        pub confidence: f32,
+    }
+
+    pub struct EntitySlotExtractor;
+    impl EntitySlotExtractor {
+        pub fn extract_entities(
+            _text: &str,
+            _file_name: &str,
+            _mtime: Option<DateTime<Utc>>,
+        ) -> Vec<ExtractedEntity> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+    pub struct SemanticSlots {
+        pub agent: Option<String>,
+        pub patient: Option<String>,
+        pub function: Option<String>,
+        pub instrument: Option<String>,
+        pub time: Option<String>,
+        pub location: Option<String>,
+        pub doc_type: Option<String>,
+        pub classifier: Option<String>,
+        pub form: Option<String>,
+        pub style: Option<String>,
+        pub shot_type: Option<String>,
+        pub modifiers: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub enum GrammarArchetype {
+        ChineseAdverbial,
+        WesternSvoPostposition,
+        EastAsianSovAgglutinative,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct CandidateSentence {
+        pub text: String,
+        pub archetype: GrammarArchetype,
+        pub pattern_id: String,
+        pub slot_coverage: f32,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ScoredSentence {
+        pub sentence: String,
+        pub archetype: GrammarArchetype,
+        pub pattern_id: String,
+        pub similarity: f32,
+        pub composite_score: f32,
+    }
+
+    pub struct ArchetypeGenerator;
+    impl ArchetypeGenerator {
+        pub fn generate_candidates(_slots: &SemanticSlots, _lang: &str) -> Vec<CandidateSentence> {
+            Vec::new()
+        }
+    }
+
+    pub struct SentenceRanker;
+    impl SentenceRanker {
+        pub fn rank_candidates(
+            _candidates: &[CandidateSentence],
+            _reference_text: &str,
+            _embedder: &BekkoEmbedder,
+        ) -> Vec<ScoredSentence> {
+            Vec::new()
+        }
+        pub fn select_best_sentence(
+            _slots: &SemanticSlots,
+            _lang: &str,
+            _reference_text: &str,
+            _embedder: &BekkoEmbedder,
+        ) -> Option<ScoredSentence> {
+            None
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+    pub struct StructuredSummaryItem {
+        pub what: Option<String>,
+        pub who: Option<String>,
+        pub where_loc: Option<String>,
+        pub when: Option<String>,
+        pub why: Option<String>,
+        pub key_points: Vec<String>,
+    }
+
+    pub struct SlotEngine;
+    impl SlotEngine {
+        pub fn generate_5w_summary(
+            _entities: &[ExtractedEntity],
+            keywords: &[String],
+        ) -> StructuredSummaryItem {
+            StructuredSummaryItem {
+                what: keywords.first().cloned(),
+                who: None,
+                where_loc: None,
+                when: None,
+                why: None,
+                key_points: keywords.to_vec(),
+            }
+        }
+        pub fn generate_one_sentence_desc(_summary: &StructuredSummaryItem) -> Option<String> {
+            None
+        }
+        pub fn generate_smart_name(
+            _entities: &[ExtractedEntity],
+            _keywords: &[String],
+            _original_file_name: &str,
+        ) -> (Option<String>, serde_json::Value) {
+            (None, serde_json::json!({}))
+        }
+        pub fn generate_candidate_matrix(
+            _ctx: &omni_core::MultimodalContext,
+        ) -> Vec<omni_core::CandidateHypothesisItem> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct TextAnalysisResult {
+        pub title: Option<String>,
+        pub language: String,
+        pub keywords: Vec<String>,
+        pub entities: Vec<ExtractedEntity>,
+        pub structured_summary: StructuredSummaryItem,
+        pub one_sentence_desc: Option<String>,
+        pub smart_name: Option<String>,
+        pub name_slots: serde_json::Value,
+        pub embedding_dense: Vec<f32>,
+        pub chunks: Vec<DocumentChunk>,
+        pub duration_ms: u64,
+        #[serde(default)]
+        pub bekko_embed_ms: u64,
+        #[serde(default)]
+        pub keybert_ms: u64,
+        #[serde(default)]
+        pub slot_summary_ms: u64,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct FusionPerfBreakdown {
+        pub global_anchor_ms: u64,
+        pub candidate_pool_ms: u64,
+        pub candidate_pool_count: usize,
+        pub score_initial_ms: u64,
+        pub prune_ms: u64,
+        pub fused_tags_count: usize,
+        pub slots_name_ms: u64,
+        pub name_slots_count: usize,
+        pub slots_desc_ms: u64,
+        pub desc_slots_count: usize,
+        pub gen_hypotheses_ms: u64,
+        pub candidates_count: usize,
+        pub arbitrate_embed_ms: u64,
+        pub finalize_ms: u64,
+        pub total_ms: u64,
+        pub embed_calls_est: usize,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct FusedPerceptionOutcome {
+        pub smart_name: Option<String>,
+        pub content_description: Option<String>,
+        pub fused_tags: Vec<omni_core::TagChainItem>,
+        pub candidate_hypotheses: Vec<omni_core::CandidateHypothesisItem>,
+        pub perf_breakdown: Option<FusionPerfBreakdown>,
+    }
+
+    pub struct OmniMultimodalFusionEngine;
+    impl OmniMultimodalFusionEngine {
+        pub fn fuse_and_arbitrate(ctx: &omni_core::MultimodalContext) -> FusedPerceptionOutcome {
+            FusedPerceptionOutcome {
+                smart_name: None,
+                content_description: None,
+                fused_tags: ctx.visual_tags.clone(),
+                candidate_hypotheses: Vec::new(),
+                perf_breakdown: None,
+            }
+        }
+
+        pub fn resolve_ext_tag_parent(_tag_name: &str, _tag_code: &str) -> String {
+            String::new()
+        }
+    }
+
+    pub struct OmniTextEngine;
+    impl OmniTextEngine {
+        pub fn analyze(
+            _text: &str,
+            _file_name: &str,
+            _mtime: Option<DateTime<Utc>>,
+            _hownet: Option<&super::hownet::OmniHowNetService>,
+        ) -> TextAnalysisResult {
+            TextAnalysisResult {
+                title: None,
+                language: "zh".to_string(),
+                keywords: Vec::new(),
+                entities: Vec::new(),
+                structured_summary: StructuredSummaryItem::default(),
+                one_sentence_desc: None,
+                smart_name: None,
+                name_slots: serde_json::json!({}),
+                embedding_dense: vec![0.0f32; EMBEDDING_DIM],
+                chunks: Vec::new(),
+                duration_ms: 0,
+                bekko_embed_ms: 0,
+                keybert_ms: 0,
+                slot_summary_ms: 0,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ResolveParentOutcome {
+        pub success: bool,
+        pub parent_code: String,
+        pub parent_name: String,
+        pub confidence: f32,
+        pub suggested_depth: u32,
+    }
+
+    #[derive(Clone, Default)]
+    pub struct TaxonomyVectorBase;
+
+    impl TaxonomyVectorBase {
+        pub fn global() -> &'static TaxonomyVectorBase {
+            static INSTANCE: TaxonomyVectorBase = TaxonomyVectorBase;
+            &INSTANCE
+        }
+        pub fn resolve_parent(
+            &self,
+            _tag_name: &str,
+            _language: Option<&str>,
+            _context_hint: Option<&str>,
+        ) -> ResolveParentOutcome {
+            ResolveParentOutcome {
+                success: true,
+                parent_code: "builtin.zhu_ti_nei_rong.13364ec8".to_string(),
+                parent_name: "主题内容".to_string(),
+                confidence: 0.50,
+                suggested_depth: 2,
+            }
+        }
+    }
+
+    pub struct FastTextNsfwClassifier;
+
+    impl FastTextNsfwClassifier {
+        pub fn classify(_text: &str, _lang_opt: Option<&str>) -> (Vec<String>, Vec<String>, Option<String>) {
+            (vec!["全年龄".to_string()], Vec::new(), Some("safe".to_string()))
+        }
+
+        pub fn reload_config() -> bool {
+            true
+        }
+    }
+}
+
+pub mod search {
+    use super::*;
+
+    pub const EMBEDDING_DIM: usize = 384;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct IndexedDocument {
+        pub fingerprint: String,
+        /// 空向量 = 仅稀疏轨（与专业版契约一致，缺省字段同样允许）
+        #[serde(default)]
+        pub embedding: Vec<f32>,
+        pub searchable_text: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HybridHit {
+        pub fingerprint: String,
+        pub dense_distance: Option<f32>,
+        pub bm25_score: Option<f32>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FusedResult {
+        pub fingerprint: String,
+        pub rrf_score: f32,
+        pub final_score: f32,
+        pub dense_rank: Option<usize>,
+        pub bm25_rank: Option<usize>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ClusterDocument {
+        pub fingerprint: String,
+        pub embedding: Vec<f32>,
+        pub keywords: Vec<String>,
+        /// 送嵌入引擎的富文本 (与 pro 实现保持同一 IPC 契约)
+        #[serde(default)]
+        pub embedding_text: Option<String>,
+        /// 正文无可见语义文本时强制按富文本重编码 (与 pro 实现保持同一 IPC 契约)
+        #[serde(default)]
+        pub prefer_embedding_text: bool,
+        /// 受控文件大类：'application' | 'media' | 'document' | 'other'，用于跨模态互斥门禁
+        #[serde(default)]
+        pub file_category: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ClusterGroup {
+        pub fingerprints: Vec<String>,
+        pub folder_name: String,
+        pub path: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ClusterTreeResult {
+        pub clusters: Vec<ClusterGroup>,
+        #[serde(rename = "unclassifiedFiles", alias = "otherFiles")]
+        pub unclassified_files: Vec<String>,
+        pub duration_ms: u64,
+    }
+
+    impl ClusterTreeResult {
+        #[inline]
+        pub fn other_files(&self) -> &[String] {
+            &self.unclassified_files
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ClusteringMode {
+        #[serde(rename = "precise", alias = "accuracy")]
+        Precise,
+        #[serde(rename = "balanced")]
+        Balanced,
+        #[serde(rename = "complete", alias = "coverage", alias = "recall")]
+        Complete,
+    }
+
+    impl Default for ClusteringMode {
+        fn default() -> Self {
+            ClusteringMode::Balanced
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ClusterTreeOptions {
+        pub max_depth: usize,
+        pub max_root_directories: usize,
+        pub max_subdirectories: usize,
+        pub distance_threshold: f32,
+        pub max_leaf_size: usize,
+        pub similarity_floor: f32,
+        pub similarity_step: f32,
+        #[serde(default)]
+        pub clustering_mode: ClusteringMode,
+    }
+
+    impl Default for ClusterTreeOptions {
+        fn default() -> Self {
+            Self {
+                max_depth: 3,
+                max_root_directories: 5,
+                max_subdirectories: 5,
+                distance_threshold: 0.40,
+                max_leaf_size: 50,
+                similarity_floor: 0.20,
+                similarity_step: 0.10,
+                clustering_mode: ClusteringMode::default(),
+            }
+        }
+    }
+
+    pub fn constrained_hac(
+        _docs: &[ClusterDocument],
+        _prompt_embedding: Option<&[f32]>,
+        _distance_threshold: f32,
+        _max_leaf_size: usize,
+    ) -> anyhow::Result<ClusterTreeResult> {
+        Ok(ClusterTreeResult {
+            clusters: Vec::new(),
+            unclassified_files: Vec::new(),
+            duration_ms: 0,
+        })
+    }
+
+    pub fn constrained_hac_with_options(
+        _docs: &[ClusterDocument],
+        _prompt_embedding: Option<&[f32]>,
+        _options: ClusterTreeOptions,
+    ) -> anyhow::Result<ClusterTreeResult> {
+        Ok(ClusterTreeResult {
+            clusters: Vec::new(),
+            unclassified_files: Vec::new(),
+            duration_ms: 0,
+        })
+    }
+
+    pub struct OmniSearchService;
+
+    impl Default for OmniSearchService {
+        fn default() -> Self {
+            Self
+        }
+    }
+
+    impl OmniSearchService {
+        pub fn new<P: AsRef<std::path::Path>>(_index_dir: P) -> Self {
+            Self
+        }
+        pub fn is_available(&self) -> bool {
+            false
+        }
+        pub fn ensure_index(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        pub fn upsert_batch(&self, _docs: &[IndexedDocument]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        pub fn search_hybrid(
+            &self,
+            _query_text: Option<&str>,
+            _query_embedding: Option<&[f32]>,
+            _top_k: usize,
+        ) -> anyhow::Result<Vec<FusedResult>> {
+            Ok(Vec::new())
+        }
+        pub fn cluster(
+            &self,
+            _docs: &[ClusterDocument],
+            _prompt_embedding: Option<&[f32]>,
+            _distance_threshold: f32,
+            _max_leaf_size: usize,
+        ) -> anyhow::Result<ClusterTreeResult> {
+            Ok(ClusterTreeResult {
+                clusters: Vec::new(),
+                unclassified_files: Vec::new(),
+                duration_ms: 0,
+            })
+        }
+        pub fn cluster_with_options(
+            &self,
+            _docs: &[ClusterDocument],
+            _prompt_embedding: Option<&[f32]>,
+            _options: ClusterTreeOptions,
+        ) -> anyhow::Result<ClusterTreeResult> {
+            Ok(ClusterTreeResult {
+                clusters: Vec::new(),
+                unclassified_files: Vec::new(),
+                duration_ms: 0,
+            })
+        }
+    }
+}
+
+pub mod semantic_loader {
+    use std::path::{Path, PathBuf};
+
+    pub struct SemanticPackLoader;
+
+    impl SemanticPackLoader {
+        pub fn resolve_derived_key() -> [u8; 32] {
+            [0u8; 32]
+        }
+        pub fn discover_pack_path() -> Option<PathBuf> {
+            None
+        }
+        pub fn load_from_file<P: AsRef<Path>>(_path: P) -> anyhow::Result<rusqlite::Connection> {
+            anyhow::bail!("Open-core mode: semantic pack requires omni-pro");
+        }
+        pub fn load_pack_raw_from_file<P: AsRef<Path>>(_path: P) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("Open-core mode: semantic pack requires omni-pro");
+        }
+        pub fn load_from_bytes(_bytes: &[u8]) -> anyhow::Result<rusqlite::Connection> {
+            anyhow::bail!("Open-core mode: semantic pack requires omni-pro");
+        }
+        pub fn create_semantic_pack(_sqlite_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("Open-core mode: semantic pack requires omni-pro");
+        }
+        pub fn load_dense_embeddings() -> anyhow::Result<crate::text::PrecomputedVectorTable> {
+            anyhow::bail!("Open-core mode: dense embeddings require omni-pro");
+        }
+    }
+}
+
+pub mod vector_engine {
+    use serde::{Deserialize, Serialize};
+    use std::path::Path;
+
+    /// 向量维度契约：适配 384 维 bekko-a8m 与 512 维 EmbeddingGemma 模型
+    pub const VECTOR_DIM_384: usize = 384;
+    pub const VECTOR_DIM_DENSE: usize = VECTOR_DIM_384;
+    pub const VECTOR_DIM_512: usize = 512;
+    pub const VECTOR_DIM: usize = VECTOR_DIM_512;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VectorMatchResult {
+        pub file_fingerprint: String,
+        pub score: f32,
+        pub encoder_id: u8,
+    }
+
+    pub type VectorMatch = VectorMatchResult;
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VectorUpsertItem {
+        #[serde(alias = "file_fingerprint")]
+        pub file_fingerprint: String,
+        pub vector: Vec<f32>,
+        #[serde(default)]
+        pub encoder_id: u8,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VectorUpsertRequest {
+        pub items: Vec<VectorUpsertItem>,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VectorSearchRequest {
+        pub vector: Vec<f32>,
+        #[serde(default = "default_top_k")]
+        pub top_k: usize,
+        pub threshold: Option<f32>,
+        #[serde(default)]
+        pub encoder_filter: Option<Vec<u8>>,
+    }
+
+    fn default_top_k() -> usize {
+        10
+    }
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VectorDeleteRequest {
+        pub file_fingerprints: Vec<String>,
+    }
+
+    pub struct VectorEngine;
+
+    impl VectorEngine {
+        pub fn open<P: AsRef<Path>>(_dir: P) -> anyhow::Result<Self> {
+            Ok(Self)
+        }
+        pub fn open_default() -> anyhow::Result<Self> {
+            Ok(Self)
+        }
+        pub fn in_memory() -> Self {
+            Self
+        }
+        pub fn count(&self) -> usize {
+            0
+        }
+        pub fn count_by_dim(&self, _dim: usize) -> usize {
+            0
+        }
+        pub fn upsert(&self, _fingerprint: &str, _vec: &[f32], _encoder_id: u8) -> anyhow::Result<()> {
+            anyhow::bail!("Open-core mode: vector engine requires omni-pro");
+        }
+        pub fn batch_upsert(&self, _items: &[VectorUpsertItem]) -> anyhow::Result<usize> {
+            anyhow::bail!("Open-core mode: vector engine requires omni-pro");
+        }
+        pub fn save_count_by_dim(&self, _dim: usize) -> usize {
+            0
+        }
+        pub fn search(
+            &self,
+            _query: &[f32],
+            _top_k: usize,
+            _threshold: Option<f32>,
+            _encoder_filter: Option<&[u8]>,
+        ) -> anyhow::Result<Vec<VectorMatchResult>> {
+            Ok(Vec::new())
+        }
+        pub fn get_vector(
+            &self,
+            _fingerprint: &str,
+            _dim: usize,
+            _allowed: Option<&[u8]>,
+        ) -> Option<Vec<f32>> {
+            None
+        }
+        pub fn get_vector_entry(&self, _fingerprint: &str, _dim: usize) -> Option<(Vec<f32>, u8)> {
+            None
+        }
+        pub fn delete(&self, _fingerprints: &[String]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        pub fn clear(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+}
+
+pub mod semantic_graph {
+    #[derive(Clone, Default)]
+    pub struct SemanticGraph;
+
+    impl SemanticGraph {
+        pub fn enrich_tag_chain_item(&self, _tag: &mut omni_core::TagChainItem) {}
+        pub fn enrich_tag_chain_item_with_context(
+            &self,
+            _tag: &mut omni_core::TagChainItem,
+            _file_group: Option<&str>,
+        ) {}
+        /// R5 泛化入口镜像（CE 无语义包 ⇒ 恒空，与真仓 `SemanticGraph::antonym_codes`
+        /// API 面对齐，保证 omni-server 双版本共享代码可编译）
+        pub fn antonym_codes(&self, _code: &str) -> Vec<String> {
+            Vec::new()
+        }
+    }
+}
+
+pub mod omw_db {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    pub struct OmwDb;
+
+    impl OmwDb {
+        pub fn unavailable() -> Self {
+            Self
+        }
+        pub fn open_read_only<P: AsRef<Path>>(_path: P) -> anyhow::Result<Self> {
+            anyhow::bail!("Open-core mode: omw requires omni-pro");
+        }
+        pub fn load_pack_bytes(&self, _pack_bytes: &[u8]) -> anyhow::Result<()> {
+            anyhow::bail!("Open-core mode: omw requires omni-pro");
+        }
+        pub fn connect<P: AsRef<Path>>(&self, _path: P) -> anyhow::Result<()> {
+            anyhow::bail!("Open-core mode: omw requires omni-pro");
+        }
+        /// 只读语义包挂载存根（GH #710 R3 补齐）：CE 无 semantic.pack，
+        /// 与真仓 `OmwDb::connect_pack` API 面对齐，保证 omni-server 双版本可编译
+        pub fn connect_pack<P: AsRef<Path>>(&self, _path: P) -> anyhow::Result<()> {
+            anyhow::bail!("Open-core mode: omw requires omni-pro");
+        }
+        pub fn disconnect(&self) {}
+        pub fn semantic_graph(&self) -> Option<Arc<super::semantic_graph::SemanticGraph>> {
+            None
+        }
+        /// 数据源能力位镜像（omni-server `/health` 与 reconnect 响应消费）：
+        /// CE 无语义包 ⇒ 恒 false
+        pub fn is_pack(&self) -> bool {
+            false
+        }
+        pub fn is_available(&self) -> bool {
+            false
+        }
+        pub fn db_path(&self) -> Option<PathBuf> {
+            None
+        }
+        pub fn validate(&self) -> bool {
+            false
+        }
+        pub fn with_conn<F, T>(&self, _f: F) -> anyhow::Result<T>
+        where
+            F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T>,
+        {
+            anyhow::bail!("Open-core mode: omw requires omni-pro");
+        }
+        pub fn reconnect<P: AsRef<Path>>(&self, _new_path: Option<P>) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+    }
+}
+
+pub mod omw_query {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TreeNode {
+        pub code: String,
+        pub name: String,
+        pub parent_codes: Vec<String>,
+        pub source: String,
+        pub depth: i64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TaxonomyNode {
+        pub code: String,
+        pub name: String,
+        pub parent_code: Option<String>,
+        pub parent_codes: Vec<String>,
+        pub source: String,
+        pub sort_order: i64,
+        pub children: Vec<TaxonomyNode>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TaxonomyTreeResponse {
+        pub locale: String,
+        pub root_nodes: Vec<TaxonomyNode>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct AliasEntry {
+        pub lemma: String,
+        pub tag_code: String,
+        pub confidence: f32,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TaxonomyAliasesResponse {
+        pub locale: String,
+        pub aliases: Vec<AliasEntry>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct GroupCount {
+        pub key: String,
+        pub count: i64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct UnmappedStats {
+        pub by_lexfile: Vec<GroupCount>,
+        pub by_top_ancestor: Vec<GroupCount>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwSynsetResult {
+        pub id: String,
+        pub pos: String,
+        pub lemmas: Vec<String>,
+        pub definition: Option<String>,
+        pub meta: serde_json::Value,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwTagResult {
+        pub tag_code: String,
+        pub tag_name: String,
+        pub match_level: i32,
+        pub confidence: f64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwAntonymResult {
+        pub word: String,
+        pub antonym: String,
+        pub source: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwSynsetNode {
+        pub synset_id: String,
+        pub rel_type: String,
+        pub lemmas: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwLookupRequest {
+        pub word: String,
+        pub language: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwHierarchyRequest {
+        pub synset_id: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwAntonymsRequest {
+        pub word: String,
+        pub language: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwDescribeRequest {
+        pub word: String,
+        pub language: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwMappingRequest {
+        pub tag_name: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OmwTreeRequest {
+        pub root: String,
+        #[serde(default = "default_tree_depth")]
+        pub depth: i64,
+    }
+
+    fn default_tree_depth() -> i64 {
+        1
+    }
+
+    pub fn resolve_tag_aliases_table(lang: &str) -> &'static str {
+        let lower = lang.trim().to_lowercase().replace('-', "_");
+        if lower.starts_with("zh") || lower.starts_with("cmn") {
+            "tag_aliases_zh_CN"
+        } else if lower.starts_with("ja") || lower.starts_with("jpn") {
+            "tag_aliases_ja_JP"
+        } else if lower.starts_with("ko") || lower.starts_with("kor") {
+            "tag_aliases_ko_KR"
+        } else if lower.starts_with("fr") || lower.starts_with("fra") {
+            "tag_aliases_fr_FR"
+        } else if lower.starts_with("de") || lower.starts_with("deu") {
+            "tag_aliases_de_DE"
+        } else if lower.starts_with("es") || lower.starts_with("spa") {
+            "tag_aliases_es_ES"
+        } else if lower.starts_with("ru") || lower.starts_with("rus") {
+            "tag_aliases_ru_RU"
+        } else if lower.starts_with("pt") || lower.starts_with("por") {
+            "tag_aliases_pt_PT"
+        } else if lower.starts_with("ar") || lower.starts_with("ara") {
+            "tag_aliases_ar_EG"
+        } else {
+            "tag_aliases_en_US"
+        }
+    }
+
+    pub fn lookup(
+        _conn: &rusqlite::Connection,
+        _word: &str,
+        _language: &str,
+    ) -> anyhow::Result<Vec<OmwSynsetResult>> {
+        Ok(Vec::new())
+    }
+
+    pub fn hierarchy(
+        _conn: &rusqlite::Connection,
+        _synset_id: &str,
+    ) -> anyhow::Result<Vec<OmwSynsetNode>> {
+        Ok(Vec::new())
+    }
+
+    pub fn antonyms(
+        _conn: &rusqlite::Connection,
+        _word: &str,
+        _language: &str,
+    ) -> anyhow::Result<Vec<OmwAntonymResult>> {
+        Ok(Vec::new())
+    }
+
+    pub fn mapping(
+        _conn: &rusqlite::Connection,
+        _tag_name: &str,
+    ) -> anyhow::Result<Vec<OmwTagResult>> {
+        Ok(Vec::new())
+    }
+
+    pub fn tree(
+        _conn: &rusqlite::Connection,
+        _root: &str,
+        _depth: i64,
+    ) -> anyhow::Result<Vec<TreeNode>> {
+        Ok(Vec::new())
+    }
+
+    pub fn unmapped_stats(
+        _conn: &rusqlite::Connection,
+    ) -> anyhow::Result<UnmappedStats> {
+        Ok(UnmappedStats {
+            by_lexfile: Vec::new(),
+            by_top_ancestor: Vec::new(),
+        })
+    }
+}
+
+
+pub use semantic_loader::SemanticPackLoader;
+pub use vector_engine::{
+    VectorDeleteRequest, VectorEngine, VectorMatch, VectorMatchResult, VectorSearchRequest,
+    VectorUpsertItem, VectorUpsertRequest, VECTOR_DIM, VECTOR_DIM_512, VECTOR_DIM_384,
+};
+pub use omw_db::OmwDb;
+pub use omw_query::{
+    antonyms, hierarchy, lookup, mapping, resolve_tag_aliases_table, tree, unmapped_stats,
+    AliasEntry, GroupCount, OmwAntonymResult, OmwAntonymsRequest, OmwDescribeRequest,
+    OmwHierarchyRequest, OmwLookupRequest, OmwMappingRequest, OmwSynsetNode, OmwSynsetResult,
+    OmwTagResult, OmwTreeRequest, TaxonomyAliasesResponse, TaxonomyNode, TaxonomyTreeResponse,
+    TreeNode, UnmappedStats,
+};
+pub use text::FastTextNsfwClassifier;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ce_stub_basic_flags() {
+        assert!(!is_pro_enabled());
+    }
+
+    #[test]
+    fn test_ce_stub_nsfw_and_vocab_blocked() {
+        // 敏感子树判据纯受控码/词表，不依赖 pro 资产 ⇒ stub 构建下也必须拦下
+        assert!(!is_nsfw_or_restricted_tag("any_word"));
+        assert!(is_nsfw_or_restricted_tag("师生情色"));
+        assert!(!is_vocab_layer_blocked("any_word", true));
+        assert!(is_vocab_layer_blocked("师生情色", true));
+    }
+
+    #[test]
+    fn test_ce_stub_video_watermark() {
+        let (lvl, status) = perceive::detect_video_dynamic_watermark(std::path::Path::new("dummy.mp4"));
+        assert_eq!(lvl, 0);
+        assert_eq!(status, "none");
+    }
+
+    #[test]
+    fn test_ce_stub_vision_engine_methods() {
+        assert_eq!(OmniVisionEngine::calibrate_clip_score(0.75), 0.75);
+
+        let mut tags = vec!["tag1".to_string()];
+        let engine_lookup = std::collections::HashMap::new();
+        OmniVisionEngine::apply_domain_matrix_gating(&mut tags, &[], None, &engine_lookup);
+        assert_eq!(tags.len(), 1);
+
+        let scored = OmniVisionEngine::extract_clip_visual_tags_scored_from_image(
+            &image::DynamicImage::new_rgb8(1, 1),
+            None,
+            5,
+        );
+        assert!(scored.is_empty());
+
+        let chain = OmniVisionEngine::resolve_tag_to_chain_item_with_lang("测试", 0.9, Some("zh"));
+        assert_eq!(chain.name, "测试");
+        assert_eq!(chain.code, "builtin.测试");
+    }
+
+    #[test]
+    fn test_ce_stub_multimodal_fusion() {
+        let parent = text::OmniMultimodalFusionEngine::resolve_ext_tag_parent("cat", "builtin.cat");
+        assert_eq!(parent, "");
+    }
+
+    #[test]
+    fn test_ce_stub_fast_tag_recognizer() {
+        let ctx = text::FastRecognizeContext::default();
+        let embedder = text::BekkoEmbedder::new();
+        let res = text::FastTagRecognizer::recognize(&ctx, None, None, &embedder);
+        assert!(res.tags.is_empty());
+        assert_eq!(res.total_candidates, 0);
+    }
+
+    #[test]
+    fn test_ce_stub_semantic_loader() {
+        let res = SemanticPackLoader::load_dense_embeddings();
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_ce_stub_omw_query() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(omw_query::lookup(&conn, "word", "en").unwrap().is_empty());
+        assert!(omw_query::hierarchy(&conn, "00001740-n").unwrap().is_empty());
+        assert!(omw_query::antonyms(&conn, "word", "cmn").unwrap().is_empty());
+        assert!(omw_query::mapping(&conn, "tag").unwrap().is_empty());
+        assert!(omw_query::tree(&conn, "root", 1).unwrap().is_empty());
+        let stats = omw_query::unmapped_stats(&conn).unwrap();
+        assert!(stats.by_lexfile.is_empty());
+        assert!(stats.by_top_ancestor.is_empty());
+    }
+}
+
+
+
+
+

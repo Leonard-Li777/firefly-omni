@@ -1,5 +1,5 @@
 use omni_core::{to_native_path_str, OmniConfig, OmniExtractionResult};
-use omni_vision::OmniVisionEngine;
+use omni_pro::OmniVisionEngine;
 use anyhow::Result;
 use encoding_rs::{GBK, UTF_8, UTF_16LE};
 use lofty::prelude::*;
@@ -9,10 +9,18 @@ use std::io::Read;
 use std::path::Path;
 use tracing::{info, warn};
 
+/// 原生事实标签抽取引擎 (Task 2)：元数据直读 + 下沉物理事实 → 受控标签链 `fact_tags`
+pub mod fact_tags;
+pub use fact_tags::{extract_fact_tags, FactTagContext, OmniFactTagExtractor, ENGINE_METADATA};
+
 /// 文档与元数据全量提取引擎 (完全对齐 Node.js 端全功能 Pipeline)
 pub struct OmniExtractor;
 
 impl OmniExtractor {
+    pub fn extract_full_exiftool_metadata<P: AsRef<Path>>(path: P) -> serde_json::Map<String, serde_json::Value> {
+        extract_full_exiftool_metadata(path.as_ref())
+    }
+
     pub async fn extract<P: AsRef<Path>>(path: P, config: &OmniConfig) -> Result<OmniExtractionResult> {
         let t_extract_start = std::time::Instant::now();
         let p = path.as_ref();
@@ -35,7 +43,7 @@ impl OmniExtractor {
                 "magika": {
                     "label": if ext.is_empty() { "bin" } else { &ext },
                     "mime_type": mime_type,
-                    "group": if mime_type.starts_with("image/") { "image" } else if mime_type.starts_with("application/pdf") || ext == "docx" || ext == "xlsx" || ext == "pptx" { "document font" } else if mime_type.starts_with("audio/") { "audio" } else if mime_type.starts_with("video/") { "video" } else { "code/text" },
+                    "group": determine_file_group(&ext, &mime_type),
                     "name": format!("Magika Identified Format ({})", mime_type),
                     "score": 0.995,
                     "description": format!("Magika Neural Network Classification for {}", mime_type),
@@ -114,7 +122,16 @@ impl OmniExtractor {
             }
 
             if let Some(val) = exiftool_map.get("Title") { doc_meta.insert("title".into(), val.clone()); }
-            if let Some(val) = exiftool_map.get("Author").or_else(|| exiftool_map.get("Creator")) { doc_meta.insert("author".into(), val.clone()); }
+            if let Some((clean_author, authors_list)) = extract_and_clean_authors(&[
+                exiftool_map.get("Author"),
+                exiftool_map.get("Creator"),
+                exiftool_map.get("Artist"),
+                exiftool_map.get("By-line"),
+            ]) {
+                doc_meta.insert("author".into(), clean_author.into());
+                doc_meta.insert("authors".into(), serde_json::Value::Array(authors_list.iter().map(|a| serde_json::Value::String(a.clone())).collect()));
+                result.metadata["authors"] = serde_json::Value::Array(authors_list.into_iter().map(serde_json::Value::String).collect());
+            }
             if let Some(val) = exiftool_map.get("Subject") { doc_meta.insert("subject".into(), val.clone()); }
             if let Some(val) = exiftool_map.get("Keywords") { doc_meta.insert("keywords".into(), val.clone()); }
             if let Some(val) = exiftool_map.get("Creator") { doc_meta.insert("creator".into(), val.clone()); }
@@ -189,15 +206,14 @@ impl OmniExtractor {
             }
             result.metadata["image"] = serde_json::Value::Object(img_meta);
 
-            if config.enable_image_ocr {
-                let t_ocr_start = std::time::Instant::now();
-                if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text_with_size(p, &config.ocr_model_size) {
-                    if !ocr_text.trim().is_empty() {
-                        result.markdown_content = ocr_text;
-                    }
+            // 所有图片均尝试 OCR 提取，底层由 fast_detect_has_text 毫秒级探测并跳过无字图片
+            let t_ocr_start = std::time::Instant::now();
+            if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text_with_size(p, &config.ocr_model_size) {
+                if !ocr_text.trim().is_empty() {
+                    result.markdown_content = ocr_text;
                 }
-                ocr_duration_ms = Some(t_ocr_start.elapsed().as_millis() as u64);
             }
+            ocr_duration_ms = Some(t_ocr_start.elapsed().as_millis() as u64);
         }
 
         // 7. 提取音频 Tag 与精细属性 (audio)
@@ -212,6 +228,16 @@ impl OmniExtractor {
                     if let Some(genre) = tag.genre() { audio_meta.insert("genre".into(), genre.to_string().into()); }
                     if let Some(track) = tag.track() { audio_meta.insert("track".into(), track.into()); }
                     if let Some(year) = tag.year() { audio_meta.insert("year".into(), year.into()); }
+
+                    // 从 lofty Tag 读取内嵌歌词 (ItemKey::Lyrics)
+                    if let Some(lyrics_item) = tag.get(&lofty::tag::ItemKey::Lyrics) {
+                        if let Some(text) = lyrics_item.value().text() {
+                            let clean_lyrics = extract_pure_lyrics(text);
+                            if !clean_lyrics.is_empty() {
+                                audio_meta.insert("lrc".into(), clean_lyrics.into());
+                            }
+                        }
+                    }
                 }
                 let properties = tagged_file.properties();
                 let secs = properties.duration().as_secs();
@@ -224,6 +250,39 @@ impl OmniExtractor {
             if let Some(val) = exiftool_map.get("Title") { audio_meta.entry("title".to_string()).or_insert(val.clone()); }
             if let Some(val) = exiftool_map.get("Artist") { audio_meta.entry("artist".to_string()).or_insert(val.clone()); }
             if let Some(val) = exiftool_map.get("Album") { audio_meta.entry("album".to_string()).or_insert(val.clone()); }
+
+            // ExifTool 兜底提取歌词
+            if !audio_meta.contains_key("lrc") {
+                let exif_lrc = exiftool_map
+                    .get("Lyrics")
+                    .or_else(|| exiftool_map.get("UnsynchronizedLyrics"))
+                    .or_else(|| exiftool_map.get("SynchronizedLyrics"))
+                    .and_then(|v| v.as_str());
+                if let Some(raw_lrc) = exif_lrc {
+                    let clean = extract_pure_lyrics(raw_lrc);
+                    if !clean.is_empty() {
+                        audio_meta.insert("lrc".into(), clean.into());
+                    }
+                }
+            }
+
+            // 音频艺术家清洗与多作者拆分
+            let artist_val = audio_meta.get("artist").and_then(|v| v.as_str()).map(String::from);
+            if let Some(artist_str) = artist_val {
+                let (clean_artist, artists_list) = clean_and_split_authors(&artist_str);
+                if !artists_list.is_empty() {
+                    audio_meta.insert("artist".into(), clean_artist.into());
+                    audio_meta.insert("artists".into(), serde_json::Value::Array(artists_list.iter().map(|a| serde_json::Value::String(a.clone())).collect()));
+                    if result.metadata.get("authors").is_none() {
+                        result.metadata["authors"] = serde_json::Value::Array(artists_list.into_iter().map(serde_json::Value::String).collect());
+                    }
+                }
+            }
+
+            // 若提取到有效歌词，同时挂载到 result.metadata["lrc"]，供顶层和感知层直接获取
+            if let Some(lrc_val) = audio_meta.get("lrc") {
+                result.metadata["lrc"] = lrc_val.clone();
+            }
 
             result.metadata["audio"] = serde_json::Value::Object(audio_meta);
         }
@@ -399,7 +458,7 @@ impl OmniExtractor {
             .collect();
 
         format!(
-            "\n\n> 📷 **[图片内提取文字]**\n>\n{}\n\n",
+            "\n\n> 📷 **[Image Text / 图片内提取文字]**\n>\n{}\n\n",
             block_lines.join("\n>\n")
         )
     }
@@ -642,11 +701,78 @@ fn extract_pdf_metadata_native(p: &Path) -> Option<serde_json::Map<String, serde
     }
 }
 
+#[cfg(windows)]
+struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for JobHandle {}
+#[cfg(windows)]
+unsafe impl Sync for JobHandle {}
+
+#[cfg(windows)]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn bind_to_kill_on_close_job(child: &std::process::Child) -> Option<JobHandle> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            tracing::warn!("[ExifToolDaemon] 无法创建 Windows Job Object");
+            return None;
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        let set_res = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+
+        if set_res == 0 {
+            tracing::warn!("[ExifToolDaemon] 设置 Windows Job Object 限制信息失败");
+            CloseHandle(job);
+            return None;
+        }
+
+        let child_handle = child.as_raw_handle() as HANDLE;
+        let assign_res = AssignProcessToJobObject(job, child_handle);
+        if assign_res == 0 {
+            tracing::warn!("[ExifToolDaemon] 将 ExifTool 进程分配到 Windows Job Object 失败");
+            CloseHandle(job);
+            return None;
+        }
+
+        tracing::info!("[ExifToolDaemon] ExifTool 守护进程已成功关联 Windows Job Object (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)");
+        Some(JobHandle(job))
+    }
+}
+
 /// ExifTool -stay_open 守护进程句柄（单进程常驻内存，延迟初始化，原子同步管道通信）
 struct ExifToolDaemon {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
     stdout_reader: std::io::BufReader<std::process::ChildStdout>,
+    #[cfg(windows)]
+    _job: Option<JobHandle>,
 }
 
 impl ExifToolDaemon {
@@ -667,6 +793,8 @@ impl ExifToolDaemon {
             .stderr(Stdio::null());
 
         let mut child = cmd.spawn().ok()?;
+        #[cfg(windows)]
+        let _job = bind_to_kill_on_close_job(&child);
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
         let stdout_reader = std::io::BufReader::new(stdout);
@@ -675,6 +803,8 @@ impl ExifToolDaemon {
             child,
             stdin,
             stdout_reader,
+            #[cfg(windows)]
+            _job,
         })
     }
 
@@ -739,7 +869,7 @@ pub fn shutdown_exiftool_daemon() {
 
 /// 提取全量 ExifTool 字典 (包含 Creator, Producer, CreateDate, ModifyDate, PDFVersion, PageCount 等全量 100+ 属性)
 /// 对于 PDF 优先使用 Rust 原生 lopdf 毫秒级提取；对于其他文件使用常驻内存的 ExifTool -stay_open 守护进程（~2ms 响应）
-fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_json::Value> {
+pub fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
 
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
@@ -859,7 +989,8 @@ fn extract_plain_text(path: &Path, max_bytes: usize) -> Result<String> {
                 return Ok(truncate_string(&utf16_decoded, max_bytes));
             }
         }
-        return Ok("[Binary File] NUL byte detected, text content skipped to prevent garbled output.".to_string());
+        // 二进制文件检测到 NUL 字节，文本内容跳过并保持为空，严禁填入调试占位符导致文本分析提取垃圾标签与伪智能命名
+        return Ok(String::new());
     }
 
     // 3. 严格验证是否为标准 UTF-8（中文及现代文本事实标准，不允许任何解码错误）
@@ -1012,7 +1143,7 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
                             break;
                         }
 
-                        if let Ok(page_text) = omni_vision::OmniVisionEngine::recognize_ocr_dynamic_image(img, &config.ocr_model_size) {
+                        if let Ok(page_text) = OmniVisionEngine::recognize_ocr_dynamic_image(img, &config.ocr_model_size) {
                             let trimmed = page_text.trim();
                             if !trimmed.is_empty() {
                                 current_bytes += trimmed.len();
@@ -1026,7 +1157,7 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
                     if !ocr_page_texts.is_empty() {
                         let combined_ocr = ocr_page_texts.join("\n\n");
                         let final_markdown = if raw_len > 0 {
-                            format!("{}\n\n---\n\n### 🔍 多页 OCR 图像识别文本\n\n{}", base_text.trim(), combined_ocr)
+                            format!("{}\n\n---\n\n### 🔍 OCR Text / 图像识别文本\n\n{}", base_text.trim(), combined_ocr)
                         } else {
                             combined_ocr
                         };
@@ -1139,7 +1270,7 @@ fn extract_docx_with_embedded_image_ocr(path: &Path, max_bytes: usize, config: &
             if name_lower.starts_with("word/media/") || name_lower.starts_with("media/") {
                 let mut bytes = Vec::new();
                 if file.read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
-                    if let Ok(ocr_text) = omni_vision::OmniVisionEngine::recognize_ocr_image_bytes(&bytes, &config.ocr_model_size) {
+                    if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_image_bytes(&bytes, &config.ocr_model_size) {
                         if !ocr_text.trim().is_empty() {
                             let clean_name = name.trim_start_matches("word/").to_string();
                             accumulated_ocr_bytes += ocr_text.len();
@@ -1393,11 +1524,230 @@ fn truncate_string(s: &str, max_bytes: usize) -> String {
     }
 }
 
+/// 作者清洗与多分隔符拆分规则 (Omni 提取清洗归位)
+/// 自动识别常见分隔符（中英文逗号、分号、顿号、斜杠、&、and），过滤垃圾签名（admin、word 等），并去重
+pub fn clean_and_split_authors(raw: &str) -> (String, Vec<String>) {
+    let raw_trimmed = raw.trim();
+    if raw_trimmed.is_empty() {
+        return (String::new(), Vec::new());
+    }
+
+    // 黑名单关键词列表（大小写不敏感）
+    const BLACKLIST: &[&str] = &[
+        "unknown", "admin", "administrator", "user", "author", "creator",
+        "microsoft", "microsoft office", "microsoft word", "microsoft excel",
+        "microsoft powerpoint", "wps", "wps office", "adobe", "acrobat",
+        "windows user", "null", "undefined", "none", "anonymous", "test",
+        "未命名", "未知", "管理员"
+    ];
+
+    let is_noisy = |name: &str| -> bool {
+        let lower = name.trim().to_lowercase();
+        if lower.is_empty() || lower.len() < 2 || lower.len() > 64 {
+            return true;
+        }
+        // 检查是否全由纯符号或数字组成
+        if lower.chars().all(|c| !c.is_alphabetic()) {
+            return true;
+        }
+        for bad in BLACKLIST {
+            if lower == *bad || lower.starts_with(&format!("{} ", bad)) || lower.ends_with(&format!(" {}", bad)) {
+                return true;
+            }
+        }
+        false
+    };
+
+    // 多字符切分
+    let delimiters = [',', '，', ';', '；', '、', '/', '\\', '|', '\n', '\r'];
+    let mut parts = Vec::new();
+    for seg in raw_trimmed.split(|c| delimiters.contains(&c)) {
+        // 对 " & " 或 " and " 二次切分
+        for sub in seg.split(" & ") {
+            for sub2 in sub.split(" and ") {
+                let trimmed = sub2.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`');
+                if !is_noisy(trimmed) {
+                    parts.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    // 有序去重
+    let mut deduped: Vec<String> = Vec::new();
+    for p in parts {
+        if !deduped.iter().any(|x| x.eq_ignore_ascii_case(&p)) {
+            deduped.push(p);
+        }
+    }
+
+    let joined = deduped.join(", ");
+    (joined, deduped)
+}
+
+/// 萃取纯文本歌词：移除时间轴 `[00:00.00]` 和元数据标签 `[ti:xxx]`、`[ar:xxx]` 等
+pub fn extract_pure_lyrics(text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+
+    use std::sync::OnceLock;
+    static RE_TIMESTAMP: OnceLock<regex::Regex> = OnceLock::new();
+    static RE_TAG: OnceLock<regex::Regex> = OnceLock::new();
+    static RE_EMPTY_BRACKET: OnceLock<regex::Regex> = OnceLock::new();
+
+    let re_ts = RE_TIMESTAMP.get_or_init(|| {
+        regex::Regex::new(r"\[\d{1,2}:\d{2}([:\.]\d{1,3})?\]").unwrap()
+    });
+    let re_tag = RE_TAG.get_or_init(|| {
+        regex::Regex::new(r"(?i)\[[a-z0-9]{1,10}:.*\]").unwrap()
+    });
+    let re_empty = RE_EMPTY_BRACKET.get_or_init(|| {
+        regex::Regex::new(r"\[\s*\]").unwrap()
+    });
+
+    let no_ts = re_ts.replace_all(text, "");
+    let no_tag = re_tag.replace_all(&no_ts, "");
+    let no_empty = re_empty.replace_all(&no_tag, "");
+
+    no_empty
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+/// 从多个候选元数据字段中提取并清洗作者
+pub fn extract_and_clean_authors(values: &[Option<&serde_json::Value>]) -> Option<(String, Vec<String>)> {
+    for val_opt in values {
+        if let Some(val) = val_opt {
+            let raw_str = match val {
+                serde_json::Value::String(s) => s.as_str(),
+                _ => continue,
+            };
+            let (joined, list) = clean_and_split_authors(raw_str);
+            if !list.is_empty() {
+                return Some((joined, list));
+            }
+        }
+    }
+    None
+}
+
+/// 根据扩展名与 MIME 类型判定权威 FileGroup（优先扩展名字典，未命中由 Magika / MIME 补齐）
+pub fn determine_file_group(ext: &str, mime_type: &str) -> &'static str {
+    let clean_ext = ext.trim().trim_start_matches('.').to_lowercase();
+
+    // 1. 优先按照扩展名映射
+    match clean_ext.as_str() {
+        // 图片
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "ico" | "tiff" | "tif"
+        | "avif" | "heic" | "heif" | "raw" | "cr2" | "nef" | "arw" | "dng" | "psd" | "ai"
+        | "jxl" | "jp2" => return "image",
+
+        // 视频
+        "mp4" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "webm" | "m4v" | "3gp" | "mts" | "m2ts"
+        | "rmvb" | "vob" => return "video",
+
+        // ts 扩展名：若明确为视频流则判定为 video，否则默认归类为 TypeScript code
+        "ts" => {
+            if mime_type.starts_with("video/") || mime_type.contains("mp2t") {
+                return "video";
+            } else {
+                return "code";
+            }
+        }
+
+        // 音频
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "ape" | "wma" | "opus" | "aiff"
+        | "mid" | "midi" => return "audio",
+
+        // 办公文档
+        "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
+        | "rtf" | "pdf" | "csv" | "tsv" | "pages" | "numbers" | "key" => return "document",
+
+        // 电子书
+        "epub" | "mobi" | "azw3" | "fb2" | "djvu" | "cbr" | "cbz" => return "ebook",
+
+        // 源代码与工程
+        "js" | "jsx" | "tsx" | "py" | "java" | "c" | "cpp" | "cc" | "cxx" | "h" | "hpp"
+        | "rs" | "go" | "php" | "rb" | "swift" | "kt" | "kts" | "scala" | "cs" | "html" | "htm"
+        | "css" | "scss" | "less" | "vue" | "svelte" | "sh" | "bash" | "ps1" | "bat" | "cmd"
+        | "json" | "xml" | "yaml" | "yml" | "toml" | "sql" | "lua" | "dart" | "zig" => return "code",
+
+        // 纯文本
+        "txt" | "md" | "markdown" | "log" | "diff" | "patch" | "tex" | "rst" | "asciidoc" => return "text",
+
+        // 压缩包
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "tgz" | "iso" | "z" => return "archive",
+
+        // 可执行程序
+        "exe" | "msi" | "apk" | "app" | "dmg" | "deb" | "rpm" | "bin" | "dll" | "so" | "dylib" => return "executable",
+
+        // 字体
+        "ttf" | "otf" | "woff" | "woff2" | "eot" | "ttc" => return "font",
+
+        // 磁盘镜像
+        "img" | "vhd" | "vhdx" | "vmdk" | "qcow2" => return "diskimage",
+
+        // 数据库
+        "db" | "sqlite" | "sqlite3" | "mdb" | "accdb" => return "database",
+
+        // 模型
+        "onnx" | "gguf" | "safetensors" | "pt" | "pth" => return "model",
+
+        _ => {}
+    }
+
+    // 2. 扩展名未命中，由 MIME 类型补齐
+    if mime_type.starts_with("image/") {
+        "image"
+    } else if mime_type.starts_with("video/") {
+        "video"
+    } else if mime_type.starts_with("audio/") {
+        "audio"
+    } else if mime_type.starts_with("text/") {
+        "text"
+    } else if mime_type == "application/pdf" || mime_type.contains("officedocument") || mime_type.contains("msword") || mime_type.contains("ms-excel") || mime_type.contains("ms-powerpoint") {
+        "document"
+    } else if mime_type.contains("zip") || mime_type.contains("compressed") || mime_type.contains("tar") || mime_type.contains("archive") {
+        "archive"
+    } else if mime_type.contains("font") {
+        "font"
+    } else {
+        "unknown"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::io::Write;
+
+    #[test]
+    fn test_clean_and_split_authors() {
+        let raw = "张三, 李四; 王五 / Microsoft Word, admin & 赵六 and 孙七";
+        let (joined, list) = clean_and_split_authors(raw);
+        assert_eq!(list, vec!["张三", "李四", "王五", "赵六", "孙七"]);
+        assert_eq!(joined, "张三, 李四, 王五, 赵六, 孙七");
+
+        let noisy = "Administrator; unknown, Microsoft Office";
+        let (joined_noisy, list_noisy) = clean_and_split_authors(noisy);
+        assert!(list_noisy.is_empty());
+        assert!(joined_noisy.is_empty());
+    }
+
+    #[test]
+    fn test_determine_file_group() {
+        assert_eq!(determine_file_group("png", "application/octet-stream"), "image");
+        assert_eq!(determine_file_group(".docx", "application/octet-stream"), "document");
+        assert_eq!(determine_file_group("mp3", "application/octet-stream"), "audio");
+        assert_eq!(determine_file_group("py", "application/octet-stream"), "code");
+        assert_eq!(determine_file_group("xyz_unknown", "image/webp"), "image");
+        assert_eq!(determine_file_group("", "application/pdf"), "document");
+    }
 
     #[test]
     fn test_replace_embedded_image_ocr() {
@@ -1407,7 +1757,7 @@ mod tests {
         map.insert("img2.jpg".to_string(), "Line 1\nLine 2".to_string());
 
         let result = OmniExtractor::replace_embedded_image_ocr(markdown, &map);
-        assert!(result.contains("📷 **[图片内提取文字]**"));
+        assert!(result.contains("📷 **[Image Text / 图片内提取文字]**"));
         assert!(result.contains("识别结果一"));
         assert!(result.contains("> Line 1"));
         assert!(result.contains("> Line 2"));
@@ -1474,7 +1824,7 @@ mod tests {
         let res = OmniExtractor::extract(&temp_path, &config).await.unwrap();
         let _ = std::fs::remove_file(&temp_path);
 
-        assert!(res.markdown_content.contains("[Binary File] NUL byte detected"));
+        assert!(res.markdown_content.is_empty());
     }
 
     #[tokio::test]
@@ -1537,6 +1887,18 @@ mod tests {
             assert!(!res.is_corrupted);
             assert!(!res.markdown_content.trim().is_empty());
         }
+    }
+
+    #[test]
+    fn test_extract_pure_lyrics() {
+        let raw = "[ti:海阔天空]\n[ar:Beyond]\n[al:乐与怒]\n[00:00.00]海阔天空 - Beyond\n[00:18.52]今天我 寒夜里看雪飘过\n[00:25.10]怀着冷却了的心窝漂远方\n[00:30.85]风雨里追赶 雾里分不清影踪\n[00:36.52]天空海阔你与我 可会变\n[02:15.00][03:40.00]原谅我这一生不羁放纵爱自由";
+        let clean = extract_pure_lyrics(raw);
+        assert!(!clean.contains("[ti:"));
+        assert!(!clean.contains("[ar:"));
+        assert!(!clean.contains("[00:18.52]"));
+        assert!(!clean.contains("[02:15.00]"));
+        assert!(clean.contains("今天我 寒夜里看雪飘过"));
+        assert!(clean.contains("原谅我这一生不羁放纵爱自由"));
     }
 }
 

@@ -11,3 +11,5 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 image = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { workspace = true }

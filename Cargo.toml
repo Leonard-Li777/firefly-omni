@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/omni-core",
     "crates/omni-extract",
-    "crates/omni-vision",
     "crates/omni-server",
     "crates/omni-cli",
     "crates/omni-mcp",
@@ -13,6 +12,9 @@ members = [
     "omni-pro",
     "omni-pro/crates/omni-geo",
     "omni-pro/crates/omni-cleanup",
+    "omni-pro/crates/omni-cover",
+    "omni-pro/crates/omni-vision",
+    "omni-pro/crates/omni-text",
 ]
 
 [workspace.package]
@@ -39,9 +41,30 @@ image = "0.25"
 encoding_rs = "0.8"
 regex = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.31", features = ["bundled", "serialize"] }
+sha2 = "0.10"
+unicode-normalization = "0.1"
+zstd = "0.13"
+aes-gcm = { version = "0.10", features = ["aes"] }
+crc32fast = "1.4"
+rand = "0.8"
+jieba-rs = "0.7"
+unicode-segmentation = "1.12"
+roaring = "0.10"
+# sherpa-onnx: 全栈音频 AI 引擎（ASR / TTS / VAD / Audio Tagging / 说话人分离）
+# 替换 audio.cpp CLI 调度方案，原生 Rust 集成，支持 ONNX Runtime EP 硬件加速
+sherpa-onnx = { version = "1.13.8", default-features = false, features = ["shared"] }
+# 统一 ONNX Runtime 动态链接底座，解耦编译期静态绑定，彻底消除 Windows MSVC /MT vs /MD (LNK2038) 冲突
+ort = { version = "=2.0.0-rc.9", features = ["load-dynamic"] }
+pelite = "0.10"
+goblin = { version = "0.8", default-features = false, features = ["elf32", "elf64", "mach32", "mach64", "endian_fd"] }
 
 [patch.crates-io]
 mupdf-sys = { path = "crates/mupdf-sys" }
+# Windows/MSVC 兼容修复：上游 usearch 2.26.2 的 build.rs 在 Windows 上硬编码 `/std:c++17`，
+# 与 cxxbridge 生成的 C++ 代码在 MSVC 14.4x 下触发 C2440（指向成员函数类型不相关）编译失败。
+# 本地 vendor 副本改用 `/std:c++20` 完成重载解析，规避该上游缺陷，保证 omni-pro 依赖链可编译。
+usearch = { path = "vendor/usearch" }
 
 [profile.release]
 opt-level = "z"
@@ -50,3 +73,15 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# 开发与 watch 模式：加速第三方依赖执行速度（让 debug 版 exe 跑得飞快且保持快速增量编译）
+[profile.dev.package."*"]
+opt-level = 2
+
+# 快速 release 测试 profile：保留优化，使用 thin LTO 与 16 并行 codegen 大幅缩短生成 exe 耗时
+[profile.quick-release]
+inherits = "release"
+opt-level = 2
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = true

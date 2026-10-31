@@ -1,0 +1,66 @@
+name: omni-ce-ci
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - tag-patch
+    paths:
+      - 'crates/**'
+      - 'scripts/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/omni-ce-ci.yml'
+  pull_request:
+    branches:
+      - main
+      - master
+      - tag-patch
+    paths:
+      - 'crates/**'
+      - 'scripts/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/omni-ce-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: omni-ce-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-ce:
+    name: CE 模式编译与存根测试 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+          key: ce-ci-${{ matrix.os }}
+
+      - name: 配置为开源版 (CE)
+        shell: bash
+        run: |
+          node scripts/configure-edition.js --ce
+
+      - name: 执行 CE 模式编译检查 (cargo check)
+        shell: bash
+        run: |
+          cargo check --workspace
+
+      - name: 执行 CE 存根单元测试 (cargo test -p omni-pro-stub)
+        shell: bash
+        run: |
+          cargo test -p omni-pro-stub

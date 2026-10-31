@@ -3,7 +3,7 @@
 use napi_derive::napi;
 use omni_core::{OmniConfig, OmniExtractionResult};
 use omni_extract::OmniExtractor;
-use omni_vision::OmniVisionEngine;
+use omni_pro::OmniVisionEngine;
 use std::collections::HashMap;
 
 #[napi]

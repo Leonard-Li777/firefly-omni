@@ -10,21 +10,81 @@ use axum::{
     Json, Router,
 };
 use omni_core::{
+    concepts::Concept,
+    tag_identity::{normalize_tag_set_to_codes, normalize_tag_to_code, tag_matches_concept},
+    tag_thresholds::{
+        EXIT_CONFIDENCE_THRESHOLD, LAYER_FALLBACK_CLIP, LAYER_FALLBACK_OCR,
+        LAYER_FALLBACK_PHYSICAL,
+    },
+    AudioConvertRequest, AudioConvertResponse, AudioTranscribeRequest, AudioTranscribeResponse,
     DuplicateFixRequest, DuplicateFixResponse, DuplicateScanRequest, DuplicateScanResponse,
-    OmniConfig, OmniExtractionResult,
+    FsAdsRequest, FsAdsResponse, OmniConfig, OmniExtractionResult, OmniPerceptionBenchmark,
+    OmniPerceptionRequest, OmniPerceptionResult, VisionInspectRequest, VisionInspectResponse,
+    VisionTagsRequest, VisionTagsResponse,
 };
 use omni_extract::OmniExtractor;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::info;
+
+pub use omni_pro::{
+    encoder_id, OmwDb, SemanticPackLoader, VectorEngine, VectorMatch, VECTOR_DIM, VECTOR_DIM_512,
+    VECTOR_DIM_384, VECTOR_DIM_DENSE,
+};
+use omni_pro::omw_query;
+use omni_pro::{
+    OmwAntonymResult, OmwAntonymsRequest, OmwDescribeRequest, OmwHierarchyRequest, OmwLookupRequest,
+    OmwMappingRequest, OmwSynsetNode, OmwSynsetResult, OmwTagResult, OmwTreeRequest, TreeNode,
+    UnmappedStats,
+};
+
+pub mod moss_tts;
+pub mod routes;
+pub mod sherpa_manager;
+pub mod text_chunker;
+
+pub use moss_tts::MossTtsManager;
+pub use sherpa_manager::{decode_audio_to_16k_mono, decode_audio_to_16k_mono_bandpass, normalize_ced_audio_event, SherpaManager};
+
+/// CLIP 互斥组标准名称定义
+const GROUP_COLOR_MODE: &str = "色彩模式";
+const GROUP_TEXT_PRESENCE: &str = "文字存在性";
+const GROUP_SCREENSHOT_SUB: &str = "截图场景细分";
+const GROUP_PHOTO_SUB: &str = "摄影题材细分";
+const GROUP_CONTENT_FORM: &str = "内容形态";
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Mutex<OmniConfig>>,
     /// 离线反向地理编码服务（数据集缺失或开源存根时为软不可用实例）
     pub geo: Arc<omni_pro::geo::GeoService>,
+    /// OpenHowNet 语义槽位挖掘与对齐服务（数据集缺失或开源存根时为软不可用实例）
+    pub hownet: Arc<omni_pro::hownet::OmniHowNetService>,
+    /// 工业级混合检索与约束聚类服务 (支柱 5)
+    pub search: Arc<omni_pro::search::OmniSearchService>,
+    /// OMW 多语言标签词库只读连接池（生产 = 启动期挂载的只读语义包 `semantic.pack`，
+    /// 见 ADR-0038；CE 存根或未挂载时为软不可用实例）
+    pub omw: OmwDb,
+    /// 阿里巴巴 zvec 嵌入式双槽位向量引擎 (RaBitQ + INT8 量化，适配 384d bekko-a8m 与 512d EmbeddingGemma，闭源优先 🔒)
+    pub vector: Arc<VectorEngine>,
+    /// 桌面端 SQLite 业务主库路径（只读访问 file_tag_relations 等主库表）
+    pub master_db_path: Arc<Mutex<Option<PathBuf>>>,
+    /// 向量存储目录实际物理路径（用于多 Worktree 隔离校验，防止盲目复用造成跨库污染）
+    pub target_vectors_dir: Option<PathBuf>,
+    /// 动态维度执行策略（由本地主库 system_config.DIMENSION_POLICIES 动态驱动，缺省回退内置）
+    pub dimension_policies: Arc<std::sync::RwLock<std::collections::HashMap<String, omni_core::DimensionExecutionPolicy>>>,
+    /// Sherpa-ONNX 全栈音频 AI 管理引擎 (SenseVoice ASR / Silero VAD / GTCRN 降噪 / CED-mini 打标)
+    pub sherpa: Arc<SherpaManager>,
+    /// MOSS-TTS 48kHz RVQ-16 自包含音色管理与合成引擎
+    pub moss: Arc<MossTtsManager>,
+    /// 最近分析文件的全局语义锚点缓存（spec §2.2.6 / §3.3）
+    ///
+    /// `perceive` 结束时写入 `e_global`，`POST /api/text/tag` 凭 `file_fingerprint` 取用；
+    /// 命中即删 + TTL 30 分钟 + LRU 300。进程内共享、不落盘。
+    pub anchor_cache: Arc<omni_core::anchor_cache::AnchorCache>,
 }
 
 #[derive(Deserialize)]
@@ -35,6 +95,20 @@ pub struct ExtractRequest {
 #[derive(Deserialize)]
 pub struct FilePreviewRequest {
     pub path: String,
+    #[serde(default, alias = "skipIfExists")]
+    pub skip_if_exists: Option<bool>,
+}
+
+/// 桌面业务主库刷新请求体: POST /api/reconnect（`dbPath` = 桌面业务主库路径）
+///
+/// ⚠️ 语义已于 2026-10-14 收敛：本端点**不再**改变 OmwDb 数据源（历史行为 `omw.connect(dbPath)`
+/// 会把语义包替换成业务主库，是 M8 事故根因）；`dbPath` 仅用于刷新主库路径与维度执行策略。
+/// `dbPath` 为 null/空串 ⇒ 仅 no-op（不再触发断开直连）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconnectRequest {
+    #[serde(default)]
+    pub db_path: Option<String>,
 }
 
 /// 反向地理编码请求体: POST /api/geo/reverse
@@ -55,24 +129,92 @@ pub struct GeoReverseRequest {
 }
 
 pub fn create_app_router(state: AppState) -> Router {
-    Router::new()
-        .route(
-            "/health",
-            get(health_handler),
-        )
+    // 1. 基础开源接口 (Open-Core Endpoints)
+    let mut router = Router::new()
+        .route("/health", get(health_handler))
         .route("/api/version", get(version_handler))
+        .route("/api/v1/engine/status", get(engine_status_handler))
         .route("/api/config", get(get_config).post(update_config).put(update_config))
         .route("/api/extract", post(extract_file_handler))
         .route("/api/extract/upload", post(extract_multipart_handler))
-        .route("/api/cleanup/scan", post(cleanup_scan_handler))
-        .route("/api/cleanup/scan/stream", post(cleanup_scan_stream_handler))
-        .route("/api/cleanup/fix", post(cleanup_fix_handler))
-        .route("/api/duplicate/scan", post(cleanup_scan_handler))
-        .route("/api/duplicate/scan/stream", post(cleanup_scan_stream_handler))
-        .route("/api/duplicate/fix", post(cleanup_fix_handler))
-        .route("/api/file/preview", get(file_preview_handler))
-        .route("/api/cover", get(cover_handler))
-        .route("/api/geo/reverse", post(geo_reverse_handler))
+        // 通用文本打标（spec §3.1）：**刻意注册在基础路由**——非 Pro 构建下须返回
+        // 「空数组 + warn」的确定性降级，而不是 404 传输错误，故不能放进下面的 Pro 分支。
+        .route("/api/text/tag", post(text_tag_handler));
+
+    // 2. 闭源专业版专享接口 (Closed-Source Pro Endpoints 🔒: 一次开发闭源优先)
+    // 依据项目架构准则：除以上四个基础接口外，其余全部归属 Pro 闭源优先体系
+    if omni_pro::is_pro_enabled() {
+        router = router
+            .route("/api/perceive", post(perceive_file_handler))
+            .route("/api/audio/transcribe", post(audio_transcribe_handler))
+            .route("/api/audio/convert", post(audio_convert_handler))
+            .route("/api/audio/analyze-voice", post(audio_analyze_voice_handler))
+            .route("/api/audio/tts/chunk", post(audio_tts_chunk_handler))
+            .route("/api/audio/tts/status", get(audio_tts_status_handler))
+            .route("/api/audio/tts/register-voice", post(audio_tts_register_voice_handler))
+            .route("/api/audio/tts/scale", post(audio_tts_scale_handler))
+            .route("/api/audio/tts/split-chunks", post(audio_tts_split_chunks_handler))
+            .route("/api/vision/tags", post(vision_tags_handler))
+            .route("/api/vision/inspect", post(vision_inspect_handler))
+            .route("/api/fs/ads", post(fs_ads_handler))
+            .route("/api/cleanup/scan", post(cleanup_scan_handler))
+            .route("/api/cleanup/scan/stream", post(cleanup_scan_stream_handler))
+            .route("/api/cleanup/fix", post(cleanup_fix_handler))
+            .route("/api/duplicate/scan", post(cleanup_scan_handler))
+            .route("/api/duplicate/scan/stream", post(cleanup_scan_stream_handler))
+            .route("/api/duplicate/fix", post(cleanup_fix_handler))
+            .route("/api/file/preview", get(file_preview_handler))
+            .route("/api/cover", get(cover_handler))
+            .route("/api/geo/reverse", post(geo_reverse_handler))
+            .route("/api/hownet/describe", post(hownet_describe_handler))
+            .route("/api/text/analyze", post(text_analyze_handler))
+            .route("/api/search/index", post(search_index_handler))
+            .route("/api/search/hybrid", post(search_hybrid_handler))
+            .route("/api/search/cluster", post(search_cluster_handler))
+            .route("/api/taxonomy/resolve-parent", post(taxonomy_resolve_parent_handler))
+            .route("/api/reconnect", post(reconnect_omw_handler))
+            .route("/api/v1/omw/lookup", post(omw_lookup_handler))
+            .route("/api/v1/omw/hierarchy", post(omw_hierarchy_handler))
+            .route("/api/v1/omw/antonyms", post(omw_antonyms_handler))
+            // 概念描述句生成 API 已按 wayfinder #669 退役（恒返回 null）
+            .route("/api/v1/omw/describe", post(omw_describe_handler))
+            .route("/api/v1/omw/mapping", post(omw_mapping_handler))
+            .route("/api/v1/omw/tree", get(omw_tree_handler))
+            .route("/api/v1/omw/unmapped-stats", get(omw_unmapped_stats_handler))
+            // ADR-0038 / PRD #679: 只读语义包与向量引擎专用服务化出口 (Pro 独占 🔒)
+            .route("/api/v1/taxonomy/tree", get(routes::taxonomy::taxonomy_tree_handler))
+            .route("/api/v1/taxonomy/aliases", get(routes::taxonomy::taxonomy_aliases_handler))
+            .route("/api/v1/taxonomy/inspect-tag", post(routes::taxonomy::taxonomy_inspect_tag_handler))
+            .route("/api/taxonomy/fast-recognize", post(routes::taxonomy::fast_recognize_handler))
+            .route("/api/v1/taxonomy/fast-recognize", post(routes::taxonomy::fast_recognize_handler))
+            .route("/api/taxonomy/reload-policies", post(routes::taxonomy::reload_policies_handler))
+            .route("/api/v1/taxonomy/reload-policies", post(routes::taxonomy::reload_policies_handler))
+            .route("/api/v1/vector/upsert", post(routes::vector::vector_upsert_handler))
+            .route("/api/v1/vector/search", post(routes::vector::vector_search_handler))
+            .route("/api/v1/vector/get", post(routes::vector::vector_get_handler))
+            .route(
+                "/api/v1/vector/delete",
+                axum::routing::delete(routes::vector::vector_delete_handler)
+                    .post(routes::vector::vector_delete_handler),
+            )
+            // ADR-0039 / Ticket 1: 高速未分析文件秒搜与密集向量段落对齐
+            .route("/api/v1/search/fs", get(routes::fs_search::fs_search_handler))
+            .route("/api/v1/vector/match-passages", post(routes::vector::match_passages_handler))
+            // 批量整理双底座文本特征向量批量抽取 (batch-organize-hybrid-vector-classification-spec.md)
+            .route("/api/v1/vector/batch-embed-text", post(routes::vector::batch_embed_text_handler))
+            // 工单 10：Chinese-CLIP 文本塔编码（512d，encoder=2），供 desktop CLIP 第 5 路使用
+            .route(
+                "/api/v1/vector/embed-clip-text",
+                post(routes::vector::embed_clip_text_handler),
+            )
+            // 文本分词 API (中英文结巴搜索切词与多字段高亮)
+            .route("/api/v1/text/tokenize", post(text_tokenize_handler))
+            .route("/api/text/tokenize", post(text_tokenize_handler))
+            // 多模态视觉塔显存驱逐 API (spec §4.3)
+            .route("/api/v1/engine/vision/evict", post(engine_vision_evict_handler));
+    }
+
+    router
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .with_state(state)
 }
@@ -88,8 +230,139 @@ async fn version_handler() -> Json<serde_json::Value> {
     }))
 }
 
-/// 健康检查：附 Pro 模块与地理子系统可用性，供前端 UI 与桌面端启动时探测
-async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+/// 引擎与多模态塔运行时状态查询: GET /api/v1/engine/status
+async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let cfg = state.config.lock().unwrap().clone();
+    let profile = cfg.embedding_profile;
+    let mrl_dim = cfg.mrl_dimension;
+    let is_pro = omni_pro::is_pro_enabled();
+    let vision_status = if is_pro {
+        omni_pro::OmniVisionEngine::gemma_vision_status()
+    } else {
+        "uninitialized".to_string()
+    };
+    let ram_status = if is_pro {
+        omni_pro::OmniVisionEngine::ram_vision_status()
+    } else {
+        "disabled: pro_disabled".to_string()
+    };
+    let vision_resident = if is_pro {
+        omni_pro::OmniVisionEngine::is_gemma_vision_resident()
+    } else {
+        false
+    };
+    let master_db_path = state
+        .master_db_path
+        .lock()
+        .ok()
+        .and_then(|p| p.clone())
+        .map(|p| p.to_string_lossy().to_string());
+    let target_vectors_dir = state
+        .target_vectors_dir
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .or_else(|| Some(state.vector.dir().to_string_lossy().to_string()));
+    Json(serde_json::json!({
+        "status": "ok",
+        "profile": profile,
+        "mrlDimension": mrl_dim,
+        "visionStatus": vision_status,
+        "visionSessionResident": vision_resident,
+        "vision_engines_available": {
+            "gemma": vision_status.clone(),
+            "ram": ram_status.clone(),
+        },
+        "visionEnginesAvailable": {
+            "gemma": vision_status.clone(),
+            "ram": ram_status.clone(),
+        },
+        "idleTimeoutSeconds": 300,
+        "isPro": is_pro,
+        "version": env!("CARGO_PKG_VERSION"),
+        "masterDbPath": master_db_path,
+        "targetVectorsDir": target_vectors_dir,
+    }))
+}
+
+/// 显式驱逐视觉显存/内存: POST /api/v1/engine/vision/evict (spec §4.3)
+async fn engine_vision_evict_handler() -> Json<serde_json::Value> {
+    if omni_pro::is_pro_enabled() {
+        omni_pro::OmniVisionEngine::evict_gemma_vision();
+    }
+    Json(serde_json::json!({
+        "status": "ok",
+        "evicted": true,
+    }))
+}
+
+
+#[derive(Debug, Deserialize)]
+struct HealthQuery {
+    lang: Option<String>,
+}
+
+/// 健康检查：附 Pro 模块与地理/HowNet 子系统可用性，供前端 UI 与桌面端启动时探测
+/// 工单 10：`/health.clipText` 五字段探活（支持按 lang 探测 Chinese-CLIP 与 MobileCLIP）。
+///
+/// - `available`：仅在三件套（模型 + 词表 + 输出可验证）齐备时为 true；
+/// - `imageEncoder`：当前激活图像塔（`chinese_clip` / `mobileclip` / `none`）；
+/// - `textModelReady` / `vocabReady`：**只查文件存在与可读，不加载模型**；
+/// - `textOutputVerified`：三态 null（未加载）/ true / false（首次编码结果）。
+fn clip_text_health(lang: Option<&str>) -> serde_json::Value {
+    let clip_dir = omni_pro::OmniVisionEngine::resolve_clip_model_dir();
+    let is_zh = lang.map(|l| l.starts_with("zh")).unwrap_or(true);
+    let (zh_model_ready, zh_vocab_ready) = match clip_dir.as_ref() {
+        Some(dir) => (
+            omni_pro::vision::clip_text_model_ready(dir),
+            omni_pro::vision::clip_text_vocab_ready(dir),
+        ),
+        None => (false, false),
+    };
+    let (mobile_model_ready, mobile_vocab_ready) = match clip_dir.as_ref() {
+        Some(dir) => (
+            omni_pro::vision::mobileclip_text_model_ready(dir),
+            omni_pro::vision::mobileclip_tokenizer_ready(dir),
+        ),
+        None => (false, false),
+    };
+    let zh_verified = omni_pro::vision::clip_text_output_verified();
+    let mobile_verified = omni_pro::vision::mobileclip_text_output_verified();
+
+    let image_encoder = omni_pro::vision::active_clip_image_encoder_label(lang).to_string();
+    let (text_model_ready, vocab_ready, text_output_verified) = if is_zh {
+        (zh_model_ready, zh_vocab_ready, zh_verified)
+    } else {
+        (mobile_model_ready, mobile_vocab_ready, mobile_verified)
+    };
+    let available = text_model_ready && vocab_ready && text_output_verified != Some(false);
+
+    serde_json::json!({
+        "available": available,
+        "imageEncoder": image_encoder,
+        "textModelReady": text_model_ready,
+        "vocabReady": vocab_ready,
+        "textOutputVerified": text_output_verified,
+        "chineseClip": {
+            "available": zh_model_ready && zh_vocab_ready && zh_verified != Some(false),
+            "imageEncoder": "chinese_clip",
+            "textModelReady": zh_model_ready,
+            "vocabReady": zh_vocab_ready,
+            "textOutputVerified": zh_verified,
+        },
+        "mobileClip": {
+            "available": mobile_model_ready && mobile_vocab_ready && mobile_verified != Some(false),
+            "imageEncoder": "mobileclip",
+            "textModelReady": mobile_model_ready,
+            "vocabReady": mobile_vocab_ready,
+            "textOutputVerified": mobile_verified,
+        }
+    })
+}
+
+async fn health_handler(
+    State(state): State<AppState>,
+    Query(query): Query<HealthQuery>,
+) -> Json<serde_json::Value> {
     let is_pro = omni_pro::is_pro_enabled();
     let geo_available = if is_pro {
         let geo = state.geo.clone();
@@ -99,14 +372,65 @@ async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value
     } else {
         false
     };
+    let hownet_available = if is_pro {
+        let hownet = state.hownet.clone();
+        tokio::task::spawn_blocking(move || hownet.is_available())
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let search_available = if is_pro {
+        let search = state.search.clone();
+        // 反映索引服务真实可用性：ensure_index 首调会打开/创建索引入口，
+        // 磁盘或权限异常时返回 Err → false（而非仅凭 is_pro 恒真判断）
+        tokio::task::spawn_blocking(move || search.ensure_index().is_ok())
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    // OMW 词库可用性：实际执行一次 SELECT 1 探测只读连接（与 is_pro 无关，直连会话独立）
+    //
+    // 能力位（2026-10-14 新增）：`omwAvailable` 仅证明"连接能跑 SELECT 1"（业务主库同样满足），
+    // 不足以反映**数据源正确性** —— 必须额外暴露 `omwSource` 与 `graphReady`，否则
+    // "语义包被换成业务主库"这类错源完全不可观测（M8 事故因此静默近一个月）。
+    let omw = state.omw.clone();
+    let omw_available = tokio::task::spawn_blocking(move || omw.validate())
+        .await
+        .unwrap_or(false);
+    let omw_source_label = omw_source(&state.omw);
+    let graph_ready = state.omw.semantic_graph().is_some();
     Json(serde_json::json!({
         "status": "ok",
         "server": "firefly-omni",
         "version": env!("CARGO_PKG_VERSION"),
         "isPro": is_pro,
         "geoAvailable": geo_available,
-        "cleanupAvailable": is_pro
+        "hownetAvailable": hownet_available,
+        "searchAvailable": search_available,
+        "cleanupAvailable": is_pro,
+        "omwAvailable": omw_available,
+        "omwSource": omw_source_label,
+        "graphReady": graph_ready,
+        // 工单 10：CLIP 文本塔探活五字段（只读探测，不加载模型）
+        "clipText": clip_text_health(query.lang.as_deref())
     }))
+}
+
+/// OmwDb 数据源能力位：`pack`（内存只读语义包，生产唯一合法源）/ `db`（普通只读库，
+/// 仅测试与离线核查注入）/ `none`（未挂载）。
+///
+/// 存在的意义：`/health` 的 `omwAvailable` 与 reconnect 响应此前只回传
+/// `is_available()`/`validate()`，业务主库也能让它们为真 ⇒ 错源不可观测。
+fn omw_source(omw: &OmwDb) -> &'static str {
+    if omw.is_pack() {
+        "pack"
+    } else if omw.is_available() {
+        "db"
+    } else {
+        "none"
+    }
 }
 
 /// 离线反向地理编码: POST /api/geo/reverse（数据缺失或开源模式返回 200 + available:false 软失败）
@@ -131,6 +455,227 @@ async fn geo_reverse_handler(
         reason: Some(format!("地理查询任务执行失败: {err}")),
     });
     Json(outcome)
+}
+
+/// OpenHowNet 语义描述查询与自然语言描述句合成: POST /api/hownet/describe
+async fn hownet_describe_handler(
+    State(state): State<AppState>,
+    Json(req): Json<omni_pro::hownet::HowNetDescribeRequest>,
+) -> Json<omni_pro::hownet::HowNetDescribeResult> {
+    let hownet = state.hownet.clone();
+    let word = req.word.clone();
+    let outcome = tokio::task::spawn_blocking(move || hownet.describe(&word))
+        .await
+        .unwrap_or_else(|err| {
+            Ok(omni_pro::hownet::HowNetDescribeResult {
+                word: req.word.clone(),
+                found: false,
+                is_aligned: false,
+                alignment_level: None,
+                top_concept: None,
+                slots: Vec::new(),
+                synonyms: Vec::new(),
+                antonyms: Vec::new(),
+                description: format!("HowNet 查询任务执行失败: {err}"),
+            })
+        })
+        .unwrap_or_else(|err| {
+            omni_pro::hownet::HowNetDescribeResult {
+                word: req.word.clone(),
+                found: false,
+                is_aligned: false,
+                alignment_level: None,
+                top_concept: None,
+                slots: Vec::new(),
+                synonyms: Vec::new(),
+                antonyms: Vec::new(),
+                description: format!("HowNet 检索内部错误: {err}"),
+            }
+        });
+    Json(outcome)
+}
+
+/// OMW 热重连: POST /api/reconnect
+///
+/// **契约收敛（2026-10-14，修 M8）**：本端点只刷新「桌面业务主库路径 + 维度执行策略」，
+/// **绝不触碰 OmwDb 数据源**。语义包挂载是启动期一次性行为（ADR-0038），且 pack 内含全语言
+/// `tag_aliases_{lang}` 分表（挂载时一次全量热载），语言切换只需查询期 `locale` 参数 ⇒
+/// 换库在架构上根本不需要。
+///
+/// 历史行为 `state.omw.connect(dbPath)` 会把内存语义包整体替换成业务主库
+/// （主库无 `file_tags`/`omw_*` 表）⇒ 语义图卸载、分类树退化为空树、量词缓存清空，
+/// 且响应 `omwAvailable` 仍为 true，桌面侧完全无感。该行为已删除。
+///
+/// 零降级：Pro 构建下若 OmwDb 当前无可用数据源，直接 panic 崩溃而非静默继续 ——
+/// 数据源缺失属启动期错误（启动链已保证 Pro 必挂载 pack），不应在此降级兜底。
+async fn reconnect_omw_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ReconnectRequest>,
+) -> Json<serde_json::Value> {
+    let db_path = req.db_path.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let mut policies_reloaded = false;
+    if let Some(p) = db_path {
+        if let Ok(mut lock) = state.master_db_path.lock() {
+            *lock = Some(std::path::PathBuf::from(p));
+        }
+        let new_policies = routes::taxonomy::load_dimension_policies_from_db(Some(std::path::Path::new(p)));
+        if let Ok(mut lock) = state.dimension_policies.write() {
+            *lock = new_policies;
+        }
+        policies_reloaded = true;
+    }
+
+    // 零降级铁律：Pro 构建下 OmwDb 必须已持有数据源（生产 = 启动期挂载的语义包）
+    if omni_pro::is_pro_enabled() && !state.omw.is_available() {
+        tracing::error!(
+            "[reconnect] OmwDb 无可用数据源（语义包未挂载），拒绝以降级状态继续服务"
+        );
+        panic!(
+            "[reconnect] OmwDb 无可用数据源：语义包未挂载。本端点不负责 OmwDb 生命周期（ADR-0038），\
+             数据源缺失属启动期错误，须修复启动链，严禁在此以降级数据源兜底。"
+        );
+    }
+
+    let master_db = state
+        .master_db_path
+        .lock()
+        .ok()
+        .and_then(|p| p.clone())
+        .map(|p| p.to_string_lossy().to_string());
+
+    let target_vectors_dir = state
+        .target_vectors_dir
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .or_else(|| Some(state.vector.dir().to_string_lossy().to_string()));
+
+    Json(serde_json::json!({
+        "status": "ok",
+        // 数据源能力位：本端点不再改变 OmwDb，故此处恒等于当前真实数据源
+        "omwAvailable": state.omw.is_available(),
+        "omwSource": omw_source(&state.omw),
+        "graphReady": state.omw.semantic_graph().is_some(),
+        "policiesReloaded": policies_reloaded,
+        "dbPath": master_db,
+        "targetVectorsDir": target_vectors_dir,
+        "reason": null
+    }))
+}
+
+/// OMW 只读查询统一软失败包装
+///
+/// 连接未配置（未传 --db-path / 已 disconnect）、查询报错或阻塞任务 panic 时，
+/// 一律记录 warn 日志并回退默认值，与桌面端 `omw*` 方法「出错返回空结果」的语义一致；
+/// 真实可用性由 `/health` 的 `omwAvailable` 单独反映。
+async fn omw_query_or_default<T, F>(omw: OmwDb, label: &'static str, default: T, query: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || omw.with_conn(query)).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) => {
+            tracing::warn!("OMW {label} 查询失败，回退默认结果: {err}");
+            default
+        }
+        Err(err) => {
+            tracing::warn!("OMW {label} 查询任务执行失败，回退默认结果: {err}");
+            default
+        }
+    }
+}
+
+/// OMW 词汇查 synset: POST /api/v1/omw/lookup
+async fn omw_lookup_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OmwLookupRequest>,
+) -> Json<Vec<OmwSynsetResult>> {
+    let language = req.language.unwrap_or_else(|| "en".to_string());
+    let word = req.word;
+    Json(
+        omw_query_or_default(state.omw.clone(), "lookup", Vec::new(), move |conn| {
+            omw_query::lookup(conn, &word, &language)
+        })
+        .await,
+    )
+}
+
+/// OMW 层级链查询: POST /api/v1/omw/hierarchy
+async fn omw_hierarchy_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OmwHierarchyRequest>,
+) -> Json<Vec<OmwSynsetNode>> {
+    let synset_id = req.synset_id;
+    Json(
+        omw_query_or_default(state.omw.clone(), "hierarchy", Vec::new(), move |conn| {
+            omw_query::hierarchy(conn, &synset_id)
+        })
+        .await,
+    )
+}
+
+/// OMW 反义词查询: POST /api/v1/omw/antonyms
+async fn omw_antonyms_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OmwAntonymsRequest>,
+) -> Json<Vec<OmwAntonymResult>> {
+    let language = req.language.unwrap_or_else(|| "cmn".to_string());
+    let word = req.word;
+    Json(
+        omw_query_or_default(state.omw.clone(), "antonyms", Vec::new(), move |conn| {
+            omw_query::antonyms(conn, &word, &language)
+        })
+        .await,
+    )
+}
+
+/// OMW 概念描述句 API 已退役（wayfinder #669 / 决策包：删除 omwGenerateDescription 等价物）。
+/// 路由 `/api/v1/omw/describe` 已摘除；本函数保留仅为避免编译引用断裂，恒返回 null。
+#[allow(dead_code)]
+async fn omw_describe_handler(
+    State(_state): State<AppState>,
+    Json(_req): Json<OmwDescribeRequest>,
+) -> Json<Option<String>> {
+    Json(None)
+}
+
+/// OMW 标签映射反查: POST /api/v1/omw/mapping（零桥表依赖，见 omw_query::mapping）
+async fn omw_mapping_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OmwMappingRequest>,
+) -> Json<Vec<OmwTagResult>> {
+    let tag_name = req.tag_name;
+    Json(
+        omw_query_or_default(state.omw.clone(), "mapping", Vec::new(), move |conn| {
+            omw_query::mapping(conn, &tag_name)
+        })
+        .await,
+    )
+}
+
+/// OMW 统一标签树单层懒加载: GET /api/v1/omw/tree?root={code}&depth=1
+async fn omw_tree_handler(
+    State(state): State<AppState>,
+    Query(req): Query<OmwTreeRequest>,
+) -> Json<Vec<TreeNode>> {
+    Json(
+        omw_query_or_default(state.omw.clone(), "tree", Vec::new(), move |conn| {
+            omw_query::tree(conn, &req.root, req.depth)
+        })
+        .await,
+    )
+}
+
+/// OMW 未映射概念聚合统计: GET /api/v1/omw/unmapped-stats
+async fn omw_unmapped_stats_handler(
+    State(state): State<AppState>,
+) -> Json<UnmappedStats> {
+    Json(
+        omw_query_or_default(state.omw.clone(), "unmapped-stats", UnmappedStats { by_lexfile: Vec::new(), by_top_ancestor: Vec::new() }, move |conn| {
+            omw_query::unmapped_stats(conn)
+        })
+        .await,
+    )
 }
 
 /// 根据文件扩展名推断浏览器可直接预览的多模态 MIME 类型（仅允许图片/视频/音频）
@@ -209,6 +754,18 @@ async fn cover_handler(
     State(state): State<AppState>,
     Query(req): Query<FilePreviewRequest>,
 ) -> Response {
+    if req.skip_if_exists.unwrap_or(false) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    if !omni_pro::is_pro_enabled() {
+        return (
+            StatusCode::FORBIDDEN,
+            "Open-core mode: cover generation requires omni-pro",
+        )
+            .into_response();
+    }
+
     let path = PathBuf::from(&req.path);
 
     // 检查是否开启了 Office 完整封面截图选项 (LibreOffice)
@@ -216,10 +773,12 @@ async fn cover_handler(
 
     // 交由 CoverRenderer 按扩展名路由：
     // 对于 Office 文档，内部会默认先解压提取压缩包中的首张图；无图时仅在 enable_office_cover = true 时才执行 LO 渲染
+    let t_cover = std::time::Instant::now();
     let outcome = tokio::task::spawn_blocking(move || {
         omni_pro::CoverRenderer::render_cover_with_options(&path, enable_office_cover)
     })
     .await;
+    let cover_ms = t_cover.elapsed().as_millis() as u64;
 
     match outcome {
         Ok(Ok(bytes)) => {
@@ -228,6 +787,10 @@ async fn cover_handler(
             // CoverRenderer 统一返回 WebP 格式
             resp.headers_mut()
                 .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/webp"));
+            if let Ok(val) = HeaderValue::from_str(&cover_ms.to_string()) {
+                resp.headers_mut()
+                    .insert(axum::http::HeaderName::from_static("x-cover-duration-ms"), val);
+            }
             resp
         }
         Ok(Err(err)) => {
@@ -277,8 +840,62 @@ fn save_config_to_disk(cfg: &OmniConfig) {
     }
 }
 
-pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
-    let initial_config = load_config_from_disk();
+/// 量词接线（GH #710 S9）：以当前词库刷新 omni-text 真实搭配量词进程缓存
+///
+/// 成功路径由 `hydrate_from_conn` 内部「局部建表 → `replace_map` 原子 swap」完成，
+/// 灌库窗口内旧词库量词仍可读（无空窗）。
+///
+/// **零降级（2026-10-14 用户裁定）**：仅"未配置数据源"（CE 存根 / 显式断开）按 info 复位；
+/// 一旦有数据源却缺 `classifier` 列、缺分表或零条有效量词，一律 **panic 崩溃** ——
+/// 那是语义包陈旧或接错库的硬信号，静默清空会让造句量词永久 miss 且无任何告警。
+fn refresh_classifier_map(omw: &OmwDb) {
+    if !omw.is_available() {
+        // 未配置/断开态：无数据源 → 复位为空（非错误，记 info）
+        omni_pro::text::classifier_lookup::reset_classifier_map();
+        info!("classifier map cleared: omw unavailable (no classifier source)");
+        return;
+    }
+    match omw.with_conn(|conn| omni_pro::text::classifier_lookup::hydrate_from_conn(conn)) {
+        Ok(n) if n > 0 => info!("classifier map hydrated: {n} lemma entries"),
+        Ok(n) => {
+            // 零降级：分表在但零条非空 classifier ⇒ 陈旧/残缺语义包，量词功能将全失
+            tracing::error!("[classifier] 语义包 tag_aliases_zh_CN.classifier 全空（{n} 条），拒绝继续运行");
+            panic!(
+                "[classifier] 语义包 tag_aliases_zh_CN.classifier 零条有效数据 ⇒ 语义包陈旧或不完整，\
+                 拒绝以缺失量词源的状态继续运行（请重跑 build-semantic-pack 流水线）。"
+            );
+        }
+        Err(err) => {
+            // 零降级：缺列/缺表 = 接入的不是当前代语义包（陈旧包或错源），直接崩溃暴露。
+            // 历史行为是 reset 后 info/warn 静默清空，正是 M8 事故中"分类树空 + 量词全丢"的放大器。
+            omni_pro::text::classifier_lookup::reset_classifier_map();
+            let msg = format!("{err:#}");
+            tracing::error!("[classifier] 量词源装载失败，拒绝继续运行: {msg}");
+            panic!(
+                "[classifier] 语义包 tag_aliases_zh_CN 缺少 classifier 列或不可读 ⇒ 数据源不是当前代语义包：{msg}"
+            );
+        }
+    }
+}
+
+pub async fn start_server(
+    addr: SocketAddr,
+    db_path: Option<PathBuf>,
+    pack_path: Option<PathBuf>,
+    embedding_profile: Option<String>,
+    mrl_dimension: Option<usize>,
+    vectors_path: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let mut initial_config = load_config_from_disk();
+    if let Some(profile) = embedding_profile {
+        initial_config.embedding_profile = profile;
+    }
+    if let Some(mrl) = mrl_dimension {
+        initial_config.mrl_dimension = mrl;
+    }
+    if omni_pro::is_pro_enabled() {
+        omni_pro::OmniVisionEngine::set_gemma_mrl_dimension(initial_config.mrl_dimension);
+    }
     // 地理数据集发现链：环境变量 → exe 相对目录 → cwd 候选；落空或开源存根时软不可用
     let geo = match omni_pro::geo::discover_dataset_path() {
         Some(path) => {
@@ -290,9 +907,141 @@ pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
             Arc::new(omni_pro::geo::GeoService::unavailable())
         }
     };
+    // HowNet 独立数据库已废弃，能力已完全合流至 semantic.pack；保持软不可用存根服务
+    let hownet = Arc::new(omni_pro::hownet::OmniHowNetService::unavailable());
+    // 索引目录发现链：优先绑定 db_path 同级 search_index 目录（确保多 Worktree 数据物理隔离），
+    // 缺失 db_path 时才尝试全局用户目录（APPDATA → LOCALAPPDATA → USERPROFILE），
+    // 全部缺失时才降级到系统临时目录（临时目录存在被系统清理导致索引重建的风险，仅作兜底）
+    let search_dir = db_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("search_index"))
+        .unwrap_or_else(|| {
+            if let Ok(appdata) = std::env::var("APPDATA") {
+                PathBuf::from(appdata).join("firefly-ai-folder").join("search_index")
+            } else if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+                PathBuf::from(local_appdata).join("firefly-ai-folder").join("search_index")
+            } else if let Ok(home) = std::env::var("USERPROFILE") {
+                PathBuf::from(home).join(".firefly-ai-folder").join("search_index")
+            } else {
+                std::env::temp_dir().join("firefly_omni_search_index")
+            }
+        });
+    let search = Arc::new(omni_pro::search::OmniSearchService::new(search_dir));
+    // OMW 词库只读语义包零磁盘内存挂载 (ADR-0038 / PRD #679: 闭源优先 🔒)
+    // 规范解耦：--pack-path 专用于只读语义包；--db-path 专用于桌面业务主库（**永不**充当 OmwDb 数据源）
+    //
+    // 零降级铁律（2026-10-14 用户裁定）：Pro 构建下语义包是 OmwDb 的唯一合法数据源 ——
+    // 未发现包或挂载失败一律 panic 崩溃，严禁回退到 --db-path 所指的业务主库。
+    // 历史事故：此处曾在 !pack_mounted 时回退 `omw.connect(db_path)`，与 /api/reconnect 的
+    // 同类错误叠加，使语义包被业务主库静默替换（M8，见
+    // docs/issues/review-semantic-graph-slice-0-4-code-audit.md）。
+    let omw = OmwDb::unavailable();
+    let mut omw_connected = false;
+    let is_pro_build = omni_pro::is_pro_enabled();
+    let pack_to_load = pack_path.or_else(SemanticPackLoader::discover_pack_path);
+    match pack_to_load {
+        Some(target_pack_path) => match omw.connect_pack(&target_pack_path) {
+            Ok(()) => {
+                info!(
+                    "semantic.pack zero-disk mounted to OmwDb from {}",
+                    target_pack_path.display()
+                );
+                omw_connected = true;
+            }
+            Err(err) => {
+                if is_pro_build {
+                    tracing::error!(
+                        "[OmwDb] 语义包挂载失败（{}），拒绝以降级数据源启动: {err:#}",
+                        target_pack_path.display()
+                    );
+                    panic!(
+                        "[OmwDb] 语义包挂载失败，拒绝以降级数据源启动（{}）：{err:#}",
+                        target_pack_path.display()
+                    );
+                }
+                tracing::warn!(
+                    "Failed to mount semantic.pack (open-core/stub mode, omw stays unavailable): {err}"
+                );
+            }
+        },
+        None => {
+            if is_pro_build {
+                tracing::error!(
+                    "[OmwDb] Pro 构建未发现任何 semantic.pack（--pack-path 未传且 discover 落空），拒绝以业务主库充当 OMW 数据源"
+                );
+                panic!(
+                    "[OmwDb] Pro 构建必须挂载 semantic.pack：--pack-path 未传入且自动 discover 未命中。\
+                     严禁以 --db-path 所指的桌面业务主库充当 OMW 数据源（该库不含 file_tags/omw_* 语义表）。"
+                );
+            }
+            info!("open-core/stub mode: no semantic.pack required, omw subsystem starts unavailable");
+        }
+    }
+    if let Some(path) = &db_path {
+        info!(
+            "db-path is reserved for desktop master database ({})",
+            path.display()
+        );
+    }
+
+    // 量词接线（GH #710 S9）：词库就绪后刷新量词进程缓存
+    // （spawn_blocking：41k 行全表 SQL 不阻塞 async runtime worker；await 保证首个请求前完成）
+    if omw_connected {
+        let omw_bg = omw.clone();
+        tokio::task::spawn_blocking(move || refresh_classifier_map(&omw_bg))
+            .await
+            .unwrap_or_else(|err| tracing::warn!("classifier map refresh join failed: {err}"));
+    }
+
+    // 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 384d bekko-a8m 与 512d EmbeddingGemma)
+    // 优先绑定 vectors_path，其次绑定 db_path 父级 vectors/ 目录（多 Worktree 物理隔离），最后 fallback
+    let target_vectors_dir = vectors_path
+        .or_else(|| db_path.as_ref().and_then(|p| p.parent()).map(|p| p.join("vectors")));
+
+    let vector = Arc::new(match target_vectors_dir {
+        Some(dir) => {
+            tracing::info!("[OmniServer] 向量引擎成功对齐目标路径: {}", dir.display());
+            VectorEngine::open(dir).unwrap_or_else(|err| {
+                tracing::warn!("Failed to open vector engine at target path ({err}), falling back to memory");
+                VectorEngine::in_memory()
+            })
+        }
+        None => VectorEngine::open_default().unwrap_or_else(|err| {
+            tracing::warn!("Failed to open default vector engine ({err}), falling back to memory");
+            VectorEngine::in_memory()
+        }),
+    });
+
+    let initial_policies = routes::taxonomy::load_dimension_policies_from_db(db_path.as_deref());
+    // 注意顺序：sherpa 必须在任何 OmniOrtRuntime 绑定之前完成运行时 A 的加载
+    // （`SetDllDirectoryW` 是进程级单槽替换，见 sherpa_manager.rs 的跨 crate 时序契约），
+    // 因此下面的运行时 B 绑定显式排在 SherpaManager::new() 之后。
+    let sherpa = Arc::new(SherpaManager::new());
+    // 【工单 04 / SPEC §3.8】启动期显式绑定运行时 B（先探后绑 + 全进程唯一一次 init_from）：
+    // 保证启动日志可观测到「运行时 B 路径 + FileVersion + 内存中 DirectML.dll 实际路径
+    // + EP 探测 + DML 闸状态」。绑定失败不阻断服务启动（推理请求会在 build_session 处
+    // 显式返回 Err），但必须 error 可见，严禁静默。
+    if let Err(err) = omni_core::OmniOrtRuntime::init() {
+        tracing::error!(
+            "[OmniServer] ONNX Runtime 运行时 B 绑定失败，全部 ONNX 推理将不可用: {err}"
+        );
+    }
+    let moss = Arc::new(MossTtsManager::new());
+    let vectors_dir_opt = Some(vector.dir().to_path_buf());
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),
         geo,
+        hownet,
+        search,
+        omw,
+        vector,
+        master_db_path: Arc::new(Mutex::new(db_path)),
+        target_vectors_dir: vectors_dir_opt,
+        dimension_policies: Arc::new(std::sync::RwLock::new(initial_policies)),
+        sherpa,
+        moss,
+        anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本
@@ -314,16 +1063,46 @@ pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
     let app = create_app_router(state);
 
     info!("firefly-omni Axum HTTP server v{} starting on {}", env!("CARGO_PKG_VERSION"), addr);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let mut retry_count = 0;
+    let listener = loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => break l,
+            Err(e) if retry_count < 10 => {
+                retry_count += 1;
+                tracing::warn!(
+                    "firefly-omni failed to bind to {} ({}), retrying in 1s (attempt {}/10)...",
+                    addr, e, retry_count
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(e) => {
+                tracing::error!("firefly-omni failed to bind to {} after {} attempts: {}", addr, retry_count, e);
+                return Err(e.into());
+            }
+        }
+    };
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            // 当由 Electron / Node.js 宿主拉起时，stdin 管道随宿主退出而关闭 (EOF)
-            // 监听 stdin EOF 或终止信号，确保宿主崩溃或强制关闭时 omni-server 立即退出不残留
-            use tokio::io::AsyncReadExt;
-            let mut stdin = tokio::io::stdin();
-            let mut buf = [0u8; 1];
+            // 当由 Electron / Node.js 宿主显式配置 OMNI_WATCH_STDIN=1 拉起时，监听 stdin EOF
+            // 默认情况下（独立运行、后台守护、CLI）仅响应 Ctrl+C 信号，杜绝无终端环境下直接读到 EOF 导致的误退出
+            let watch_stdin = std::env::var("OMNI_WATCH_STDIN").map(|v| v == "1").unwrap_or(false);
             tokio::select! {
-                _ = stdin.read(&mut buf) => {
+                _ = async {
+                    if !watch_stdin {
+                        std::future::pending::<()>().await;
+                        return;
+                    }
+                    use tokio::io::AsyncReadExt;
+                    let mut stdin = tokio::io::stdin();
+                    let mut buf = [0u8; 1];
+                    loop {
+                        match stdin.read(&mut buf).await {
+                            Ok(0) => break, // 真正读到 EOF (宿主进程已销毁)
+                            Ok(_) => continue, // 宿主写入了心跳或数据，继续等待
+                            Err(_) => break, // 管道断开
+                        }
+                    }
+                } => {
                     tracing::info!("firefly-omni stdin closed (host terminated), shutting down gracefully.");
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -332,6 +1111,7 @@ pub async fn start_server(addr: SocketAddr) -> anyhow::Result<()> {
             }
         })
         .await?;
+    omni_extract::shutdown_exiftool_daemon();
     Ok(())
 }
 
@@ -344,12 +1124,32 @@ async fn get_config(
 
 async fn update_config(
     State(state): State<AppState>,
-    Json(new_config): Json<OmniConfig>,
+    Json(payload): Json<serde_json::Value>,
 ) -> Json<OmniConfig> {
     let mut cfg = state.config.lock().unwrap();
-    *cfg = new_config.clone();
-    save_config_to_disk(&new_config);
-    Json(new_config)
+    if let Ok(new_cfg) = serde_json::from_value::<OmniConfig>(payload.clone()) {
+        let prev_profile = cfg.embedding_profile.clone();
+        let prev_mrl = cfg.mrl_dimension;
+
+        *cfg = new_cfg;
+
+        // 若传入 payload 未显式指定 embedding_profile，保留当前激活档位，杜绝被 serde default 降级覆盖
+        if payload.get("embedding_profile").is_none() {
+            cfg.embedding_profile = prev_profile;
+        }
+        // 若传入 payload 未显式指定 mrl_dimension，保留当前 MRL 维度
+        if payload.get("mrl_dimension").is_none() {
+            cfg.mrl_dimension = prev_mrl;
+        }
+
+        if omni_pro::is_pro_enabled() {
+            omni_pro::OmniVisionEngine::set_gemma_mrl_dimension(cfg.mrl_dimension);
+        }
+        save_config_to_disk(&*cfg);
+        Json(cfg.clone())
+    } else {
+        Json(cfg.clone())
+    }
 }
 
 /// 处理本地 JSON 文件路径提取请求: POST /api/extract { "file_path": "/path/to/file" }
@@ -391,6 +1191,3879 @@ async fn extract_file_handler(
         }
     };
     res
+}
+
+#[derive(Default, Clone)]
+pub struct VisionComputed {
+    pub has_text: Option<bool>,
+    pub morphology_tags: Vec<String>,
+    pub morphology_high_confidence_tags: Vec<String>,
+    pub clip_tags: Vec<String>,
+    /// (WP2b) CLIP 标定置信度快照：标签名 → 标定分，供 6.2 TagChainItem.confidence 贯通
+    pub clip_tag_confs: std::collections::HashMap<String, f32>,
+    pub clip_high_confidence_tags: Vec<String>,
+    pub nsfw_probs: Option<[f32; 5]>,
+    pub watermark_level: Option<u8>,
+    pub watermark_status: Option<String>,
+    pub has_watermark: Option<bool>,
+    pub mosaic_level: Option<u8>,
+    pub mosaic_status: Option<String>,
+    pub has_mosaic: Option<bool>,
+    pub aesthetic_score: Option<f32>,
+    pub quality_score: Option<f32>,
+    pub quality_issues: Vec<String>,
+    pub photo_type: Option<String>,
+    pub ram_tags: Vec<omni_core::RamTagItem>,
+    pub inspect_img: Option<image::DynamicImage>,
+    /// CLIP 图像嵌入向量（512 维归一化），用于级联假设仲裁
+    pub image_embedding: Option<Vec<f32>>,
+    /// 图像嵌入向量的编码器出处（zvec v3 encoder_id），由 omni-vision 返回，禁止本层猜
+    pub image_encoder_id: Option<u8>,
+    /// CLIP 互斥组分类结果：(标签名, 置信度, 组名)
+    /// 覆盖：内容形态/文字存在性/色彩模式/截图细分 四个互斥维度
+    pub clip_mutual_tags: Vec<(String, f32, &'static str)>,
+    pub duration_ms: u64,
+
+    // 各视觉子任务独立耗时 (毫秒)
+    pub text_detect_ms: u64,
+    pub clip_ms: u64,
+    pub nsfw_ms: u64,
+    pub watermark_ms: u64,
+    pub mosaic_ms: u64,
+    pub aesthetic_ms: u64,
+    pub bw_ms: u64,
+    pub tag_ms: u64,
+    pub ram_ms: u64,
+    pub subtasks: std::collections::BTreeMap<String, u64>,
+}
+
+/// 阶段一主向量的编码器出处：有文本向量时取文本编码层出处，否则取视觉层出处。
+///
+/// 纯透传函数：出处由产出层（omni-text / omni-vision）给出，**禁止在此按界面语言或档位猜测**。
+/// 主向量优先级与 `embedding_dense = text_emb.or(image_embedding)` 保持一致。
+fn resolve_main_vector_encoder(
+    has_text_vector: bool,
+    text_encoder: Option<u8>,
+    image_encoder: Option<u8>,
+) -> Option<u8> {
+    if has_text_vector {
+        text_encoder
+    } else {
+        image_encoder
+    }
+}
+
+/// 视频领域排他门禁：视频媒体严禁挂载纯图片专有维度（截图细分、摄影照片细分等）
+pub fn filter_video_visual_tags(tags: &mut Vec<String>) {
+    tags.retain(|t| !omni_core::is_image_exclusive_tag(t));
+}
+
+/// 纯内存多核零拷贝并行视觉感知流水线: 支持单张图像与视频代表帧的视觉打标与特征提取
+pub fn run_vision_pipeline_on_image(
+    inspect_img: &image::DynamicImage,
+    exif_orient: Option<&str>,
+    enable_visual_tags: bool,
+    lang: Option<&str>,
+    embedding_profile: &str,
+) -> Result<VisionComputed, String> {
+    let t_vision = std::time::Instant::now();
+    let mut out = VisionComputed::default();
+
+    // 档位硬门禁校验：两模式绝对物理隔离与零降级抛错
+    if embedding_profile == "gemma_unified" {
+        let gemma = omni_pro::OmniVisionEngine::gemma_engine();
+        if gemma.circuit_breaker().is_disabled() {
+            return Err("EmbeddingGemma 视觉塔已熔断或禁用，gemma_unified 档位禁止降级到 CLIP".to_string());
+        }
+    }
+
+    let (raw_w, raw_h) = (inspect_img.width(), inspect_img.height());
+    // 大图自适应预降采样 (限制长边 <= 1280px)，采用高速 thumbnail 将千万级像素运算量削减 95%
+    let thumb_owned;
+    let img_ref = if raw_w > 1280 || raw_h > 1280 {
+        thumb_owned = inspect_img.thumbnail(1280, 1280);
+        &thumb_owned
+    } else {
+        inspect_img
+    };
+
+    // 多核并行：7 大视觉算子零拷贝只读引用借用 &img_ref，独立计时
+    let scope_res = std::thread::scope(|s| -> Result<(), String> {
+        // 1. 文本探活 (DBNet / MobileNet 骨干)
+        let h_text = omni_core::timed_spawn!(s, {
+            omni_pro::OmniVisionEngine::fast_detect_has_text(img_ref)
+        });
+
+        // 2. 视觉语义标签 (Chinese-CLIP / Mobile-CLIP / EmbeddingGemma)
+        // 档位绝对隔离：gemma_unified 严格只走 Gemma，classic_light 严格只走 CLIP，严禁降级
+        let h_clip = omni_core::timed_spawn!(s, {
+            if enable_visual_tags {
+                if embedding_profile == "gemma_unified" {
+                    let tags = omni_pro::OmniVisionEngine::extract_gemma_visual_tags_scored_from_image(
+                        img_ref,
+                        10,
+                    );
+                    Ok(tags)
+                } else {
+                    let tags = omni_pro::OmniVisionEngine::extract_clip_visual_tags_scored_from_image(
+                        img_ref,
+                        lang,
+                        10,
+                    );
+                    Ok(tags)
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        });
+
+        // 3. NSFW 模型 5 分类概率推理
+        let h_nsfw = omni_core::timed_spawn!(s, {
+            omni_pro::OmniVisionEngine::run_nsfw_model(img_ref)
+        });
+
+        // 4. 频域水印检测
+        let h_wm = omni_core::timed_spawn!(s, {
+            omni_pro::perceive::detect_watermark_level(img_ref)
+        });
+
+        // 5. 宏块打码检测
+        let h_mc = omni_core::timed_spawn!(s, {
+            omni_pro::perceive::detect_mosaic_level(img_ref)
+        });
+
+        // 6. 物理美学与画质评估 (直接消费前置 ExifTool 提取的 exif_orient！)
+        let h_aes = omni_core::timed_spawn!(s, {
+            omni_pro::perceive::evaluate_image_aesthetic_and_quality(img_ref, exif_orient)
+        });
+
+        // 7. 黑白全彩检测
+        let h_bw = omni_core::timed_spawn!(s, {
+            omni_pro::OmniVisionEngine::detect_is_black_and_white(img_ref)
+        });
+
+        // 8. RAM++ 细粒度实体与泛维度/泛标签投影提取
+        let h_ram = omni_core::timed_spawn!(s, {
+            if enable_visual_tags {
+                omni_pro::OmniVisionEngine::extract_ram_tags(img_ref, lang, 10)
+            } else {
+                Vec::new()
+            }
+        });
+
+        // 9. 图像嵌入向量提取 (用于级联假设仲裁与多模态稠密检索)，统一走 timed_spawn! 计时宏
+        // 编码器出处由产出层回传：Gemma 视觉塔 → 4；CLIP 图像塔 → 由 omni-vision 判定 2/3。
+        let h_embed = omni_core::timed_spawn!(s, {
+            if embedding_profile == "gemma_unified" {
+                match omni_pro::OmniVisionEngine::encode_gemma_image(img_ref) {
+                    Ok(v) => Ok(Some((v, omni_pro::vector_engine::encoder_id::GEMMA))),
+                    Err(e) => {
+                        Err(format!("EmbeddingGemma 图像向量编码失败: {:?}，禁止降级到 CLIP", e))
+                    }
+                }
+            } else {
+                Ok(omni_pro::OmniVisionEngine::extract_clip_image_embedding(img_ref, lang))
+            }
+        });
+
+        // 汇聚并行子任务: panic 时回退默认值并记录日志，避免零耗时误导瓶颈判定
+        macro_rules! join_or_log {
+            ($handle:expr, $name:literal, $default:expr) => {
+                match $handle.join() {
+                    Ok(v) => v,
+                    Err(err) => {
+                        tracing::warn!("视觉流水线子任务 {} panic，回退默认值: {:?}", $name, err);
+                        $default
+                    }
+                }
+            };
+        }
+        let (td, td_ms) = join_or_log!(h_text, "text_detect", (false, 0));
+        let (ct_res, ct_ms) = join_or_log!(h_clip, "clip", (Ok(Vec::new()), 0));
+        let ct_scored = match ct_res {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        let (np, np_ms) = join_or_log!(h_nsfw, "nsfw", (None, 0));
+        let (wl, wl_ms) = join_or_log!(h_wm, "watermark", (0, 0));
+        let (ml, ml_ms) = join_or_log!(h_mc, "mosaic", (0, 0));
+        let (ar, ar_ms) = join_or_log!(h_aes, "aesthetic", ((7.5, Vec::new()), 0));
+        let (bw, bw_ms) = join_or_log!(h_bw, "bw", (false, 0));
+        let (ram_res, ram_ms) = join_or_log!(h_ram, "ram", (Vec::new(), 0));
+        let (embed_res, embed_ms) = join_or_log!(h_embed, "clip_embed", (Ok(None), 0));
+        let img_embed = match embed_res {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+
+        out.has_text = Some(td);
+        out.text_detect_ms = td_ms;
+        // (WP2b) 分数快照与标签名拆分：clip_tags 保持 Vec<String> 兼容既有门禁/消歧流程
+        out.clip_tag_confs = ct_scored.iter().cloned().collect();
+        out.clip_tags = ct_scored.into_iter().map(|(t, _)| t).collect();
+        // gemma_unified 档位：补齐组内单选互斥（2026-10-30 风景照误标事故修复）。
+        // 该档位此前被整体旁路（图像嵌入来自 Gemma 塔，无法与 CLIP 文本锚空间做余弦竞争），
+        // 导致同维度多标签并存（风景照+宠物照）流出。改为对按生点积降序的标签序列
+        // 做纯序数 Top-1 过滤，不需要任何嵌入向量，与档位天然解耦。
+        if embedding_profile == "gemma_unified" && enable_visual_tags {
+            out.clip_tags = omni_pro::OmniVisionEngine::filter_mutual_groups_top1(
+                std::mem::take(&mut out.clip_tags),
+            );
+        }
+        out.clip_ms = ct_ms;
+        out.nsfw_probs = np;
+        out.nsfw_ms = np_ms;
+        out.watermark_level = Some(wl);
+        out.watermark_ms = wl_ms;
+        out.mosaic_level = Some(ml);
+        out.mosaic_ms = ml_ms;
+        out.aesthetic_score = Some(ar.0);
+        out.quality_score = Some(ar.0);
+        out.quality_issues = ar.1;
+        out.aesthetic_ms = ar_ms;
+        out.bw_ms = bw_ms;
+        out.ram_tags = ram_res;
+        out.ram_ms = ram_ms;
+        // 解包 (向量, 编码器出处)：出处与向量同源同生，不在此层推断
+        let (img_vec, img_enc) = match img_embed {
+            Some((v, enc)) => (Some(v), Some(enc)),
+            None => (None, None),
+        };
+        out.image_embedding = img_vec;
+        out.image_encoder_id = img_enc;
+        // CLIP 互斥分类：利用图像嵌入向量对内容形态/色彩/文字等互斥组分类（仅 Classic Light 模式使用）
+        let mut mutual_ms = 0u64;
+        if let Some(ref emb) = out.image_embedding {
+            if embedding_profile != "gemma_unified" {
+                let t_mutual = std::time::Instant::now();
+                out.clip_mutual_tags = omni_pro::OmniVisionEngine::classify_mutual_exclusive_groups(
+                    emb.as_slice(),
+                    lang,
+                );
+                mutual_ms = t_mutual.elapsed().as_millis() as u64;
+            }
+        }
+        // 标签分支挂钟 = 并行段长尾 (CLIP/NSFW/RAM/Embed 取 Max) + 串行尾巴 (互斥分类)
+        let tag_wall_ms = ct_ms.max(np_ms).max(ram_ms).max(embed_ms) + mutual_ms;
+        out.tag_ms = tag_wall_ms;
+
+        // 统一汇总至子任务度量字典
+        out.subtasks.insert("text_detect_ms".to_string(), td_ms);
+        out.subtasks.insert("clip_ms".to_string(), ct_ms);
+        out.subtasks.insert("clip_embed_ms".to_string(), embed_ms);
+        out.subtasks.insert("clip_mutual_ms".to_string(), mutual_ms);
+        out.subtasks.insert("nsfw_ms".to_string(), np_ms);
+        out.subtasks.insert("watermark_ms".to_string(), wl_ms);
+        out.subtasks.insert("mosaic_ms".to_string(), ml_ms);
+        out.subtasks.insert("aesthetic_ms".to_string(), ar_ms);
+        out.subtasks.insert("bw_ms".to_string(), bw_ms);
+        out.subtasks.insert("ram_ms".to_string(), ram_ms);
+        out.subtasks.insert("tag_ms".to_string(), tag_wall_ms);
+
+        // 零耗时内存推导
+        out.has_watermark = Some(wl > 0);
+        out.watermark_status = Some(match wl {
+            2 => "heavy",
+            1 => "light",
+            _ => "none",
+        }.to_string());
+
+        out.has_mosaic = Some(ml > 0);
+        out.mosaic_status = Some(match ml {
+            2 => "heavy",
+            1 => "thin",
+            _ => "none",
+        }.to_string());
+
+        let aspect = img_ref.width() as f32 / img_ref.height().max(1) as f32;
+        let (mut morphology_tags, mut morphology_high_confidence_tags) =
+            omni_pro::OmniVisionEngine::derive_morphology_tags(aspect, td, bw);
+
+        // 物理事实轻量算子注入 (DEC-05)
+        // 1. 画幅算子 (ID 143)
+        let aspect_concept = omni_pro::OmniVisionEngine::detect_aspect_ratio_type(raw_w, raw_h);
+        let aspect_name = aspect_concept.zh_name().to_string();
+        if !morphology_tags.contains(&aspect_name) {
+            morphology_tags.push(aspect_name.clone());
+            morphology_high_confidence_tags.push(aspect_name);
+        }
+
+        // 2. 背景算子 (ID 139)
+        let bg_concept = omni_pro::OmniVisionEngine::detect_background_type(img_ref);
+        let bg_name = bg_concept.zh_name().to_string();
+        if !morphology_tags.contains(&bg_name) {
+            morphology_tags.push(bg_name.clone());
+            morphology_high_confidence_tags.push(bg_name);
+        }
+
+        // 3. 主色调与色系算子 (ID 149)
+        let (main_color_opt, color_series_opt) = omni_pro::OmniVisionEngine::detect_main_color_and_series(img_ref);
+        if let Some(mc) = main_color_opt {
+            let mc_name = mc.zh_name().to_string();
+            if !morphology_tags.contains(&mc_name) {
+                morphology_tags.push(mc_name.clone());
+                morphology_high_confidence_tags.push(mc_name);
+            }
+        }
+        if let Some(series_concept) = color_series_opt {
+            let cs_name = series_concept.zh_name().to_string();
+            if !morphology_tags.contains(&cs_name) {
+                morphology_tags.push(cs_name.clone());
+                morphology_high_confidence_tags.push(cs_name);
+            }
+        }
+
+        // 4. 画质等级算子 (ID 122)
+        if let Some(rq) = omni_pro::OmniVisionEngine::detect_resolution_quality(raw_w, raw_h) {
+            let rq_name = rq.zh_name().to_string();
+            if !morphology_tags.contains(&rq_name) {
+                morphology_tags.push(rq_name.clone());
+                morphology_high_confidence_tags.push(rq_name);
+            }
+        }
+
+        // 无字图排版门禁：若未探活出文本内容，严禁打上依赖排版文字的海报宣发或截图标签
+        if !td {
+            out.clip_tags.retain(|t| {
+                !tag_matches_concept(t, "海报宣发") && !tag_matches_concept(t, "截图")
+            });
+        }
+
+        // CLIP 高置信度标签截取 Top 5，同互斥单选组内仅保留最高排序项
+        let mut high_conf: Vec<String> = Vec::with_capacity(5);
+        let mut seen_groups: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+        for t in &out.clip_tags {
+            if high_conf.len() >= 5 {
+                break;
+            }
+            let code = normalize_tag_to_code(t);
+            if omni_core::tag_admissibility::is_rejected_code(&code) {
+                continue;
+            }
+            let group = match omni_core::tag_identity::concept_from_code(code.as_str()) {
+                Some(Concept::Windows截图)
+                | Some(Concept::macOS截图)
+                | Some(Concept::iOS截图)
+                | Some(Concept::Android截图)
+                | Some(Concept::Linux截图) => Some("system_ecology"),
+
+                Some(Concept::实拍)
+                | Some(Concept::手绘)
+                | Some(Concept::CG渲染)
+                | Some(Concept::AI生成) => Some("generation_carrier"),
+
+                Some(Concept::横屏)
+                | Some(Concept::竖屏)
+                | Some(Concept::超宽长条)
+                | Some(Concept::正方形) => Some("aspect_ratio"),
+
+                _ => None,
+            };
+
+            if let Some(g) = group {
+                if seen_groups.insert(g) {
+                    high_conf.push(t.clone());
+                }
+            } else {
+                high_conf.push(t.clone());
+            }
+        }
+        out.clip_high_confidence_tags = high_conf;
+
+        // 漫画细分标签形态门禁
+        let is_anime_art = out.clip_tags.iter().any(|t| {
+            tag_matches_concept(t, "二次元")
+                || tag_matches_concept(t, "动漫")
+                || tag_matches_concept(t, "插画")
+                || tag_matches_concept(t, "漫画")
+                || tag_matches_concept(t, "手绘")
+        });
+        if is_anime_art {
+            if aspect < 0.45 {
+                if !morphology_tags.contains(&"条漫".to_string()) {
+                    morphology_tags.push("条漫".to_string());
+                }
+            } else if (aspect >= 0.55 && aspect <= 0.90) || (aspect >= 1.20 && aspect <= 1.60) {
+                if !morphology_tags.contains(&"页漫".to_string()) {
+                    morphology_tags.push("页漫".to_string());
+                }
+            }
+        }
+
+        out.morphology_tags = morphology_tags;
+        out.morphology_high_confidence_tags = morphology_high_confidence_tags;
+
+        // 图像细分形态分类
+        let p_type = omni_pro::perceive::infer_image_modal_type(
+            img_ref,
+            &out.morphology_tags,
+            &out.clip_tags,
+            &[],
+            td,
+            "",
+        );
+        out.photo_type = Some(p_type);
+
+        Ok(())
+    });
+
+    if let Err(e) = scope_res {
+        return Err(e);
+    }
+
+    out.inspect_img = Some(img_ref.clone());
+    out.duration_ms = t_vision.elapsed().as_millis() as u64;
+    Ok(out)
+}
+
+/// 兼容既有磁盘路径调用的薄包装层
+fn run_vision_pipeline(
+    file_path: &str,
+    exif_orient: Option<&str>,
+    enable_visual_tags: bool,
+    lang: Option<&str>,
+    embedding_profile: &str,
+) -> VisionComputed {
+    let t_vision = std::time::Instant::now();
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tiff" | "gif");
+    let is_video = omni_core::is_video_ext(&ext);
+
+    if is_image {
+        match image::open(file_path) {
+            Ok(img) => {
+                match run_vision_pipeline_on_image(&img, exif_orient, enable_visual_tags, lang, embedding_profile) {
+                    Ok(mut computed) => {
+                        computed.duration_ms = t_vision.elapsed().as_millis() as u64;
+                        tracing::info!(
+                            "[OmniServer] 图片文本前置检测: file={}, has_text={}",
+                            file_path,
+                            computed.has_text.unwrap_or(false)
+                        );
+                        return computed;
+                    }
+                    Err(e) => {
+                        tracing::error!("[OmniServer] 图像视觉感知流水线失败: file={}, err={}", file_path, e);
+                        let mut out = VisionComputed::default();
+                        out.duration_ms = t_vision.elapsed().as_millis() as u64;
+                        return out;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[OmniServer] 无法打开图像文件: file={}, err={}", file_path, e);
+            }
+        }
+    } else if is_video {
+        let (v_wm_lvl, v_wm_status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(file_path));
+        let mut out = VisionComputed::default();
+        out.watermark_level = Some(v_wm_lvl);
+        out.has_watermark = Some(v_wm_lvl > 0);
+        out.watermark_status = Some(v_wm_status.to_string());
+        out.duration_ms = t_vision.elapsed().as_millis() as u64;
+        return out;
+    }
+
+    let mut out = VisionComputed::default();
+    out.duration_ms = t_vision.elapsed().as_millis() as u64;
+    out
+}
+
+use omni_core::arbitrate_tags_by_dimension_policies;
+
+/// 处理全量原生多模态感知请求: POST /api/perceive
+/// 单次 I/O 汇聚元数据提取、NTFS ADS 来源直查、频域水印/打码检测、离线逆地理编码与物理事实
+async fn perceive_file_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OmniPerceptionRequest>,
+) -> Json<OmniPerceptionResult> {
+    let cfg = state.config.lock().unwrap().clone();
+    let t_start = std::time::Instant::now();
+    let file_path = req.file_path.clone();
+
+    let mut benchmark = OmniPerceptionBenchmark::default();
+
+    let is_pro = omni_pro::is_pro_enabled();
+
+    let p = std::path::Path::new(&file_path);
+    // 一次性读取文件元数据，file_size 与 Tier1 文本分析的 mtime 均复用该结果，避免重复 syscall
+    let file_meta = std::fs::metadata(p).ok();
+    let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let is_corrupted = file_size == 0;
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    // 1. 前置步骤 1: Magika 文件类型精准识别 (所有后续分析的前置)
+    let t_magika = std::time::Instant::now();
+    let mime_type = omni_pro::OmniVisionEngine::detect_mime_type(p)
+        .unwrap_or_else(|_| "application/octet-stream".to_string());
+    let magika_ms = t_magika.elapsed().as_millis() as u64;
+    benchmark.record("magika_ms", magika_ms);
+
+    // 2. 根据 MIME 类型与扩展名判定大类分支
+    let is_image = mime_type.starts_with("image/") || matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff");
+    let is_video = mime_type.starts_with("video/") || omni_core::is_video_ext(&ext);
+    let is_audio = mime_type.starts_with("audio/") || omni_core::is_audio_ext(&ext);
+
+    // 并行任务: NTFS ADS 溯源
+    let f_ads = {
+        let file_path = file_path.clone();
+        let lang = req.language.clone();
+        async move {
+            if is_pro {
+                let t_ads = std::time::Instant::now();
+                let (fs, fsc, su) = omni_pro::perceive::detect_ntfs_zone_identifier_with_lang(&file_path, lang.as_deref());
+                (fs, fsc, su, Some(t_ads.elapsed().as_millis() as u64))
+            } else {
+                (None, None, None, None)
+            }
+        }
+    };
+
+    let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, video_chunks, video_timings, video_cover_webp_base64)) = if is_image {
+        let f_img = async {
+            // 步骤 A1: 前置 ExifTool 全量元数据提取 (画质姿态/方向依赖 exiftool 提取的元数据)
+            let t_meta = std::time::Instant::now();
+            let exiftool_map = OmniExtractor::extract_full_exiftool_metadata(p);
+            let metadata_ms = t_meta.elapsed().as_millis() as u64;
+
+            let exif_orient = exiftool_map
+                .get("Orientation")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            // 步骤 A2: 运行视觉流水线 run_vision_pipeline (传入前置获取的 exif_orient)
+            let enable_visual_tags = req.enable_visual_tags.unwrap_or(true);
+            let lang = req.language.clone();
+            let fp = file_path.clone();
+            let eo = exif_orient.clone();
+            let profile = cfg.embedding_profile.clone();
+            let vision_res = if is_pro {
+                tokio::task::spawn_blocking(move || {
+                    run_vision_pipeline(&fp, eo.as_deref(), enable_visual_tags, lang.as_deref(), &profile)
+                })
+                .await
+                .unwrap_or_default()
+            } else {
+                VisionComputed::default()
+            };
+
+            // 步骤 A3: 文字提取 (仅当 has_text == Some(true) 时才调用 OCR 识别)
+            // Issue 0046 §1：纯图片的 OCR 结果独占 `ocr` 字段，`markdown_content` 严格保持空字符串，
+            // 避免把 OCR 文本伪装成「正文」污染排版结构（复合文档方允许原位嵌合 OCR）。
+            let markdown_content = String::new();
+            let mut ocr_ms = None;
+            let mut text_ms = None;
+            let mut ocr_text: Option<String> = None;
+            if vision_res.has_text == Some(true) {
+                let t_ocr = std::time::Instant::now();
+                let p_buf = p.to_path_buf();
+                let ocr_size = cfg.ocr_model_size.clone();
+                let inspect_img_opt = vision_res.inspect_img.clone();
+                let ocr_res = tokio::task::spawn_blocking(move || {
+                    if let Some(ref im) = inspect_img_opt {
+                        omni_pro::OmniVisionEngine::recognize_ocr_dynamic_image(im, &ocr_size)
+                    } else {
+                        omni_pro::OmniVisionEngine::recognize_ocr_text_with_size(&p_buf, &ocr_size)
+                    }
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+
+                let ocr_duration = t_ocr.elapsed().as_millis() as u64;
+                ocr_ms = Some(ocr_duration);
+                text_ms = Some(ocr_duration);
+                if !ocr_res.trim().is_empty() {
+                    ocr_text = Some(ocr_res);
+                }
+            }
+
+            // 步骤 A4: 计算 pHash
+            let phash = OmniExtractionResult::compute_phash(p);
+
+            // 步骤 A5: 组装图片元数据
+            let mut metadata_obj = serde_json::Map::new();
+            metadata_obj.insert("magika".into(), serde_json::json!({
+                "label": if ext.is_empty() { "bin" } else { &ext },
+                "mime_type": mime_type.clone(),
+                "group": "image",
+                "name": format!("Magika Identified Format ({})", mime_type),
+                "score": 0.995,
+                "description": format!("Magika Neural Network Classification for {}", mime_type),
+                "extensions": if ext.is_empty() { vec![] } else { vec![ext.clone()] }
+            }));
+            if !exiftool_map.is_empty() {
+                metadata_obj.insert("exiftool".into(), serde_json::Value::Object(exiftool_map.clone()));
+            }
+            let mut img_meta = serde_json::Map::new();
+            if let (Some(w), Some(h)) = (exiftool_map.get("ImageWidth"), exiftool_map.get("ImageHeight")) {
+                img_meta.insert("width".into(), w.clone());
+                img_meta.insert("height".into(), h.clone());
+                img_meta.insert("resolution".into(), format!("{}x{}", w.as_str().unwrap_or(""), h.as_str().unwrap_or("")).into());
+            } else if let Ok((width, height)) = image::image_dimensions(p) {
+                img_meta.insert("width".into(), width.into());
+                img_meta.insert("height".into(), height.into());
+                img_meta.insert("resolution".into(), format!("{}x{}", width, height).into());
+            }
+            if !exiftool_map.is_empty() {
+                img_meta.insert("exif".into(), serde_json::Value::Object(exiftool_map.clone()));
+            }
+            metadata_obj.insert("image".into(), serde_json::Value::Object(img_meta));
+
+            // 如果提取到了文字识别内容，写入标准的 text_stats（纯图片走 OCR 字段）
+            if let Some(text_for_stats) = ocr_text.as_deref().filter(|s| !s.is_empty()) {
+                let lines = text_for_stats.lines().count();
+                let words = text_for_stats.split_whitespace().count();
+                let chars = text_for_stats.chars().count();
+                let mut text_stats = serde_json::Map::new();
+                text_stats.insert("encoding".into(), "UTF-8".into());
+                text_stats.insert("line_count".into(), lines.into());
+                text_stats.insert("word_count".into(), words.into());
+                text_stats.insert("char_count".into(), chars.into());
+                metadata_obj.insert("text_stats".into(), serde_json::Value::Object(text_stats));
+            }
+
+            let metadata = serde_json::Value::Object(metadata_obj);
+
+            (
+                metadata_ms,
+                vision_res,
+                markdown_content,
+                ocr_ms,
+                text_ms,
+                phash,
+                metadata,
+                ocr_text,
+            )
+        };
+        let (ads_res, (metadata_ms, vision_res, markdown_content, ocr_ms, text_ms, phash, metadata, ocr_text)) =
+            tokio::join!(f_ads, f_img);
+
+        benchmark.record_opt("metadata_ms", if metadata_ms > 0 { Some(metadata_ms) } else { None });
+        benchmark.vision_ms = Some(vision_res.duration_ms);
+        benchmark.extend_subtasks(vision_res.subtasks.clone());
+        benchmark.record_opt("ocr_ms", ocr_ms);
+        benchmark.record_opt("text_ms", text_ms);
+        benchmark.extract_ms = Some(vision_res.duration_ms.max(metadata_ms).max(ocr_ms.unwrap_or(0)));
+
+        (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, Vec::new(), None, None))
+    } else {
+        let f_non_img = async {
+            let t_extract = std::time::Instant::now();
+            let mut ext_res = match OmniExtractor::extract(&file_path, &cfg).await {
+                Ok(res) => res,
+                Err(err) => {
+                    tracing::warn!("[OmniServer] 感知基础提取失败: file={}, err={}", file_path, err);
+                    OmniExtractionResult {
+                        file_path: file_path.clone(),
+                        mime_type: mime_type.clone(),
+                        file_size,
+                        markdown_content: String::new(),
+                        metadata: serde_json::json!({}),
+                        phash: None,
+                        is_corrupted: true,
+                        benchmark: None,
+                    }
+                }
+            };
+            let extract_ms = t_extract.elapsed().as_millis() as u64;
+
+            let mut v = VisionComputed::default();
+            let mut video_chunks: Vec<omni_core::OmniVideoChunk> = Vec::new();
+            let mut video_timings = omni_pro::perceive::VideoProcessTimings::default();
+            let mut video_cover_webp_base64: Option<String> = None;
+            if is_video && is_pro {
+                let (v_wm_lvl, v_wm_status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(&file_path));
+                v.watermark_level = Some(v_wm_lvl);
+                v.has_watermark = Some(v_wm_lvl > 0);
+                v.watermark_status = Some(v_wm_status.to_string());
+
+                let file_path_for_video = file_path.clone();
+                // 抽帧间隔已从 UI 移除，这里只是求解器的**下限**：真正取值由
+                // `solve_video_analysis_budget_with_asr` 按预算反解（只会放大、不会更密）。
+                // 故下限取引擎最密的 1.0s —— 短视频因此更密，长视频结果不变（求解器本就选到 60s）。
+                let video_interval = req.video_frame_interval_seconds.unwrap_or(1.0);
+                let video_soft_token_budget = req
+                    .video_soft_token_budget
+                    .unwrap_or(omni_pro::perceive::VIDEO_SOFT_TOKEN_BUDGET_DEFAULT);
+                // 预算模型必须知道 ASR 真实会跑多久：ASR 成本是 min(A, D)·r，不是 D·r。
+                // 这里与下方 ASR 分支取同一个上限（请求值 → 全局配置），保证两边同源。
+                let audio_cap_for_budget = req
+                    .audio_analysis_duration
+                    .unwrap_or(cfg.audio_analysis_duration) as f64;
+                let (chunks, timings, rep_frame) = tokio::task::spawn_blocking(move || {
+                    omni_pro::perceive::process_video_time_chunks_with_representative(
+                        std::path::Path::new(&file_path_for_video),
+                        video_interval,
+                        None,
+                        video_soft_token_budget,
+                        Some(audio_cap_for_budget),
+                    )
+                })
+                .await
+                .unwrap_or_default();
+                video_chunks = chunks;
+                video_timings = timings;
+                if let Some(ref rep_rgb) = rep_frame {
+                    // 1. 官方 WebP 封面直出 (Ticket 03)
+                    match omni_pro::cover::raw_to_webp(rep_rgb.as_raw(), rep_rgb.width(), rep_rgb.height(), 3) {
+                        Ok(webp_bytes) => {
+                            use base64::Engine;
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&webp_bytes);
+                            video_cover_webp_base64 = Some(b64);
+                        }
+                        Err(e) => {
+                            tracing::warn!("[OmniServer] 视频代表帧转换为 WebP 封面失败: {:?}", e);
+                        }
+                    }
+
+                    // 2. 代表帧纯内存视觉感知打标与特征提取
+                    let dyn_img = image::DynamicImage::ImageRgb8(rep_rgb.clone());
+                    match run_vision_pipeline_on_image(
+                        &dyn_img,
+                        None,
+                        req.enable_visual_tags.unwrap_or(true),
+                        req.language.as_deref(),
+                        &cfg.embedding_profile,
+                    ) {
+                        Ok(mut rep_vision) => {
+                            // 视频领域排他门禁：严格剔除截图细分、摄影照片细分等图片专有维度
+                            filter_video_visual_tags(&mut rep_vision.clip_tags);
+                            filter_video_visual_tags(&mut rep_vision.clip_high_confidence_tags);
+                            filter_video_visual_tags(&mut rep_vision.morphology_tags);
+                            filter_video_visual_tags(&mut rep_vision.morphology_high_confidence_tags);
+
+                            // 视频代表帧门禁：严禁保留图片专有互斥组（截图场景细分、摄影题材细分）及专有概念
+                            rep_vision.clip_mutual_tags.retain(|(tag, _, group)| {
+                                if *group == GROUP_SCREENSHOT_SUB || *group == GROUP_PHOTO_SUB {
+                                    return false;
+                                }
+                                if omni_core::is_image_exclusive_tag(tag) {
+                                    return false;
+                                }
+                                true
+                            });
+
+                            rep_vision.photo_type = None;
+
+                            v.clip_tags = rep_vision.clip_tags;
+                            v.clip_tag_confs = rep_vision.clip_tag_confs;
+                            v.clip_high_confidence_tags = rep_vision.clip_high_confidence_tags;
+                            v.clip_mutual_tags = rep_vision.clip_mutual_tags;
+                            v.aesthetic_score = rep_vision.aesthetic_score;
+                            v.quality_score = rep_vision.quality_score;
+                            v.quality_issues = rep_vision.quality_issues;
+                            v.has_text = rep_vision.has_text;
+                            v.ram_tags = rep_vision.ram_tags;
+                            v.nsfw_probs = rep_vision.nsfw_probs;
+                            v.morphology_tags = rep_vision.morphology_tags;
+                            v.morphology_high_confidence_tags = rep_vision.morphology_high_confidence_tags;
+                            if v.image_embedding.is_none() {
+                                v.image_embedding = rep_vision.image_embedding;
+                                v.image_encoder_id = rep_vision.image_encoder_id;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!("[OmniServer] 视频代表帧视觉感知打标失败: {}", err);
+                        }
+                    }
+                }
+            }
+
+            // 音频/视频文件: 纯内存解码 (16kHz 单声道) → GTCRN 降噪 + Silero VAD + SenseVoice 转录 + CED-mini 声学打标
+            let is_audio = mime_type.starts_with("audio/") || omni_core::is_audio_ext(&ext);
+            let is_audio_or_video = is_audio || is_video;
+            let mut audio_ms: Option<u64> = None;
+
+            // 仅在音视频文件且 enable_asr 未显式关闭时执行纯内存声学流水线
+            // 纯乐谱格式（mid/midi）无语音波形且缺乏音色库，显式排除在 ASR 之外
+            let is_not_pure_midi = !matches!(ext.as_str(), "mid" | "midi");
+            let should_transcribe = is_audio_or_video
+                && is_not_pure_midi
+                && req.enable_asr.unwrap_or(true);
+
+            if should_transcribe {
+                let t_audio = std::time::Instant::now();
+                // 优先使用请求中传入的截取时长，否则读取全局配置
+                let requested_audio_duration =
+                    req.audio_analysis_duration.unwrap_or(cfg.audio_analysis_duration);
+                // D2 联动（2026-10-24 裁决）：视频侧已按 90s 向量预算截断时，ASR 必须收敛到同一上限。
+                // 否则视频截在 3531s、ASR 却跑完整 2h（7200 × 0.112 = 806s），85s 可用预算被直接打穿。
+                // 未截断 / 时长未知（None）时保持原行为，不擅自裁剪用户请求的时长。
+                // ASR 时长严格按两阶段解耦的 audio_analysis_duration_sec 截断，避免误用全片视频时长
+                let duration_seconds = match video_timings.audio_analysis_duration_sec.or(video_timings.analysis_duration_sec) {
+                    Some(limit) if limit.is_finite() && limit > 0.0 => {
+                        requested_audio_duration.min(limit.round().max(1.0) as u32)
+                    }
+                    // 纯音频：没有画面要抢预算，直接吃满 90s 向量预算（≈425s）。
+                    // 「语音识别时长」设置只约束视频——否则纯音频会被同一个 30s 上限锁死。
+                    _ if is_audio => {
+                        omni_pro::perceive::max_audio_analysis_duration_sec() as u32
+                    }
+                    _ => requested_audio_duration,
+                };
+                let file_path_for_audio = file_path.clone();
+                let sherpa_engine = state.sherpa.clone();
+
+                // spawn_blocking: 纯内存管道解码 + 纯内存 GTCRN 降噪 + VAD + SenseVoice ASR (带语言/情感解析) + CED-mini 打标
+                let (sense_voice_result, events_result) = tokio::task::spawn_blocking(move || {
+                    let path = std::path::Path::new(&file_path_for_audio);
+                    if let Some(samples) = decode_audio_to_16k_mono(path, Some(duration_seconds)) {
+                        sherpa_engine.process_audio_pipeline_full(&samples, 16000)
+                    } else {
+                        (None, Vec::new())
+                    }
+                })
+                .await
+                .unwrap_or((None, Vec::new()));
+
+                audio_ms = Some(t_audio.elapsed().as_millis() as u64);
+
+                if let serde_json::Value::Object(ref mut map) = ext_res.metadata {
+                    if let Some(sv) = sense_voice_result {
+                        if omni_core::is_meaningful_asr_text(&sv.text) {
+                            tracing::info!(
+                                "[OmniServer] 音频转录完成: file={}, len={}, lang={:?}, emotion={:?}, audio_ms={:?}",
+                                file_path, sv.text.len(), sv.lang, sv.emotion, audio_ms
+                            );
+                            // Issue 0046 §1：ASR 结果独占 `asr` 字段（不再回填 markdown_content，
+                            // 保证音视频文件的「正文」结构与语音转录事实物理分离）。
+                            map.insert("asr".to_string(), serde_json::Value::String(sv.text));
+
+                            if let Some(ref lang) = sv.lang {
+                                map.insert("language".to_string(), serde_json::Value::String(lang.clone()));
+                            }
+                            if let Some(ref emo) = sv.emotion {
+                                map.insert("emotion".to_string(), serde_json::Value::String(emo.clone()));
+                            }
+                        } else {
+                            tracing::info!(
+                                "[OmniServer] 音频转录结果为无实质语义文本或标点噪声，已过滤: file={}, raw_text={:?}",
+                                file_path, sv.text
+                            );
+                        }
+                    } else {
+                        tracing::info!("[OmniServer] 音频转录无语音内容或模型未就绪: file={}", file_path);
+                    }
+
+                    if !events_result.is_empty() {
+                        tracing::info!(
+                            "[OmniServer] 声学事件打标完成: file={}, events={:?}",
+                            file_path, events_result
+                        );
+                        let events_json: Vec<serde_json::Value> = events_result
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect();
+                        map.insert("audio_events".to_string(), serde_json::Value::Array(events_json));
+                    }
+                }
+            }
+
+            (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings, video_cover_webp_base64)
+        };
+        let (ads_res, (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings, video_cover_webp_base64)) = tokio::join!(f_ads, f_non_img);
+
+        benchmark.extract_ms = Some(extract_ms);
+        benchmark.audio_ms = audio_ms;
+        if is_video {
+            benchmark.record("ffmpeg_ms", video_timings.ffmpeg_ms);
+            benchmark.record("decode_resize_ms", video_timings.decode_ms);
+            benchmark.vision_ms = Some(video_timings.vision_ms);
+        }
+        if let Some(bm) = &ext_res.benchmark {
+            benchmark.record_opt("metadata_ms", bm.metadata_ms);
+            benchmark.record_opt("text_ms", bm.text_ms);
+            benchmark.record_opt("ocr_ms", bm.ocr_ms);
+            if let Some(t_ms) = bm.text_ms {
+                benchmark.record("doc_parse_ms", t_ms);
+            }
+        }
+
+        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, None, video_chunks, Some(video_timings), video_cover_webp_base64))
+    };
+
+    benchmark.ads_ms = ads_ms;
+
+    // 二进制文件静态分析 (BinaryLens: PE/ELF/Mach-O)
+    let is_binary_prog = !is_image && !is_video && !is_audio && (
+        matches!(ext.as_str(), "exe" | "dll" | "sys" | "elf" | "so" | "dylib" | "msi" | "app" | "bin")
+            || mime_type.starts_with("application/x-executable")
+            || mime_type.starts_with("application/x-dosexec")
+            || mime_type.starts_with("application/vnd.microsoft.portable-executable")
+            || mime_type.starts_with("application/x-sharedlib")
+    );
+
+    let (binary_analysis_info, binary_ms) = if is_binary_prog {
+        let t_bin = std::time::Instant::now();
+        let fp = file_path.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            omni_core::analyze_binary(std::path::Path::new(&fp)).ok()
+        })
+        .await
+        .unwrap_or(None);
+        let elapsed = t_bin.elapsed().as_millis() as u64;
+        (res, Some(elapsed))
+    } else {
+        (None, None)
+    };
+    benchmark.record_opt("binary_ms", binary_ms);
+
+    // ASR 语音转录事实（Issue 0046 §1：metadata 键统一为 `asr`）
+    let asr = metadata
+        .get("asr")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| omni_core::is_meaningful_asr_text(s));
+    let has_asr = asr.is_some();
+    let asr_length = asr.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+
+    // 统一「可参与事实推导的文本正文」：
+    // 复合文档正文 > 纯图片 OCR > 音视频 ASR。
+    // 后两者不再写入 markdown_content（保持正文结构纯粹），但必须继续驱动
+    // 文字存在性判定、Tier1 文本分析与混合索引，否则会丢失 OCR/ASR 语义。
+    let effective_text: String =
+        omni_core::resolve_effective_text(&markdown_content, ocr_text.as_deref(), asr.as_deref());
+
+    // 内存零耗时推导: NSFW 敏感内容与高置信度标签 (结合 OCR/ASR 提取文本和 CLIP 标签，两层漏斗过滤)
+    // 按媒体类型分流：图片/视频走视觉 NSFW 管线（nsfw_tags），文本/文档走文本 NSFW 管线（nsfw_text_tags）
+    let (nsfw_tags, nsfw_text_tags, sensitive_types, content_rating) = if is_pro {
+        let (tags, sens, rating) = omni_pro::OmniVisionEngine::derive_nsfw_tags_and_rating_full(
+            vision_res.nsfw_probs,
+            &effective_text,
+            &vision_res.clip_tags,
+            req.language.as_deref(),
+            Some(&file_path),
+        );
+        if is_image || is_video {
+            // 视觉路径：NSFW 结论写 nsfw_tags，nsfw_text_tags 为空
+            (tags, vec![], sens, rating)
+        } else {
+            // 文本/文档路径：NSFW 结论写 nsfw_text_tags，nsfw_tags 为空（避免与视觉引擎字段混淆）
+            (vec![], tags, sens, rating)
+        }
+    } else {
+        (vec!["全年龄".to_string()], vec![], Vec::new(), Some("safe".to_string()))
+    };
+
+    let nsfw_high_confidence_tags = if is_pro {
+        omni_pro::OmniVisionEngine::derive_nsfw_high_confidence_tags(
+            &nsfw_tags,
+            content_rating.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
+
+
+    let watermark_level = vision_res.watermark_level;
+    let watermark_status = vision_res.watermark_status;
+    let has_watermark = vision_res.has_watermark;
+    let mosaic_level = vision_res.mosaic_level;
+    let mosaic_status = vision_res.mosaic_status;
+    let has_mosaic = vision_res.has_mosaic;
+    let mut has_text = vision_res.has_text;
+    let aesthetic_score = vision_res.aesthetic_score;
+    let quality_score = vision_res.quality_score;
+    let mut photo_type = vision_res.photo_type;
+    let quality_issues = vision_res.quality_issues;
+    let mut morphology_tags = vision_res.morphology_tags;
+    // ★ ADR-0045「物理事实绝对覆盖律」溯源基线（2026-10-16 定性修复）：
+    //   derive_morphology_tags（客观文字检测 has_text → 有字图/无字图、黑白像素检测 is_bw → 黑白/全彩）
+    //   与 DEC-05 物理算子（画幅 143 / 背景 139 / 主色调·色系 149 / 画质等级 122）产出的形态标签
+    //   是**确定性物理事实**。此处必须在 CLIP 互斥组合并（下方 `let mut morphology_tags = if ...`）
+    //   **之前**捕获该基线：合并后的集合混入了互斥组独有胜出项（摄影题材细分等语义标签），
+    //   不可再作为「物理事实」判据。该基线供下方互斥组注册循环保护 physical 来源标签
+    //   不被冗余语义投票覆盖（详见该处注释）。
+    let physical_fact_tags: std::collections::HashSet<String> =
+        morphology_tags.iter().cloned().collect();
+    let mut clip_tags = vision_res.clip_tags;
+    // (WP2b) CLIP 标定分快照（名 → 分），供 engine map 与 6.2 confidence 贯通
+    let clip_tag_confs = vision_res.clip_tag_confs;
+
+    // 基于实际 OCR 文本正向直通校准截图形态与文字客观事实 (彻底根除有字却输出无字图的倒挂)
+    // (WP2a) ocr_forced_tag_names: OCR 事实强制注入的标签名，用于后续 engine 来源标记 (最高物理事实优先级)
+    // 仅图片路径生效：纯文本/文档正文不是「图面有字」，不得注入有字图等视觉形态标签
+    let mut ocr_forced_tag_names: Vec<String> = Vec::new();
+    let visual_text_fact = is_image && !effective_text.trim().is_empty();
+    if visual_text_fact {
+        has_text = Some(true);
+        clip_tags.retain(|t| !tag_matches_concept(t, "无字图"));
+        if !clip_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
+            clip_tags.push("有字图".to_string());
+            ocr_forced_tag_names.push("有字图".to_string());
+        }
+
+        let text_lower = effective_text.to_lowercase();
+        let is_code_syntax = text_lower.contains("public class")
+            || text_lower.contains("public void")
+            || text_lower.contains("private boolean")
+            || text_lower.contains("import java")
+            || text_lower.contains("vim命令")
+            || text_lower.contains("normal mode")
+            || text_lower.contains("insert mode")
+            || text_lower.contains("split window")
+            || text_lower.contains("function(")
+            || text_lower.contains("console.log")
+            || text_lower.contains("#include <")
+            || text_lower.contains("fn main");
+        if is_code_syntax {
+            photo_type = Some("代码截图".to_string());
+            if !clip_tags.iter().any(|t| tag_matches_concept(t, "代码截图")) {
+                clip_tags.retain(|t| !tag_matches_concept(t, "聊天截图"));
+                clip_tags.push("代码截图".to_string());
+                ocr_forced_tag_names.push("代码截图".to_string());
+            }
+        }
+    }
+    let mut morphology_high_confidence_tags = vision_res.morphology_high_confidence_tags;
+    let mut clip_high_confidence_tags = vision_res.clip_high_confidence_tags;
+
+    let ram_tags = vision_res.ram_tags;
+    let image_embedding = vision_res.image_embedding;
+    // 图像向量的编码器出处由视觉层随向量一并返回，后续原样透传
+    let image_encoder_id = vision_res.image_encoder_id;
+    let clip_mutual_tags = vision_res.clip_mutual_tags;
+
+    // CLIP 互斥分类结果增强 morphology_tags：
+    // 若 CLIP 互斥分类成功，直接替换规则推导结果（语义更准确）；
+    // 若 CLIP 不可用（无模型），则保留规则推导的 morphology_tags 作为兜底。
+    let mut morphology_tags = if !clip_mutual_tags.is_empty() {
+        let mut merged = morphology_tags.clone();
+        for (tag, _conf, _group) in &clip_mutual_tags {
+            if !merged.contains(tag) {
+                merged.push(tag.clone());
+            }
+        }
+        // CLIP 互斥分类保证组内只有一个胜出者，移除被覆盖的规则推导冲突项
+        // 1. 色彩模式：CLIP 结果与黑白检测结果互斥对齐（概念 code 匹配，兼容中英）
+        if clip_mutual_tags
+            .iter()
+            .any(|(t, _, g)| *g == GROUP_COLOR_MODE && tag_matches_concept(t, Concept::全彩.zh_name()))
+        {
+            merged.retain(|t| !tag_matches_concept(t, Concept::黑白.zh_name()));
+        } else if clip_mutual_tags
+            .iter()
+            .any(|(t, _, g)| *g == GROUP_COLOR_MODE && tag_matches_concept(t, Concept::黑白.zh_name()))
+        {
+            merged.retain(|t| !tag_matches_concept(t, Concept::全彩.zh_name()));
+        }
+        // 2. 文字存在性：客观检测与 OCR 事实优先于语义猜测（仅图片路径，避免文本正文误标有字图）
+        if is_image && (has_text == Some(true) || !effective_text.trim().is_empty()) {
+            merged.retain(|t| !tag_matches_concept(t, Concept::无字图.zh_name()));
+            if !merged.iter().any(|t| tag_matches_concept(t, Concept::有字图.zh_name())) {
+                merged.push(Concept::有字图.zh_name().to_string());
+            }
+        } else if clip_mutual_tags
+            .iter()
+            .any(|(t, _, g)| *g == GROUP_TEXT_PRESENCE && tag_matches_concept(t, Concept::有字图.zh_name()))
+        {
+            merged.retain(|t| !tag_matches_concept(t, Concept::无字图.zh_name()));
+        } else if clip_mutual_tags
+            .iter()
+            .any(|(t, _, g)| *g == GROUP_TEXT_PRESENCE && tag_matches_concept(t, Concept::无字图.zh_name()))
+        {
+            merged.retain(|t| !tag_matches_concept(t, Concept::有字图.zh_name()));
+        }
+        merged
+    } else {
+        if is_image && (has_text == Some(true) || !effective_text.trim().is_empty()) {
+            morphology_tags.retain(|t| !tag_matches_concept(t, Concept::无字图.zh_name()));
+            if !morphology_tags.iter().any(|t| tag_matches_concept(t, Concept::有字图.zh_name())) {
+                morphology_tags.push(Concept::有字图.zh_name().to_string());
+            }
+        }
+        morphology_tags
+    };
+
+    // 5. 文字密度物理算子注入 (ID 146, 依 OCR 文本字数区间确定，非模型余弦推断)
+    if is_image {
+        let ocr_char_count = ocr_text.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+        if let Some(density_concept) = omni_pro::OmniVisionEngine::detect_text_density(ocr_char_count, false) {
+            let density_name = density_concept.zh_name().to_string();
+            if !morphology_tags.contains(&density_name) {
+                morphology_tags.push(density_name.clone());
+                morphology_high_confidence_tags.push(density_name);
+            }
+        }
+    }
+
+    // CLIP 互斥组与 photo_type 细化联动更新（语义优先于规则推导，严格仅适用于图片）
+    if !clip_mutual_tags.is_empty() && is_image {
+        // 优先取截图细分（比泛截图更精确）
+        if let Some((sub_tag, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == GROUP_SCREENSHOT_SUB) {
+            if photo_type.is_none()
+                || photo_type.as_deref() == Some(Concept::截图.zh_name())
+                || photo_type.as_deref() == Some(Concept::截图.code())
+            {
+                photo_type = Some(sub_tag.clone());
+            }
+        } else if let Some((photo_sub, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == GROUP_PHOTO_SUB) {
+            // 若为摄影照片，细化为风景照/人物照/静物照等
+            if photo_type.is_none()
+                || photo_type.as_deref() == Some(Concept::摄影照片.zh_name())
+                || photo_type.as_deref() == Some(Concept::摄影照片.code())
+            {
+                photo_type = Some(photo_sub.clone());
+            }
+        } else if let Some((form_tag, _, _)) = clip_mutual_tags.iter().find(|(_, _, g)| *g == GROUP_CONTENT_FORM) {
+            // 内容形态胜出者作为 photo_type 的兜底
+            if photo_type.is_none() {
+                photo_type = Some(form_tag.clone());
+            }
+        }
+    }
+
+    // 汇聚各大引擎的所有标签至 detected_visual_tags (有序去重)
+    let mut detected_visual_tags: Vec<String> = Vec::new();
+    for tag in clip_tags
+        .iter()
+        .chain(morphology_tags.iter())
+        .chain(nsfw_tags.iter())
+        .chain(quality_issues.iter())
+        // (#718 汇聚侧同源化) ram 贡献改推 r.code（proj.code = 受控反查 zh 规范名，权威）：
+        // 此前推 r.name（展示名）→ normalize 后未受控条目 code = 展示名 hash，与过滤侧
+        // r.code（zh 规范名 hash）派生输入不同必然分叉；同源化后两侧消费同一 code，
+        // 非 zh 会话未受控条目不再依赖 OR 兜底存活。r.code 为空的条目回落展示名（旧行为）。
+        .chain(ram_tags.iter().map(|r| if r.code.is_empty() { &r.name } else { &r.code }))
+    {
+        if !detected_visual_tags.contains(tag) {
+            detected_visual_tags.push(tag.clone());
+        }
+    }
+
+    // (WP2a) 来源标记 + (WP2b) 置信度贯通：登记 name → (engine, 优先级, 真实分数 Option) 映射，
+    // 优先级 物理事实(ocr) > 互斥组 > 物理规则 > ram > clip > nsfw/quality；
+    // 同名多来源时高优先级覆盖（分数随覆盖项携带），6.2 构建 TagChainItem 时按 original_name 反查
+    let mut tag_engine_map: std::collections::HashMap<String, (&'static str, u8, Option<f32>)> =
+        std::collections::HashMap::new();
+    {
+        let mut register = |name: &str, engine: &'static str, prio: u8, conf: Option<f32>| {
+            match tag_engine_map.get(name) {
+                Some((_, p, _)) if *p >= prio => {}
+                _ => {
+                    tag_engine_map.insert(name.to_string(), (engine, prio, conf));
+                }
+            }
+        };
+        for t in &clip_tags {
+            // CLIP/Gemma：提取层标定分 (calibrate_clip_score / gemma 线性标定)，无分回退 0.55 起步值。
+            // 引擎名按档位如实登记：gemma_unified 档位的标签物理上由 EmbeddingGemma 产出，
+            // 此前恒登记为 "clip"（历史坏账），误导日志归因与桌面端溯源映射。
+            let engine: &'static str = if cfg.embedding_profile == "gemma_unified" { "gemma" } else { "clip" };
+            register(t, engine, 2, clip_tag_confs.get(t).copied());
+        }
+        for t in &morphology_tags {
+            // 物理规则推导：无模型分数，分层回退 0.90
+            register(t, "physical", 4, None);
+        }
+        for t in &nsfw_tags {
+            register(t, "nsfw", 1, None);
+        }
+        for t in &quality_issues {
+            register(t, "quality", 1, None);
+        }
+        for r in &ram_tags {
+            // RAM++：真实模型置信度直接贯通
+            register(&r.name, "ram", 3, Some(r.confidence));
+            // (#718) 汇聚侧同源化后 detected_visual_tags 内 ram 条目为 r.code 形态，
+            // engine_lookup（域压制②按集合条目精确取来源）必须同时覆盖 code 键，
+            // 否则「截图域压制 ram 来源」静默失效。
+            if !r.code.is_empty() && r.code != r.name {
+                register(&r.code, "ram", 3, Some(r.confidence));
+            }
+        }
+        for (tag, conf, _group) in &clip_mutual_tags {
+            // ★ ADR-0045「物理事实绝对覆盖律」（2026-10-16 定性修复）：
+            //   已登记为 physical 的**规则推导物理事实**（见上方 physical_fact_tags 基线注释：
+            //   客观文字检测 has_text → 有字图/无字图、DEC-05 算子 → 画幅/背景/主色调/画质等级）
+            //   不得被 CLIP 互斥组的语义投票覆盖来源标签。互斥组（如「文字存在性」组命中无字图）
+            //   即便与客观检测同向，也只是对确定性事实的冗余确认——一旦覆盖为 mutual_group，
+            //   桌面端 `resolveProvenanceGroup(engine, 'visual')` 会把「无字图」这类客观物理事实
+            //   误归 visual 组而非 fact 组（真实事故：has_text=false 时无字图同时命中规则推导与
+            //   CLIP 文字存在性互斥组，prio 5 > 4 被覆盖，属性面板把物理事实显示在视觉标签分组）。
+            //   仅拦截基线集合内的物理事实；互斥组独有胜出项（摄影题材细分等语义标签）
+            //   保持 mutual_group 语义不变（模型推理不得伪装成物理事实）。
+            if physical_fact_tags.contains(tag) {
+                continue;
+            }
+            // 互斥组胜出项：组内点积经同一标定函数换算
+            register(
+                tag,
+                "mutual_group",
+                5,
+                Some(omni_pro::OmniVisionEngine::calibrate_clip_score(*conf)),
+            );
+        }
+        for t in &ocr_forced_tag_names {
+            // OCR 物理事实：无模型分数，分层回退 0.99
+            register(t, "ocr", 6, None);
+        }
+    }
+
+    // 架构级通用分类互斥门控引擎：统一处理组内竞争排他、跨形态互斥、安全合规阻断与光学质量限制
+    omni_pro::OmniVisionEngine::apply_mutual_exclusion_gating(
+        &mut detected_visual_tags,
+        &clip_mutual_tags,
+        content_rating.as_deref(),
+        &sensitive_types,
+        quality_score,
+    );
+
+    // (WP3) 内容域矩阵门禁：按声明式矩阵（domain_tag_matrix.json）执行
+    // ① 域不适用互斥组胜出项剔除（截图域压制「作品题材设定」→ 清除“体育”类自然内容组噪声）
+    // ② 域不适用来源层整体压制（截图域压制 ram 来源 → 清除“癌症/药物”等 RAM 自然图像模型噪声）
+    // ③ 跨域禁用标签剔除（concept code 匹配，兼容中英别名）
+    let engine_lookup: std::collections::HashMap<String, String> = tag_engine_map
+        .iter()
+        .map(|(name, (engine, _, _))| (name.clone(), engine.to_string()))
+        .collect();
+    omni_pro::OmniVisionEngine::apply_domain_matrix_gating(
+        &mut detected_visual_tags,
+        &clip_mutual_tags,
+        photo_type.as_deref(),
+        &engine_lookup,
+    );
+
+    // 文字存在性绝对保护：若已探活出文字或 OCR 内容，无条件排除无字图，确保有字图存在（仅图片路径）
+    if is_image && (has_text == Some(true) || !effective_text.trim().is_empty()) {
+        detected_visual_tags.retain(|t| !tag_matches_concept(t, "无字图"));
+        if !detected_visual_tags.iter().any(|t| tag_matches_concept(t, "有字图")) {
+            detected_visual_tags.push("有字图".to_string());
+        }
+    }
+
+    // Spec D12：统一归一为稳定 code 后再做集合同步，保证 zh/en 输入幂等
+    // 修复(问题2)：normalize 前先保留「原始名 → code」映射，供 6.2 步骤反查真实展示名
+    let mut detected_visual_tag_name_to_code: std::collections::HashMap<String, String> = detected_visual_tags
+        .iter()
+        .map(|name| (name.clone(), normalize_tag_to_code(name)))
+        .collect();
+    // (#718) 同源化后 ram 条目在集合内是 code 形态，6.2 反查展示名需补「展示名 → code」
+    // 条目；同 code 多键时反查侧优先非 code 形态键（见下方 original_name 查找）。
+    for r in &ram_tags {
+        if !r.code.is_empty() && r.code != r.name {
+            detected_visual_tag_name_to_code.insert(r.name.clone(), r.code.clone());
+        }
+    }
+    let detected_visual_tags = normalize_tag_set_to_codes(&detected_visual_tags);
+
+    // 修复(问题4)：clip/morphology 只用 code 集合做内部比对，保留原始名供输出
+    // 同步清洗 morphology_tags 与 clip_tags，确保互斥清洗结果一致贯通（防止被清洗的子标签混入下游主体池）
+    // 输出保留原始中文/英文名（debug 字段，与 ram_tags 保持一致）
+    let morphology_tags: Vec<String> = morphology_tags
+        .into_iter()
+        .filter(|name| {
+            let code = normalize_tag_to_code(name);
+            detected_visual_tags.contains(&code)
+        })
+        .collect();
+    let mut clip_tags: Vec<String> = clip_tags
+        .into_iter()
+        .filter(|name| {
+            let code = normalize_tag_to_code(name);
+            detected_visual_tags.contains(&code)
+        })
+        .collect();
+    // RAM 对称治理 (P3 来源对称)：与 clip/morphology 一致，按 gated 后 code 集回写过滤，
+    // 杜绝原始 ram_tags 经「6.1 直注 / ram_tags_flat / 级联主体池」三条通道绕过互斥门禁
+    let gated_ram_tags: Vec<omni_core::RamTagItem> = ram_tags
+        .iter()
+        .filter(|r| {
+            // spec §6.9.6 待裁定项 2 —— #718 同源化后 OR 兜底退役为单判据：
+            // 汇聚侧 ram 贡献已改推 r.code（权威 proj.code），过滤判据与派生源合一：
+            // r.code 非空 → contains(r.code)（自身贡献在集合 = 未被门控剔除）；
+            // r.code 为空（投影缺格）→ 回落名字归一（旧行为保底）。
+            // 旧 OR 的名字归一分支曾依赖「展示名 hash」偶然命中，已随同源化失去存在意义。
+            if r.code.is_empty() {
+                detected_visual_tags.contains(&normalize_tag_to_code(&r.name))
+            } else {
+                detected_visual_tags.contains(&r.code)
+            }
+        })
+        .cloned()
+        .collect();
+    let sem_graph = if is_pro { state.omw.semantic_graph() } else { None };
+    let current_file_group = if is_video {
+        Some("video")
+    } else if is_image {
+        let is_manga = photo_type.as_deref().map_or(false, |p| {
+            p == Concept::漫画.zh_name() || p == Concept::漫画.code() || p == "omw.06780678.n"
+        }) || detected_visual_tags.iter().any(|t| {
+            t == Concept::漫画.code() || t == "omw.06780678.n" || t == Concept::漫画.zh_name()
+        });
+        if is_manga {
+            Some("manga")
+        } else {
+            Some("image")
+        }
+    } else if is_audio {
+        Some("audio")
+    } else {
+        Some("document")
+    };
+    let enrich_tag = |tag: &mut omni_core::TagChainItem| {
+        if let Some(ref g) = sem_graph {
+            g.enrich_tag_chain_item_with_context(tag, current_file_group);
+        }
+    };
+    let mut gated_ram_tags = gated_ram_tags;
+    for r in &mut gated_ram_tags {
+        enrich_tag(r);
+    }
+
+    // 4. 离线逆地理编码 (若元数据中含 GPS 坐标且开启了地理反查，Pro 专享)
+    // 维度 16「地理位置」的 trigger 文件类型分支为「图片 / 视频」⇒ 仅 image / video 参与逆地理编码，
+    // 避免文档 / 音频 / 压缩包等介质仅因携带 GPS 元数据而被挂上地理位置维度。
+    let mut geo_address = None;
+    let enable_geo = req.enable_geo_reverse.unwrap_or(true);
+
+    if is_pro && enable_geo && (is_image || is_video) {
+        let t_geo = std::time::Instant::now();
+        let lat_opt = metadata
+            .get("GPSLatitude")
+            .or_else(|| metadata.get("exiftool").and_then(|e| e.get("GPSLatitude")));
+        let lon_opt = metadata
+            .get("GPSLongitude")
+            .or_else(|| metadata.get("exiftool").and_then(|e| e.get("GPSLongitude")));
+
+        let parse_coord = |v: Option<&serde_json::Value>| -> Option<f64> {
+            match v {
+                Some(serde_json::Value::Number(n)) => n.as_f64(),
+                Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+                _ => None,
+            }
+        };
+
+        if let (Some(lat), Some(lon)) = (parse_coord(lat_opt), parse_coord(lon_opt)) {
+            let geo = state.geo.clone();
+            let lang = req.language.clone().unwrap_or_else(|| "zh-CN".to_string());
+            let outcome = tokio::task::spawn_blocking(move || {
+                let points = vec![omni_pro::geo::GeoQueryPoint {
+                    latitude: lat,
+                    longitude: lon,
+                }];
+                geo.reverse(&points, Some(&lang), Some(50.0), Some(500.0))
+            })
+            .await;
+
+            if let Ok(outcome) = outcome {
+                if let Some(results) = outcome.results {
+                    if let Some(first) = results.into_iter().next() {
+                        if first.found {
+                            let parts: Vec<String> = [first.country, first.province, first.city]
+                                .into_iter()
+                                .flatten()
+                                .collect();
+                            if !parts.is_empty() {
+                                geo_address = Some(parts.join(" "));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        benchmark.geo_ms = Some(t_geo.elapsed().as_millis() as u64);
+    }
+
+    // 5. 工作流状态与安全等级推断 (输出语言中立机器代码，Pro 专享)
+    let (workflow_state_code, workflow_state, mut security_level_code, mut security_level) = if is_pro {
+        let ws_code = Some(omni_pro::perceive::detect_workflow_state(&file_path, &metadata));
+        let ws = ws_code.as_deref().map(|c| {
+            // 机器码别名 → AOT 中文 Concept 变体（源码中文直写，展示名由构建期字典给出）
+            match c {
+                "unarchived" | "not_archived" => Concept::未归档.zh_name().to_string(),
+                "archived" => Concept::已归档.zh_name().to_string(),
+                "draft" => Concept::草稿.zh_name().to_string(),
+                "reviewing" => Concept::审核中.zh_name().to_string(),
+                "completed" => Concept::已完成.zh_name().to_string(),
+                other => omni_core::get_canonical_concept_name(other).unwrap_or(other).to_string(),
+            }
+        });
+        let sec_code = Some(omni_pro::perceive::detect_security_level(&file_path, &effective_text));
+        let sec = sec_code.as_deref().map(|c| {
+            match c {
+                "public" => Concept::公开.zh_name().to_string(),
+                "internal" => Concept::内部.zh_name().to_string(),
+                "confidential" => Concept::机密.zh_name().to_string(),
+                "secret" => Concept::绝密.zh_name().to_string(),
+                other => omni_core::get_canonical_concept_name(other).unwrap_or(other).to_string(),
+            }
+        });
+        (ws_code, ws, sec_code, sec)
+    } else {
+        (None, None, None, None)
+    };
+
+    // 联动逻辑: 若检出敏感内容 (色情/涉政/血腥/违规) 或 R-18 尺度，强制安全等级联动输出为 "保密" (confidential)
+    if !sensitive_types.is_empty()
+        || nsfw_tags.iter().any(|t| tag_matches_concept(t, "色情") || tag_matches_concept(t, "R-18") || tag_matches_concept(t, "R-18G"))
+        || content_rating.as_deref() == Some("r18")
+        || content_rating.as_deref() == Some("r18g")
+    {
+        security_level_code = Some("confidential".to_string());
+        security_level = Some("保密".to_string());
+    }
+
+    // 6. 统一汇聚各大引擎标签并解析为标签链 (TagChainItem) 结构
+    let mut structured_visual_tags: Vec<omni_core::TagChainItem> = Vec::new();
+
+    // 6.1 首先将已具备完整维度与逻辑泛维度的 RAM++ 标签加入
+    // (P3 来源对称：只注入互斥门禁后存活的 gated_ram_tags，原始 ram_tags 不得绕过门禁直注)
+    for r in &gated_ram_tags {
+        if !structured_visual_tags.iter().any(|t| t.name.eq_ignore_ascii_case(&r.name)) {
+            let mut item = r.clone();
+            // (WP2a) 标记打标引擎来源
+            item.engine = Some("ram".to_string());
+            structured_visual_tags.push(item);
+        }
+    }
+
+    // 6.2 将其他各大引擎的有效视觉标签 (经过互斥门禁过滤的 detected_visual_tags) 统一映射为 TagChainItem
+    // 修复(问题2)：detected_visual_tags 此时为 code 字符串（normalize 后），
+    // 需先从 name→code 映射反查原始展示名，再构建 TagChainItem，防止 name 被写成 code 串
+    for raw_code in &detected_visual_tags {
+        // 按 code 去重（normalize 后 code 已稳定，避免同一概念 zh/en 名称不同但指向同 code 时重复添加）
+        if !structured_visual_tags.iter().any(|t| &t.code == raw_code) {
+            // 从 normalize 前的映射反查原始名（找不到则用 code 作为 fallback）。
+            // (#718) 同 code 多键（展示名 + code 自映射）时优先展示名键，
+            // 防止 ram 条目的 TagChainItem.name 被写成 code 串。
+            // (#718 R1/M1) 确定性仲裁：HashMap 迭代序不定，同 code 存在多个非 code 词面键
+            // （如 zh 规范名与 en 别名并存）时选择结果随运行波动 → 规则化：
+            // ① 非 ASCII（CJK）字符多者优先（zh 规范展示名优先于 translit 别名）；
+            // ② 字符数更少者优先（短规范名优先于长复合词）；
+            // ③ 字典序兜底，保证完全可复现。
+            let is_code_form = |k: &str| {
+                k.starts_with("builtin.") || k.starts_with("omw.") || k.starts_with("hownet.")
+                    || k.starts_with("_ext.") || k.starts_with("dim.")
+            };
+            let original_name = detected_visual_tag_name_to_code
+                .iter()
+                .filter(|(_name, code): &(&String, &String)| code.as_str() == raw_code.as_str())
+                .map(|(name, _code): (&String, &String)| name.clone())
+                .filter(|name: &String| !is_code_form(name))
+                .min_by_key(|name: &String| {
+                    (
+                        std::cmp::Reverse(name.chars().filter(|c| !c.is_ascii()).count()),
+                        name.chars().count(),
+                        name.clone(),
+                    )
+                })
+                .unwrap_or_else(|| raw_code.clone());
+            // (WP2b) 分层置信度：优先真实分数（CLIP 标定分 / 互斥组标定分 / RAM 真实分），
+            // 缺失时按引擎分层回退：OCR事实 0.99 > 物理/互斥/NSFW/画质/RAM 0.90 > CLIP 起步 0.55
+            let (engine_name, real_conf) = match tag_engine_map.get(&original_name) {
+                Some((engine, _prio, conf)) => (Some(*engine), *conf),
+                None => (None, None),
+            };
+            let fallback_conf = match engine_name {
+                Some("ocr") => LAYER_FALLBACK_OCR,
+                Some("mutual_group") | Some("physical") | Some("nsfw") | Some("quality")
+                | Some("ram") => LAYER_FALLBACK_PHYSICAL,
+                Some("clip") => LAYER_FALLBACK_CLIP,
+                _ => LAYER_FALLBACK_PHYSICAL,
+            };
+            let confidence = real_conf.unwrap_or(fallback_conf);
+            let mut item = if is_pro {
+                // 用原始名查 RAM++ 投影表 / builtin 字典，得到正确的 code + name + parent_codes
+                let mut resolved =
+                    omni_pro::OmniVisionEngine::resolve_tag_to_chain_item_with_lang(
+                        &original_name,
+                        confidence,
+                        req.language.as_deref(),
+                    );
+                // G1 词形闸哨兵：空 code 表示该词未通过准入——**必须丢弃**，
+                // 否则坏概念会写进概念表、别名表与标签树（spec §6.9.1）。
+                // 正常路径下 normalize_tag_set_to_codes 已滤除坏词，此处是防御性二道保险；
+                // 注意必须判在 code 覆盖**之前**，否则 raw_code 会把哨兵盖掉。
+                if omni_core::tag_admissibility::is_rejected_code(&resolved.code) {
+                    continue;
+                }
+                // 确保 code 与归一结果一致（仅当 raw_code 是合法受控码时才覆盖；若 raw_code 发生 _ext 漂移而 resolved 命中受控码则严格保留受控码）
+                if omni_core::tag_identity::is_controlled_code(raw_code) || !omni_core::tag_identity::is_controlled_code(&resolved.code) {
+                    resolved.code = raw_code.clone();
+                }
+                resolved
+            } else {
+                omni_core::TagChainItem {
+                    code: raw_code.clone(),
+                    name: original_name.clone(),
+                    confidence,
+                    ..Default::default()
+                }
+            };
+            // (WP2a) 按登记的来源映射回填打标引擎
+            if let Some(engine) = engine_name {
+                item.engine = Some(engine.to_string());
+            }
+            enrich_tag(&mut item);
+            structured_visual_tags.push(item);
+        }
+    }
+
+    // 7. 级联提示词合成 + CLIP 向量仲裁终局裁决 (Pro 专享，仅图片路径生效)
+    // 注意：此处在 ram_tags 降级为 flat 前调用，以获取完整 TagChainItem 结构
+    // (P3 来源对称：级联主体池同样只消费门禁后存活的 gated_ram_tags)
+    let (cascade_candidates, winning_hypothesis, activated_dimension_tags, _smart_name, _content_description, pruned_ambiguous_words) = if is_pro && is_image {
+        omni_pro::OmniVisionEngine::synthesize_cascade_hypotheses_and_arbitrate(
+            &file_path,
+            &detected_visual_tags,
+            &gated_ram_tags,
+            &morphology_tags,
+            &nsfw_tags,
+            image_embedding.as_deref(),
+            req.language.as_deref(),
+        )
+    } else {
+        (Vec::new(), None, Vec::new(), None, None, Vec::new())
+    };
+
+    // 6.3 ram_tags 平铺字符串数组：忠实透出 RAM++ 模型端原始识别结果 (全年龄/安全内容下过滤违禁敏感词)
+    let is_all_ages_content = is_pro && sensitive_types.is_empty() && (
+        content_rating.as_deref() == Some("safe")
+            || content_rating.as_deref() == Some("all_ages")
+            || content_rating.as_deref().map_or(false, |r| tag_matches_concept(r, Concept::全年龄.code()))
+            || nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::全年龄.code()))
+            || (!nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || t == "R-18" || t == "R-18G")
+                && !nsfw_text_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || t == "R-18" || t == "R-18G"))
+    );
+    let ram_tags_flat: Vec<String> = if is_all_ages_content {
+        ram_tags
+            .iter()
+            .filter(|r| !omni_pro::is_nsfw_or_restricted_tag(&r.name))
+            .map(|r| r.name.clone())
+            .collect()
+    } else {
+        ram_tags.iter().map(|r| r.name.clone()).collect()
+    };
+
+    let lrc = metadata
+        .get("lrc")
+        .or_else(|| metadata.get("audio").and_then(|a| a.get("lrc")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let audio_events = metadata
+        .get("audio_events")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    let category = metadata
+        .get("category")
+        .and_then(|c| c.get("group"))
+        .and_then(|g| g.as_str())
+        .map(|s| s.to_string());
+
+    // 8. Tier 1 端侧纯 CPU 确定性文本特征与 384 维向量提取 (omni-text 支柱 4)
+    // 包含: #615 Chunker, #616 fastText/KeyBERT, #617 bekko-a8m 384d, #618 实体槽位/5W摘要/智能重命名
+    // 开源构建或无配置开关时跳过，避免存根空转下发全零向量并冲击感知 SLO
+    let mtime = file_meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t));
+    let file_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+
+    let enable_frontend_text = req.enable_text_analysis.unwrap_or(cfg.enable_text_analysis);
+    let text_analysis = if is_pro && enable_frontend_text && !effective_text.trim().is_empty() {
+        let t_text = std::time::Instant::now();
+        let text = effective_text.clone();
+        let fname = file_name.clone();
+        let hownet = state.hownet.clone();
+        let profile = cfg.embedding_profile.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            // 双档位契约：gemma_unified 档位下主向量与 KeyBERT 主题词抽取**都由 EmbeddingGemma
+            // 文本塔产出**，全程不触碰已退役的 bekko-a8m（否则每次文件分析都会加载 384d 旧模型）。
+            // classic_light 档位保持原路径（bekko-a8m 384d），行为不变。
+            let is_gemma = profile == "gemma_unified";
+            let r = if is_gemma {
+                // fallback_dim = 0：编码失败回退空向量，由下面 encoder 判定为「无主向量」
+                omni_pro::text::OmniTextEngine::analyze_with_embedder(
+                    &text,
+                    &fname,
+                    mtime,
+                    Some(&*hownet),
+                    &GemmaTextEmbedder,
+                    0,
+                )
+            } else {
+                omni_pro::text::OmniTextEngine::analyze(&text, &fname, mtime, Some(&*hownet))
+            };
+            // 编码器出处随向量一起返回：Bekko 384 默认 1；gemma 文本编码成功才升为 4。
+            // 禁止下游按 profile/界面语言猜测（gemma 编码失败时向量为空，不得标 4）。
+            let encoder = if is_gemma {
+                if !r.embedding_dense.is_empty() {
+                    omni_pro::vector_engine::encoder_id::GEMMA
+                } else {
+                    omni_pro::vector_engine::encoder_id::UNKNOWN
+                }
+            } else {
+                omni_pro::vector_engine::encoder_id::BEKKO
+            };
+            (r, encoder)
+        })
+        .await;
+        let text_duration = t_text.elapsed().as_millis() as u64;
+        let cur_text_ms = benchmark.get("text_ms").unwrap_or(0);
+        benchmark.record("text_ms", cur_text_ms + text_duration);
+        if let Ok((ref result, _)) = res {
+            benchmark.record("bekko_embed_ms", result.bekko_embed_ms);
+            benchmark.record("keybert_ms", result.keybert_ms);
+            benchmark.record("slot_summary_ms", result.slot_summary_ms);
+        }
+        match res {
+            Ok(result) => Some(result),
+            Err(e) => {
+                tracing::error!("[OmniServer] 文本分析任务执行失败: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (text_title, mut text_keywords, text_entities, text_summary, text_one_desc, text_slots, text_emb, text_emb_encoder, text_smart_name) = match text_analysis {
+        Some((res, encoder)) => (
+            res.title,
+            res.keywords,
+            res.entities.iter().filter_map(|e| serde_json::to_value(e).ok()).collect(),
+            serde_json::to_value(&res.structured_summary).ok(),
+            res.one_sentence_desc,
+            serde_json::to_value(&res.name_slots).ok(),
+            Some(res.embedding_dense),
+            Some(encoder),
+            res.smart_name,
+        ),
+        None => (
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    };
+
+    // 8.5 全文本打标 (Ticket 01 & Ticket 04 text_tags)
+    let extracted_text_tags = if is_pro {
+        let vt_ref = global_text_vector_table();
+
+        if asr.is_some() || lrc.is_some() {
+            omni_pro::text::TextTagger::tag_asr_or_lrc(asr.as_deref(), lrc.as_deref(), vt_ref)
+        } else if !is_image && !markdown_content.trim().is_empty() {
+            omni_pro::text::TextTagger::tag_text(&markdown_content, Some("document"), vt_ref)
+        } else if let Some(ref ocr) = ocr_text {
+            if !ocr.trim().is_empty() {
+                omni_pro::text::TextTagger::tag_text(ocr, Some("ocr"), vt_ref)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // 9. 第三阶段: 双锚点交叉向量验证与多模态终局融合 (Task 626)
+    // 汇聚第二阶段收集到的所有多模态异构信息为 MultimodalContext
+    let current_policies = state.dimension_policies.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let multimodal_ctx = omni_core::MultimodalContext {
+        file_path: file_path.clone(),
+        file_name: file_name.clone(),
+        mime_type: mime_type.clone(),
+        document_text: if !is_image && !markdown_content.trim().is_empty() { Some(markdown_content.clone()) } else { None },
+        ocr_text: ocr_text.clone(),
+        // 对外契约字段为 `asr`（Issue 0046 §1），MultimodalContext 内部沿用历史名 audio_transcript
+        audio_transcript: asr.clone(),
+        lrc_text: lrc.clone(),
+        visual_tags: structured_visual_tags.clone(),
+        text_tags: extracted_text_tags.clone(),
+        exif_metadata: metadata.clone(),
+        is_image,
+        is_video,
+        is_document: !is_image && !is_video,
+        is_audio_or_video: is_video || has_asr || lrc.is_some(),
+        language: req.language.clone(),
+        dimension_policies: Some(current_policies.clone()),
+    };
+
+    let t_fusion = std::time::Instant::now();
+    let fusion_outcome = if is_pro {
+        omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate(&multimodal_ctx)
+    } else {
+        // 非 Pro 构建无融合引擎：fused_tags 必须留空，严禁以 visual_tags 顶替。
+        // 顶替会让视觉标签在桌面端被误判为「融合标签」组（ADR-0045 来源分组语义污染）。
+        omni_pro::text::FusedPerceptionOutcome {
+            smart_name: None,
+            content_description: None,
+            fused_tags: Vec::new(),
+            candidate_hypotheses: Vec::new(),
+            perf_breakdown: None,
+            // 非 Pro 无融合引擎 ⇒ 无全局锚点可导出；锚点缓存保持空，
+            // 文本标注端点据此降级为「仅受控词表」（spec §2.2.6 降级语义）
+            anchor_vector: None,
+        }
+    };
+    let fusion_ms = t_fusion.elapsed().as_millis() as u64;
+    benchmark.record("fusion_ms", fusion_ms);
+
+    // 批 B 锚点暂存：把本次 perceive 的**全局锚点**按文件指纹放进缓存，
+    // 供 LLM 产物返送打标（POST /api/text/tag）取用（spec §2.2.6 / §3.3）。
+    //
+    // - 只暂存 `e_global` 单锚：批 A 阈值与批 B 门控都是「与全局锚点的余弦」；
+    //   融合引擎内部的描述锚点/段落向量是瞬时量，**严禁**缓存（会迅速突破内存红线）；
+    // - 无指纹（调用方未传）或无锚点（非 Pro / 编码失败）⇒ 不写入，返送侧走降级；
+    // - 编码器身份取 `encoder_id::BEKKO`：融合锚点恒由 `BekkoEmbedder`（384d）产出。
+    if let (Some(fp), Some(anchor)) = (
+        req.file_fingerprint.as_deref(),
+        fusion_outcome.anchor_vector.as_ref(),
+    ) {
+        if !fp.is_empty() {
+            state.anchor_cache.put(
+                fp,
+                omni_core::anchor_cache::AnchorCacheEntry::new(
+                    anchor.clone(),
+                    omni_core::encoder_id::BEKKO,
+                    std::time::Instant::now(),
+                ),
+            );
+        }
+    }
+
+    if let Some(ref perf) = fusion_outcome.perf_breakdown {
+        benchmark.record("fusion_anchor_ms", perf.global_anchor_ms);
+        benchmark.record("fusion_pool_ms", perf.candidate_pool_ms);
+        benchmark.record("fusion_score_ms", perf.score_initial_ms);
+        benchmark.record("fusion_prune_ms", perf.prune_ms);
+        benchmark.record("fusion_slots_name_ms", perf.slots_name_ms);
+        benchmark.record("fusion_slots_desc_ms", perf.slots_desc_ms);
+        benchmark.record("fusion_gen_hypo_ms", perf.gen_hypotheses_ms);
+        benchmark.record("fusion_arbitrate_embed_ms", perf.arbitrate_embed_ms);
+        benchmark.record("fusion_finalize_ms", perf.finalize_ms);
+        benchmark.record("fusion_embed_calls", perf.embed_calls_est as u64);
+    }
+
+    let candidate_hypotheses = if !fusion_outcome.candidate_hypotheses.is_empty() {
+        fusion_outcome.candidate_hypotheses
+    } else {
+        cascade_candidates
+    };
+
+    // 若第三阶段双锚点融合产生了胜出假设，优先更新 winning_hypothesis
+    let winning_hypothesis = candidate_hypotheses
+        .iter()
+        .find(|c| c.is_winner)
+        .map(|c| omni_core::WinningHypothesisItem {
+            prompt_text: c.prompt_text.clone(),
+            confidence: c.confidence,
+        })
+        .or(winning_hypothesis);
+
+    // 终局智能重命名与描述：优先取第三阶段双锚点交叉验证胜出者 (Fusion 轨单轨出厂，PRD §7.1.4)
+    // 视觉内联旁路已退役，图片路径绝不回退至 text 5W 范畴错配
+    let mut smart_name = fusion_outcome.smart_name.or(if is_image { None } else { text_smart_name });
+    let content_description = fusion_outcome.content_description.or_else(|| if is_image { None } else { text_one_desc.clone() });
+
+    if let Some(ref bin) = binary_analysis_info {
+        if let Some(ref prod) = bin.product_name {
+            if !prod.trim().is_empty() {
+                smart_name = Some(prod.clone());
+            }
+        }
+    }
+
+    let author: Option<String> = if let Some(ref bin) = binary_analysis_info {
+        bin.company_name.clone().or_else(|| bin.signer_organization.clone())
+    } else {
+        metadata.get("authors").or_else(|| metadata.get("author")).and_then(|v| {
+            if let Some(s) = v.as_str() {
+                Some(s.to_string())
+            } else if let Some(arr) = v.as_array() {
+                arr.first().and_then(|item| item.as_str()).map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+    };
+    
+    // 置信度门限控制：低于 EXIT_CONFIDENCE_THRESHOLD 的候选标签严禁透出到接口返回结果中 (日志中已输出完整候选打分)
+    structured_visual_tags.retain(|t| t.confidence >= EXIT_CONFIDENCE_THRESHOLD);
+
+    let fused_tags = if !fusion_outcome.fused_tags.is_empty() {
+        let mut filtered = fusion_outcome.fused_tags;
+        filtered.retain(|t| t.confidence >= EXIT_CONFIDENCE_THRESHOLD);
+        filtered
+    } else {
+        // ADR-0045：融合引擎无产出时**不得**回退为 visual_tags 整份拷贝。
+        // 该回退会让「视觉标签」冒充「融合标签」：桌面端 `isFusedAuthoritative`
+        // 据 fused_tags 非空判真，把整份标签赋 `fused` 组，而真正的「视觉标签」组
+        // 因同名去重（fused 优先于 visual）恒空。
+        // 语义正确做法 = 无融合产出即返回空，视觉标签走自身通道 visual_tags。
+        Vec::new()
+    };
+
+    // 缺口2（GH #712 S7）：融合标签组补挂词性回填。
+    // 融合引擎（OmniMultimodalFusionEngine::fuse_and_arbitrate）产出的 fused_tags
+    // 中的 TagChainItem 不一定经过了 enrich_tag，导致 pos 字段为空。
+    // 物理事实标签组（fact_tags）按豁免规则可不挂（ADR-0052 §6 决策⑥）。
+    let mut fused_tags = fused_tags;
+    for item in &mut fused_tags {
+        enrich_tag(item);
+    }
+
+    // 票 05：受控标签与扩展标签经由父 (via_parent_code) 与树状父 (parent_codes) 主链回填
+    // 终结「工单 01 已知限制」，确保受控标签行落库时 via_parent_code != ''
+    let backfill_chain_item = |mut tag: omni_core::TagChainItem| -> omni_core::TagChainItem {
+        // 1. 若已有 parent_codes 且 via_parent_code 为空，优先以首个父级作为经由父消歧锚
+        if tag.via_parent_code.is_none() && !tag.parent_codes.is_empty() {
+            tag.via_parent_code = tag.parent_codes.first().cloned();
+        }
+        // 2. 若依然缺失经由父且不是真根节点（受控标签 builtin.* / omw.* / hownet.* 或扩展标签 _ext.*），在 Pro 下通过向量底座推导补全
+        if tag.via_parent_code.is_none() && is_pro {
+            if tag.code.starts_with("_ext.") || tag.code.starts_with("builtin.") || tag.code.starts_with("omw.") || tag.code.starts_with("hownet.") {
+                let outcome = omni_pro::text::OmniMultimodalFusionEngine::resolve_ext_tag_parent(
+                    &tag.name,
+                    &tag.code,
+                );
+                if !outcome.is_empty() {
+                    tag.via_parent_code = Some(outcome.clone());
+                    if tag.parent_codes.is_empty() {
+                        tag.parent_codes = vec![outcome];
+                    }
+                }
+            }
+        }
+        tag
+    };
+
+    let structured_visual_tags: Vec<omni_core::TagChainItem> = structured_visual_tags
+        .into_iter()
+        .map(backfill_chain_item)
+        .collect();
+
+    let fused_tags: Vec<omni_core::TagChainItem> = fused_tags
+        .into_iter()
+        .map(backfill_chain_item)
+        .collect();
+
+    let extracted_text_tags: Vec<omni_core::TagChainItem> = extracted_text_tags
+        .into_iter()
+        .map(backfill_chain_item)
+        .collect();
+
+    // 9.1 基于维度策略执行单选互斥 argmax 与多选维度放行最终一致性仲裁
+    let mut structured_visual_tags = arbitrate_tags_by_dimension_policies(structured_visual_tags, &current_policies);
+    let mut fused_tags = arbitrate_tags_by_dimension_policies(fused_tags, &current_policies);
+
+    // 9.1-b 语义对立对跨集合联合互斥（响应出口最后一道门）：
+    //   视觉组与融合组是两条独立通道，各自仲裁后可能对同一对对立概念**各留一侧**
+    //   （视觉组留「兴奋」、融合组留「压抑」）；桌面端按组并集落库，矛盾对仍会同时出现在
+    //   标签面板（真实事故：DSC01875.jpg）。故此处跨集合再裁一次：对立对只留置信度更高一侧。
+    //   数据源为「受控注册表（情感轴 + 视觉/画幅互斥轴，有限本体人工确权）
+    //   + OMW 反义图谱（按本次候选现取）」，任一源判定成对即裁决；
+    //   多选维度仍为多选（互补情绪如「致郁+压抑+紧张」不受影响）。
+    {
+        // 外部本体源：只取本次候选实际涉及的 OMW 反义边（受控概念 4 万量级，全量装表无必要），
+        // 且仅在语义包已挂载（Pro）时可用；CE 无语义包 ⇒ 仅受控注册表生效。
+        let omw_pairs = sem_graph.as_ref().map(|graph| {
+            let mut pairs = Vec::new();
+            for tag in structured_visual_tags.iter().chain(fused_tags.iter()) {
+                let Some(concept_item) =
+                    omni_core::tag_identity::concept_from_code_or_alias(&tag.code)
+                else {
+                    continue;
+                };
+                for antonym in graph.antonym_codes(&tag.code) {
+                    if let Some(other) =
+                        omni_core::tag_identity::concept_from_code_or_alias(&antonym)
+                    {
+                        pairs.push((concept_item, other));
+                    }
+                }
+            }
+            omni_core::concept_opposition::PairSet::from_pairs(pairs)
+        });
+
+        let mut opposition_sources: Vec<&dyn omni_core::concept_opposition::OppositeSource> = vec![
+            &omni_core::emotion_opposition::EMOTION_REGISTRY,
+            &omni_core::concept_opposition::CONTROLLED_VISUAL_REGISTRY,
+        ];
+        if let Some(ref pair_set) = omw_pairs {
+            opposition_sources.push(pair_set);
+        }
+        let dropped = omni_core::concept_opposition::OppositionResolver::new(opposition_sources)
+            .arbitrate_across_sets(&mut [&mut structured_visual_tags, &mut fused_tags]);
+        if dropped > 0 {
+            tracing::debug!(
+                "[OmniServer] 语义对立对跨集合联合互斥: 剔除 {} 条矛盾标签",
+                dropped
+            );
+        }
+    }
+
+    // 9.2 二进制文件 (BinaryLens) 事实标签与正交多路径标签派生
+    if let Some(ref bin) = binary_analysis_info {
+        // A. 运行平台标签 (Windows / Linux / macOS)
+        let plat_tag = match bin.format.as_str() {
+            "PE" => Some((omni_core::concepts::Concept::Windows.code(), omni_core::concepts::Concept::Windows.zh_name())),
+            "ELF" => Some((omni_core::concepts::Concept::Linux.code(), omni_core::concepts::Concept::Linux.zh_name())),
+            "Mach-O" => Some((omni_core::concepts::Concept::macOS.code(), omni_core::concepts::Concept::macOS.zh_name())),
+            _ => None,
+        };
+        if let Some((code, name)) = plat_tag {
+            fused_tags.push(omni_core::TagChainItem {
+                code: code.to_string(),
+                name: name.to_string(),
+                confidence: 1.0,
+                source: Some("fact".to_string()),
+                engine: Some("rule".to_string()),
+                via_parent_code: Some(omni_core::concepts::Concept::运行平台.code().to_string()),
+                parent_codes: vec![omni_core::concepts::Concept::运行平台.code().to_string()],
+                depth: Some(2),
+                ..Default::default()
+            });
+        }
+
+        // B. 运行时框架
+        if let Some(ref fw_code) = bin.detected_framework_code {
+            if let Some(fw_name) = omni_core::get_canonical_concept_name(fw_code) {
+                fused_tags.push(omni_core::TagChainItem {
+                    code: fw_code.clone(),
+                    name: fw_name.to_string(),
+                    confidence: 0.95,
+                    source: Some("fact".to_string()),
+                    engine: Some("rule".to_string()),
+                    via_parent_code: Some(omni_core::concepts::Concept::运行时框架.code().to_string()),
+                    parent_codes: vec![omni_core::concepts::Concept::运行时框架.code().to_string()],
+                    depth: Some(2),
+                    ..Default::default()
+                });
+            }
+        }
+
+        // C. 能力特征 (多选放行)
+        for cap_code in &bin.capability_codes {
+            if let Some(cap_name) = omni_core::get_canonical_concept_name(cap_code) {
+                fused_tags.push(omni_core::TagChainItem {
+                    code: cap_code.clone(),
+                    name: cap_name.to_string(),
+                    confidence: 0.90,
+                    source: Some("fact".to_string()),
+                    engine: Some("rule".to_string()),
+                    via_parent_code: Some(omni_core::concepts::Concept::程序能力特征.code().to_string()),
+                    parent_codes: vec![omni_core::concepts::Concept::程序能力特征.code().to_string()],
+                    depth: Some(2),
+                    ..Default::default()
+                });
+            }
+        }
+
+        // D. 程序细分与正交多路径派生 (如分类为开发工具，自动派生工具应用)
+        let dev_tools_concept = omni_core::concepts::Concept::开发工具;
+        let cat_code = bin.category_code.as_deref().unwrap_or(dev_tools_concept.code());
+        if let Some(cat_name) = omni_core::get_canonical_concept_name(cat_code) {
+            // 根据 tagImplications 映射规则求解对应【文件用途】受控概念
+            let implied_purpose_concept: Option<omni_core::concepts::Concept> = match cat_code {
+                c if c == omni_core::concepts::Concept::开发工具.code() => Some(omni_core::concepts::Concept::工具应用),
+                c if c == omni_core::concepts::Concept::影音创作.code() => Some(omni_core::concepts::Concept::创意项目),
+                c if c == omni_core::concepts::Concept::网络通信工具.code() => Some(omni_core::concepts::Concept::工具应用),
+                c if c == omni_core::concepts::Concept::系统运维.code() => Some(omni_core::concepts::Concept::系统维护),
+                c if c == omni_core::concepts::Concept::办公实用.code() => Some(omni_core::concepts::Concept::工具应用),
+                c if c == omni_core::concepts::Concept::游戏程序.code() => Some(omni_core::concepts::Concept::游戏娱乐),
+                _ => None,
+            };
+
+            let mut parent_codes = vec![omni_core::concepts::Concept::程序细分.code().to_string()];
+            if let Some(ref purpose) = implied_purpose_concept {
+                parent_codes.push(purpose.code().to_string());
+            }
+
+            fused_tags.push(omni_core::TagChainItem {
+                code: cat_code.to_string(),
+                name: cat_name.to_string(),
+                confidence: bin.confidence_score,
+                source: Some("fusion".to_string()),
+                engine: Some("rule".to_string()),
+                via_parent_code: Some(omni_core::concepts::Concept::程序细分.code().to_string()),
+                parent_codes,
+                depth: Some(2),
+                ..Default::default()
+            });
+
+            // 正交非排他派生至【文件用途】
+            if let Some(usage_concept) = implied_purpose_concept {
+                fused_tags.push(omni_core::TagChainItem {
+                    code: usage_concept.code().to_string(),
+                    name: usage_concept.zh_name().to_string(),
+                    confidence: bin.confidence_score,
+                    source: Some("fusion".to_string()),
+                    engine: Some("rule".to_string()),
+                    via_parent_code: Some(omni_core::concepts::Concept::文件用途.code().to_string()),
+                    parent_codes: vec![omni_core::concepts::Concept::文件用途.code().to_string()],
+                    depth: Some(2),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    // 10. 原生事实标签抽取 (Task 2)：元数据直读 + 下沉物理事实 → fact_tags 直出
+    //
+    // 语言细分 (dim 11, applicableFileTypes: document, text, ebook, audio, video):
+    // 严格按客观内容特征推导，严禁由 UI 语言 (req.language) 臆测，且严禁对图片 (applicable 不含 image) 及压缩包挂语言标签。
+    // ① 音频/视频：优先使用真实 ASR 语音转录语料，次选 LRC 歌词，再次选音视频元数据 language 字段；
+    // ② 文档/文本：使用提取的真实正文 markdown_content；
+    // ③ 纯图片/无语音音频/无文本文件：不产出语言事实标签 (None，宁缺勿错)。
+    let fact_language_concept: Option<omni_core::concepts::Concept> = if !is_image {
+        let meta_lang_concept = if is_audio || is_video {
+            metadata
+                .get("language")
+                .or_else(|| metadata.get("audio").and_then(|a| a.get("language")))
+                .or_else(|| metadata.get("exiftool").and_then(|e| e.get("AudioLanguage").or_else(|| e.get("Language"))))
+                .and_then(|v| v.as_str())
+                .and_then(omni_core::concept_from_language_code)
+        } else {
+            None
+        };
+
+        if let Some(concept_val) = meta_lang_concept {
+            Some(concept_val)
+        } else {
+            let candidate_text = if is_audio || is_video {
+                asr.as_deref().or(lrc.as_deref())
+            } else {
+                let trimmed = markdown_content.trim();
+                if !trimmed.is_empty() {
+                    Some(trimmed)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(text) = candidate_text {
+                omni_core::detect_fact_language(text)
+            } else {
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let language_label = fact_language_concept.map(|concept_val| concept_val.zh_name().to_string());
+
+    let media_domain = if is_audio {
+        Some(omni_core::MediaDomain::Audio)
+    } else if is_video {
+        Some(omni_core::MediaDomain::Video)
+    } else if is_image {
+        Some(omni_core::MediaDomain::Image)
+    } else {
+        None
+    };
+
+    let mut fact_tags: Vec<omni_core::TagChainItem> = {
+        let ctx = omni_extract::FactTagContext {
+            metadata: &metadata,
+            file_path: Some(&file_path),
+            extension: None,
+            media_domain,
+            file_source: file_source.clone(),
+            workflow_state: workflow_state.clone(),
+            security_level: security_level.clone(),
+            quality_score,
+            language_label,
+        };
+        omni_extract::OmniFactTagExtractor::extract(&ctx)
+    };
+    for item in &mut fact_tags {
+        enrich_tag(item);
+    }
+
+    // 维度 126「摄影照片细分」声明 `applicable=['image']` + `trigger=图片细分(摄影照片)`（双声明一致），
+    // 但其事实抽取（EXIF / QuickTime 的 Make / Model）对任意文件类型均生效
+    // （手机拍摄的 MP4 亦含 QuickTime Make / Model）⇒ 按媒体文件组后置门控，仅图片保留。
+    // 注：源头门控需在 `omni-extract` 的 `FactTagContext` 补 file_group 后实施，此处先行兜底。
+    if !is_image {
+        fact_tags.retain(|t| {
+            let photo_code = Concept::摄影照片细分.code();
+            let under_photography = t.via_parent_code.as_deref() == Some(photo_code)
+                || t.parent_codes.iter().any(|c| c == photo_code);
+            !under_photography
+        });
+    }
+
+    // 核心安全合规契约：无论什么类型的文件（图片/视频/音频/文本/文档），
+    // 若通过 nsfw_tags 或 nsfw_text_tags 专职判定为非 NSFW 的内容 (is_all_ages_content)，全面过滤所有通道的敏感标签！
+    // 若为真正违规/NSFW 的内容，则不过滤，忠实透出全部检测结果供审计与标记。
+    if is_all_ages_content {
+        clip_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(t));
+        clip_high_confidence_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(t));
+        structured_visual_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(&t.name));
+        fused_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(&t.name));
+        fact_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(&t.name));
+        text_keywords.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(t));
+    }
+
+    benchmark.total_ms = t_start.elapsed().as_millis() as u64;
+
+    tracing::info!(
+        "[OmniServer] 原生多模态感知完成: file={}, 耗时={}ms, watermark_level={:?}, mosaic_level={:?}, has_text={:?}, visual_tags_count={}, fused_tags_count={}, ram_tags={:?}, geo={:?}",
+        file_path,
+        benchmark.total_ms,
+        watermark_level,
+        mosaic_level,
+        has_text,
+        structured_visual_tags.len(),
+        fused_tags.len(),
+        ram_tags_flat,
+        geo_address
+    );
+
+    tracing::info!(
+        "[事实标签抽取:fact_tags] 文件: {}, 产出标签数: {}, 标签: {:?}",
+        file_name,
+        fact_tags.len(),
+        fact_tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
+    );
+
+    let mut result = Json(OmniPerceptionResult {
+        file_path: file_path.clone(),
+        mime_type,
+        file_size,
+        category,
+        markdown_content: markdown_content.clone(),
+        ocr_text,
+        metadata,
+        file_source,
+        file_source_code,
+        source_url,
+        workflow_state,
+        workflow_state_code,
+        security_level,
+        security_level_code,
+        has_watermark,
+        watermark_level,
+        watermark_status,
+        has_mosaic,
+        mosaic_level,
+        mosaic_status,
+        has_text,
+        aesthetic_score,
+        quality_score,
+        photo_type,
+        quality_issues,
+        visual_tags: structured_visual_tags,
+        morphology_tags,
+        clip_tags,
+        nsfw_tags,
+        nsfw_text_tags,
+        ram_tags: ram_tags_flat,
+        morphology_high_confidence_tags,
+        clip_high_confidence_tags,
+        nsfw_high_confidence_tags,
+        sensitive_types,
+        content_rating,
+        asr,
+        has_asr,
+        asr_length,
+        lrc,
+        audio_events,
+        geo_address,
+        phash,
+        is_corrupted,
+        // 级联假设仲裁终局字段
+        candidate_hypotheses,
+        winning_hypothesis,
+        activated_dimension_tags,
+        fused_tags,
+        fact_tags,
+        smart_name,
+        content_description,
+        pruned_ambiguous_words,
+        // Tier 1 端侧纯 CPU 确定性文本特征与向量
+        title: text_title,
+        keywords: text_keywords,
+        entities: text_entities,
+        structured_summary: text_summary,
+        one_sentence_desc: text_one_desc,
+        name_slots: text_slots,
+        // 空文本向量不得遮蔽视觉主向量：gemma 文本塔编码失败时 text_emb 为空向量
+        embedding_dense: text_emb
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or(image_embedding),
+        // 主向量编码器出处：与向量同源（文本层 or 视觉层），禁止本层猜测
+        embedding_encoder_id: resolve_main_vector_encoder(
+            text_emb.as_ref().is_some_and(|v| !v.is_empty()),
+            text_emb_encoder,
+            image_encoder_id,
+        ),
+        benchmark: Some(benchmark),
+        author,
+        binary_info: binary_analysis_info,
+        // 生效采样间隔随切片下发（由视频管线按预算求解后写入每个切片），
+        // 供桌面端落库与缓存升级判据使用；无切片时为 None。
+        // 注意：必须写在 `video_chunks` 之前，否则字段移动后无法再借用。
+        video_sampling_interval_seconds: video_chunks
+            .first()
+            .map(|c| c.sampling_interval_seconds),
+        video_analysis_duration_sec: video_timings
+            .as_ref()
+            .and_then(|t| t.visual_analysis_duration_sec.or(t.analysis_duration_sec))
+            .map(|d| d as f32),
+        video_truncated: video_timings.as_ref().and_then(|t| t.video_truncated),
+        cover_webp_base64: video_cover_webp_base64,
+        text_tags: extracted_text_tags,
+        video_chunks,
+        vector_saved: None,
+    });
+
+    // 统一就地单次原子批量落盘 (Zero-Boomerang IPC)
+    if let Some(ref fp) = req.file_fingerprint {
+        let mut batch_items = Vec::with_capacity(result.video_chunks.len() + 1);
+
+        // 1. 主向量一并打包 (优先取稠密嵌入)，编码器出处与向量同源透传。
+        // 空向量必须跳过：gemma 文本塔编码失败时 embedding_dense 为空（fallback_dim=0），
+        // 写入空向量会污染 zvec 槽位并让后续检索恒定失配。
+        if let Some(ref main_vec) = result.embedding_dense {
+            if !main_vec.is_empty() {
+                // 阶段一正文大头向量隔离：有正文文本的文件写入 {fp}:tc0 切片槽，
+                // 主槽 {fp} 专用于阶段二 Canonical 聚焦语义向量（供聚类与整理消费）。
+                // 纯视觉多模态（图片/视频主特征）无正文时，仍写入 {fp} 主槽。
+                let is_text_body = text_emb.as_ref().is_some_and(|v| !v.is_empty());
+                let target_fp = if is_text_body {
+                    format!("{}:tc0", fp)
+                } else {
+                    fp.clone()
+                };
+                batch_items.push(omni_pro::vector_engine::VectorUpsertItem {
+                    file_fingerprint: target_fp,
+                    vector: main_vec.clone(),
+                    encoder_id: result.embedding_encoder_id.unwrap_or(
+                        omni_pro::vector_engine::encoder_id::UNKNOWN,
+                    ),
+                });
+            }
+        }
+
+        // 2. 切片向量打包
+        for c in result.video_chunks.iter() {
+            batch_items.push(omni_pro::vector_engine::VectorUpsertItem {
+                file_fingerprint: format!("{}:c{}", fp, c.chunk_index),
+                vector: c.vector.clone(),
+                encoder_id: c.encoder_id,
+            });
+        }
+
+        // 3. 内部就地单次原子批量持久化
+        if !batch_items.is_empty() {
+            let t_zvec_start = std::time::Instant::now();
+            let saved = match state.vector.batch_upsert(&batch_items) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!("向量内部批量写入失败: {:?}", e);
+                    false
+                }
+            };
+            let t_zvec = t_zvec_start.elapsed();
+            result.vector_saved = Some(saved);
+
+            // 4. 关键：无论写盘成功与否均彻底剥离浮点数组，将网络响应体积压缩至 < 2KB (避免失败时依然向 IPC 传输大 payload)
+            for c in result.video_chunks.iter_mut() {
+                c.vector.clear();
+            }
+
+            // 5. 5 段全链路耗时监控埋点
+            let total_chunks = result.video_chunks.len();
+            if total_chunks > 0 {
+                let bench = result.benchmark.as_ref();
+                let ffmpeg_ms = bench.and_then(|b| b.subtasks.get("ffmpeg_ms").copied()).unwrap_or(0);
+                let decode_ms = bench.and_then(|b| b.subtasks.get("decode_resize_ms").copied()).unwrap_or(0);
+                let vision_ms = bench.and_then(|b| b.vision_ms).unwrap_or(0);
+                let text_ms = bench.and_then(|b| b.extract_ms).unwrap_or(0);
+                tracing::info!(
+                    "[PERF_PROFILE] 视频分析完成 | 文件: {} | 切片数: {} | 总耗时: {}ms [抽帧直连: {}ms | 读图解码缩放: {}ms | 视觉塔前向: {}ms | 文本塔前向: {}ms | 向量批量写盘: {}ms]",
+                    req.file_path,
+                    total_chunks,
+                    t_start.elapsed().as_millis(),
+                    ffmpeg_ms,
+                    decode_ms,
+                    vision_ms,
+                    text_ms,
+                    t_zvec.as_millis()
+                );
+            }
+        }
+    }
+
+    // 跨支柱自动索引 (Pillar 4 -> Pillar 5): 若感知产出了稠密特征向量且有文本，自动异步入库双轨混合索引
+    if let (Some(ref emb), false) = (&text_emb, effective_text.trim().is_empty()) {
+        let indexed_doc = omni_pro::search::IndexedDocument {
+            fingerprint: file_path.clone(),
+            embedding: emb.clone(),
+            searchable_text: format!("{}\n{}", file_name, effective_text),
+        };
+        let search_arc = state.search.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = search_arc.upsert_batch(&[indexed_doc]);
+        });
+    }
+
+    result
+}
+
+/// 受控词表预计算向量表（进程级只读，一次加载全程复用）。
+///
+/// `perceive` 的文本打标与 `POST /api/text/tag` **必须共用同一实例**——若各自持有
+/// `OnceLock`，同一张表会被加载两遍（内存翻倍）且两处口径可能因加载时点不同而分叉。
+fn global_text_vector_table() -> Option<&'static omni_pro::text::PrecomputedVectorTable> {
+    static GLOBAL_TEXT_VECTOR_TABLE: std::sync::OnceLock<
+        Option<omni_pro::text::PrecomputedVectorTable>,
+    > = std::sync::OnceLock::new();
+    GLOBAL_TEXT_VECTOR_TABLE
+        .get_or_init(|| {
+            omni_pro::text::PrecomputedVectorTable::discover_table_path()
+                .and_then(|p| omni_pro::text::PrecomputedVectorTable::load_from_file(p).ok())
+        })
+        .as_ref()
+}
+
+/// LLM 产物返送打标请求体: POST /api/text/tag（spec §3.1）
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextTagRequest {
+    /// 文件唯一指纹（= 首次 perceive 传入的 `fileFingerprint`），用于取回**同源**全局锚点
+    pub file_fingerprint: String,
+    /// 待打标文本。必须是**完整原句**：去标签化由 `exclude_names` 在词元级完成，
+    /// **严禁**调用方先做子串替换（会破坏分词上下文，§2.2.4）
+    pub text: String,
+    /// BCP-47 语言标签。**仅用于可观测性**：本接口判据（G1 词形闸 + 违禁词元 + 锚点余弦）
+    /// 不依赖语言入参，语种由分词器自行判定（§2.2.2）
+    #[serde(default)]
+    pub language: Option<String>,
+    /// 是否允许产出 `_ext.*` 新标签。**缺省 `false`**（安全默认：只做受控反查，杜绝自证）
+    #[serde(default)]
+    pub allow_new_tags: bool,
+    /// 首次已胜出标签展示名（大小写不敏感），在**候选词元层**按整词相等剔除
+    #[serde(default)]
+    pub exclude_names: Vec<String>,
+}
+
+/// 通用文本打标 API: POST /api/text/tag（spec §2.2 / §3.1）
+///
+/// 底座复用 `TextTagger`（受控反查 → 派生 `_ext.*` → 置信度标定 → 去重限 8），
+/// 本接口**仅叠加**「锚点余弦 ≥ 0.55」这一批 B 新增判据；过滤发生在截断之前。
+async fn text_tag_handler(
+    State(state): State<AppState>,
+    Json(req): Json<TextTagRequest>,
+) -> Json<Vec<omni_core::TagChainItem>> {
+    // 非 Pro：与 perceive 的非 Pro 契约一致——返回空数组存根，严禁以其它来源顶替（§3.1）
+    if !omni_pro::is_pro_enabled() {
+        tracing::warn!(
+            "[OmniServer] /api/text/tag 在非 Pro 构建下无打标能力，返回空数组存根（fingerprint={}）",
+            req.file_fingerprint
+        );
+        return Json(Vec::new());
+    }
+
+    if req.text.trim().is_empty() {
+        return Json(Vec::new());
+    }
+
+    // 锚点同源取用：**命中即删**；每个失败分支都必须 warn 上报降级原因（§2.2.6 禁静默）
+    let lookup = state.anchor_cache.take(
+        &req.file_fingerprint,
+        omni_core::encoder_id::BEKKO,
+        omni_pro::text::EMBEDDING_DIM,
+    );
+    let anchor = match lookup {
+        omni_core::anchor_cache::AnchorLookup::Hit(vector) => Some(vector),
+        other => {
+            tracing::warn!(
+                "[OmniServer] 返送打标缺少同源锚点，降级为纯受控打标（不产 _ext.*）：reason={} fingerprint={} language={:?}",
+                other.degrade_reason().unwrap_or_default(),
+                req.file_fingerprint,
+                req.language
+            );
+            None
+        }
+    };
+    // 降级铁律：无锚点即无法做余弦门控 ⇒ **禁止抽新标签**（§2.2.6 降级路径）
+    let allow_new_tags = req.allow_new_tags && anchor.is_some();
+
+    let text = req.text;
+    let exclude_names = req.exclude_names;
+    let res = tokio::task::spawn_blocking(move || {
+        let embedder = omni_pro::text::BekkoEmbedder::new();
+        let anchor_ref = anchor.as_deref().map(|vector| (&embedder, vector));
+        omni_pro::text::TextTagger::tag_text_with_anchor(
+            &text,
+            Some("text"),
+            global_text_vector_table(),
+            allow_new_tags,
+            &exclude_names,
+            anchor_ref,
+        )
+    })
+    .await;
+
+    Json(match res {
+        Ok(tags) => tags,
+        Err(e) => {
+            // 任务 panic 时返回空数组：调用方按「无返送标签」处理，不得误判为正常空结果
+            tracing::error!("[OmniServer] 返送打标任务执行失败: {e}");
+            Vec::new()
+        }
+    })
+}
+
+/// 纯文本确定性特征分析请求体: POST /api/text/analyze
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextAnalyzeRequest {
+    pub text: String,
+    pub file_name: Option<String>,
+    pub mtime: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// 纯文本确定性特征与 384 维向量分析 API: POST /api/text/analyze
+async fn text_analyze_handler(
+    State(state): State<AppState>,
+    Json(req): Json<TextAnalyzeRequest>,
+) -> Json<omni_pro::text::TextAnalysisResult> {
+    // P4: 开源构建下 omni-pro 为存根（仅空转返回全零向量），直接返回确定性空结果，避免全零 embedding 下发
+    if !omni_pro::is_pro_enabled() {
+        return Json(empty_text_analysis_result());
+    }
+    let file_name = req.file_name.unwrap_or_default();
+    let hownet = state.hownet.clone();
+    let text = req.text;
+    let mtime = req.mtime;
+    let profile = state.config.lock().unwrap().embedding_profile.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        // 与 perceive 同源：gemma_unified 档位由 EmbeddingGemma 文本塔接管主向量与 KeyBERT，
+        // 严禁先跑 bekko-a8m 再覆盖（那是「已选 gemma 却加载 bekko」的另一条路径）。
+        if profile == "gemma_unified" {
+            omni_pro::text::OmniTextEngine::analyze_with_embedder(
+                &text,
+                &file_name,
+                mtime,
+                Some(&*hownet),
+                &GemmaTextEmbedder,
+                0,
+            )
+        } else {
+            omni_pro::text::OmniTextEngine::analyze(&text, &file_name, mtime, Some(&*hownet))
+        }
+    })
+    .await;
+    Json(match res {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("[OmniServer] 文本分析任务执行失败: {e}");
+            // 任务 panic 时返回确定性空结果，避免调用方误判为正常特征
+            empty_text_analysis_result()
+        }
+    })
+}
+
+/// 确定性空文本特征分析结果（panic 兜底 / 开源存根模式共用）
+fn empty_text_analysis_result() -> omni_pro::text::TextAnalysisResult {
+    omni_pro::text::TextAnalysisResult {
+        title: None,
+        language: "zh".to_string(),
+        keywords: Vec::new(),
+        entities: Vec::new(),
+        structured_summary: Default::default(),
+        one_sentence_desc: None,
+        smart_name: None,
+        name_slots: Default::default(),
+        embedding_dense: Vec::new(),
+        chunks: Vec::new(),
+        duration_ms: 0,
+        bekko_embed_ms: 0,
+        keybert_ms: 0,
+        slot_summary_ms: 0,
+    }
+}
+
+/// 文本分词请求体: POST /api/v1/text/tokenize
+#[derive(Deserialize)]
+pub struct TextTokenizeRequest {
+    pub text: String,
+}
+
+/// 文本分词响应体
+#[derive(Serialize)]
+pub struct TextTokenizeResponse {
+    pub tokens: Vec<String>,
+}
+
+/// 文本分词处理器: POST /api/v1/text/tokenize
+async fn text_tokenize_handler(
+    Json(req): Json<TextTokenizeRequest>,
+) -> Json<TextTokenizeResponse> {
+    if !omni_pro::is_pro_enabled() {
+        return Json(TextTokenizeResponse { tokens: Vec::new() });
+    }
+    let text = req.text;
+    let tokens = tokio::task::spawn_blocking(move || {
+        omni_pro::text::TextTokenizer::tokenize(&text)
+    })
+    .await
+    .unwrap_or_default();
+
+    Json(TextTokenizeResponse { tokens })
+}
+
+/// 语义标签父级求解请求体: POST /api/taxonomy/resolve-parent
+#[derive(Deserialize)]
+pub struct ResolveParentRequest {
+    pub tag_name: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub context_hint: Option<String>,
+}
+
+/// 语义标签父级求解响应体 (严格对齐 PRD §4.3 B 契约)
+#[derive(Serialize)]
+pub struct ResolveParentResponse {
+    pub success: bool,
+    pub parent_code: String,
+    /// 语义标签消歧经由父级 code (ADR-0047，与 parent_code 双向对齐)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_parent_code: Option<String>,
+    pub parent_name: String,
+    pub confidence: f32,
+    pub suggested_depth: u32,
+}
+
+/// 语义标签父级推荐 API: POST /api/taxonomy/resolve-parent
+async fn taxonomy_resolve_parent_handler(
+    Json(req): Json<ResolveParentRequest>,
+) -> Json<ResolveParentResponse> {
+    let outcome = tokio::task::spawn_blocking(move || {
+        let base = omni_pro::text::TaxonomyVectorBase::global();
+        base.resolve_parent(
+            &req.tag_name,
+            req.language.as_deref(),
+            req.context_hint.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| {
+        omni_pro::text::ResolveParentOutcome {
+            success: true,
+            parent_code: "builtin.zhu_ti_nei_rong.13364ec8".to_string(),
+            parent_name: "主题内容".to_string(),
+            confidence: 0.50,
+            suggested_depth: 2,
+        }
+    });
+
+    Json(ResolveParentResponse {
+        success: outcome.success,
+        via_parent_code: Some(outcome.parent_code.clone()),
+        parent_code: outcome.parent_code,
+        parent_name: outcome.parent_name,
+        confidence: outcome.confidence,
+        suggested_depth: outcome.suggested_depth,
+    })
+}
+
+/// 批量构建混合索引请求体: POST /api/search/index
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchIndexRequest {
+    pub documents: Vec<omni_pro::search::IndexedDocument>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchIndexResponse {
+    pub success: bool,
+    pub total_indexed: usize,
+    pub error: Option<String>,
+}
+
+/// 批量写入双轨混合索引 (USearch 密集向量 + Tantivy BM25): POST /api/search/index
+async fn search_index_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SearchIndexRequest>,
+) -> Json<SearchIndexResponse> {
+    let search = state.search.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let docs = req.documents;
+        let batch_len = docs.len();
+        // 维度契约 (vector-semantic-text-unified-scheme §3.9 P0)：缺向量或维度不符时
+        // 不再用 searchable_text 自动编码补 384 维，避免静默生成第二个向量空间；
+        // 空向量文档仅写稀疏轨 (BM25)，由 HybridIndex::upsert_batch 告警并计数。
+        // 语义说明：返回本批提交/写入的文档数（而非索引存量），供调用方作为分批进度使用
+        search.upsert_batch(&docs).map(|_| batch_len)
+    }).await;
+    match res {
+        Ok(Ok(batch_len)) => Json(SearchIndexResponse {
+            success: true,
+            total_indexed: batch_len,
+            error: None,
+        }),
+        Ok(Err(e)) => Json(SearchIndexResponse {
+            success: false,
+            total_indexed: 0,
+            error: Some(e.to_string()),
+        }),
+        Err(e) => Json(SearchIndexResponse {
+            success: false,
+            total_indexed: 0,
+            error: Some(format!("Task panic: {e}")),
+        }),
+    }
+}
+
+/// 双轨混合检索与加权 RRF 融合重排请求体: POST /api/search/hybrid
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHybridRequest {
+    pub query_text: Option<String>,
+    pub query_embedding: Option<Vec<f32>>,
+    #[serde(default = "default_search_top_k")]
+    pub top_k: usize,
+}
+
+fn default_search_top_k() -> usize {
+    20
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHybridResponse {
+    pub success: bool,
+    pub results: Vec<omni_pro::search::FusedResult>,
+    pub error: Option<String>,
+}
+
+/// 双轨混合检索与 RRF 融合重排: POST /api/search/hybrid
+async fn search_hybrid_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SearchHybridRequest>,
+) -> Json<SearchHybridResponse> {
+    let search = state.search.clone();
+    // 查询向量编码器跟随当前嵌入档位（双档位契约）：gemma_unified → EmbeddingGemma 文本塔，
+    // classic_light → bekko-a8m 384d。严禁在 gemma 档位下恒加载 bekko（已退役档位模型）。
+    let embedding_profile = state.config.lock().unwrap().embedding_profile.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        // 跨支柱补缝：若未显式提供 query_embedding，但提供了 query_text，按当前档位计算查询向量
+        let query_emb = match (req.query_embedding, req.query_text.as_deref()) {
+            (Some(emb), _) => Some(emb),
+            (None, Some(text)) if !text.trim().is_empty() => {
+                if embedding_profile.contains("gemma") {
+                    omni_pro::OmniVisionEngine::encode_gemma_text(text).ok()
+                } else {
+                    omni_pro::text::BekkoEmbedder::new().embed(text).ok()
+                }
+            }
+            _ => None,
+        };
+
+        search.search_hybrid(
+            req.query_text.as_deref(),
+            query_emb.as_deref(),
+            req.top_k,
+        )
+    })
+    .await;
+    match res {
+        Ok(Ok(results)) => Json(SearchHybridResponse {
+            success: true,
+            results,
+            error: None,
+        }),
+        Ok(Err(e)) => Json(SearchHybridResponse {
+            success: false,
+            results: Vec::new(),
+            error: Some(e.to_string()),
+        }),
+        Err(e) => Json(SearchHybridResponse {
+            success: false,
+            results: Vec::new(),
+            error: Some(format!("Task panic: {e}")),
+        }),
+    }
+}
+
+/// 提示词引导层次凝聚聚类与目录树生成请求体: POST /api/search/cluster
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchClusterRequest {
+    pub documents: Vec<omni_pro::search::ClusterDocument>,
+    pub prompt: Option<String>,
+    pub prompt_embedding: Option<Vec<f32>>,
+    /// 当前嵌入档位：classic_light (bekko 384d) | gemma_unified (MRL 256/512/768d)
+    #[serde(default)]
+    pub embedding_profile: Option<String>,
+    /// 当前目标向量维度；缺省时按 embedding_profile 与服务器配置自适应
+    #[serde(default)]
+    pub embedding_dim: Option<usize>,
+    #[serde(default = "default_distance_threshold")]
+    pub distance_threshold: f32,
+    #[serde(default = "default_max_leaf_size")]
+    pub max_leaf_size: usize,
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
+    #[serde(default = "default_max_root_directories")]
+    pub max_root_directories: usize,
+    #[serde(default = "default_max_subdirectories")]
+    pub max_subdirectories: usize,
+    #[serde(default = "default_similarity_floor")]
+    pub similarity_floor: f32,
+    #[serde(default = "default_similarity_step")]
+    pub similarity_step: f32,
+    #[serde(default)]
+    pub clustering_mode: Option<omni_pro::search::ClusteringMode>,
+}
+
+fn default_similarity_floor() -> f32 {
+    0.20
+}
+
+fn default_similarity_step() -> f32 {
+    0.10
+}
+
+fn default_max_depth() -> usize {
+    3
+}
+
+fn default_max_root_directories() -> usize {
+    5
+}
+
+fn default_max_subdirectories() -> usize {
+    5
+}
+
+fn default_distance_threshold() -> f32 {
+    // 与 V4 规格 §4.3 的 IPC 契约默认值保持一致
+    0.40
+}
+
+fn default_max_leaf_size() -> usize {
+    50
+}
+
+/// JIT 向量缓存上限：超出后整体清空，避免长驻进程无界增长
+const JIT_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// `gemma_unified` 档位的文本嵌入器适配：把 EmbeddingGemma 文本塔接到
+/// `omni_pro::text::TextEmbedder` 抽象上，供 `OmniTextEngine::analyze_with_embedder`
+/// 的主向量与 KeyBERT 主题词抽取共用。
+///
+/// 存在意义（缺陷根因）：`OmniTextEngine::analyze` 早期恒构造 `BekkoEmbedder`，
+/// 导致「已选 gemma_unified 却仍在加载 bekko-a8m 384d」——perceive 的文本分析
+/// 正是那条日志的真实来源（检索侧已另行档位化）。
+struct GemmaTextEmbedder;
+
+impl omni_pro::text::TextEmbedder for GemmaTextEmbedder {
+    fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        // encode_text 内部已按引擎 mrl_dimension 截断并 L2 归一化，无需二次裁剪
+        omni_pro::OmniVisionEngine::encode_gemma_text(text)
+    }
+
+    /// EmbeddingGemma 文本塔单次编码成本远高于 bekko-a8m（大参数量 + 512 token），
+    /// 候选词按 48 收敛：MMR 只取 top-5，48 个候选已足以表达多样性，
+    /// 避免长文档抽词把单文件分析预算吃满。
+    fn keybert_candidate_cap(&self) -> usize {
+        48
+    }
+}
+
+/// 进程内 JIT 向量缓存 (profile + 维度 + 富文本 → 最终向量)。
+///
+/// 聚类每次换提示词都会重新请求，若每轮都重跑 EmbeddingGemma（46 条约 3s），
+/// 端侧交互会明显变慢；缓存仅在进程生命周期内有效，不落盘。
+static JIT_EMBEDDING_CACHE: OnceLock<Mutex<HashMap<String, Vec<f32>>>> = OnceLock::new();
+
+/// 按当前嵌入档位 JIT 编码文本并裁剪到目标维度，命中缓存时直接复用。
+fn jit_embedding(
+    text: &str,
+    is_gemma: bool,
+    target_dim: usize,
+    bekko: Option<&omni_pro::text::BekkoEmbedder>,
+) -> Option<Vec<f32>> {
+    let profile = if is_gemma { "gemma_unified" } else { "classic_light" };
+    let cache_key = format!("{profile}|{target_dim}|{text}");
+    let cache = JIT_EMBEDDING_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(vector) = guard.get(&cache_key) {
+            return Some(vector.clone());
+        }
+    }
+
+    let encoded = if is_gemma {
+        omni_pro::OmniVisionEngine::encode_gemma_text(text)
+    } else {
+        bekko?.embed(text)
+    };
+    let vector = encoded.ok().and_then(|v| fit_embedding_to_dim(v, target_dim))?;
+
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= JIT_CACHE_MAX_ENTRIES {
+            guard.clear();
+        }
+        guard.insert(cache_key, vector.clone());
+    }
+    Some(vector)
+}
+
+/// 将编码结果裁剪/校验为目标维度。
+///
+/// EmbeddingGemma 使用 MRL 训练，截断前缀并重新 L2 归一化仍是合法语义向量，
+/// 因此当编码维度大于目标维度时允许前缀截断；小于目标维度则无法补齐。
+pub(crate) fn fit_embedding_to_dim(mut vector: Vec<f32>, target_dim: usize) -> Option<Vec<f32>> {
+    if vector.len() == target_dim {
+        return Some(vector);
+    }
+    if vector.len() < target_dim || target_dim == 0 {
+        return None;
+    }
+    vector.truncate(target_dim);
+    let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm <= 1e-6 {
+        return None;
+    }
+    for x in vector.iter_mut() {
+        *x /= norm;
+    }
+    Some(vector)
+}
+
+fn normalize_embedding_dim(profile: &str, requested: Option<usize>, configured_mrl: usize) -> usize {
+    let is_gemma = profile.contains("gemma");
+    if !is_gemma {
+        if let Some(dim) = requested {
+            if dim != 384 {
+                tracing::warn!(
+                    "[HAC] 请求维度 {} 与 classic_light 档位不匹配，已回退至 384d",
+                    dim
+                );
+            }
+        }
+        return 384;
+    }
+    if let Some(dim) = requested.filter(|d| matches!(d, 256 | 512 | 768)) {
+        return dim;
+    }
+    if requested.is_some() {
+        tracing::warn!(
+            "[HAC] 请求维度 {:?} 不是 EmbeddingGemma MRL 支持的 256/512/768，回退至配置维度 {}",
+            requested,
+            configured_mrl
+        );
+    }
+    match configured_mrl {
+        256 | 768 => configured_mrl,
+        _ => 512,
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchClusterResponse {
+    pub success: bool,
+    pub result: Option<omni_pro::search::ClusterTreeResult>,
+    pub error: Option<String>,
+}
+
+/// 约束层次聚类多级目录自动归档: POST /api/search/cluster
+async fn search_cluster_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SearchClusterRequest>,
+) -> Json<SearchClusterResponse> {
+    let search = state.search.clone();
+    let vector = state.vector.clone();
+    // 服务器配置作为请求缺省值：AI_EMBEDDING_PROFILE / EMBEDDING_MRL_DIMENSION 变更时 Omni 会重启并同步配置
+    let (configured_profile, configured_mrl) = {
+        let cfg = state.config.lock().unwrap();
+        (cfg.embedding_profile.clone(), cfg.mrl_dimension)
+    };
+    let res = tokio::task::spawn_blocking(move || {
+        // 进程内向量补齐 (ADR-0054 / ADR-0056)：
+        // 1. 先按当前嵌入档位解析目标维度 (classic_light=384d / gemma_unified=256|512|768d)；
+        // 2. 若 doc.embedding 匹配目标维度，直接使用；
+        // 3. 否则从端侧 zvec 对应维度槽位读取反量化向量回填；
+        // 4. 仍未命中时按当前档位 JIT 即时编码（仅服务本次聚类，严禁回写检索槽位）；
+        // 5. 过滤未能获得有效向量的文档，若有效文档数 < 2 则拦截报错。
+        let requested_count = req.documents.len();
+        let active_profile = req
+            .embedding_profile
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or(configured_profile);
+        let target_dim = normalize_embedding_dim(&active_profile, req.embedding_dim, configured_mrl);
+        let is_gemma = active_profile.contains("gemma");
+
+        // HAC 直读必须带当前档位的编码器白名单：
+        // classic 384 → [0,1]（Bekko + v2 legacy 过渡）；gemma activeDim → [4]。
+        // gemma@512 不得把同槽位的 classic CLIP(encoder=2) 向量喂进 HAC，不匹配按未命中走 JIT。
+        let allowed_encoders: &[u8] = if is_gemma {
+            omni_pro::vector_engine::encoder_id::GEMMA_ALLOWED
+        } else {
+            omni_pro::vector_engine::encoder_id::CLASSIC_384_ALLOWED
+        };
+
+        tracing::info!(
+            "[HAC] 聚类向量档位: profile={}, dim={}, documents={}",
+            active_profile,
+            target_dim,
+            requested_count
+        );
+
+        let mut docs: Vec<omni_pro::search::ClusterDocument> =
+            Vec::with_capacity(requested_count);
+        // bekko 模型按需加载：全部命中原有向量时不触发模型初始化
+        let mut bekko_embedder: Option<omni_pro::text::BekkoEmbedder> = None;
+        let prefer_count = req
+            .documents
+            .iter()
+            .filter(|d| {
+                d.prefer_embedding_text
+                    && d.embedding_text
+                        .as_deref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+            })
+            .count();
+        if prefer_count > 0 {
+            tracing::info!(
+                "[HAC] {} 份文档无可见语义文本，本次聚类改用文件名/主题词富文本编码（已有槽位不覆盖）",
+                prefer_count
+            );
+        }
+        for mut doc in req.documents {
+            let embedding_text = doc
+                .embedding_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            // 正文/OCR/ASR 均无可见语义文本时，聚类改用富文本证据
+            let prefer_text = doc.prefer_embedding_text && embedding_text.is_some();
+
+            if !prefer_text {
+                if doc.embedding.len() == target_dim {
+                    docs.push(doc);
+                    continue;
+                }
+                if let Some(vec) = vector.get_vector(
+                    &doc.fingerprint,
+                    target_dim,
+                    Some(allowed_encoders),
+                ) {
+                    doc.embedding = vec;
+                    docs.push(doc);
+                    continue;
+                }
+            }
+            // 注意：聚类 JIT 向量（富文本、文件名或指纹兜底）只用于本次 HAC 距离矩阵，
+            // 严禁写回检索槽位。该文本与主分析链路 effective_text 口径不同，且无可见正文的
+            // 文件（如 工具.lnk）会把标题向量混入混合检索候选池，以高余弦污染语义排序。
+
+            // JIT 即时向量补全自愈 (ADR-0056):
+            // 若文档未携带有效向量且本地槽位未命中（冷启动/未预先分析/缓存丢失），
+            // 优先用富文本（主题词优先，缺词时为剥掉模板骨架的文件名），其次主题词，最后指纹兜底
+            let fallback_text;
+            let text_to_embed = if let Some(text) = embedding_text {
+                text
+            } else if !doc.keywords.is_empty() {
+                fallback_text = doc.keywords.join(" ");
+                fallback_text.as_str()
+            } else {
+                doc.fingerprint.as_str()
+            };
+
+            let bekko_ref = if is_gemma {
+                None
+            } else {
+                if bekko_embedder.is_none() {
+                    bekko_embedder = Some(omni_pro::text::BekkoEmbedder::new());
+                }
+                bekko_embedder.as_ref()
+            };
+
+            match jit_embedding(text_to_embed, is_gemma, target_dim, bekko_ref) {
+                Some(vec) => {
+                    doc.embedding = vec;
+                    docs.push(doc);
+                }
+                None => {
+                    // 禁止静默降级：JIT 失败必须显式暴露，不得让文件无声消失
+                    tracing::warn!(
+                        "[HAC] 文件 {} 缺少 {}d 向量且 JIT 补全失败，已从本次聚类中剔除",
+                        doc.fingerprint,
+                        target_dim
+                    );
+                }
+            }
+        }
+
+        if requested_count > 0 && docs.len() < 2 {
+            anyhow::bail!(
+                "具备 {}d 有效向量的文档不足 2 份 (请求 {} 份，有效 {} 份)，无法执行 HAC 聚类",
+                target_dim,
+                requested_count,
+                docs.len()
+            );
+        }
+
+        // 跨支柱补缝：若未显式提供 prompt_embedding，但提供了自然语言 prompt，
+        // 自动通过当前档位的嵌入引擎计算聚类引导向量，确保 v_p 与文件向量同维度
+        let prompt_emb = match (req.prompt_embedding, req.prompt.as_deref()) {
+            (Some(emb), _) => match fit_embedding_to_dim(emb, target_dim) {
+                Some(vec) => Some(vec),
+                None => {
+                    tracing::warn!(
+                        "[HAC] 请求携带的 prompt_embedding 无法对齐到 {}d，已忽略提示词引导",
+                        target_dim
+                    );
+                    None
+                }
+            },
+            (None, Some(p)) if !p.trim().is_empty() => {
+                let encoded = if is_gemma {
+                    omni_pro::OmniVisionEngine::encode_gemma_text(p)
+                } else {
+                    omni_pro::text::BekkoEmbedder::new().embed(p)
+                };
+                match encoded
+                    .ok()
+                    .and_then(|vec| fit_embedding_to_dim(vec, target_dim))
+                {
+                    Some(vec) => Some(vec),
+                    None => {
+                        // 禁止静默降级：提示词向量失败会让命名退化为纯词频，必须上报
+                        tracing::warn!(
+                            "[HAC] 提示词向量编码失败或维度无法对齐到 {}d，本次聚类将仅按词频命名",
+                            target_dim
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        let cluster_options = omni_pro::search::ClusterTreeOptions {
+            max_depth: req.max_depth,
+            max_root_directories: req.max_root_directories,
+            max_subdirectories: req.max_subdirectories,
+            distance_threshold: req.distance_threshold,
+            max_leaf_size: req.max_leaf_size,
+            similarity_floor: req.similarity_floor,
+            similarity_step: req.similarity_step,
+            clustering_mode: req.clustering_mode.unwrap_or_default(),
+        };
+        search.cluster_with_options(
+            &docs,
+            prompt_emb.as_deref(),
+            cluster_options,
+        )
+    })
+    .await;
+    match res {
+        Ok(Ok(tree)) => {
+            // 分区粒度可观测：巨型簇（占据过半样本）是"任意提示词都只有一个大目录"的形态指纹，
+            // 线上排障必须能直接从引擎日志看到是否又出现了这种分区
+            let sizes: Vec<usize> = tree.clusters.iter().map(|c| c.fingerprints.len()).collect();
+            let total = sizes.iter().sum::<usize>() + tree.unclassified_files.len();
+            if let Some(largest) = sizes.iter().max() {
+                if total > 0 && *largest * 2 > total {
+                    tracing::warn!(
+                        "[HAC] 分区仍含过半巨型簇: 最大簇={}/{} 簇规模={:?} 未归类={} (下钻已收敛或该簇无纵向结构)",
+                        largest,
+                        total,
+                        sizes,
+                        tree.unclassified_files.len()
+                    );
+                }
+            }
+            Json(SearchClusterResponse {
+                success: true,
+                result: Some(tree),
+                error: None,
+            })
+        }
+        Ok(Err(e)) => Json(SearchClusterResponse {
+            success: false,
+            result: None,
+            error: Some(e.to_string()),
+        }),
+        Err(e) => Json(SearchClusterResponse {
+            success: false,
+            result: None,
+            error: Some(format!("Task panic: {e}")),
+        }),
+    }
+}
+
+/// 单指标音频转录处理: POST /api/audio/transcribe (SherpaManager 纯内存进程内推理)
+async fn audio_transcribe_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AudioTranscribeRequest>,
+) -> Json<AudioTranscribeResponse> {
+    let cfg = state.config.lock().unwrap().clone();
+    let t_start = std::time::Instant::now();
+    let file_path = req.file_path.clone();
+    // 优先使用请求中的截取时长，否则使用配置默认值
+    let duration_seconds = req.duration_seconds.unwrap_or(cfg.audio_analysis_duration);
+
+    let file_path_c = file_path.clone();
+    let sherpa_engine = state.sherpa.clone();
+
+    // Step 1: 优先通过 SherpaManager 进程内转录 (纯内存解码 -> GTCRN 降噪 -> VAD -> SenseVoice ASR + CED-mini 打标)
+    let (sv_opt, mut events) = tokio::task::spawn_blocking(move || {
+        let path = std::path::Path::new(&file_path_c);
+        if let Some(samples) = decode_audio_to_16k_mono(path, Some(duration_seconds)) {
+            sherpa_engine.process_audio_pipeline_full(&samples, 16000)
+        } else {
+            (None, Vec::new())
+        }
+    })
+    .await
+    .unwrap_or((None, Vec::new()));
+
+    let mut transcript = sv_opt
+        .as_ref()
+        .map(|s| s.text.clone())
+        .filter(|s| omni_core::is_meaningful_asr_text(s));
+    let mut detected_lang = if transcript.is_some() {
+        sv_opt.as_ref().and_then(|s| s.lang.clone()).or(req.language)
+    } else {
+        None
+    };
+    let mut detected_emotion = if transcript.is_some() {
+        sv_opt.as_ref().and_then(|s| s.emotion.clone())
+    } else {
+        None
+    };
+
+    // Step 2: 降级：从 OmniExtractor 元数据中取 asr（若已有提取结果）
+    if transcript.is_none() {
+        if let Ok(res) = OmniExtractor::extract(&file_path, &cfg).await {
+            if let Some(t) = res.metadata.get("asr").and_then(|v| v.as_str()) {
+                if omni_core::is_meaningful_asr_text(t) {
+                    transcript = Some(t.to_string());
+                }
+            } else if !res.markdown_content.is_empty()
+                && (res.mime_type.starts_with("audio/") || res.mime_type.starts_with("video/"))
+            {
+                if omni_core::is_meaningful_asr_text(&res.markdown_content) {
+                    transcript = Some(res.markdown_content);
+                }
+            }
+
+            if transcript.is_some() {
+                if detected_lang.is_none() {
+                    detected_lang = res.metadata.get("language").and_then(|v| v.as_str()).map(|s| s.to_string());
+                }
+                if detected_emotion.is_none() {
+                    detected_emotion = res.metadata.get("emotion").and_then(|v| v.as_str()).map(|s| s.to_string());
+                }
+            }
+
+            if events.is_empty() {
+                if let Some(ev) = res.metadata.get("audio_events").and_then(|v| v.as_array()) {
+                    events = ev.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+                }
+            }
+        }
+    }
+
+    let duration_ms = t_start.elapsed().as_millis() as u64;
+    Json(AudioTranscribeResponse {
+        file_path,
+        transcript,
+        events,
+        language: detected_lang,
+        emotion: detected_emotion,
+        duration_ms,
+    })
+}
+
+/// 音频标准化转换接口: POST /api/audio/convert
+/// 纯内存解码至 16kHz Mono，经由 GTCRN 深度学习降噪后写出标准 PCM WAV
+async fn audio_convert_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AudioConvertRequest>,
+) -> Json<AudioConvertResponse> {
+    let cfg = state.config.lock().unwrap().clone();
+    let t_start = std::time::Instant::now();
+    let file_path = req.file_path.clone();
+    let duration_seconds = req.duration_seconds.unwrap_or(cfg.audio_analysis_duration);
+
+    let file_path_c = file_path.clone();
+    let sherpa = state.sherpa.clone();
+    let output_path = tokio::task::spawn_blocking(move || {
+        let p = std::path::Path::new(&file_path_c);
+        let samples = decode_audio_to_16k_mono(p, Some(duration_seconds))?;
+        let denoised_samples = sherpa.denoise(&samples, 16000);
+
+        // 写入临时缓存目录
+        let cache_key = {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for &b in format!("{}:{}", file_path_c, duration_seconds).as_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x00000100000001b3);
+            }
+            format!("{:016x}", h)
+        };
+        let cache_dir = std::env::temp_dir().join("firefly-ai-audio-cache");
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let cache_path = cache_dir.join(format!("{}.wav", cache_key));
+
+        // 写入标准 16-bit PCM WAV (16000Hz 单声道)
+        write_wav_s16le(&cache_path, &denoised_samples, 16000).ok()?;
+        Some(cache_path)
+    }).await.ok().flatten();
+
+    let duration_ms = t_start.elapsed().as_millis() as u64;
+    let output_path_str = output_path
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    Json(AudioConvertResponse {
+        file_path,
+        output_path: output_path_str,
+        duration_seconds,
+        duration_ms,
+    })
+}
+
+/// 将 f32 样本转为 16-bit PCM WAV 写入指定路径
+fn write_wav_s16le(path: &std::path::Path, samples: &[f32], sample_rate: u32) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    let num_channels: u16 = 1;
+    let bits_per_sample: u16 = 16;
+    let byte_rate = sample_rate * (num_channels as u32) * (bits_per_sample as u32 / 8);
+    let block_align = num_channels * (bits_per_sample / 8);
+    let data_len = (samples.len() * 2) as u32;
+    let riff_chunk_size = 36 + data_len;
+
+    // RIFF header
+    file.write_all(b"RIFF")?;
+    file.write_all(&riff_chunk_size.to_le_bytes())?;
+    file.write_all(b"WAVE")?;
+
+    // fmt subchunk
+    file.write_all(b"fmt ")?;
+    file.write_all(&16u32.to_le_bytes())?; // Subchunk1Size (16 for PCM)
+    file.write_all(&1u16.to_le_bytes())?;  // AudioFormat (1 for PCM)
+    file.write_all(&num_channels.to_le_bytes())?;
+    file.write_all(&sample_rate.to_le_bytes())?;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&block_align.to_le_bytes())?;
+    file.write_all(&bits_per_sample.to_le_bytes())?;
+
+    // data subchunk
+    file.write_all(b"data")?;
+    file.write_all(&data_len.to_le_bytes())?;
+
+    for &s in samples {
+        // Clamp and convert to i16
+        let clamped = s.max(-1.0).min(1.0);
+        let val = (clamped * 32767.0) as i16;
+        file.write_all(&val.to_le_bytes())?;
+    }
+
+    file.flush()?;
+    Ok(())
+}
+
+/// TTS 分块合成请求参数
+#[derive(Debug, serde::Deserialize)]
+pub struct AudioTtsChunkRequest {
+    pub text: String,
+    #[serde(default)]
+    pub voice_id: Option<String>,
+    pub sid: Option<i32>,
+    pub speed: Option<f32>,
+}
+
+/// 内存热注册音色请求参数
+#[derive(Debug, serde::Deserialize)]
+pub struct AudioTtsRegisterVoiceRequest {
+    pub voice_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub gender: Option<String>,
+    #[serde(default)]
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub sid: Option<i32>,
+    pub frames: usize,
+    pub codes: Vec<Vec<i16>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AudioTtsRegisterVoiceResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// TTS 引擎状态响应
+#[derive(Debug, serde::Serialize)]
+pub struct AudioTtsStatusResponse {
+    pub ready: bool,
+    pub total_voices: usize,
+    pub sample_rate: i32,
+    pub engine: String,
+}
+
+/// 查询 TTS 引擎状态: GET /api/audio/tts/status
+async fn audio_tts_status_handler(
+    State(state): State<AppState>,
+) -> Json<AudioTtsStatusResponse> {
+    let ready = state.moss.is_ready();
+    let total_voices = state.moss.total_voices().await;
+    Json(AudioTtsStatusResponse {
+        ready,
+        total_voices,
+        sample_rate: 48000,
+        engine: "moss-tts-nano-int8".to_string(),
+    })
+}
+
+/// 内存热注册自定义音色特征码: POST /api/audio/tts/register-voice
+async fn audio_tts_register_voice_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AudioTtsRegisterVoiceRequest>,
+) -> Json<AudioTtsRegisterVoiceResponse> {
+    match state
+        .moss
+        .register_voice(
+            req.voice_id,
+            req.display_name,
+            req.gender,
+            req.lang,
+            req.sid,
+            req.frames,
+            req.codes,
+        )
+        .await
+    {
+        Ok(_) => Json(AudioTtsRegisterVoiceResponse {
+            success: true,
+            error: None,
+        }),
+        Err(e) => Json(AudioTtsRegisterVoiceResponse {
+            success: false,
+            error: Some(e),
+        }),
+    }
+}
+
+/// 单句离线语音合成处理: POST /api/audio/tts/chunk
+/// 经由 Semaphore(1) 限制单通道排队，并在 spawn_blocking 工作池中执行神经网络推理
+async fn audio_tts_chunk_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AudioTtsChunkRequest>,
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    let clean_text = req.text.replace('\0', " ").trim().to_string();
+    if clean_text.is_empty() {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "text cannot be empty".to_string()));
+    }
+
+    if !state.moss.is_ready() {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "MOSS-TTS engine not ready or model missing".to_string(),
+        ));
+    }
+
+    let speed = req.speed.unwrap_or(1.0);
+    let voice_id = req.voice_id.unwrap_or_else(|| "preset_azure_yunxi".to_string());
+
+    // 优先按指定 voice_id 寻址，未找到时平滑 fallback 到默认 preset_azure_yunxi
+    let target_voice = match state.moss.get_voice(&voice_id).await {
+        Some(v) => v,
+        None => match state.moss.get_voice("preset_azure_yunxi").await {
+            Some(v) => v,
+            None => {
+                return Err((
+                    axum::http::StatusCode::NOT_FOUND,
+                    format!("Voice '{}' not found and default preset_azure_yunxi unavailable", voice_id),
+                ));
+            }
+        },
+    };
+
+    let permit = state.moss.semaphore().acquire_owned().await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire tts lock: {}", e)))?;
+
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_clone = cancel_flag.clone();
+
+    // RAII 守卫：当客户端断开连接或超时 Future 提早 Drop 时，自动触发协作式中断并释放锁
+    struct CancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _cancel_guard = CancelOnDrop(cancel_flag);
+
+    let moss = state.moss.clone();
+    let synth_res = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        moss.synthesize_with_cancel(&clean_text, &target_voice, speed, Some(cancel_clone))
+    })
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TTS task panicked: {}", e)))?
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let response = axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "audio/wav")
+        .header(axum::http::header::CONTENT_LENGTH, synth_res.wav_bytes.len().to_string())
+        .header("X-Moss-Hit-Cap", synth_res.hit_cap.to_string())
+        .header("X-Moss-Steps", synth_res.steps.to_string())
+        .body(axum::body::Body::from(synth_res.wav_bytes))
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(response)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioTtsScaleParams {
+    pub speed: Option<f32>,
+}
+
+/// 极速音频保音调倍速转换: POST /api/audio/tts/scale?speed=1.25
+/// 纯 Rust WSOLA 内存算法，< 30ms 毫秒级重采样与内嵌 meta chunk 增量更新，免除重复运行神经网络
+async fn audio_tts_scale_handler(
+    Query(params): Query<AudioTtsScaleParams>,
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    let speed = params.speed.unwrap_or(1.0);
+    if speed <= 0.1 || speed > 5.0 {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "Invalid speed parameter: must be between 0.1 and 5.0".to_string(),
+        ));
+    }
+    if body.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "Audio WAV body cannot be empty".to_string(),
+        ));
+    }
+
+    let wav_bytes = moss_tts::scale_wav_speed(&body, speed)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("WAV scaling failed: {}", e)))?;
+
+    let response = axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "audio/wav")
+        .header(axum::http::header::CONTENT_LENGTH, wav_bytes.len().to_string())
+        .body(axum::body::Body::from(wav_bytes))
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(response)
+}
+
+/// 智能分句切片请求体: POST /api/audio/tts/split-chunks
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTtsSplitChunksRequest {
+    pub text: String,
+    #[serde(default, alias = "max_chunk_chars", alias = "max_length", alias = "maxLength")]
+    pub max_chunk_chars: Option<usize>,
+    #[serde(default, alias = "min_chunk_chars", alias = "min_length", alias = "minLength")]
+    pub min_chunk_chars: Option<usize>,
+    #[serde(default, alias = "target_chunk_chars", alias = "target_length", alias = "targetLength")]
+    pub target_chunk_chars: Option<usize>,
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+/// 智能分句切片响应体
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTtsSplitChunksResponse {
+    pub chunks: Vec<String>,
+    pub total_chunks: usize,
+    pub total_chars: usize,
+}
+
+/// 智能分句切片处理: POST /api/audio/tts/split-chunks
+async fn audio_tts_split_chunks_handler(
+    Json(req): Json<AudioTtsSplitChunksRequest>,
+) -> Result<Json<AudioTtsSplitChunksResponse>, (StatusCode, String)> {
+    let text = req.text;
+    let char_count = text.chars().count();
+    if char_count > 50_000 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Text length of {} characters exceeds 50000 limit", char_count),
+        ));
+    }
+
+    if text.trim().is_empty() {
+        return Ok(Json(AudioTtsSplitChunksResponse {
+            chunks: Vec::new(),
+            total_chunks: 0,
+            total_chars: 0,
+        }));
+    }
+
+    let chunks = text_chunker::split_text_chunks(
+        &text,
+        req.target_chunk_chars,
+        req.min_chunk_chars,
+        req.max_chunk_chars,
+        req.language.as_deref(),
+    );
+    let total_chunks = chunks.len();
+    let total_chars = chunks.iter().map(|c| c.chars().count()).sum();
+
+    Ok(Json(AudioTtsSplitChunksResponse {
+        chunks,
+        total_chunks,
+        total_chars,
+    }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioAnalyzeVoiceRequest {
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioAnalyzeVoiceResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub lang: String,
+    pub emotion: String,
+    pub text: String,
+    pub frames: usize,
+    pub codes: Vec<Vec<i16>>,
+}
+
+/// 音频特征分析与提取: POST /api/audio/analyze-voice
+///
+/// 契约说明 (PRD-0058 / Spec §2.4 & §3.1.2):
+/// 1. 显式降级治理 (AGENTS.md §2.9): 若 GTCRN 降噪模型、Silero VAD 或 MOSS-TTS 原生 ONNX 引擎未就绪，
+///    严禁静默放行未提纯音频或空特征码，显式记录错误并返回 HTTP 503 SERVICE_UNAVAILABLE；
+/// 2. 多级人声净化流水线:
+///    - Stage 1: FFmpeg 频带通 (80-8000Hz) 与单声道合规下混 (-t 15 截取)；
+///    - Stage 2: 纯内存 GTCRN 深度复数残差降噪；
+///    - Stage 3: Silero VAD 伴奏截断 + 0.15s 平滑拼接；
+///    - 门禁: 3.0s 有效真人发音把关，不足 3s 返回 HTTP 400 BAD_REQUEST；
+///    - 截片: 前 3.0s ~ 5.0s 纯干声 (最多 80,000 点 @ 16kHz)；
+/// 3. SenseVoice 三层语言确定性决策 + 情绪自动识别；
+/// 4. MOSS-TTS Codec Encode 提取 48kHz RVQ-16 离散声学特征码 (frames 落在 38~62 帧)。
+async fn audio_analyze_voice_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AudioAnalyzeVoiceRequest>,
+) -> (StatusCode, Json<AudioAnalyzeVoiceResponse>) {
+    let file_path = req.file_path.trim().to_string();
+    if file_path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AudioAnalyzeVoiceResponse {
+                success: false,
+                error: Some("file_path cannot be empty".to_string()),
+                lang: "zh".to_string(),
+                emotion: "neutral".to_string(),
+                text: String::new(),
+                frames: 0,
+                codes: Vec::new(),
+            }),
+        );
+    }
+
+    let path = std::path::PathBuf::from(&file_path);
+    if !path.exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AudioAnalyzeVoiceResponse {
+                success: false,
+                error: Some(format!("Audio file not found: {}", file_path)),
+                lang: "zh".to_string(),
+                emotion: "neutral".to_string(),
+                text: String::new(),
+                frames: 0,
+                codes: Vec::new(),
+            }),
+        );
+    }
+
+    // 1. 检查人声净化与声学特征提取模型是否就绪（AGENTS.md §2.9 禁止静默降级铁律）
+    if !state.sherpa.is_purification_ready() || !state.moss.is_ready() {
+        tracing::error!(
+            "[audio_analyze_voice_handler] 人声净化或声学特征提取模型未就绪 (purification_ready={}, moss_ready={})",
+            state.sherpa.is_purification_ready(),
+            state.moss.is_ready()
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AudioAnalyzeVoiceResponse {
+                success: false,
+                error: Some("人声净化或声学特征提取模型未就绪".to_string()),
+                lang: "zh".to_string(),
+                emotion: "neutral".to_string(),
+                text: String::new(),
+                frames: 0,
+                codes: Vec::new(),
+            }),
+        );
+    }
+
+    let sherpa = state.sherpa.clone();
+    let moss = state.moss.clone();
+
+    let res = tokio::task::spawn_blocking(move || {
+        // Stage 1: FFmpeg 频带通 (80-8000Hz) 与单声道合规下混 (前 15 秒)
+        let raw_16k = match decode_audio_to_16k_mono_bandpass(&path, Some(15)) {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "音频文件转码失败或时长为空".to_string(),
+                ))
+            }
+        };
+
+        // Stage 2 & 3: 纯内存 GTCRN 降噪 + Silero VAD 伴奏截断 + 3.0s 发音门禁 + 5.0s 黄金区间截取
+        let dry_vocal_stem = match sherpa.purify_vocal_and_extract_dry_stem(&raw_16k, 16000) {
+            Ok(stem) => stem,
+            Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
+        };
+
+        let sv_opt = sherpa.transcribe_full(&dry_vocal_stem, 16000);
+        let (text, lang, emotion) = if let Some(sv) = sv_opt {
+            if omni_core::is_meaningful_asr_text(&sv.text) {
+                let l = sv.lang.unwrap_or_else(|| "zh".to_string());
+                let e = sv.emotion.unwrap_or_else(|| "neutral".to_string());
+                (sv.text, l, e)
+            } else {
+                (String::new(), "zh".to_string(), "neutral".to_string())
+            }
+        } else {
+            (String::new(), "zh".to_string(), "neutral".to_string())
+        };
+
+        // Stage 5: MOSS-TTS Codec Encode 提取 48kHz RVQ-16 离散声学特征码
+        let codes = match moss.extract_voice_codes(&dry_vocal_stem) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("[audio_analyze_voice_handler] Codec 特征码提取失败: {}", e);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Codec 特征码提取失败: {}", e),
+                ));
+            }
+        };
+
+        let frames = codes.len();
+        Ok((text, lang, emotion, frames, codes))
+    })
+    .await;
+
+    match res {
+        Ok(Ok((text, lang, emotion, frames, codes))) => (
+            StatusCode::OK,
+            Json(AudioAnalyzeVoiceResponse {
+                success: true,
+                error: None,
+                lang,
+                emotion,
+                text,
+                frames,
+                codes,
+            }),
+        ),
+        Ok(Err((status, err))) => (
+            status,
+            Json(AudioAnalyzeVoiceResponse {
+                success: false,
+                error: Some(err),
+                lang: "zh".to_string(),
+                emotion: "neutral".to_string(),
+                text: String::new(),
+                frames: 0,
+                codes: Vec::new(),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AudioAnalyzeVoiceResponse {
+                success: false,
+                error: Some(format!("Analyze voice task panicked: {}", e)),
+                lang: "zh".to_string(),
+                emotion: "neutral".to_string(),
+                text: String::new(),
+                frames: 0,
+                codes: Vec::new(),
+            }),
+        ),
+    }
+}
+
+/// 单指标视觉标签处理: POST /api/vision/tags
+async fn vision_tags_handler(
+    State(state): State<AppState>,
+    Json(req): Json<VisionTagsRequest>,
+) -> Json<VisionTagsResponse> {
+    let cfg = state.config.lock().unwrap().clone();
+    let t_start = std::time::Instant::now();
+    let file_path = req.file_path.clone();
+
+    let mut tags = Vec::new();
+    let mut scored_tags: Option<Vec<(String, f32)>> = None;
+    if omni_pro::is_pro_enabled() {
+        if cfg.embedding_profile == "gemma_unified" {
+            // gemma_unified 档位：严格只走 EmbeddingGemma 视觉感知，禁止互通，禁止降级到 CLIP
+            match image::open(&file_path) {
+                Ok(img) => {
+                    let scored = omni_pro::OmniVisionEngine::extract_gemma_visual_tags_scored_from_image(
+                        &img,
+                        req.top_k.unwrap_or(5),
+                    );
+                    tags = scored.iter().map(|(c, _)| c.clone()).collect();
+                    scored_tags = Some(scored);
+                }
+                Err(e) => {
+                    tracing::error!("[OmniVision] gemma_unified 无法打开图片: {e}");
+                }
+            }
+        } else {
+            // classic_light 档位：严格只走 CLIP 视觉感知，禁止互通，禁止借道 Gemma
+            tags = omni_pro::OmniVisionEngine::extract_clip_visual_tags(
+                &file_path,
+                req.language.as_deref(),
+                req.top_k.unwrap_or(5),
+            );
+        }
+    }
+
+    if let Some(top_k) = req.top_k {
+        if tags.len() > top_k {
+            tags.truncate(top_k);
+        }
+        if let Some(ref mut st) = scored_tags {
+            if st.len() > top_k {
+                st.truncate(top_k);
+            }
+        }
+    }
+
+    let duration_ms = t_start.elapsed().as_millis() as u64;
+    Json(VisionTagsResponse {
+        file_path,
+        tags,
+        scored_tags,
+        duration_ms,
+    })
+}
+
+/// 单指标图像频域特征检测处理: POST /api/vision/inspect
+async fn vision_inspect_handler(
+    Json(req): Json<VisionInspectRequest>,
+) -> Json<VisionInspectResponse> {
+    if !omni_pro::is_pro_enabled() {
+        return Json(VisionInspectResponse {
+            file_path: req.file_path,
+            has_watermark: false,
+            watermark_level: 0,
+            watermark_status: "none".to_string(),
+            has_mosaic: false,
+            mosaic_level: 0,
+            mosaic_status: "none".to_string(),
+            duration_ms: 0,
+        });
+    }
+
+    let t_start = std::time::Instant::now();
+    let file_path = req.file_path.clone();
+
+    let mut has_watermark = false;
+    let mut watermark_level = 0u8;
+    let mut watermark_status = "none".to_string();
+    let mut has_mosaic = false;
+    let mut mosaic_level = 0u8;
+    let mut mosaic_status = "none".to_string();
+
+    if let Ok(img) = image::open(&file_path) {
+        watermark_level = omni_pro::perceive::detect_watermark_level(&img);
+        has_watermark = watermark_level > 0;
+        watermark_status = omni_pro::perceive::detect_watermark_status(&img).to_string();
+
+        mosaic_level = omni_pro::perceive::detect_mosaic_level(&img);
+        has_mosaic = mosaic_level > 0;
+        mosaic_status = omni_pro::perceive::detect_mosaic_status(&img).to_string();
+    }
+
+    let duration_ms = t_start.elapsed().as_millis() as u64;
+    Json(VisionInspectResponse {
+        file_path,
+        has_watermark,
+        watermark_level,
+        watermark_status,
+        has_mosaic,
+        mosaic_level,
+        mosaic_status,
+        duration_ms,
+    })
+}
+
+/// 单指标文件系统 ADS 来源检测处理: POST /api/fs/ads
+async fn fs_ads_handler(
+    Json(req): Json<FsAdsRequest>,
+) -> Json<FsAdsResponse> {
+    if !omni_pro::is_pro_enabled() {
+        return Json(FsAdsResponse {
+            file_path: req.file_path,
+            file_source: None,
+            file_source_code: None,
+            source_url: None,
+            duration_ms: 0,
+        });
+    }
+
+    let t_start = std::time::Instant::now();
+    let file_path = req.file_path.clone();
+
+    let (file_source, file_source_code, source_url) = omni_pro::perceive::detect_ntfs_zone_identifier(&file_path);
+
+    let duration_ms = t_start.elapsed().as_millis() as u64;
+    Json(FsAdsResponse {
+        file_path,
+        file_source,
+        file_source_code,
+        source_url,
+        duration_ms,
+    })
 }
 
 /// 处理 Web UI 前端拖拽文件二进制流上传请求: POST /api/extract/upload
@@ -547,4 +5220,173 @@ async fn cleanup_fix_handler(
     })
 }
 
+#[cfg(test)]
+mod encoder_origin_tests {
+    use super::*;
 
+    /// 工单 02 AC：阶段一主向量出处必须来自产出层，不得按界面语言或档位猜测。
+    #[test]
+    fn main_vector_encoder_origin_is_not_guessed() {
+        use omni_pro::vector_engine::encoder_id;
+
+        // 文本向量存在时，出处必须取文本层给出的值（即使视觉层给了不同出处）
+        assert_eq!(
+            resolve_main_vector_encoder(true, Some(encoder_id::BEKKO), Some(encoder_id::MOBILE_CLIP)),
+            Some(encoder_id::BEKKO),
+            "有文本向量时主向量出处必须为文本层出处"
+        );
+        // 文本缺失时，出处必须原样采用视觉层出处（例如回退 mobileclip 时是 3，不是 2）
+        assert_eq!(
+            resolve_main_vector_encoder(false, None, Some(encoder_id::MOBILE_CLIP)),
+            Some(encoder_id::MOBILE_CLIP),
+            "无文本向量时必须原样透传视觉层出处，禁止按语言猜成 ChineseCLIP"
+        );
+        // 两路都没有向量时不得编造出处
+        assert_eq!(
+            resolve_main_vector_encoder(false, None, None),
+            None,
+            "无向量时不得编造 encoder_id"
+        );
+        // 有文本向量但文本层未给出处（异常路径）时，不得偷偷回退视觉出处造成向量/出处错配
+        assert_eq!(
+            resolve_main_vector_encoder(true, None, Some(encoder_id::CHINESE_CLIP)),
+            None,
+            "文本向量存在时不得改用视觉层出处，避免向量与出处错配"
+        );
+    }
+}
+
+#[cfg(test)]
+mod representative_vision_tests {
+    use super::*;
+
+    #[test]
+    fn test_representative_frame_vision_pipeline_profile_dispatch() {
+        // 1. 构造代表帧图像
+        let img = image::DynamicImage::new_rgb8(100, 100);
+
+        // 2. 测试 classic_light 档位分流与隔离
+        let res_classic = run_vision_pipeline_on_image(&img, None, false, None, "classic_light");
+        assert!(res_classic.is_ok(), "classic_light 模式在关闭视觉打标时必须成功返回");
+        let comp_classic = res_classic.unwrap();
+        // 验证没有调用 Gemma 视觉塔
+        if let Some(enc) = comp_classic.image_encoder_id {
+            assert_ne!(enc, omni_pro::vector_engine::encoder_id::GEMMA, "classic_light 档位严禁使用 Gemma 编码器");
+        }
+
+        // 3. 测试 gemma_unified 档位分流与隔离
+        // 在 gemma_unified 下若 Gemma 熔断，必须立即 Fail-Fast 报错
+        let gemma = omni_pro::OmniVisionEngine::gemma_engine();
+        gemma.circuit_breaker().trip("模拟熔断测试物理隔离".to_string());
+        let res_gemma = run_vision_pipeline_on_image(&img, None, true, None, "gemma_unified");
+        assert!(res_gemma.is_err(), "gemma_unified 档位在 Gemma 熔断时必须 Fail-Fast 报错，严禁降级到 CLIP");
+        gemma.circuit_breaker().mark_ready(); // 恢复状态
+
+        // 4. 测试全媒体视频领域排他门禁与全细分拦截
+        let mut test_tags = vec![
+            "猫".to_string(),
+            "截图".to_string(),
+            "Windows截图".to_string(),
+            "游戏截图".to_string(),
+            "UI界面截图".to_string(),
+            "摄影照片".to_string(),
+            "风景照".to_string(),
+            "夜景照".to_string(),
+            "建筑摄影".to_string(),
+            "黄昏".to_string(),
+            "实拍".to_string(),
+        ];
+        filter_video_visual_tags(&mut test_tags);
+        assert!(test_tags.contains(&"猫".to_string()), "内容标签 猫 必须保留");
+        assert!(test_tags.contains(&"黄昏".to_string()), "内容标签 黄昏 必须保留");
+        assert!(test_tags.contains(&"实拍".to_string()), "跨模态生成载体 实拍 必须保留");
+        assert!(!test_tags.contains(&"截图".to_string()), "图片专有维度 截图 必须被门禁剔除");
+        assert!(!test_tags.contains(&"Windows截图".to_string()), "图片专有维度 Windows截图 必须被门禁剔除");
+        assert!(!test_tags.contains(&"游戏截图".to_string()), "图片专有维度 游戏截图 必须被门禁剔除");
+        assert!(!test_tags.contains(&"UI界面截图".to_string()), "图片专有维度 UI界面截图 必须被门禁剔除");
+        assert!(!test_tags.contains(&"摄影照片".to_string()), "图片专有维度 摄影照片 必须被门禁剔除");
+        assert!(!test_tags.contains(&"风景照".to_string()), "图片专有维度 风景照 必须被门禁剔除");
+        assert!(!test_tags.contains(&"夜景照".to_string()), "图片专有维度 夜景照 必须被门禁剔除");
+        assert!(!test_tags.contains(&"建筑摄影".to_string()), "图片专有维度 建筑摄影 必须被门禁剔除");
+    }
+
+    #[test]
+    fn test_video_multimodal_fused_tags_with_rep_frame() {
+        // 1. 构造音视频视听双模态上下文
+        let asr_text = "今天我们在这堂公开课上，带领大家深入研讨这部伟大的小说，现场气氛十分热烈激昂。";
+        // 通过 TextTagger 提取 ASR 文本标签
+        let text_tags = omni_pro::text::TextTagger::tag_asr_or_lrc(Some(asr_text), None, None);
+        assert!(!text_tags.is_empty(), "必须从 ASR 文本中提取出文本标签");
+
+        // 2. 构造代表帧视觉标签（画面主体：猫咪，场景：草地）
+        let visual_tags = vec![
+            omni_core::TagChainItem {
+                code: "omw.02121620.n".to_string(), // 猫咪
+                name: "猫咪".to_string(),
+                confidence: 0.92,
+                via_parent_code: Some("builtin.content_tags".to_string()),
+                parent_codes: vec!["builtin.content_tags".to_string()],
+                source: Some("visual".to_string()),
+                ..Default::default()
+            },
+            omni_core::TagChainItem {
+                code: "omw.08572105.n".to_string(), // 草地
+                name: "草地".to_string(),
+                confidence: 0.88,
+                via_parent_code: Some("builtin.content_tags".to_string()),
+                parent_codes: vec!["builtin.content_tags".to_string()],
+                source: Some("visual".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        // 3. 构建视频模式 MultimodalContext (is_video = true)
+        let ctx = omni_core::MultimodalContext {
+            file_path: "D:/test/lecture_cat.mp4".to_string(),
+            file_name: "lecture_cat.mp4".to_string(),
+            mime_type: "video/mp4".to_string(),
+            document_text: None,
+            ocr_text: None,
+            audio_transcript: Some(asr_text.to_string()),
+            lrc_text: None,
+            visual_tags,
+            text_tags: text_tags.clone(),
+            exif_metadata: serde_json::json!({}),
+            is_image: false,
+            is_video: true,
+            is_document: false,
+            is_audio_or_video: true,
+            language: Some("zh".to_string()),
+            dimension_policies: None,
+        };
+
+        // 4. 调用融合仲裁引擎
+        let outcome = omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate(&ctx);
+
+        // 5. 验证 fused_tags 聚合视听双模态特征
+        let fused_names: Vec<&str> = outcome.fused_tags.iter().map(|t| t.name.as_str()).collect();
+        println!("[DEBUG TEST] fused_names = {:?}", fused_names);
+        for tag in &outcome.fused_tags {
+            println!("  [fused_tag] code={}, name={}, conf={}, source={:?}", tag.code, tag.name, tag.confidence, tag.source);
+        }
+
+        // 必须包含画面特征（如 猫咪 或 草地）
+        assert!(
+            fused_names.contains(&"猫咪") || fused_names.contains(&"草地"),
+            "fused_tags 必须包含视频代表帧视觉画面特征，实际: {:?}",
+            fused_names
+        );
+
+        // 必须包含文本特征（如 小说 或 激昂 或 公开课）
+        assert!(
+            fused_names.contains(&"小说") || fused_names.contains(&"公开课") || fused_names.contains(&"激昂"),
+            "fused_tags 必须包含 ASR 语音文本提取的体裁/情绪特征，实际: {:?}",
+            fused_names
+        );
+
+        // 6. 验证视频介质不触发视觉污染惩罚（content_description 应正常生成）
+        assert!(outcome.content_description.is_some(), "视频介质代表帧视觉描述必须正常生成，不得被视觉污染一票否决");
+        let desc = outcome.content_description.as_ref().unwrap();
+        assert!(!desc.is_empty(), "描述句不得为空");
+    }
+}

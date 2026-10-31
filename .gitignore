@@ -1,4 +1,7 @@
 /target
+# 隔离构建目录：target-runs/<task>/ 供并行测试，target-review 等备用
+/target-*
+/target_*
 node_modules/
 dist/
 .DS_Store
@@ -8,6 +11,7 @@ build/extraResources/geo
 build/geo-cache
 build/presetResources
 build/libmupdf
+build/
 
 # omni-pro 闭源专业版子模块隔离 (firefly-omni-pro.git)
 omni-pro/
@@ -23,5 +27,3 @@ pro/
 *.pem
 *.db
 *.sqlite
-
-

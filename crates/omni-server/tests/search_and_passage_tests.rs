@@ -1,0 +1,473 @@
+//! search_and_passage_tests.rs — 高速未分析文件秒搜与向量段落对齐集成测试
+//!
+//! 依据 ADR-0039 与 PRD 0039 / Ticket 1 验收契约：
+//! 1. GET /api/v1/search/fs 在多层真实文件树中高速扫描，支持大小写不敏感匹配、limit 约束截断、双轨平滑降级；
+//! 2. POST /api/v1/vector/match-passages 单次 Query 编码，批量余弦相似度计算，精准锁定最相关段落，单次耗时 < 15ms；
+//! 3. 边界条件防御：空关键词、空段落集合、不存在目录等软失败处理。
+
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use omni_core::OmniConfig;
+use omni_server::{
+    create_app_router, routes::fs_search::*, routes::vector::*, AppState, OmwDb, VectorEngine,
+};
+use std::fs::{create_dir_all, File};
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use tower::ServiceExt;
+
+/// 初始化包含内存向量引擎的最小测试 App
+fn setup_test_app() -> axum::Router {
+    let state = AppState {
+        config: Arc::new(Mutex::new(OmniConfig::default())),
+        geo: Arc::new(omni_pro::geo::GeoService::unavailable()),
+        hownet: Arc::new(omni_pro::hownet::OmniHowNetService::unavailable()),
+        search: Arc::new(omni_pro::search::OmniSearchService::default()),
+        omw: OmwDb::unavailable(),
+        vector: Arc::new(VectorEngine::in_memory()),
+        master_db_path: Arc::new(Mutex::new(None)),
+        dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
+        sherpa: Arc::new(omni_server::SherpaManager::new()),
+        moss: Arc::new(omni_server::MossTtsManager::new()),
+        anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
+    };
+    create_app_router(state)
+}
+
+#[tokio::test]
+async fn test_fast_fs_search_walk_and_limit() {
+    let temp_dir = tempfile::tempdir().expect("创建临时测试目录失败");
+    let base_path = temp_dir.path();
+
+    // 构造嵌套目录与测试文件
+    let sub1 = base_path.join("finance_folder");
+    let sub2 = base_path.join("documents").join("nested");
+    create_dir_all(&sub1).unwrap();
+    create_dir_all(&sub2).unwrap();
+
+    let f1 = sub1.join("annual_financial_report_2025.pdf");
+    {
+        let mut file1 = File::create(&f1).unwrap();
+        writeln!(file1, "PDF content 1").unwrap();
+        file1.sync_all().unwrap();
+    }
+
+    let f2 = sub1.join("QUARTERLY_REPORT_Q3.docx");
+    {
+        let mut file2 = File::create(&f2).unwrap();
+        writeln!(file2, "Word content 2").unwrap();
+        file2.sync_all().unwrap();
+    }
+
+    let f3 = sub2.join("audit_report_final.xlsx");
+    {
+        let mut file3 = File::create(&f3).unwrap();
+        writeln!(file3, "Excel content 3").unwrap();
+        file3.sync_all().unwrap();
+    }
+
+    let f4 = base_path.join("other_file_image.png");
+    {
+        let mut file4 = File::create(&f4).unwrap();
+        writeln!(file4, "PNG image").unwrap();
+        file4.sync_all().unwrap();
+    }
+
+    let app = setup_test_app();
+    let dir_str = base_path.to_string_lossy().to_string();
+
+    // 1. 验证 limit=2 截断及大小写不敏感匹配 (q=report 应命中 f1, f2, f3 中截取 2 个)
+    let uri = format!(
+        "/api/v1/search/fs?dir={}&q=report&limit=2",
+        urlencoding::encode(&dir_str)
+    );
+    let req = Request::builder()
+        .uri(&uri)
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+
+    let t_search = Instant::now();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let search_cost = t_search.elapsed();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let search_resp: FsSearchResponse = serde_json::from_slice(&body_bytes).unwrap();
+
+    println!(
+        "fast_walk 扫描测试耗时: {:?}, 接口返回内部耗时: {}ms",
+        search_cost, search_resp.duration_ms
+    );
+    assert_eq!(search_resp.items.len(), 2, "返回结果条目数必须严格受 limit=2 截断约束");
+    assert_eq!(search_resp.total, 2);
+    assert_eq!(search_resp.returned, 2);
+    assert!(search_resp.source == "fast_walk" || search_resp.source == "everything");
+
+    for item in &search_resp.items {
+        assert!(
+            item.name.to_lowercase().contains("report"),
+            "文件名必须包含搜索词 report，当前为: {}",
+            item.name
+        );
+        if !item.is_directory {
+            assert!(item.size > 0, "非目录文件大小应大于0: {}", item.name);
+        }
+        assert!(item.extension.is_some());
+    }
+
+    // 2. 验证全量 limit=100 召回全部 3 个匹配文件
+    let uri_all = format!(
+        "/api/v1/search/fs?dir={}&q=REPORT&limit=100",
+        urlencoding::encode(&dir_str)
+    );
+    let req_all = Request::builder()
+        .uri(&uri_all)
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp_all = app.clone().oneshot(req_all).await.unwrap();
+    assert_eq!(resp_all.status(), StatusCode::OK);
+    let bytes_all = axum::body::to_bytes(resp_all.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let all_resp: FsSearchResponse = serde_json::from_slice(&bytes_all).unwrap();
+    assert_eq!(all_resp.items.len(), 3, "全量搜索应召回全部 3 个匹配文件");
+
+    // 3. 验证空关键词查询：返回空列表
+    let uri_empty_q = format!(
+        "/api/v1/search/fs?dir={}&q=",
+        urlencoding::encode(&dir_str)
+    );
+    let req_empty_q = Request::builder()
+        .uri(&uri_empty_q)
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp_empty_q = app.clone().oneshot(req_empty_q).await.unwrap();
+    assert_eq!(resp_empty_q.status(), StatusCode::OK);
+    let bytes_empty_q = axum::body::to_bytes(resp_empty_q.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let empty_q_resp: FsSearchResponse = serde_json::from_slice(&bytes_empty_q).unwrap();
+    assert_eq!(empty_q_resp.items.len(), 0);
+    assert_eq!(empty_q_resp.total, 0);
+    assert_eq!(empty_q_resp.returned, 0);
+
+    // 4. 验证不存在目录防御：返回 404 NOT_FOUND
+    let req_not_found = Request::builder()
+        .uri("/api/v1/search/fs?dir=C%3A%2Fnon_existent_folder_xyz_123&q=test")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp_not_found = app.oneshot(req_not_found).await.unwrap();
+    assert_eq!(resp_not_found.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_vector_match_passages_alignment() {
+    let app = setup_test_app();
+
+    let payload = serde_json::json!({
+        "query": "2025年企业净利润与营业收入大幅增长",
+        "items": [
+            {
+                "fileFingerprint": "fp_financial_report",
+                "passages": [
+                    "本公司关于办公区空调节能与用电安全管理规范细则，请各部门严格遵守执行。",
+                    "2025年度报告显示，公司营业收入和净利润双双突破历史新高，各项经营财务指标表现强劲优异。",
+                    "关于组织全体员工参加秋季户外徒步及露营团建活动的日程安排与物资准备清单。"
+                ]
+            },
+            {
+                "fileFingerprint": "fp_engineering_guide",
+                "passages": [
+                    "微服务架构设计与高并发分布式系统核心实践指南与限流策略。",
+                    "办公室绿色植物领养与定期养护常识说明。"
+                ]
+            }
+        ]
+    });
+
+    let req = Request::builder()
+        .uri("/api/v1/vector/match-passages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+
+    let t_start = Instant::now();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let total_cost = t_start.elapsed();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let match_resp: MatchPassagesResponse = serde_json::from_slice(&body_bytes).unwrap();
+
+    println!(
+        "match-passages 端到端耗时: {:?}, 服务内部耗时: {}ms",
+        total_cost, match_resp.duration_ms
+    );
+
+    assert_eq!(match_resp.matches.len(), 2);
+
+    // 验证文件 1 精准命中段落 1 ("2025年度报告显示，公司营业收入和净利润双双突破历史新高...")
+    let m1 = &match_resp.matches[0];
+    assert_eq!(m1.file_fingerprint, "fp_financial_report");
+    assert_eq!(
+        m1.best_passage_index, 1,
+        "必须精准对齐到最相关的第二段 (index 1)"
+    );
+    assert!(m1.best_passage.contains("营业收入和净利润"));
+    assert!(
+        m1.similarity > 0.20,
+        "相关段落余弦相似度应显著高出基准，当前: {}",
+        m1.similarity
+    );
+
+    // 验证第二篇文档也正常计算
+    let m2 = &match_resp.matches[1];
+    assert_eq!(m2.file_fingerprint, "fp_engineering_guide");
+    assert!(!m2.best_passage.is_empty());
+    assert!(m2.similarity >= -1.0 && m2.similarity <= 1.0);
+
+    // 性能契约检验: Release <15ms；Debug/CI 允许冷启动波动放宽至 40ms
+    let max_allowed_ms = if cfg!(debug_assertions) { 40 } else { 15 };
+    assert!(
+        match_resp.duration_ms <= max_allowed_ms,
+        "match-passages 接口计算耗时超出契约限制: {}ms",
+        match_resp.duration_ms
+    );
+}
+
+#[tokio::test]
+async fn test_vector_match_passages_empty_and_robustness() {
+    let app = setup_test_app();
+
+    // 包含空 passages 列表的文件项
+    let payload = serde_json::json!({
+        "query": "人工智能模型架构",
+        "items": [
+            {
+                "fileFingerprint": "fp_empty_passages",
+                "passages": []
+            }
+        ]
+    });
+
+    let req = Request::builder()
+        .uri("/api/v1/vector/match-passages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let match_resp: MatchPassagesResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(match_resp.matches.len(), 1);
+    assert_eq!(match_resp.matches[0].file_fingerprint, "fp_empty_passages");
+    assert_eq!(match_resp.matches[0].best_passage_index, 0);
+    assert_eq!(match_resp.matches[0].similarity, 0.0);
+    assert!(match_resp.matches[0].best_passage.is_empty());
+}
+
+#[tokio::test]
+async fn test_vector_match_passages_cache_hit_is_fast() {
+    let app = setup_test_app();
+
+    let payload = serde_json::json!({
+        "query": "缓存命中路径验证",
+        "items": [{
+            "fileFingerprint": "fp_cache",
+            "passages": [
+                "缓存命中路径验证：同一段落在第二次请求时应直接使用进程级向量缓存。",
+                "无关段落：办公室绿植养护说明。"
+            ]
+        }]
+    });
+
+    // 第一次：冷路径，填充段落缓存
+    let req1 = Request::builder()
+        .uri("/api/v1/vector/match-passages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let b1 = axum::body::to_bytes(resp1.into_body(), usize::MAX).await.unwrap();
+    let cold: MatchPassagesResponse = serde_json::from_slice(&b1).unwrap();
+
+    // 第二次：热路径（段落向量缓存命中）
+    let req2 = Request::builder()
+        .uri("/api/v1/vector/match-passages")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let resp2 = app.oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let b2 = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+    let hot: MatchPassagesResponse = serde_json::from_slice(&b2).unwrap();
+
+    println!(
+        "cache 冷路径: {}ms, 热路径: {}ms",
+        cold.duration_ms, hot.duration_ms
+    );
+    assert_eq!(hot.matches[0].best_passage_index, cold.matches[0].best_passage_index);
+    assert!(
+        hot.duration_ms <= cold.duration_ms.max(5),
+        "缓存命中路径耗时不应高于冷路径: hot={}ms cold={}ms",
+        hot.duration_ms,
+        cold.duration_ms
+    );
+}
+
+/// 双档位契约回归：match-passages 必须按请求档位分派文本塔，gemma_unified 档位下严禁回退 bekko-a8m。
+///
+/// 缺陷背景：该端点早期无档位概念，恒用 BekkoEmbedder 编码 query 与段落，
+/// 导致「已选 gemma_unified 的会话仍加载 bekko-a8m 模型」且段落相似度跨向量空间无意义。
+#[tokio::test]
+async fn test_vector_match_passages_dual_profiles() {
+    let app = setup_test_app();
+
+    let build_req = |profile: &str, dim: usize| -> Request<Body> {
+        let payload = serde_json::json!({
+            "query": "2025年企业净利润与营业收入大幅增长",
+            "profile": profile,
+            "dim": dim,
+            "items": [{
+                "fileFingerprint": "fp_dual_profile",
+                "passages": [
+                    "本公司关于办公区空调节能与用电安全管理规范细则，请各部门严格遵守执行。",
+                    "2025年度报告显示，公司营业收入和净利润双双突破历史新高，各项经营财务指标表现强劲优异。",
+                    "关于组织全体员工参加秋季户外徒步及露营团建活动的日程安排与物资准备清单。"
+                ]
+            }]
+        });
+        Request::builder()
+            .uri("/api/v1/vector/match-passages")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    };
+
+    // 1. classic_light (bekko-a8m 384d)：历史契约不变
+    let resp = app.clone().oneshot(build_req("classic_light", 384)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let classic: MatchPassagesResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(classic.matches.len(), 1);
+    assert_eq!(
+        classic.matches[0].best_passage_index, 1,
+        "classic 档位必须对齐到财务段落"
+    );
+
+    // 2. gemma_unified (EmbeddingGemma 文本塔 + MRL 512d)：必须成功编码，不得静默回退 bekko
+    let resp = app.clone().oneshot(build_req("gemma_unified", 512)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "gemma_unified 档位必须走 EmbeddingGemma 文本塔；返回非 200 说明回退或编码失败"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let gemma: MatchPassagesResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(gemma.matches.len(), 1);
+    assert_eq!(
+        gemma.matches[0].best_passage_index, 1,
+        "gemma 文本塔同样必须对齐到财务段落"
+    );
+    assert!(
+        gemma.matches[0].similarity >= -1.0 && gemma.matches[0].similarity <= 1.0,
+        "余弦相似度必须落在合法区间，当前: {}",
+        gemma.matches[0].similarity
+    );
+    // 两档位向量空间正交（384d bekko vs 512d Gemma MRL），同一 query/段落对的余弦不可能相等；
+    // 若相等说明段落缓存未按档位隔离（串用另一档位的 384d 向量）。
+    assert!(
+        (gemma.matches[0].similarity - classic.matches[0].similarity).abs() > 1e-6,
+        "classic 与 gemma 档位相似度相同 ⇒ 段落缓存未按档位隔离: classic={} gemma={}",
+        classic.matches[0].similarity,
+        gemma.matches[0].similarity
+    );
+
+    // 3. 非法 MRL 维度 (1024) 必须回退引擎当前维度而非报错/截断成零向量
+    let resp = app.oneshot(build_req("gemma_unified", 1024)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "非法 MRL 维度应回退引擎当前维度，不得直接失败"
+    );
+}
+
+#[tokio::test]
+async fn test_batch_embed_text_dual_profiles() {
+    let app = setup_test_app();
+
+    // 1. 测试 classic_light (Bekko 384d)
+    let bekko_req = Request::builder()
+        .uri("/api/v1/vector/batch-embed-text")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({
+            "texts": [
+                "2026年第一季度财务报销发票清单",
+                "UI设计高保真切图资源"
+            ],
+            "profile": "classic_light",
+            "dim": 384
+        }).to_string()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(bekko_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let res: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(res["count"], 2);
+    assert_eq!(res["dim"], 384);
+    assert_eq!(res["profile"], "classic_light");
+    let vecs = res["vectors"].as_array().unwrap();
+    assert_eq!(vecs.len(), 2);
+    assert_eq!(vecs[0].as_array().unwrap().len(), 384);
+    assert_eq!(vecs[1].as_array().unwrap().len(), 384);
+
+    // 2. 测试 gemma_unified (Gemma 512d)
+    let gemma_req = Request::builder()
+        .uri("/api/v1/vector/batch-embed-text")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({
+            "texts": [
+                "深度学习模型训练日志"
+            ],
+            "profile": "gemma_unified",
+            "dim": 512
+        }).to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(gemma_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let res: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(res["count"], 1);
+    assert_eq!(res["dim"], 512);
+    assert_eq!(res["profile"], "gemma_unified");
+    let vecs = res["vectors"].as_array().unwrap();
+    assert_eq!(vecs.len(), 1);
+    assert_eq!(vecs[0].as_array().unwrap().len(), 512);
+}
+

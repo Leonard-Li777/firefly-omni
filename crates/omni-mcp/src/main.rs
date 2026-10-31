@@ -1,7 +1,7 @@
 use anyhow::Result;
 use omni_core::OmniExtractionResult;
 use omni_extract::OmniExtractor;
-use omni_vision::OmniVisionEngine;
+use omni_pro::OmniVisionEngine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
