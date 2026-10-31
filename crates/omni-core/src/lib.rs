@@ -7,6 +7,13 @@ pub use tag_identity::is_controlled_code;
 /// 标签别名热载的紧凑索引表示（PRD 07：Arena + 全局/按语言双索引 + 进程级 code intern）
 pub mod tag_alias_index;
 
+/// PRD 07 Slice 4/5：双索引 vs 现网仲裁的全量等价性基线与内存/延迟实测。
+///
+/// 仅测试构建，读真实 `semantic.raw.db`；放在 `src/` 下是为了走 `--lib` 单测目标
+/// （testing-guide 铁律 3：独立集成测试二进制要完整链接数十兆依赖，慢 5~10 倍）。
+#[cfg(test)]
+mod alias_equivalence;
+
 /// AOT 受控概念强类型枚举（PRD-0050）
 pub mod concepts;
 
