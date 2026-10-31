@@ -32,6 +32,7 @@ fn setup_test_app() -> axum::Router {
         dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
         sherpa: Arc::new(omni_server::SherpaManager::new()),
         moss: Arc::new(omni_server::MossTtsManager::new()),
+        anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
     };
     create_app_router(state)
 }

@@ -1044,6 +1044,18 @@ pub mod text {
         ) -> Vec<omni_core::TagChainItem> {
             Vec::new()
         }
+
+        /// 批 B 打标入口存根（spec §2.2.1）：开源构建无受控词表与编码器，恒空
+        pub fn tag_text_with_anchor(
+            _text: &str,
+            _source_kind: Option<&str>,
+            _vector_table: Option<&PrecomputedVectorTable>,
+            _allow_new_tags: bool,
+            _exclude_names: &[String],
+            _anchor: Option<(&BekkoEmbedder, &[f32])>,
+        ) -> Vec<omni_core::TagChainItem> {
+            Vec::new()
+        }
     }
 
     /// 两阶段快速标签识别编排器存根

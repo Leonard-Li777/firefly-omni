@@ -80,6 +80,11 @@ pub struct AppState {
     pub sherpa: Arc<SherpaManager>,
     /// MOSS-TTS 48kHz RVQ-16 自包含音色管理与合成引擎
     pub moss: Arc<MossTtsManager>,
+    /// 最近分析文件的全局语义锚点缓存（spec §2.2.6 / §3.3）
+    ///
+    /// `perceive` 结束时写入 `e_global`，`POST /api/text/tag` 凭 `file_fingerprint` 取用；
+    /// 命中即删 + TTL 30 分钟 + LRU 300。进程内共享、不落盘。
+    pub anchor_cache: Arc<omni_core::anchor_cache::AnchorCache>,
 }
 
 #[derive(Deserialize)]
@@ -131,7 +136,10 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/api/v1/engine/status", get(engine_status_handler))
         .route("/api/config", get(get_config).post(update_config).put(update_config))
         .route("/api/extract", post(extract_file_handler))
-        .route("/api/extract/upload", post(extract_multipart_handler));
+        .route("/api/extract/upload", post(extract_multipart_handler))
+        // 通用文本打标（spec §3.1）：**刻意注册在基础路由**——非 Pro 构建下须返回
+        // 「空数组 + warn」的确定性降级，而不是 404 传输错误，故不能放进下面的 Pro 分支。
+        .route("/api/text/tag", post(text_tag_handler));
 
     // 2. 闭源专业版专享接口 (Closed-Source Pro Endpoints 🔒: 一次开发闭源优先)
     // 依据项目架构准则：除以上四个基础接口外，其余全部归属 Pro 闭源优先体系
@@ -1033,6 +1041,7 @@ pub async fn start_server(
         dimension_policies: Arc::new(std::sync::RwLock::new(initial_policies)),
         sherpa,
         moss,
+        anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本
@@ -2850,20 +2859,15 @@ async fn perceive_file_handler(
 
     // 8.5 全文本打标 (Ticket 01 & Ticket 04 text_tags)
     let extracted_text_tags = if is_pro {
-        static GLOBAL_TEXT_VECTOR_TABLE: std::sync::OnceLock<Option<omni_pro::text::PrecomputedVectorTable>> =
-            std::sync::OnceLock::new();
-        let vt_ref = GLOBAL_TEXT_VECTOR_TABLE.get_or_init(|| {
-            omni_pro::text::PrecomputedVectorTable::discover_table_path()
-                .and_then(|p| omni_pro::text::PrecomputedVectorTable::load_from_file(p).ok())
-        });
+        let vt_ref = global_text_vector_table();
 
         if asr.is_some() || lrc.is_some() {
-            omni_pro::text::TextTagger::tag_asr_or_lrc(asr.as_deref(), lrc.as_deref(), vt_ref.as_ref())
+            omni_pro::text::TextTagger::tag_asr_or_lrc(asr.as_deref(), lrc.as_deref(), vt_ref)
         } else if !is_image && !markdown_content.trim().is_empty() {
-            omni_pro::text::TextTagger::tag_text(&markdown_content, Some("document"), vt_ref.as_ref())
+            omni_pro::text::TextTagger::tag_text(&markdown_content, Some("document"), vt_ref)
         } else if let Some(ref ocr) = ocr_text {
             if !ocr.trim().is_empty() {
-                omni_pro::text::TextTagger::tag_text(ocr, Some("ocr"), vt_ref.as_ref())
+                omni_pro::text::TextTagger::tag_text(ocr, Some("ocr"), vt_ref)
             } else {
                 Vec::new()
             }
@@ -2909,10 +2913,37 @@ async fn perceive_file_handler(
             fused_tags: Vec::new(),
             candidate_hypotheses: Vec::new(),
             perf_breakdown: None,
+            // 非 Pro 无融合引擎 ⇒ 无全局锚点可导出；锚点缓存保持空，
+            // 文本标注端点据此降级为「仅受控词表」（spec §2.2.6 降级语义）
+            anchor_vector: None,
         }
     };
     let fusion_ms = t_fusion.elapsed().as_millis() as u64;
     benchmark.record("fusion_ms", fusion_ms);
+
+    // 批 B 锚点暂存：把本次 perceive 的**全局锚点**按文件指纹放进缓存，
+    // 供 LLM 产物返送打标（POST /api/text/tag）取用（spec §2.2.6 / §3.3）。
+    //
+    // - 只暂存 `e_global` 单锚：批 A 阈值与批 B 门控都是「与全局锚点的余弦」；
+    //   融合引擎内部的描述锚点/段落向量是瞬时量，**严禁**缓存（会迅速突破内存红线）；
+    // - 无指纹（调用方未传）或无锚点（非 Pro / 编码失败）⇒ 不写入，返送侧走降级；
+    // - 编码器身份取 `encoder_id::BEKKO`：融合锚点恒由 `BekkoEmbedder`（384d）产出。
+    if let (Some(fp), Some(anchor)) = (
+        req.file_fingerprint.as_deref(),
+        fusion_outcome.anchor_vector.as_ref(),
+    ) {
+        if !fp.is_empty() {
+            state.anchor_cache.put(
+                fp,
+                omni_core::anchor_cache::AnchorCacheEntry::new(
+                    anchor.clone(),
+                    omni_core::encoder_id::BEKKO,
+                    std::time::Instant::now(),
+                ),
+            );
+        }
+    }
+
     if let Some(ref perf) = fusion_outcome.perf_breakdown {
         benchmark.record("fusion_anchor_ms", perf.global_anchor_ms);
         benchmark.record("fusion_pool_ms", perf.candidate_pool_ms);
@@ -3494,6 +3525,111 @@ async fn perceive_file_handler(
     }
 
     result
+}
+
+/// 受控词表预计算向量表（进程级只读，一次加载全程复用）。
+///
+/// `perceive` 的文本打标与 `POST /api/text/tag` **必须共用同一实例**——若各自持有
+/// `OnceLock`，同一张表会被加载两遍（内存翻倍）且两处口径可能因加载时点不同而分叉。
+fn global_text_vector_table() -> Option<&'static omni_pro::text::PrecomputedVectorTable> {
+    static GLOBAL_TEXT_VECTOR_TABLE: std::sync::OnceLock<
+        Option<omni_pro::text::PrecomputedVectorTable>,
+    > = std::sync::OnceLock::new();
+    GLOBAL_TEXT_VECTOR_TABLE
+        .get_or_init(|| {
+            omni_pro::text::PrecomputedVectorTable::discover_table_path()
+                .and_then(|p| omni_pro::text::PrecomputedVectorTable::load_from_file(p).ok())
+        })
+        .as_ref()
+}
+
+/// LLM 产物返送打标请求体: POST /api/text/tag（spec §3.1）
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextTagRequest {
+    /// 文件唯一指纹（= 首次 perceive 传入的 `fileFingerprint`），用于取回**同源**全局锚点
+    pub file_fingerprint: String,
+    /// 待打标文本。必须是**完整原句**：去标签化由 `exclude_names` 在词元级完成，
+    /// **严禁**调用方先做子串替换（会破坏分词上下文，§2.2.4）
+    pub text: String,
+    /// BCP-47 语言标签。**仅用于可观测性**：本接口判据（G1 词形闸 + 违禁词元 + 锚点余弦）
+    /// 不依赖语言入参，语种由分词器自行判定（§2.2.2）
+    #[serde(default)]
+    pub language: Option<String>,
+    /// 是否允许产出 `_ext.*` 新标签。**缺省 `false`**（安全默认：只做受控反查，杜绝自证）
+    #[serde(default)]
+    pub allow_new_tags: bool,
+    /// 首次已胜出标签展示名（大小写不敏感），在**候选词元层**按整词相等剔除
+    #[serde(default)]
+    pub exclude_names: Vec<String>,
+}
+
+/// 通用文本打标 API: POST /api/text/tag（spec §2.2 / §3.1）
+///
+/// 底座复用 `TextTagger`（受控反查 → 派生 `_ext.*` → 置信度标定 → 去重限 8），
+/// 本接口**仅叠加**「锚点余弦 ≥ 0.55」这一批 B 新增判据；过滤发生在截断之前。
+async fn text_tag_handler(
+    State(state): State<AppState>,
+    Json(req): Json<TextTagRequest>,
+) -> Json<Vec<omni_core::TagChainItem>> {
+    // 非 Pro：与 perceive 的非 Pro 契约一致——返回空数组存根，严禁以其它来源顶替（§3.1）
+    if !omni_pro::is_pro_enabled() {
+        tracing::warn!(
+            "[OmniServer] /api/text/tag 在非 Pro 构建下无打标能力，返回空数组存根（fingerprint={}）",
+            req.file_fingerprint
+        );
+        return Json(Vec::new());
+    }
+
+    if req.text.trim().is_empty() {
+        return Json(Vec::new());
+    }
+
+    // 锚点同源取用：**命中即删**；每个失败分支都必须 warn 上报降级原因（§2.2.6 禁静默）
+    let lookup = state.anchor_cache.take(
+        &req.file_fingerprint,
+        omni_core::encoder_id::BEKKO,
+        omni_pro::text::EMBEDDING_DIM,
+    );
+    let anchor = match lookup {
+        omni_core::anchor_cache::AnchorLookup::Hit(vector) => Some(vector),
+        other => {
+            tracing::warn!(
+                "[OmniServer] 返送打标缺少同源锚点，降级为纯受控打标（不产 _ext.*）：reason={} fingerprint={} language={:?}",
+                other.degrade_reason().unwrap_or_default(),
+                req.file_fingerprint,
+                req.language
+            );
+            None
+        }
+    };
+    // 降级铁律：无锚点即无法做余弦门控 ⇒ **禁止抽新标签**（§2.2.6 降级路径）
+    let allow_new_tags = req.allow_new_tags && anchor.is_some();
+
+    let text = req.text;
+    let exclude_names = req.exclude_names;
+    let res = tokio::task::spawn_blocking(move || {
+        let embedder = omni_pro::text::BekkoEmbedder::new();
+        let anchor_ref = anchor.as_deref().map(|vector| (&embedder, vector));
+        omni_pro::text::TextTagger::tag_text_with_anchor(
+            &text,
+            Some("text"),
+            global_text_vector_table(),
+            allow_new_tags,
+            &exclude_names,
+            anchor_ref,
+        )
+    })
+    .await;
+
+    Json(match res {
+        Ok(tags) => tags,
+        Err(e) => {
+            // 任务 panic 时返回空数组：调用方按「无返送标签」处理，不得误判为正常空结果
+            tracing::error!("[OmniServer] 返送打标任务执行失败: {e}");
+            Vec::new()
+        }
+    })
 }
 
 /// 纯文本确定性特征分析请求体: POST /api/text/analyze

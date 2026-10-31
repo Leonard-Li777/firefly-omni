@@ -29,6 +29,7 @@ fn setup_test_app() -> Router {
         )),
         sherpa: Arc::new(SherpaManager::new()),
         moss: Arc::new(omni_server::MossTtsManager::new()),
+        anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
     };
     create_app_router(state)
 }
