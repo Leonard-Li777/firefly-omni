@@ -41,6 +41,13 @@ pub mod tag_thresholds;
 /// 标签准入闸门 · G1 词形层（取码前，零本体依赖；单一数据源 `taxonomy/tag-admissibility.json`）
 pub mod tag_admissibility;
 
+/// 批 B 锚点缓存：最近分析文件的**全局语义锚点**进程内中转（spec §2.2.6 / §3.3）
+///
+/// 住在 omni-core 而非 omni-text：该类型被 `omni-server` 的 `AppState` 持有，
+/// 而 `omni-server` 需同时支持 Open-Core 与 Pro 两种构建（非 Pro 下 `omni_pro` 为存根），
+/// 落在 Pro 侧会迫使存根复制一份平行实现。
+pub mod anchor_cache;
+
 /// (DEC-03) 维度执行策略与多选/互斥裁决保底定义
 pub mod dimension_policies_generated;
 pub use dimension_policies_generated::*;
