@@ -89,22 +89,61 @@ pub const UNKNOWN_TAG_CODE: &str = "builtin.unknown"; // locale-invariant-ok: �
 /// AOT 自动生成的受控标签别名常量切片（单一事实源自 file-dimension-source.ts + curated-model-aliases.json）
 pub use crate::builtin_aliases_generated::BUILTIN_ALIASES;
 
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
-static DYNAMIC_ALIASES: OnceLock<RwLock<HashMap<String, &'static str>>> = OnceLock::new();
-static DYNAMIC_ALIASES_BY_LANG: OnceLock<RwLock<HashMap<String, HashMap<String, &'static str>>>> = OnceLock::new();
-static DYNAMIC_CANONICAL_BY_LANG: OnceLock<RwLock<HashMap<String, HashMap<String, &'static str>>>> = OnceLock::new();
+/// 热载构建期的可变缓冲（PRD 07）。
+///
+/// 只在 `load_aliases_for_lang` 与 `commit_alias_index` 之间短暂存在；`finish` 之后立即置空，
+/// 稳态只保留 [`crate::tag_alias_index::installed`] 那份不可变索引，**不留第二事实源**
+/// （用户故事 34）。构建期内部的 `HashMap` 键是临时脚手架，不进入常驻。
+static ALIAS_BUILDER: OnceLock<RwLock<Option<crate::tag_alias_index::TagAliasBuilder>>> =
+    OnceLock::new();
 
-fn dynamic_aliases() -> &'static RwLock<HashMap<String, &'static str>> {
-    DYNAMIC_ALIASES.get_or_init(|| RwLock::new(HashMap::new()))
+/// 是否存在未提交的增量。惰性提交闸：调用方漏调 `commit_alias_index` 时，读取路径也不会
+/// 拿到空索引 —— 静默降级在这里被物理排除（§2.9 禁止静默降级）。
+static ALIAS_BUILDER_DIRTY: AtomicBool = AtomicBool::new(false);
+
+fn alias_builder_slot() -> &'static RwLock<Option<crate::tag_alias_index::TagAliasBuilder>> {
+    ALIAS_BUILDER.get_or_init(|| RwLock::new(None))
 }
 
-fn dynamic_aliases_by_lang() -> &'static RwLock<HashMap<String, HashMap<String, &'static str>>> {
-    DYNAMIC_ALIASES_BY_LANG.get_or_init(|| RwLock::new(HashMap::new()))
+/// 提交构建结果：产出不可变快照并原子替换安装槽。
+///
+/// **不取走 builder**：热载是追加式的，取走会让下一批增量从空容器重建并覆盖已安装索引
+/// （实测 `Connected` 退化成 `None`）。构建期容器由 [`seal_alias_builder`] 显式释放。
+pub fn commit_alias_index() {
+    let snapshot = {
+        let guard = match alias_builder_slot().write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.as_ref().map(|builder| builder.snapshot())
+    };
+    if let Some(index) = snapshot {
+        crate::tag_alias_index::install(Arc::new(index));
+    }
+    ALIAS_BUILDER_DIRTY.store(false, Ordering::Release);
 }
 
-fn dynamic_canonical_by_lang() -> &'static RwLock<HashMap<String, HashMap<String, &'static str>>> {
-    DYNAMIC_CANONICAL_BY_LANG.get_or_init(|| RwLock::new(HashMap::new()))
+/// 封存构建期容器：确保最新增量已提交，然后释放构建期 `HashMap`。
+///
+/// 语义包全量热载（10 张分表灌完）后调用一次，稳态只留不可变双索引；之后若再
+/// `load_aliases_for_lang`，会从空容器重新累积（与断开重连语义一致）。
+pub fn seal_alias_builder() {
+    commit_alias_index();
+    if let Ok(mut guard) = alias_builder_slot().write() {
+        guard.take();
+    }
+    ALIAS_BUILDER_DIRTY.store(false, Ordering::Release);
+}
+
+/// 取当前索引；存在未提交增量时先提交（惰性闸）
+fn current_alias_index() -> Option<Arc<crate::tag_alias_index::TagAliasIndex>> {
+    if ALIAS_BUILDER_DIRTY.load(Ordering::Acquire) {
+        commit_alias_index();
+    }
+    crate::tag_alias_index::installed()
 }
 
 /// 规约语言标识（支持 "zh-CN", "zh_CN", "zh" -> "zh", "en-US" -> "en" 等）
@@ -175,83 +214,13 @@ where
     S1: AsRef<str>,
     S2: AsRef<str>,
 {
-    // 受控前缀优先级：omw.* (3) > hownet.* (2) > builtin.* (1) > 其它/_ext.* (0)
-    fn code_priority(code: &str) -> u8 {
-        if code.starts_with("omw.") {
-            3
-        } else if code.starts_with("hownet.") {
-            2
-        } else if code.starts_with("builtin.") {
-            1
-        } else {
-            0
-        }
-    }
-
-    // 冲突仲裁：返回 true 表示 incoming 应覆盖 existing
-    // 由于 SQL 查询已按 is_canonical DESC, count DESC 排序，
-    // 最权威、词频最高的概念最先被读取入表，同优先级下保留最先入表的高频词义，
-    // 仅当 incoming 体系优先级更高 (omw > hownet > builtin) 时才允许覆盖。
-    fn prefer_incoming(existing: &str, incoming: &str) -> bool {
-        let p_existing = code_priority(existing);
-        let p_incoming = code_priority(incoming);
-        p_incoming > p_existing
-    }
-
-    let norm_lang = normalize_language_code(lang).to_string();
-    let mut by_lang_guard = dynamic_aliases_by_lang().write().unwrap();
-    let mut canonical_guard = dynamic_canonical_by_lang().write().unwrap();
-    let mut global_guard = dynamic_aliases().write().unwrap();
-
-    let lang_map = by_lang_guard.entry(norm_lang.clone()).or_insert_with(HashMap::new);
-    let can_map = canonical_guard.entry(norm_lang).or_insert_with(HashMap::new);
-
-    for (lemma, code, is_canonical) in entries {
-        let norm_lemma = normalize_lemma(lemma.as_ref());
-        if norm_lemma.is_empty() {
-            continue;
-        }
-        let code_ref = code.as_ref();
-        // 门禁：受控别名表严禁载入 _ext.* 非受控扩展代码
-        if !is_controlled_code(code_ref) {
-            continue;
-        }
-        let should_insert = match lang_map.get(&norm_lemma) {
-            Some(existing) => is_canonical && prefer_incoming(existing, code_ref),
-            None => true,
-        };
-
-        if should_insert {
-            // 指针复用：语言分表已存在相同 code 时直接复用，避免重复 Box::leak
-            let leaked_code: &'static str = match lang_map.get(&norm_lemma) {
-                Some(&existing) if existing == code_ref => existing,
-                _ => Box::leak(code_ref.to_string().into_boxed_str()),
-            };
-            lang_map.insert(norm_lemma.clone(), leaked_code);
-
-            // 全局表独立仲裁（同名 lemma 跨语言分表可能映射不同 code，
-            // 维持 omw.* 优先，其余后写覆盖，与分表规则一致）
-            match global_guard.get(&norm_lemma) {
-                Some(&existing) if existing == leaked_code => {}
-                Some(&existing) if !is_canonical || !prefer_incoming(existing, leaked_code) => {}
-                _ => {
-                    global_guard.insert(norm_lemma.clone(), leaked_code);
-                }
-            }
-        }
-
-        // 规范展示名仲裁 (以 code_ref 为主键，独立于 lemma 映射是否插入):
-        // 1. 若 is_canonical 为 true，优先更新覆盖；
-        // 2. 若当前分表中尚未记录该 code 的展示名，以首个出现的词形保底记录，
-        //    防止因同名 lemma 未更新导致特定 code 的母语展示名被漏登 (Q2 选项 A)。
-        if is_canonical || !can_map.contains_key(code_ref) {
-            let leaked_lemma: &'static str = match can_map.get(code_ref) {
-                Some(&existing) if is_canonical && existing == lemma.as_ref() => existing,
-                _ => Box::leak(lemma.as_ref().to_string().into_boxed_str()),
-            };
-            can_map.insert(code_ref.to_string(), leaked_lemma);
-        }
-    }
+    let mut guard = match alias_builder_slot().write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let builder = guard.get_or_insert_with(crate::tag_alias_index::TagAliasBuilder::new);
+    builder.push_lang(lang, entries);
+    ALIAS_BUILDER_DIRTY.store(true, Ordering::Release);
 }
 
 /// 动态批量载入受控标签别名（由 SQLite 连接时读取 tag_aliases 表注入，或从 json 载入）
@@ -273,6 +242,8 @@ where
     for (lang, list) in batch_by_lang {
         load_aliases_for_lang(lang, list);
     }
+    // 增量灌完立即提交，避免读取路径依赖惰性闸（显式优于隐式）
+    commit_alias_index();
 }
 
 /// 受控标签 code 反查（运行时单语言/全局归一入口）
@@ -287,15 +258,15 @@ pub fn resolve_controlled_tag_code(tag: &str) -> Option<&'static str> {
     if key.is_empty() {
         return None;
     }
-    // 1. 动态轨（含 omw.* / hownet.* / builtin.*）
-    if let Ok(dyn_map) = dynamic_aliases().read() {
-        if let Some(&code) = dyn_map.get(&key) {
+    // 1. 动态轨（含 omw.* / hownet.* / builtin.*），走全局索引（等价原 DYNAMIC_ALIASES）
+    if let Some(index) = current_alias_index() {
+        if let Some(code) = index.global_code(&key) {
             if is_controlled_code(code) {
                 return Some(code);
             }
         }
         for cand in english_lemma_candidates(&key) {
-            if let Some(&code) = dyn_map.get(&cand) {
+            if let Some(code) = index.global_code(&cand) {
                 if is_controlled_code(code) {
                     return Some(code);
                 }
@@ -345,17 +316,19 @@ pub fn english_lemma_candidates(key: &str) -> Vec<String> {
     candidates
 }
 
-fn lookup_map_with_en_lemmas<'a>(
-    map: &'a HashMap<String, &'static str>,
+/// 单语言分表反查（含英文词形还原候选），等价原 `lookup_map_with_en_lemmas`
+fn lang_lookup_with_en_lemmas(
+    index: &crate::tag_alias_index::TagAliasIndex,
+    lang: &str,
     key: &str,
 ) -> Option<&'static str> {
-    if let Some(&code) = map.get(key) {
+    if let Some(code) = index.lang_code(lang, key) {
         if is_controlled_code(code) {
             return Some(code);
         }
     }
     for cand in english_lemma_candidates(key) {
-        if let Some(&code) = map.get(&cand) {
+        if let Some(code) = index.lang_code(lang, &cand) {
             if is_controlled_code(code) {
                 return Some(code);
             }
@@ -404,14 +377,13 @@ pub fn resolve_controlled_tag_two_stage(
     }
     let curr_lang = normalize_language_code(current_lang.unwrap_or("zh"));
     let detected_lang = detect_tag_language(tag);
+    let index = current_alias_index();
 
     // 辅助闭包：反查当前系统语言的权威规范展示名 (Q2 选项 A 就地本地化)
     let resolve_canonical = |code: &str| -> Option<String> {
-        if let Ok(canon_guard) = dynamic_canonical_by_lang().read() {
-            if let Some(cmap) = canon_guard.get(curr_lang) {
-                if let Some(&name) = cmap.get(code) {
-                    return Some(name.to_string());
-                }
+        if let Some(idx) = index.as_ref() {
+            if let Some(name) = idx.canonical_name(curr_lang, code) {
+                return Some(name.to_string());
             }
         }
         let fallback_name = tag_display(code, curr_lang);
@@ -424,16 +396,14 @@ pub fn resolve_controlled_tag_two_stage(
 
     // ─── 第一阶段：当前语言分表直查 ───
     if detected_lang == curr_lang {
-        if let Ok(by_lang) = dynamic_aliases_by_lang().read() {
-            if let Some(map) = by_lang.get(curr_lang) {
-                if curr_lang == "en" {
-                    if let Some(code) = lookup_map_with_en_lemmas(map, &key) {
-                        return Some((code, None));
-                    }
-                } else if let Some(&code) = map.get(&key) {
-                    if is_controlled_code(code) {
-                        return Some((code, None));
-                    }
+        if let Some(idx) = index.as_ref() {
+            if curr_lang == "en" {
+                if let Some(code) = lang_lookup_with_en_lemmas(idx, curr_lang, &key) {
+                    return Some((code, None));
+                }
+            } else if let Some(code) = idx.lang_code(curr_lang, &key) {
+                if is_controlled_code(code) {
+                    return Some((code, None));
                 }
             }
         }
@@ -455,20 +425,16 @@ pub fn resolve_controlled_tag_two_stage(
 
     // ─── 异语分表反查 ───
     let mut matched_code: Option<&'static str> = None;
-    if let Ok(by_lang) = dynamic_aliases_by_lang().read() {
-        if let Some(map) = by_lang.get(detected_lang) {
-            if detected_lang == "en" {
-                matched_code = lookup_map_with_en_lemmas(map, &key);
-            } else if let Some(&code) = map.get(&key) {
-                if is_controlled_code(code) {
-                    matched_code = Some(code);
-                }
+    if let Some(idx) = index.as_ref() {
+        if detected_lang == "en" {
+            matched_code = lang_lookup_with_en_lemmas(idx, detected_lang, &key);
+        } else if let Some(code) = idx.lang_code(detected_lang, &key) {
+            if is_controlled_code(code) {
+                matched_code = Some(code);
             }
         }
         if matched_code.is_none() && detected_lang != "en" {
-            if let Some(map) = by_lang.get("en") {
-                matched_code = lookup_map_with_en_lemmas(map, &key);
-            }
+            matched_code = lang_lookup_with_en_lemmas(idx, "en", &key);
         }
     }
 
@@ -486,15 +452,13 @@ pub fn resolve_controlled_tag_two_stage(
 
 /// 清空动态别名字典（用于热切换或断开连接时）
 pub fn clear_dynamic_aliases() {
-    if let Ok(mut map) = dynamic_aliases().write() {
-        map.clear();
+    // 清空构建期缓冲与安装槽；`code_intern` 层**不清空**——已发出的 `&'static str`
+    // 一旦悬垂即为 UB（PRD 07 决策 6）。
+    if let Ok(mut guard) = alias_builder_slot().write() {
+        guard.take();
     }
-    if let Ok(mut map) = dynamic_aliases_by_lang().write() {
-        map.clear();
-    }
-    if let Ok(mut map) = dynamic_canonical_by_lang().write() {
-        map.clear();
-    }
+    ALIAS_BUILDER_DIRTY.store(false, Ordering::Release);
+    crate::tag_alias_index::uninstall();
 }
 
 fn alias_map() -> &'static HashMap<String, String> {
@@ -581,13 +545,12 @@ pub fn tag_display(code: &str, lang: &str) -> String {
         }
     }
 
-    // 2. 动态规范词典：omw.*/hownet.* 的母语规范展示名由 semantic.pack 热载入轨写入 dynamic_canonical_by_lang
-    if let Ok(canon_guard) = dynamic_canonical_by_lang().read() {
-        if let Some(cmap) = canon_guard.get(normalize_language_code(lang)) {
-            if let Some(&name) = cmap.get(clean_code) {
-                if !name.is_empty() && name != clean_code {
-                    return name.to_string();
-                }
+    // 2. 动态规范词典：omw.*/hownet.* 的母语规范展示名由 semantic.pack 热载入轨写入 canonical 索引
+    //    （原 `dynamic_canonical_by_lang`，PRD 07 后由 `TagAliasIndex::canonical_name` 承载）
+    if let Some(idx) = current_alias_index() {
+        if let Some(name) = idx.canonical_name(normalize_language_code(lang), clean_code) {
+            if !name.is_empty() && name != clean_code {
+                return name.to_string();
             }
         }
     }
@@ -723,8 +686,8 @@ pub fn concept_from_code_or_alias(raw: &str) -> Option<crate::concepts::Concept>
 pub fn builtin_tag_code(tag: &str) -> Option<&'static str> {
     let key = normalize_lemma(tag);
     // 1. 优先查动态载入字典（DB/JSON 热载入轨）
-    if let Ok(dyn_map) = dynamic_aliases().read() {
-        if let Some(&code) = dyn_map.get(&key) {
+    if let Some(idx) = current_alias_index() {
+        if let Some(code) = idx.global_code(&key) {
             if is_controlled_code(code) {
                 return Some(code);
             }
