@@ -41,13 +41,19 @@ use omni_pro::{
     UnmappedStats,
 };
 
-pub mod moss_tts;
 pub mod routes;
-pub mod sherpa_manager;
 pub mod text_chunker;
 
-pub use moss_tts::MossTtsManager;
-pub use sherpa_manager::{decode_audio_to_16k_mono, decode_audio_to_16k_mono_bandpass, normalize_ced_audio_event, SherpaManager};
+pub use omni_pro::audio::{
+    decode_audio_to_16k_mono, decode_audio_to_16k_mono_bandpass, normalize_ced_audio_event,
+    scale_wav_speed, MossTtsManager, SherpaManager,
+};
+pub mod moss_tts {
+    pub use omni_pro::audio::*;
+}
+pub mod sherpa_manager {
+    pub use omni_pro::audio::*;
+}
 
 /// CLIP 互斥组标准名称定义
 const GROUP_COLOR_MODE: &str = "色彩模式";
@@ -2104,7 +2110,7 @@ async fn perceive_file_handler(
         let t_bin = std::time::Instant::now();
         let fp = file_path.clone();
         let res = tokio::task::spawn_blocking(move || {
-            omni_core::analyze_binary(std::path::Path::new(&fp)).ok()
+            omni_pro::binarylens::analyze_binary(std::path::Path::new(&fp)).ok()
         })
         .await
         .unwrap_or(None);

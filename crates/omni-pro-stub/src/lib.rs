@@ -2089,3 +2089,141 @@ mod tests {
 
 
 
+
+pub mod audio {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    #[derive(Debug, Clone)]
+    pub struct SenseVoiceResult {
+        pub clean_text: String,
+        pub language_code: Option<String>,
+        pub emotion_tag: Option<String>,
+        pub event_tag: Option<String>,
+    }
+
+    pub fn normalize_ced_audio_event(_raw_event: &str) -> String {
+        String::new()
+    }
+
+    pub fn decode_audio_to_16k_mono<P: AsRef<Path>>(_path: P) -> Result<Vec<f32>, String> {
+        Err("Audio decoding is not available in Community Edition".to_string())
+    }
+
+    pub fn decode_audio_to_16k_mono_bandpass<P: AsRef<Path>>(_path: P, _low_cutoff: f32, _high_cutoff: f32) -> Result<Vec<f32>, String> {
+        Err("Audio bandpass decoding is not available in Community Edition".to_string())
+    }
+
+    pub struct SherpaManager;
+    impl SherpaManager {
+        pub fn new() -> Self {
+            Self
+        }
+        pub fn denoise(&self, _samples: &[f32], _sample_rate: i32) -> Vec<f32> {
+            Vec::new()
+        }
+        pub fn vad_filter(&self, _samples: &[f32], _sample_rate: i32) -> (bool, Vec<f32>) {
+            (false, Vec::new())
+        }
+        pub fn transcribe_full(&self, _samples: &[f32], _sample_rate: i32) -> Option<SenseVoiceResult> {
+            None
+        }
+        pub fn transcribe(&self, _samples: &[f32], _sample_rate: i32) -> Option<String> {
+            None
+        }
+        pub fn tag_audio(&self, _samples: &[f32], _sample_rate: i32, _top_k: usize) -> Vec<String> {
+            Vec::new()
+        }
+        pub fn is_purification_ready(&self) -> bool {
+            false
+        }
+        pub fn purify_vocal_and_extract_dry_stem(&self, _samples: &[f32], _sample_rate: i32) -> Result<Vec<f32>, String> {
+            Err("Audio purification not available in Community Edition".to_string())
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct VoicePromptData {
+        pub voice_id: String,
+        pub name: String,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct SynthResult {
+        pub wav_bytes: Vec<u8>,
+        pub sample_rate: u32,
+        pub duration_ms: u64,
+        pub rtf: f32,
+    }
+
+    pub fn scale_wav_speed(_wav_bytes: &[u8], _speed: f32) -> Result<Vec<u8>, String> {
+        Err("Speed scaling not available in Community Edition".to_string())
+    }
+
+    pub struct MossTtsManager;
+    impl MossTtsManager {
+        pub fn new() -> Self {
+            Self
+        }
+        pub fn is_ready(&self) -> bool {
+            false
+        }
+        pub fn semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+            Arc::new(tokio::sync::Semaphore::new(1))
+        }
+        pub fn synthesize(&self, _text: &str, _voice: &VoicePromptData, _speed: f32) -> Result<SynthResult, String> {
+            Err("MOSS-TTS is not available in Community Edition".to_string())
+        }
+        pub fn synthesize_with_cancel(&self, _text: &str, _voice: &VoicePromptData, _speed: f32, _cancel_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Result<SynthResult, String> {
+            Err("MOSS-TTS is not available in Community Edition".to_string())
+        }
+        pub fn extract_voice_codes(&self, _samples_16k: &[f32]) -> Result<Vec<Vec<i16>>, String> {
+            Err("Voice extraction not available in Community Edition".to_string())
+        }
+    }
+}
+pub use audio::*;
+
+
+pub mod fact_tags {
+    use omni_core::TagChainItem;
+    use serde_json::Value;
+
+    pub const ENGINE_METADATA: &str = "metadata";
+
+    #[derive(Debug, Clone, Default)]
+    pub struct FactTagContext<'a> {
+        pub metadata: &'a Value,
+        pub file_path: Option<&'a str>,
+        pub extension: Option<&'a str>,
+        pub media_domain: Option<omni_core::MediaDomain>,
+        pub file_source: Option<String>,
+        pub workflow_state: Option<String>,
+        pub security_level: Option<String>,
+        pub quality_score: Option<f32>,
+        pub language_label: Option<String>,
+    }
+
+    pub struct OmniFactTagExtractor;
+
+    impl OmniFactTagExtractor {
+        pub fn extract(_ctx: &FactTagContext<'_>) -> Vec<TagChainItem> {
+            Vec::new()
+        }
+    }
+
+    pub fn extract_fact_tags(_metadata: &Value) -> Vec<TagChainItem> {
+        Vec::new()
+    }
+}
+pub use fact_tags::*;
+
+pub mod binarylens {
+    use std::path::Path;
+    use omni_core::{BinaryAnalysisInfo, BinaryLensError};
+
+    pub fn analyze_binary(_path: &Path) -> Result<BinaryAnalysisInfo, BinaryLensError> {
+        Err(BinaryLensError::UnsupportedFormat("BinaryLens is a Pro feature".to_string()))
+    }
+}
+pub use binarylens::*;
