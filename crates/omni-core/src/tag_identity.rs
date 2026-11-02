@@ -17,7 +17,7 @@ pub fn content_hash8(input: &str) -> String {
     hex[..8.min(hex.len())].to_string()
 }
 
-fn sanitize_en_slug(raw: &str) -> String {
+pub fn sanitize_en_slug(raw: &str) -> String {
     let lower = raw.trim().to_lowercase();
     let mut out = String::with_capacity(lower.len());
     let mut last_us = false;

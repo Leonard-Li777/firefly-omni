@@ -349,7 +349,13 @@ impl TagAdmissibility {
             verb_adv_pos: vec!["v".into(), "r".into()],
             banned_lemmas: Vec::new(),
             banned_lexfiles: vec!["adv.all".into(), "adj.pert".into()],
-            shell_nouns: Vec::new(),
+            shell_nouns: vec![
+                "习惯".into(), "情况".into(), "问题".into(), "方式".into(), "方法".into(),
+                "原因".into(), "结果".into(), "过程".into(), "状态".into(), "内容".into(),
+                "意义".into(), "目的".into(), "现象".into(), "东西".into(), "事情".into(),
+                "部分".into(), "中央".into(), "画面".into(), "整体".into(),
+                "habit".into(), "situation".into(), "problem".into(), "method".into(), "process".into(), "result".into(),
+            ],
             builtin_default: true,
         }
     }
@@ -619,8 +625,8 @@ pub fn is_jieba_tag_compound_prefix(tag: &str) -> bool {
     if t.is_empty() {
         return false;
     }
-    // 名词族 (n, nr, ns, nt, nz, nl, ng, vn, an)、形容词族 (a, ag, al)、动词族 (v) 或 英文 (eng)
-    t.starts_with('n') || t.starts_with('a') || t.starts_with('v') || t == "eng"
+    // 名词族 (n, nr, ns, nt, nz, nl, ng, vn, an)、形容词族 (a, ag, al)、区别词 (b, bl)、动词族 (v) 或 英文 (eng)
+    t.starts_with('n') || t.starts_with('a') || t.starts_with('b') || t.starts_with('v') || t == "eng"
 }
 
 /// 判定 jieba 分词的 POS 标注是否可以作为二元复合实体的中心语/后置词 (Suffix)
@@ -629,9 +635,74 @@ pub fn is_jieba_tag_compound_suffix(tag: &str) -> bool {
     if t.is_empty() {
         return false;
     }
-    // 复合词中心语必须为名词族 (n, nr, ns, nt, nz, nl, ng)、名动词 (vn)、名形词 (an) 或 英文 (eng)
+    // 复合词中心语必须为名词族 (n, nr, ns, nt, nz, nl, ng)、名动词 (vn)、名形词 (an)、时间词 (t) 或 英文 (eng)
     // 严禁纯动词族 (v, vd, vg 等) 充当非受控自由复合短语的词尾中心语
-    t.starts_with('n') || t == "vn" || t == "an" || t == "eng"
+    t.starts_with('n') || t == "vn" || t == "an" || t.starts_with('t') || t == "eng"
+}
+
+/// 独立候选词准入判定（严格遵循 O(1) 成本递增短路）
+#[inline]
+pub fn is_admissible_standalone_candidate(word: &str, pos: &str) -> bool {
+    // Step 1: 词长与 G1 基础词形短路
+    if word.chars().count() < 2 || is_g1_rejected(word) {
+        return false;
+    }
+    // Step 2: 独立候选必须是名词族、动名词(vn)、英文实体(eng)或成语(i)；
+    // 严禁纯动词(v)、形容词(a)、区别词(b)、数词(m)、量词(q)、方位词(f)等独立成标
+    let valid_standalone_pos = pos.starts_with('n') || pos == "vn" || pos.starts_with('t') || pos == "eng" || pos == "i";
+    if !valid_standalone_pos {
+        return false;
+    }
+    if is_jieba_tag_non_entity(pos) {
+        return false;
+    }
+    // Step 3: 单一数据源壳名词（如“部分”、“情况”、“数据”）与违禁词拦截
+    !is_shell_noun(word) && !is_banned_lemma(word)
+}
+
+/// 二元复合词 (modifier + head) 准入判定（Head-Noun & Modifier 规则）
+#[inline]
+pub fn is_admissible_compound_candidate(
+    modifier: &str,
+    mod_pos: &str,
+    head: &str,
+    head_pos: &str,
+    compound: &str,
+) -> bool {
+    // Step 1: 整体词长不能超标（不超过 8 字）且通过 G1 词形与壳名词/违禁词拦截
+    if compound.chars().count() < 2 || compound.chars().count() > 8 {
+        return false;
+    }
+    if is_g1_rejected(compound) || is_shell_noun(compound) || is_banned_lemma(compound) {
+        return false;
+    }
+    // Step 2: 中心语（后词）必须具备有效实体名词或名动词性
+    // 注意：抽象壳名词（如“问题”、“方法”、“习惯”）禁止单独成标，但在二元偏正复合词中（如“网络问题”、“生活习惯”）作为中心语是合法的！
+    // 严禁空间方位/构图词（“中央”、“中间”、“周围”、“上面”、“下面”）充当中心语
+    if head == "中央" || head == "中间" || head == "周围" || head == "上面" || head == "下面" {
+        return false;
+    }
+    let is_governance_head = head == "治理" || head == "管理" || head == "建设" || head == "研发";
+    let valid_head_pos = head_pos.starts_with('n')
+        || head_pos == "vn"
+        || head_pos == "an"
+        || head_pos.starts_with('t')
+        || head_pos == "eng"
+        || is_governance_head;
+    if !valid_head_pos || is_jieba_tag_non_entity(head_pos) || is_banned_lemma(head) {
+        return false;
+    }
+    // Step 3: 修饰语（前词）词性受控放行（允许名词族、动名词 vn、形容词 a、区别词 b）
+    let valid_mod_pos = mod_pos.starts_with('n')
+        || mod_pos == "vn"
+        || mod_pos.starts_with('a')
+        || mod_pos.starts_with('b')
+        || mod_pos == "eng";
+    if !valid_mod_pos {
+        return false;
+    }
+    // Step 4: 修饰语自身不得命中壳名词或违禁词（阻断“部分人员 [shell+n]”、“画面中央 [shell+head]”）
+    !is_shell_noun(modifier) && !is_banned_lemma(modifier)
 }
 
 /// 规则资源所在目录候选。
@@ -1520,6 +1591,9 @@ mod tests {
         assert!(is_shell_noun("现象"));
         assert!(is_shell_noun("东西"));
         assert!(is_shell_noun("事情"));
+        assert!(is_shell_noun("中央"));
+        assert!(is_shell_noun("画面"));
+        assert!(is_shell_noun("整体"));
         assert!(is_shell_noun("habit"));
         assert!(is_shell_noun("problem"));
 
