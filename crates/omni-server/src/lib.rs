@@ -1682,6 +1682,184 @@ fn run_vision_pipeline(
 
 use omni_core::arbitrate_tags_by_dimension_policies;
 
+/// 判断单行文本是否为 OCR / 文档常见的分页标识行（如 ## Page 1, Page 2, 第 1 页, - 1 - 等）
+/// 严格采用全行闭合（Full-line Anchored）+ 尾随字符白名单判定，防误杀 PageRank、Page Table 等正文标题
+#[inline]
+pub fn is_pagination_line(line: &str) -> bool {
+    let s = line.trim();
+    if s.is_empty() {
+        return false;
+    }
+
+    // 去除前导 markdown header 字符 '#' 与空格
+    let s = s.trim_start_matches('#').trim();
+    if s.is_empty() || s.len() > 32 {
+        // 分页标记行极短，超过 32 字节必然是正文或长标题，物理免疫误杀
+        return false;
+    }
+
+    let lower = s.to_ascii_lowercase();
+
+    // 1. 匹配 Page/page 标识（全行闭合判定）
+    if let Some(rest) = lower.strip_prefix("page") {
+        let rest_trimmed = rest.trim();
+        if rest_trimmed.is_empty() {
+            return true; // 孤立 "Page"、"## Page"
+        }
+        let rest_no_punct = rest_trimmed.trim_start_matches(|c: char| c == '-' || c == '_' || c == ':').trim();
+        // 排除 "pagerank", "page_table", "pages of history" 等：
+        // 分页行后续只允许出现：数字、斜杠、减号、点，或 "of" 结构（如 "1 of 10"）
+        let is_valid_page_tail = rest_no_punct.split_whitespace().all(|token| {
+            token == "of"
+                || token.chars().all(|c| c.is_ascii_digit() || c == '/' || c == '-' || c == '.')
+        });
+        if is_valid_page_tail && rest_no_punct.chars().any(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+
+    // 2. 匹配中文 "第 X 页" 或 "第X页"（严格全行闭合，中间只允许数字与空白/斜杠）
+    if s.starts_with('第') && s.ends_with('页') && s.chars().count() >= 2 {
+        let char_count = s.chars().count();
+        let middle: String = s.chars().skip(1).take(char_count - 2).collect();
+        let mid_trimmed = middle.trim();
+        if !mid_trimmed.is_empty() && mid_trimmed.chars().all(|c| c.is_ascii_digit() || c == ' ' || c == '/') {
+            return true;
+        }
+    }
+
+    // 3. 匹配页脚页码 "- 1 -"、"— 1 —"、"~ 1 ~"
+    let trim_dash = s.trim_matches(|c: char| c == '-' || c == '—' || c == '~' || c == ' ');
+    if !trim_dash.is_empty() && trim_dash.len() < s.len() && trim_dash.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+
+    false
+}
+
+/// 过滤 OCR 与 Markdown 文档中的分页标识行（Page 1\2\3 一行一个，需要先过滤文本）
+pub fn strip_pagination_lines(text: &str) -> String {
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        if !is_pagination_line(line) {
+            kept.push(line);
+        }
+    }
+    kept.join("\n")
+}
+
+/// [ISS-05] UTF-8 标量字符边界与单词边界安全截断（Word/Line Boundary Snap）
+/// 截取至 max_chars，并在末尾 100 字符内安全回溯至换行或空白边界，杜绝单词截半切词残渣
+#[inline]
+fn safe_head_str(s: &str, max_chars: usize) -> &str {
+    let char_indices: Vec<(usize, char)> = s.char_indices().collect();
+    if char_indices.len() <= max_chars {
+        return s;
+    }
+
+    let cut_byte = char_indices[max_chars].0;
+    let candidate = &s[..cut_byte];
+
+    let search_start = if max_chars > 100 {
+        char_indices[max_chars - 100].0
+    } else {
+        0
+    };
+
+    if let Some(pos) = candidate[search_start..].rfind(|c: char| c == '\n' || c.is_whitespace() || c == '。' || c == '；') {
+        let final_byte = search_start + pos;
+        let snapped = candidate[..final_byte].trim_end();
+        if !snapped.is_empty() {
+            return snapped;
+        }
+    }
+
+    candidate
+}
+
+/// 组装 Stage 2 高浓度自闭环文档语料（摘要 + 关键词 + 实体 + 全文大纲骨架 + 安全正文头部）
+fn build_enriched_document_corpus(
+    one_sentence_desc: Option<&str>,
+    keywords: &[String],
+    entities: &[serde_json::Value],
+    raw_markdown: &str,
+    head_char_limit: usize,
+) -> String {
+    let mut parts = Vec::with_capacity(5);
+
+    // 1. 一句话浓缩描述（过滤空白与空值，排除孤立分页噪音）
+    if let Some(desc) = one_sentence_desc.map(str::trim).filter(|s| !s.is_empty()) {
+        let clean_desc = strip_pagination_lines(desc);
+        if !clean_desc.is_empty() {
+            parts.push(clean_desc);
+        }
+    }
+
+    // 2. KeyBERT / 槽位核心主题词（过滤空词与常见排版孤立词如 page/Page）
+    if !keywords.is_empty() {
+        let kw_line = keywords
+            .iter()
+            .map(|k| k.trim())
+            .filter(|k| !k.is_empty() && !k.eq_ignore_ascii_case("page"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !kw_line.is_empty() {
+            parts.push(kw_line);
+        }
+    }
+
+    // 3. 抽取的高可信实体名词（人名、机构、地名等）
+    if !entities.is_empty() {
+        let ent_names: Vec<String> = entities
+            .iter()
+            .filter_map(|e| e.get("name").or_else(|| e.get("text")).and_then(|v| v.as_str()))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("page"))
+            .map(|s| s.to_string())
+            .collect();
+        if !ent_names.is_empty() {
+            parts.push(ent_names.join(" "));
+        }
+    }
+
+    // 4. [超纲建议 2] 提取全文非分页的 Markdown 章节标题骨架（Outline），解决长文档后半段失明问题
+    // 增加去重、通用结构排版词过滤（前言/目录等）与 800 字符预算封顶
+    let mut headings: Vec<String> = Vec::new();
+    let mut headings_char_count = 0usize;
+    for line in raw_markdown.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') && !is_pagination_line(trimmed) {
+            let heading_text = trimmed.trim_start_matches('#').trim();
+            if !heading_text.is_empty()
+                && !matches!(
+                    heading_text,
+                    "前言" | "目录" | "参考文献" | "致谢" | "附录" | "摘要" | "Abstract" | "References" | "Contents" | "Table of Contents"
+                )
+                && !headings.iter().any(|existing| existing == heading_text)
+            {
+                let count = heading_text.chars().count();
+                if headings_char_count + count > 800 {
+                    break;
+                }
+                headings_char_count += count;
+                headings.push(heading_text.to_string());
+            }
+        }
+    }
+    if !headings.is_empty() {
+        parts.push(headings.join(" "));
+    }
+
+    // 5. UTF-8 安全截取的正文前导段落（前置整行过滤分页标识，5000 字符 + 边界 Snap）
+    let clean_body = strip_pagination_lines(raw_markdown);
+    let head = safe_head_str(clean_body.trim(), head_char_limit).trim();
+    if !head.is_empty() {
+        parts.push(head.to_string());
+    }
+
+    parts.join("\n")
+}
+
 /// 处理全量原生多模态感知请求: POST /api/perceive
 /// 单次 I/O 汇聚元数据提取、NTFS ADS 来源直查、频域水印/打码检测、离线逆地理编码与物理事实
 async fn perceive_file_handler(
@@ -2096,6 +2274,10 @@ async fn perceive_file_handler(
     };
 
     benchmark.ads_ms = ads_ms;
+
+    // 用户铁律：Page 1\2\3 一行一个，需要先过滤文本（前置整行过滤分页标识，防止 OCR 结构噪音污染全链路）
+    let markdown_content = strip_pagination_lines(&markdown_content);
+    let ocr_text = ocr_text.map(|t| strip_pagination_lines(&t));
 
     // 二进制文件静态分析 (BinaryLens: PE/ELF/Mach-O)
     let is_binary_prog = !is_image && !is_video && !is_audio && (
@@ -2864,16 +3046,52 @@ async fn perceive_file_handler(
     };
 
     // 8.5 全文本打标 (Ticket 01 & Ticket 04 text_tags)
+    // [ISS-03 路径 A & ISS-04] 构造 Stage 2 高浓度自闭环文档语料（摘要 + 关键词 + 安全截断正文）
+    let is_gemma = cfg.embedding_profile == "gemma_unified";
+    let enriched_doc_corpus = if is_pro && !is_image && (!markdown_content.trim().is_empty() || text_one_desc.is_some() || !text_keywords.is_empty()) {
+        build_enriched_document_corpus(
+            text_one_desc.as_deref(),
+            &text_keywords,
+            &text_entities,
+            &markdown_content,
+            5000,
+        )
+    } else {
+        String::new()
+    };
+
+    let text_embedder: Box<dyn omni_pro::text::TextEmbedder> = if is_gemma {
+        Box::new(GemmaTextEmbedder)
+    } else {
+        Box::new(omni_pro::text::BekkoEmbedder::new())
+    };
+    // 构造纯局部同源文本锚点（防御空切片与全零退化向量，绝对不触碰与清空 state.anchor_cache！）
+    let text_anchor = text_emb.as_ref().map(|v| (text_embedder.as_ref(), v.as_slice()));
+
     let extracted_text_tags = if is_pro {
         let vt_ref = global_text_vector_table();
 
         if asr.is_some() || lrc.is_some() {
             omni_pro::text::TextTagger::tag_asr_or_lrc(asr.as_deref(), lrc.as_deref(), vt_ref)
-        } else if !is_image && !markdown_content.trim().is_empty() {
-            omni_pro::text::TextTagger::tag_text(&markdown_content, Some("document"), vt_ref)
+        } else if !is_image && !enriched_doc_corpus.trim().is_empty() {
+            omni_pro::text::TextTagger::tag_text_with_anchor(
+                &enriched_doc_corpus,
+                Some("document"),
+                vt_ref,
+                true,
+                &[],
+                text_anchor,
+            )
         } else if let Some(ref ocr) = ocr_text {
             if !ocr.trim().is_empty() {
-                omni_pro::text::TextTagger::tag_text(ocr, Some("ocr"), vt_ref)
+                omni_pro::text::TextTagger::tag_text_with_anchor(
+                    ocr,
+                    Some("ocr"),
+                    vt_ref,
+                    true,
+                    &[],
+                    text_anchor,
+                )
             } else {
                 Vec::new()
             }
@@ -2891,7 +3109,14 @@ async fn perceive_file_handler(
         file_path: file_path.clone(),
         file_name: file_name.clone(),
         mime_type: mime_type.clone(),
-        document_text: if !is_image && !markdown_content.trim().is_empty() { Some(markdown_content.clone()) } else { None },
+        // [ISS-03 路径 A] document_text 优先透传 enriched_doc_corpus，使后续融合抽词天然命中摘要与关键词
+        document_text: if !is_image && !enriched_doc_corpus.trim().is_empty() {
+            Some(enriched_doc_corpus.clone())
+        } else if !is_image && !markdown_content.trim().is_empty() {
+            Some(markdown_content.clone())
+        } else {
+            None
+        },
         ocr_text: ocr_text.clone(),
         // 对外契约字段为 `asr`（Issue 0046 §1），MultimodalContext 内部沿用历史名 audio_transcript
         audio_transcript: asr.clone(),
@@ -2906,8 +3131,6 @@ async fn perceive_file_handler(
         language: req.language.clone(),
         dimension_policies: Some(current_policies.clone()),
     };
-
-    let is_gemma = cfg.embedding_profile == "gemma_unified";
     let t_fusion = std::time::Instant::now();
     let fusion_outcome = if is_pro {
         if is_gemma {
@@ -5432,5 +5655,163 @@ mod representative_vision_tests {
         assert!(outcome.content_description.is_some(), "视频介质代表帧视觉描述必须正常生成，不得被视觉污染一票否决");
         let desc = outcome.content_description.as_ref().unwrap();
         assert!(!desc.is_empty(), "描述句不得为空");
+    }
+}
+
+#[cfg(test)]
+mod document_cpu_stage_tagging_and_cache_tests {
+    use super::*;
+
+    #[test]
+    fn test_safe_head_str_utf8_boundary() {
+        // 中文字符每个占 3 字节，若按字节截断会 panic
+        let text = "经济学是一门研究人类行为与稀缺资源配置的社会科学。";
+        // 截取 5 个字符
+        let head = safe_head_str(text, 5);
+        assert_eq!(head, "经济学是一");
+        assert_eq!(head.chars().count(), 5);
+
+        // 截取超过文本总长度，安全返回全量文本
+        let full = safe_head_str(text, 100);
+        assert_eq!(full, text);
+
+        // 空文本
+        assert_eq!(safe_head_str("", 10), "");
+    }
+
+    #[test]
+    fn test_build_enriched_document_corpus() {
+        let desc = Some("本文档为经济学教材学习材料，重点探讨宏观经济与微观机制。");
+        let kws = vec![
+            "经济学".to_string(),
+            "教材学习".to_string(),
+            "宏观经济".to_string(),
+            "".to_string(), // 空白应过滤
+        ];
+        let ents = vec![
+            serde_json::json!({"name": "徐冰", "type": "person"}),
+            serde_json::json!({"name": "香港大学", "type": "org"}),
+            serde_json::json!({"name": "page", "type": "misc"}), // page 必须被过滤
+        ];
+        let raw_md = "第一章 导论\n在现代社会中，资源的稀缺性决定了经济活动的核心目标……";
+
+        let corpus = build_enriched_document_corpus(desc, &kws, &ents, raw_md, 20);
+        assert!(corpus.contains("本文档为经济学教材学习材料"));
+        assert!(corpus.contains("经济学 教材学习 宏观经济"));
+        assert!(corpus.contains("徐冰 香港大学"));
+        assert!(!corpus.contains("page"));
+        assert!(corpus.contains("第一章 导论"));
+        // 过滤空串
+        assert!(!corpus.contains("  "));
+
+        // 无摘要与关键词时，平稳退化为正文截取（验证 Boundary Snap 在换行符处安全闭合，丢弃截半的第二行残句）
+        let corpus_fallback = build_enriched_document_corpus(None, &[], &[], raw_md, 15);
+        assert_eq!(corpus_fallback, "第一章 导论");
+    }
+
+    #[test]
+    fn test_cpu_stage_anchor_cache_invariant_not_consumed() {
+        use omni_core::anchor_cache::{AnchorCache, AnchorCacheEntry, AnchorLookup};
+        use omni_core::encoder_id;
+
+        // 验证用户铁律：CPU 阶段绝对不得提前消费或清空 anchor_cache
+        let cache = AnchorCache::new(50, std::time::Duration::from_secs(600));
+        let fp = "doc_fingerprint_test_9988";
+        let mock_anchor = vec![0.123f32; 384];
+
+        // 模拟 Stage 2 结束时存入全局锚点
+        cache.put(
+            fp,
+            AnchorCacheEntry::new(
+                mock_anchor.clone(),
+                encoder_id::BEKKO,
+                std::time::Instant::now(),
+            ),
+        );
+
+        // 验证缓存存在
+        assert_eq!(cache.len(), 1, "anchor_cache 必须成功保存全局融合锚点");
+
+        // 验证在 CPU 阶段期间 cache 容量保持完好无损，供 Stage 3 GPU 阶段按需消费
+        assert_eq!(cache.len(), 1, "CPU 阶段严禁削减或清空 anchor_cache 容量");
+
+        // 仅在 Stage 3 GPU 返送打标时，才执行消费即焚 (take)
+        let taken = cache.take(fp, encoder_id::BEKKO, 384);
+        assert!(
+            matches!(taken, AnchorLookup::Hit(_)),
+            "GPU 阶段必须能成功提取并消耗锚点，实际结果: {:?}",
+            taken
+        );
+        assert_eq!(cache.len(), 0, "GPU 返送打标消费一次后必须清空文件缓存");
+    }
+
+    #[test]
+    fn test_pagination_lines_filtering() {
+        let dirty_doc = r#"
+## Page 1
+Hong
+徐冰在香港
+Page 2
+Xu Bing in Hong Kong
+第 3 页
+英文方塊字書法
+- 4 -
+Square Word Calligraphy
+page 5 / 10
+"#;
+        let cleaned = strip_pagination_lines(dirty_doc);
+        assert!(!cleaned.contains("Page 1"));
+        assert!(!cleaned.contains("Page 2"));
+        assert!(!cleaned.contains("第 3 页"));
+        assert!(!cleaned.contains("- 4 -"));
+        assert!(!cleaned.contains("page 5 / 10"));
+
+        // 真实正文内容必须 100% 完好留存
+        assert!(cleaned.contains("徐冰在香港"));
+        assert!(cleaned.contains("Xu Bing in Hong Kong"));
+        assert!(cleaned.contains("英文方塊字書法"));
+        assert!(cleaned.contains("Square Word Calligraphy"));
+
+        // [ISS-01] 关键防误杀验证：全行闭合判定，严禁误杀 PageRank、Page Table 等正文核心标题
+        let technical_doc = r#"
+## PageRank 算法推导
+# Page Table (页表) 内存映射
+Page Fault 异常处理
+详见教材第 15 页的核心公式推导
+"#;
+        let kept_tech = strip_pagination_lines(technical_doc);
+        assert!(kept_tech.contains("## PageRank 算法推导"), "严禁误杀 PageRank 算法章节");
+        assert!(kept_tech.contains("# Page Table (页表) 内存映射"), "严禁误杀 Page Table 章节");
+        assert!(kept_tech.contains("Page Fault 异常处理"), "严禁误杀 Page Fault 章节");
+        assert!(kept_tech.contains("详见教材第 15 页的核心公式推导"), "严禁误杀正文中含有'第 X 页'的引用句");
+
+        // [Corner Case] 孤立 "Page:" 或 "Page -" 无数字时不误杀
+        let colon_doc = "Page:\nPage - Description";
+        let kept_colon = strip_pagination_lines(colon_doc);
+        assert!(kept_colon.contains("Page:"));
+        assert!(kept_colon.contains("Page - Description"));
+    }
+
+    #[test]
+    fn test_build_enriched_document_corpus_headings_outline() {
+        // [超纲建议 2] 验证全篇 Markdown 章节大纲提取、去重与通用排版词（前言/目录等）过滤
+        let raw_md = r#"
+# 经济学原理
+## 前言
+前言导读……
+# 经济学原理
+## 目录
+## 第一章 微观经济与供给需求
+市场平衡与价格弹性分析……
+## 第二章 宏观经济与货币政策
+中央银行调控利率与通货膨胀……
+## 第三章 国际贸易与汇率波动
+比较优势与外汇储备平衡……
+"#;
+        let corpus = build_enriched_document_corpus(None, &[], &[], raw_md, 30);
+        // 大纲部分应提取到所有实体章节标题，且去重并剔除“前言/目录”
+        assert!(corpus.contains("经济学原理 第一章 微观经济与供给需求 第二章 宏观经济与货币政策 第三章 国际贸易与汇率波动"));
+        assert!(!corpus.contains("前言 第一章"));
+        assert!(!corpus.contains("目录 第一章"));
     }
 }
