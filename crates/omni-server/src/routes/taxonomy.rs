@@ -1407,7 +1407,20 @@ pub fn query_taxonomy_tree_fast(
             is_root,
             in_action_branch,
         };
-        let policy = evaluate_node_policy(&ctx);
+        let mut policy = evaluate_node_policy(&ctx);
+
+        // ★ 内容标签分支内单传空目录紧凑坍缩 (Zero-Entropy Node Collapse)
+        // 规则：仅在内容标签内部、非根维度与非根节点、自身无直接文件挂载(通过位图准确判定，兼容 include_files=false 默认模式)、且仅有单一子节点分支
+        if policy == TaxonomyFoldPolicy::Keep
+            && !is_root
+            && !omni_core::is_root_dimension(&node.code)
+            && node.code != omni_core::concepts::Concept::内容标签.code()
+            && path.starts_with("/builtin.content_tags/")
+            && node.direct_bitmap.is_empty()
+            && node.children_paths.len() == 1
+        {
+            policy = TaxonomyFoldPolicy::BypassAndHoist;
+        }
 
         match policy {
             TaxonomyFoldPolicy::RejectSubtree => {
@@ -4187,5 +4200,124 @@ mod tests {
         // 尝试写入必须被拦截阻断
         let write_res = ro_conn.execute("INSERT INTO test (id) VALUES (1)", []);
         assert!(write_res.is_err(), "只读连接严禁写入");
+    }
+
+    /// 断言 14【内容标签单传空目录紧凑坍缩 (Zero-Entropy Node Collapse) 与默认模式安全】
+    #[test]
+    fn test_content_tags_single_child_collapse_and_default_mode_safety() {
+        let pack_conn = Connection::open_in_memory().unwrap();
+        pack_conn
+            .execute_batch(
+                "CREATE TABLE file_tags (
+                    code TEXT PRIMARY KEY,
+                    parent_codes TEXT NOT NULL DEFAULT '[]',
+                    source TEXT NOT NULL DEFAULT 'omw',
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO file_tags (code, sort_order) VALUES
+                    ('builtin.file_type', 1),
+                    ('builtin.content_tags', 28),
+                    ('omw.furniture.n', 10),
+                    ('omw.seat.n', 20),
+                    ('omw.throne.n', 30),
+                    ('omw.sofa.n', 40);",
+            )
+            .unwrap();
+
+        let master_conn = Connection::open_in_memory().unwrap();
+        master_conn
+            .execute_batch(
+                "CREATE TABLE workspace_files (
+                    file_fingerprint TEXT PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    workspace_id INTEGER NOT NULL DEFAULT 1,
+                    status INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE file_tag_relations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_fingerprint TEXT NOT NULL,
+                    tag_code TEXT NOT NULL,
+                    code_path TEXT,
+                    name_path TEXT
+                );
+                INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
+                    ('fp_1', 'D:\\files\\throne.jpg', 1, 1);
+
+                INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                    ('fp_1', 'omw.throne.n', '/builtin.content_tags/omw.furniture.n/omw.seat.n/omw.throne.n', '/内容标签/家具/座位/宝座');",
+            )
+            .unwrap();
+
+        // 1. 首次查询：单文件场景（include_files = false 默认参数）
+        let resp1 = query_taxonomy_tree_fast(
+            &pack_conn,
+            "zh-CN",
+            None,
+            &master_conn,
+            false,
+            Some(1),
+            None,
+        )
+        .expect("query_taxonomy_tree_fast failed");
+
+        let content_tags_root = resp1
+            .root_nodes
+            .iter()
+            .find(|n| n.code == "builtin.content_tags")
+            .expect("内容标签根节点必须存在且保持受控代码");
+
+        // 断言 P0-02：内容标签根自身 Code 绝不被覆盖
+        assert_eq!(content_tags_root.code, "builtin.content_tags");
+
+        // 断言 P0-01 & AC-03：单文件单传空目录（家具、座位）被紧凑坍缩，子节点提拔为内容标签直接子级
+        assert_eq!(
+            content_tags_root.children.len(),
+            1,
+            "单文件单传路径必须坍缩为 1 个直接子节点"
+        );
+        let single_child = &content_tags_root.children[0];
+        assert_eq!(single_child.code, "omw.throne.n");
+        assert_eq!(single_child.name, "宝座");
+        assert_eq!(single_child.file_count, 1, "文件计数必须准确继承");
+
+        // 2. 插入第二份文件：沙发（与宝座同属家具与座位）
+        master_conn
+            .execute_batch(
+                "INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
+                    ('fp_2', 'D:\\files\\sofa.jpg', 1, 1);
+                INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
+                    ('fp_2', 'omw.sofa.n', '/builtin.content_tags/omw.furniture.n/omw.seat.n/omw.sofa.n', '/内容标签/家具/座位/沙发');",
+            )
+            .unwrap();
+
+        let resp2 = query_taxonomy_tree_fast(
+            &pack_conn,
+            "zh-CN",
+            None,
+            &master_conn,
+            false,
+            Some(1),
+            None,
+        )
+        .expect("query_taxonomy_tree_fast 2nd failed");
+
+        let content_tags_root2 = resp2
+            .root_nodes
+            .iter()
+            .find(|n| n.code == "builtin.content_tags")
+            .expect("内容标签根节点必须存在");
+
+        assert_eq!(content_tags_root2.file_count, 2);
+        // 强断言：多文件产生分支后，上级目录自动显现，旗下聚拢宝座与沙发 2 个分支
+        let seat_or_furniture = content_tags_root2
+            .children
+            .iter()
+            .find(|c| c.code == "omw.seat.n" || c.code == "omw.furniture.n")
+            .expect("内容标签下必须自动撑开中观聚拢目录（座位或家具）");
+        assert_eq!(seat_or_furniture.file_count, 2, "聚拢目录必须包含 2 份文件");
+        let has_throne = seat_or_furniture.children.iter().any(|c| c.code == "omw.throne.n" || c.children.iter().any(|gc| gc.code == "omw.throne.n"));
+        let has_sofa = seat_or_furniture.children.iter().any(|c| c.code == "omw.sofa.n" || c.children.iter().any(|gc| gc.code == "omw.sofa.n"));
+        assert!(has_throne, "聚拢目录下必须包含宝座分支");
+        assert!(has_sofa, "聚拢目录下必须包含沙发分支");
     }
 }
