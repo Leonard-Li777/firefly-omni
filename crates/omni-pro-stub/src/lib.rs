@@ -955,6 +955,13 @@ pub mod text {
         }
     }
 
+    pub trait TextEmbedder: Send + Sync {
+        fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>>;
+        fn keybert_candidate_cap(&self) -> usize {
+            0
+        }
+    }
+
     pub struct BekkoEmbedder;
     impl BekkoEmbedder {
         pub fn new() -> Self {
@@ -968,6 +975,12 @@ pub mod text {
         }
         pub fn cosine_similarity(_a: &[f32], _b: &[f32]) -> f32 {
             0.0
+        }
+    }
+
+    impl TextEmbedder for BekkoEmbedder {
+        fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.embed(text)
         }
     }
 
@@ -1052,7 +1065,7 @@ pub mod text {
             _vector_table: Option<&PrecomputedVectorTable>,
             _allow_new_tags: bool,
             _exclude_names: &[String],
-            _anchor: Option<(&BekkoEmbedder, &[f32])>,
+            _anchor: Option<(&dyn TextEmbedder, &[f32])>,
         ) -> Vec<omni_core::TagChainItem> {
             Vec::new()
         }
@@ -1268,6 +1281,13 @@ pub mod text {
     pub struct OmniMultimodalFusionEngine;
     impl OmniMultimodalFusionEngine {
         pub fn fuse_and_arbitrate(ctx: &omni_core::MultimodalContext) -> FusedPerceptionOutcome {
+            Self::fuse_and_arbitrate_with_embedder(ctx, &BekkoEmbedder::new())
+        }
+
+        pub fn fuse_and_arbitrate_with_embedder(
+            ctx: &omni_core::MultimodalContext,
+            _embedder: &dyn TextEmbedder,
+        ) -> FusedPerceptionOutcome {
             FusedPerceptionOutcome {
                 smart_name: None,
                 content_description: None,
