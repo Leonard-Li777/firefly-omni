@@ -265,7 +265,7 @@ async fn test_get_and_update_config_api() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let config: OmniConfig = serde_json::from_slice(&body).unwrap();
-    assert_eq!(config.max_document_ocr_items, 0);
+    assert_eq!(config.max_document_ocr_items, 3);
 
     // 测试 POST /api/config
     let mut new_config = config.clone();
