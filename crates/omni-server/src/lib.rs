@@ -2500,9 +2500,9 @@ async fn perceive_file_handler(
         Some("video")
     } else if is_image {
         let is_manga = photo_type.as_deref().map_or(false, |p| {
-            p == Concept::漫画.zh_name() || p == Concept::漫画.code() || p == "omw.06780678.n"
+            p == Concept::漫画.zh_name() || p == Concept::漫画.code() || p == "omw.06780678.n" // lint-ignore: raw-code
         }) || detected_visual_tags.iter().any(|t| {
-            t == Concept::漫画.code() || t == "omw.06780678.n" || t == Concept::漫画.zh_name()
+            t == Concept::漫画.code() || t == "omw.06780678.n" || t == Concept::漫画.zh_name() // lint-ignore: raw-code
         });
         if is_manga {
             Some("manga")
@@ -2907,9 +2907,20 @@ async fn perceive_file_handler(
         dimension_policies: Some(current_policies.clone()),
     };
 
+    let is_gemma = cfg.embedding_profile == "gemma_unified";
     let t_fusion = std::time::Instant::now();
     let fusion_outcome = if is_pro {
-        omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate(&multimodal_ctx)
+        if is_gemma {
+            omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate_with_embedder(
+                &multimodal_ctx,
+                &GemmaTextEmbedder,
+            )
+        } else {
+            omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate_with_embedder(
+                &multimodal_ctx,
+                &omni_pro::text::BekkoEmbedder::new(),
+            )
+        }
     } else {
         // 非 Pro 构建无融合引擎：fused_tags 必须留空，严禁以 visual_tags 顶替。
         // 顶替会让视觉标签在桌面端被误判为「融合标签」组（ADR-0045 来源分组语义污染）。
@@ -2934,6 +2945,11 @@ async fn perceive_file_handler(
     //   融合引擎内部的描述锚点/段落向量是瞬时量，**严禁**缓存（会迅速突破内存红线）；
     // - 无指纹（调用方未传）或无锚点（非 Pro / 编码失败）⇒ 不写入，返送侧走降级；
     // - 编码器身份取 `encoder_id::BEKKO`：融合锚点恒由 `BekkoEmbedder`（384d）产出。
+    let (target_encoder_id, _) = if is_gemma {
+        (omni_core::encoder_id::GEMMA, cfg.mrl_dimension)
+    } else {
+        (omni_core::encoder_id::BEKKO, omni_pro::text::EMBEDDING_DIM)
+    };
     if let (Some(fp), Some(anchor)) = (
         req.file_fingerprint.as_deref(),
         fusion_outcome.anchor_vector.as_ref(),
@@ -2943,7 +2959,7 @@ async fn perceive_file_handler(
                 fp,
                 omni_core::anchor_cache::AnchorCacheEntry::new(
                     anchor.clone(),
-                    omni_core::encoder_id::BEKKO,
+                    target_encoder_id,
                     std::time::Instant::now(),
                 ),
             );
@@ -3591,20 +3607,38 @@ async fn text_tag_handler(
         return Json(Vec::new());
     }
 
-    // 锚点同源取用：**命中即删**；每个失败分支都必须 warn 上报降级原因（§2.2.6 禁静默）
+    // 锚点同源取用：**命中即删**；每个失败分支都必须 warn 上报降级原因（§2.2.6 禁静默）。
+    // 动态感知当前激活档位（GEMMA vs BEKKO），严格杜绝跨模型空间与硬编码 384d。
+    let (is_gemma, target_encoder_id, target_dim) = {
+        let cfg = state.config.lock().unwrap();
+        let is_g = cfg.embedding_profile == "gemma_unified";
+        let enc = if is_g {
+            omni_core::encoder_id::GEMMA
+        } else {
+            omni_core::encoder_id::BEKKO
+        };
+        let dim = if is_g {
+            cfg.mrl_dimension
+        } else {
+            omni_pro::text::EMBEDDING_DIM
+        };
+        (is_g, enc, dim)
+    };
+
     let lookup = state.anchor_cache.take(
         &req.file_fingerprint,
-        omni_core::encoder_id::BEKKO,
-        omni_pro::text::EMBEDDING_DIM,
+        target_encoder_id,
+        target_dim,
     );
     let anchor = match lookup {
         omni_core::anchor_cache::AnchorLookup::Hit(vector) => Some(vector),
         other => {
             tracing::warn!(
-                "[OmniServer] 返送打标缺少同源锚点，降级为纯受控打标（不产 _ext.*）：reason={} fingerprint={} language={:?}",
+                "[OmniServer] 返送打标缺少同源锚点，降级为纯受控打标（不产 _ext.*）：reason={} fingerprint={} language={:?} encoder={}",
                 other.degrade_reason().unwrap_or_default(),
                 req.file_fingerprint,
-                req.language
+                req.language,
+                target_encoder_id
             );
             None
         }
@@ -3615,8 +3649,12 @@ async fn text_tag_handler(
     let text = req.text;
     let exclude_names = req.exclude_names;
     let res = tokio::task::spawn_blocking(move || {
-        let embedder = omni_pro::text::BekkoEmbedder::new();
-        let anchor_ref = anchor.as_deref().map(|vector| (&embedder, vector));
+        let text_embedder: Box<dyn omni_pro::text::TextEmbedder> = if is_gemma {
+            Box::new(GemmaTextEmbedder)
+        } else {
+            Box::new(omni_pro::text::BekkoEmbedder::new())
+        };
+        let anchor_ref = anchor.as_deref().map(|vector| (text_embedder.as_ref(), vector));
         omni_pro::text::TextTagger::tag_text_with_anchor(
             &text,
             Some("text"),
