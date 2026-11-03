@@ -301,7 +301,7 @@ async fn test_perceive_special_xp_scale() {
     let res = perceive_file(&app, &file_path, Some("zh")).await;
 
     assert_ne!(res.content_rating.as_deref(), Some("safe"));
-    panic!("DEBUG_RES: rating={:?}, text_tags={:?}, types={:?}", res.content_rating, res.nsfw_text_tags, res.sensitive_types);
+    assert!(res.nsfw_text_tags.contains(&"特殊XP".to_string()));
     assert!(res.nsfw_tags.is_empty());
 }
 
