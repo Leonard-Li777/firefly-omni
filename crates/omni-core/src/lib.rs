@@ -244,6 +244,18 @@ pub struct OmniPerceptionRequest {
     /// 视频帧视觉软 token 预算（70=精简快速，140=标准精细；缺省按 140，越界由感知层收敛）
     #[serde(default)]
     pub video_soft_token_budget: Option<usize>,
+    /// 自定义单视频最大抓图数量配额（8~240 帧，缺省 60 帧）
+    #[serde(default)]
+    pub video_frame_quota_max: Option<usize>,
+    /// 镜头切换捕捉敏锐度（low, medium, high；缺省 medium）
+    #[serde(default)]
+    pub video_cut_sensitivity: Option<String>,
+    /// 视频分析视界上限（秒，例如免费用户前 300 秒，缺省为 None 全片分析）(ISS-01 / ISS-32)
+    #[serde(default)]
+    pub video_max_analyze_sec: Option<f64>,
+    /// 视频分析起始时间（秒，用于长视频按 300s 切片流式派发，缺省为 0.0）(ISS-48)
+    #[serde(default)]
+    pub video_analyze_start_sec: Option<f64>,
     /// 是否需要生成缩略图/封面（若已有则传 false，不要求生成）
     #[serde(default)]
     pub generate_thumbnail: Option<bool>,

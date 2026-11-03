@@ -1777,6 +1777,39 @@ fn safe_head_str(s: &str, max_chars: usize) -> &str {
     candidate
 }
 
+/// 剥离摘要中的 AI 模板元语言词、结构前缀与生成时间戳（从根源阻断“核心要点”、“中心思想”污染打标候选池）
+fn strip_ai_template_meta_language(desc: &str) -> String {
+    let mut s = desc.trim();
+    // 剥离分类前缀，如 [Calligraphy]
+    if s.starts_with('[') {
+        if let Some(end_idx) = s.find(']') {
+            s = s[end_idx + 1..].trim();
+        }
+    }
+    // 剥离 "产生时间: ..." 生成元字段
+    if let Some(pos) = s.find("产生时间:") {
+        let after = &s[pos + "产生时间:".len()..];
+        if let Some(end) = after.find(['。', '，', '\n']) {
+            let matched_char_len = after[end..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            let prefix = &s[..pos];
+            let suffix = &after[end + matched_char_len..];
+            let combined = format!("{} {}", prefix.trim(), suffix.trim());
+            return strip_ai_template_meta_language(&combined);
+        }
+    }
+    // 清洗模板短语引导词，保留后文实体但消除“核心要点”这4个字符避免成标
+    let cleaned = s
+        .replace("核心要点:", " ")
+        .replace("核心要点：", " ")
+        .replace("中心思想:", " ")
+        .replace("中心思想：", " ")
+        .replace("主要内容:", " ")
+        .replace("主要内容：", " ")
+        .replace("摘要要点:", " ")
+        .replace("摘要要点：", " ");
+    cleaned.trim().to_string()
+}
+
 /// 组装 Stage 2 高浓度自闭环文档语料（摘要 + 关键词 + 实体 + 全文大纲骨架 + 安全正文头部）
 fn build_enriched_document_corpus(
     one_sentence_desc: Option<&str>,
@@ -1787,20 +1820,21 @@ fn build_enriched_document_corpus(
 ) -> String {
     let mut parts = Vec::with_capacity(5);
 
-    // 1. 一句话浓缩描述（过滤空白与空值，排除孤立分页噪音）
+    // 1. 一句话浓缩描述（过滤空白与空值，剥离 AI 模板元语言，排除孤立分页噪音）
     if let Some(desc) = one_sentence_desc.map(str::trim).filter(|s| !s.is_empty()) {
-        let clean_desc = strip_pagination_lines(desc);
+        let stripped = strip_ai_template_meta_language(desc);
+        let clean_desc = strip_pagination_lines(&stripped);
         if !clean_desc.is_empty() {
             parts.push(clean_desc);
         }
     }
 
-    // 2. KeyBERT / 槽位核心主题词（过滤空词与常见排版孤立词如 page/Page）
+    // 2. KeyBERT / 槽位核心主题词（过滤空词、壳名词与常见排版孤立词如 page/Page）
     if !keywords.is_empty() {
         let kw_line = keywords
             .iter()
             .map(|k| k.trim())
-            .filter(|k| !k.is_empty() && !k.eq_ignore_ascii_case("page"))
+            .filter(|k| !k.is_empty() && !k.eq_ignore_ascii_case("page") && !omni_core::tag_admissibility::is_shell_noun(k))
             .collect::<Vec<_>>()
             .join(" ");
         if !kw_line.is_empty() {
@@ -1808,13 +1842,13 @@ fn build_enriched_document_corpus(
         }
     }
 
-    // 3. 抽取的高可信实体名词（人名、机构、地名等）
+    // 3. 抽取的高可信实体名词（人名、机构、地名等，过滤壳名词）
     if !entities.is_empty() {
         let ent_names: Vec<String> = entities
             .iter()
             .filter_map(|e| e.get("name").or_else(|| e.get("text")).and_then(|v| v.as_str()))
             .map(|s| s.trim())
-            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("page"))
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("page") && !omni_core::tag_admissibility::is_shell_noun(s))
             .map(|s| s.to_string())
             .collect();
         if !ent_names.is_empty() {
@@ -2062,6 +2096,8 @@ async fn perceive_file_handler(
             let mut video_chunks: Vec<omni_core::OmniVideoChunk> = Vec::new();
             let mut video_timings = omni_pro::perceive::VideoProcessTimings::default();
             let mut video_cover_webp_base64: Option<String> = None;
+            let mut video_rep_ocr: Option<String> = None;
+            let mut video_ocr_ms: Option<u64> = None;
             if is_video && is_pro {
                 let (v_wm_lvl, v_wm_status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(&file_path));
                 v.watermark_level = Some(v_wm_lvl);
@@ -2081,13 +2117,21 @@ async fn perceive_file_handler(
                 let audio_cap_for_budget = req
                     .audio_analysis_duration
                     .unwrap_or(cfg.audio_analysis_duration) as f64;
+                                let quota_opt = req.video_frame_quota_max;
+                let cut_sens_opt = req.video_cut_sensitivity.as_deref().map(|s| omni_pro::perceive::VideoCutSensitivity::from_str_opt(Some(s)));
+                let max_analyze_sec_opt = req.video_max_analyze_sec;
+                let analyze_start_sec_opt = req.video_analyze_start_sec;
                 let (chunks, timings, rep_frame) = tokio::task::spawn_blocking(move || {
-                    omni_pro::perceive::process_video_time_chunks_with_representative(
+                    omni_pro::perceive::process_video_time_chunks_with_options(
                         std::path::Path::new(&file_path_for_video),
                         video_interval,
                         None,
                         video_soft_token_budget,
                         Some(audio_cap_for_budget),
+                        quota_opt,
+                        cut_sens_opt,
+                        max_analyze_sec_opt,
+                        analyze_start_sec_opt,
                     )
                 })
                 .await
@@ -2155,6 +2199,25 @@ async fn perceive_file_handler(
                         }
                         Err(err) => {
                             tracing::error!("[OmniServer] 视频代表帧视觉感知打标失败: {}", err);
+                        }
+                    }
+
+                    // 3. 视频代表帧 OCR 文本提取 (当画面检测出文字且开启文本分析时)
+                    if v.has_text == Some(true) && req.enable_text_analysis.unwrap_or(cfg.enable_text_analysis) {
+                        let t_ocr = std::time::Instant::now();
+                        let dyn_img_for_ocr = dyn_img.clone();
+                        let ocr_size = cfg.ocr_model_size.clone();
+                        let ocr_res = tokio::task::spawn_blocking(move || {
+                            omni_pro::OmniVisionEngine::recognize_ocr_dynamic_image(&dyn_img_for_ocr, &ocr_size)
+                        })
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
+                        let ocr_duration = t_ocr.elapsed().as_millis() as u64;
+                        video_ocr_ms = Some(ocr_duration);
+                        if !ocr_res.trim().is_empty() {
+                            video_rep_ocr = Some(ocr_res);
                         }
                     }
                 }
@@ -2250,9 +2313,9 @@ async fn perceive_file_handler(
                 }
             }
 
-            (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings, video_cover_webp_base64)
+            (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings, video_cover_webp_base64, video_rep_ocr, video_ocr_ms)
         };
-        let (ads_res, (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings, video_cover_webp_base64)) = tokio::join!(f_ads, f_non_img);
+        let (ads_res, (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings, video_cover_webp_base64, video_rep_ocr, video_ocr_ms)) = tokio::join!(f_ads, f_non_img);
 
         benchmark.extract_ms = Some(extract_ms);
         benchmark.audio_ms = audio_ms;
@@ -2260,6 +2323,7 @@ async fn perceive_file_handler(
             benchmark.record("ffmpeg_ms", video_timings.ffmpeg_ms);
             benchmark.record("decode_resize_ms", video_timings.decode_ms);
             benchmark.vision_ms = Some(video_timings.vision_ms);
+            benchmark.record_opt("ocr_ms", video_ocr_ms);
         }
         if let Some(bm) = &ext_res.benchmark {
             benchmark.record_opt("metadata_ms", bm.metadata_ms);
@@ -2270,7 +2334,7 @@ async fn perceive_file_handler(
             }
         }
 
-        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, None, video_chunks, Some(video_timings), video_cover_webp_base64))
+        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, video_rep_ocr, video_chunks, Some(video_timings), video_cover_webp_base64))
     };
 
     benchmark.ads_ms = ads_ms;
@@ -3071,33 +3135,64 @@ async fn perceive_file_handler(
     let extracted_text_tags = if is_pro {
         let vt_ref = global_text_vector_table();
 
+        let mut tags: Vec<omni_core::TagChainItem> = Vec::new();
+        // 1. ASR / LRC 提取 (source: "asr")
         if asr.is_some() || lrc.is_some() {
-            omni_pro::text::TextTagger::tag_asr_or_lrc(asr.as_deref(), lrc.as_deref(), vt_ref)
-        } else if !is_image && !enriched_doc_corpus.trim().is_empty() {
-            omni_pro::text::TextTagger::tag_text_with_anchor(
-                &enriched_doc_corpus,
-                Some("document"),
-                vt_ref,
-                true,
-                &[],
-                text_anchor,
-            )
-        } else if let Some(ref ocr) = ocr_text {
+            let asr_tags = omni_pro::text::TextTagger::tag_asr_or_lrc(asr.as_deref(), lrc.as_deref(), vt_ref);
+            tags.extend(asr_tags);
+        }
+
+        // 2. OCR 提取 (纯图片 OCR 或 视频代表帧 OCR，source: "ocr")
+        // 注意：复合文档的正文提取走 enriched_doc_corpus
+        if let Some(ref ocr) = ocr_text {
             if !ocr.trim().is_empty() {
-                omni_pro::text::TextTagger::tag_text_with_anchor(
+                let ocr_tags = omni_pro::text::TextTagger::tag_text_with_anchor(
                     ocr,
                     Some("ocr"),
                     vt_ref,
                     true,
                     &[],
                     text_anchor,
-                )
-            } else {
-                Vec::new()
+                );
+                for ot in ocr_tags {
+                    if let Some(existing) = tags.iter_mut().find(|t| t.code == ot.code || t.name == ot.name) {
+                        if ot.confidence > existing.confidence {
+                            *existing = ot;
+                        }
+                    } else {
+                        tags.push(ot);
+                    }
+                }
             }
-        } else {
-            Vec::new()
         }
+
+        // 3. 文档正文提取 (source: "document")
+        if !is_image && !is_video && !enriched_doc_corpus.trim().is_empty() {
+            let doc_tags = omni_pro::text::TextTagger::tag_text_with_anchor(
+                &enriched_doc_corpus,
+                Some("document"),
+                vt_ref,
+                true,
+                &[],
+                text_anchor,
+            );
+            for dt in doc_tags {
+                if let Some(existing) = tags.iter_mut().find(|t| t.code == dt.code || t.name == dt.name) {
+                    if dt.confidence > existing.confidence {
+                        *existing = dt;
+                    }
+                } else {
+                    tags.push(dt);
+                }
+            }
+        }
+
+        // 4. 按置信度降序排序并截断至对应容量上限（文档类放宽至 20，多媒体保留 8）
+        tags.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        let max_text_tags = if !is_image && !is_video { 20 } else { 8 };
+        tags.truncate(max_text_tags);
+
+        tags
     } else {
         Vec::new()
     };
@@ -3807,6 +3902,23 @@ pub struct TextTagRequest {
     /// 首次已胜出标签展示名（大小写不敏感），在**候选词元层**按整词相等剔除
     #[serde(default)]
     pub exclude_names: Vec<String>,
+    /// 文本来源种类（"multimodal_desc" | "document" | "summary" 等）
+    #[serde(default)]
+    pub source_kind: Option<String>,
+}
+
+/// 判定是否应采用篇章扩容打标模式（上限 20 个标签，0.30 稀释门限）
+pub fn is_expanded_capacity_source(source_kind: Option<&str>, text: &str) -> bool {
+    match source_kind {
+        Some("document") | Some("multimodal_desc") | Some("summary") => true,
+        Some(_) => false,
+        None => {
+            let char_count = text.chars().count();
+            let cjk_count = text.chars().filter(|c| omni_core::tag_admissibility::is_cjk_char(*c)).count();
+            // CJK 篇章以 20 汉字/假名/谚文为完整句，西文/其它语言以 60 字符（约 10 个词）为完整句
+            cjk_count >= 20 || char_count >= 60
+        }
+    }
 }
 
 /// 通用文本打标 API: POST /api/text/tag（spec §2.2 / §3.1）
@@ -3871,6 +3983,17 @@ async fn text_tag_handler(
 
     let text = req.text;
     let exclude_names = req.exclude_names;
+    let is_expanded = is_expanded_capacity_source(req.source_kind.as_deref(), &text);
+    let resolved_source_kind = match req.source_kind.as_deref() {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => {
+            if is_expanded {
+                "document".to_string()
+            } else {
+                "text".to_string()
+            }
+        }
+    };
     let res = tokio::task::spawn_blocking(move || {
         let text_embedder: Box<dyn omni_pro::text::TextEmbedder> = if is_gemma {
             Box::new(GemmaTextEmbedder)
@@ -3878,14 +4001,24 @@ async fn text_tag_handler(
             Box::new(omni_pro::text::BekkoEmbedder::new())
         };
         let anchor_ref = anchor.as_deref().map(|vector| (text_embedder.as_ref(), vector));
-        omni_pro::text::TextTagger::tag_text_with_anchor(
+        let mut tags = omni_pro::text::TextTagger::tag_text_with_anchor(
             &text,
-            Some("text"),
+            Some(&resolved_source_kind),
             global_text_vector_table(),
             allow_new_tags,
             &exclude_names,
             anchor_ref,
-        )
+        );
+        // 全媒体领域排他终检：非视觉介质严禁输出视觉专有维度标签（如高质量、中等质量、画质等级、打码等）
+        // 介质排他与容量解耦：只有当确属纯文档/文本而非多模态描述（multimodal_desc）时才排他
+        if resolved_source_kind == "document" {
+            tags.retain(|t| {
+                !omni_core::tag_identity::is_visual_exclusive_tag(&t.name)
+                    && !omni_core::tag_identity::is_visual_exclusive_tag(&t.code)
+                    && !omni_core::tag_identity::is_image_exclusive_tag(&t.name)
+            });
+        }
+        tags
     })
     .await;
 
@@ -5813,5 +5946,106 @@ Page Fault 异常处理
         assert!(corpus.contains("经济学原理 第一章 微观经济与供给需求 第二章 宏观经济与货币政策 第三章 国际贸易与汇率波动"));
         assert!(!corpus.contains("前言 第一章"));
         assert!(!corpus.contains("目录 第一章"));
+    }
+    #[test]
+    fn test_user_feedback_remediation_e2e() {
+        use omni_core::tag_admissibility::{is_g1_rejected, is_shell_noun};
+        use omni_core::tag_identity::{concept_from_code_or_alias, is_visual_exclusive_tag};
+
+        // 1. 结构化元语言词、排版词一票否决
+        assert!(is_shell_noun("核心要点"));
+        assert!(is_shell_noun("中心思想"));
+        assert!(is_shell_noun("前言"));
+        assert!(is_shell_noun("主要内容"));
+        assert!(is_shell_noun("港式"));
+        assert!(is_shell_noun("高质量"));
+
+        // 2. 带下划线的代码标识符/文件名脏残渣拦截
+        assert!(is_g1_rejected("MoA_XB教材"));
+        assert!(is_g1_rejected("user_id_test"));
+
+        // 3. 繁简归一化对齐（繁体'藝術' -> 受控'艺术'，繁体'書法' -> '书法'，'方塊字' -> '方块字'）
+        let concept_yishu = concept_from_code_or_alias("藝術");
+        assert!(concept_yishu.is_some(), "繁体'藝術'必须成功繁简对齐归一化到受控本体 Concept::艺术");
+        assert_eq!(concept_yishu.unwrap().zh_name(), "绘画");
+
+        let simplified_sf = omni_core::tag_identity::to_simplified_chinese("書法");
+        assert_eq!(simplified_sf, "书法");
+
+        let simplified_fk = omni_core::tag_identity::to_simplified_chinese("方塊字");
+        assert_eq!(simplified_fk, "方块字");
+
+        // 4. 全媒体领域排他：高质量、中等质量等视觉专有标签在非视觉介质下必须被拦截
+        assert!(is_visual_exclusive_tag("高质量"));
+        assert!(is_visual_exclusive_tag("中等质量"));
+        assert!(is_visual_exclusive_tag("画质等级"));
+
+        // 5. 摘要中的模板元语言前缀剥离
+        let raw_desc = "[Calligraphy] 产生时间: 2026-11-02。核心要点: Calligraphy, 香港, Square, Xu, 英文";
+        let cleaned_desc = strip_ai_template_meta_language(raw_desc);
+        assert!(!cleaned_desc.contains("[Calligraphy]"), "必须剥离分类前缀");
+        assert!(!cleaned_desc.contains("产生时间"), "必须剥离时间元字段");
+        assert!(!cleaned_desc.contains("核心要点:"), "必须剥离核心要点前缀");
+        assert!(cleaned_desc.contains("香港"), "正文真实实体必须保留");
+
+        // 6. 端到端文本打标验证（文档介质下：排他、保送与英文单字阻断）
+        let doc_sample = "艺术家徐冰在香港中文大学举办英文方块字书法展，深入探讨当代书法艺术与文化传播。";
+        use omni_pro::text::TextEmbedder;
+        let embedder = omni_pro::text::BekkoEmbedder::new();
+        let anchor_vec = embedder.embed_text(doc_sample).unwrap();
+
+
+        let tags = omni_pro::text::TextTagger::tag_text_with_anchor(
+            doc_sample,
+            Some("document"),
+            None,
+            true,
+            &[],
+            Some((&embedder, &anchor_vec)),
+        );
+        let tag_names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+
+        // 绝不能有 AI 模板与视觉专有词
+        assert!(!tag_names.contains(&"高质量"), "非视觉介质绝不出高质量标签");
+        assert!(!tag_names.contains(&"核心要点"), "绝不出核心要点");
+        assert!(!tag_names.contains(&"前言"), "绝不出前言");
+
+        // 核心实体必须保送成功
+        assert!(tag_names.contains(&"徐冰"), "正文核心艺术家人名'徐冰'必须作为核心实体成功胜出，实际标签: {:?}", tag_names);
+        assert!(
+            tag_names.contains(&"书法")
+                || tag_names.contains(&"书法艺术")
+                || tag_names.contains(&"艺术")
+                || tag_names.contains(&"绘画"),
+            "书法或艺术受控概念/实体必须成功产出，实际标签: {:?}",
+            tag_names
+        );
+    }
+
+    #[test]
+    fn test_is_expanded_capacity_source_rules() {
+        // 显式指定篇章源
+        assert!(is_expanded_capacity_source(Some("document"), "short text"));
+        assert!(is_expanded_capacity_source(Some("multimodal_desc"), "short text"));
+        assert!(is_expanded_capacity_source(Some("summary"), "short text"));
+        assert!(!is_expanded_capacity_source(Some("text"), "short text"));
+        assert!(!is_expanded_capacity_source(Some("ocr"), "short text"));
+
+        // 未显式指定时的启发式判定
+        // CJK 字符数 >= 20
+        let cjk_long = "这是一个用于测试中文篇章容量放宽的完整长句子描述，包含超过二十个汉字。";
+        assert!(is_expanded_capacity_source(None, cjk_long));
+        let cjk_short = "短句子，七个字。";
+        assert!(!is_expanded_capacity_source(None, cjk_short));
+
+        // 西文字符数 >= 60
+        let en_long = "This is a sufficiently long English paragraph that contains more than sixty characters in total for testing.";
+        assert!(is_expanded_capacity_source(None, en_long));
+        let en_short = "This is short.";
+        assert!(!is_expanded_capacity_source(None, en_short));
+
+        // 俄文（西里尔字母）字符数 >= 60
+        let ru_long = "Это достаточно длинное предложение на русском языке для проверки шестидесяти символов.";
+        assert!(is_expanded_capacity_source(None, ru_long));
     }
 }
