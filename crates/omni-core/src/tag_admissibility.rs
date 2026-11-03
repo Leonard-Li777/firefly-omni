@@ -581,8 +581,35 @@ pub fn is_banned_lexfile(lex: &str) -> bool {
     config().is_banned_lexfile(lex)
 }
 
-/// 判定词形是否命中抽象空洞壳名词（R-G2-11；禁止单独成标）
+/// 判定词形是否命中抽象空洞壳名词与 AI 元语言/排版章节词（R-G2-11；禁止单独成标）
 pub fn is_shell_noun(tag: &str) -> bool {
+    let t = tag.trim().to_lowercase();
+    // 硬编码防御：AI 模板元语言词、排版章节词与结构提示词，绝对严禁独立成标
+    if matches!(
+        t.as_str(),
+        "核心要点"
+            | "中心思想"
+            | "主要内容"
+            | "文件记录"
+            | "产生工作"
+            | "产生时间"
+            | "摘要要点"
+            | "前言"
+            | "后记"
+            | "导读"
+            | "要点"
+            | "概述"
+            | "总结"
+            | "绪论"
+            | "附录"
+            | "致谢"
+            | "港式"
+            | "高质量"
+            | "中等质量"
+            | "低质量"
+    ) {
+        return true;
+    }
     config().is_shell_noun(tag)
 }
 
@@ -640,6 +667,55 @@ pub fn is_jieba_tag_compound_suffix(tag: &str) -> bool {
     t.starts_with('n') || t == "vn" || t == "an" || t.starts_with('t') || t == "eng"
 }
 
+/// 字符是否属于 CJK 语族（中日韩统一表意文字、日文平假名/片假名、韩文谚文）
+#[inline]
+pub fn is_cjk_char(c: char) -> bool {
+    matches!(c as u32,
+        0x4E00..=0x9FFF | 0x3400..=0x4DBF // 汉字（含扩展A）
+        | 0x3040..=0x309F | 0x30A0..=0x30FF // 日文平假名/片假名
+        | 0xAC00..=0xD7AF | 0x1100..=0x11FF // 韩文谚文音节/字母
+    )
+}
+
+/// 中文专有名词/未登录专名候选判定（保护人名如“徐冰”，同时拦截“一个”、“这两种”等非专名虚词残渣）
+#[inline]
+pub fn is_cjk_proper_candidate(word: &str, pos: &str) -> bool {
+    let char_count = word.chars().count();
+    if char_count < 2 || char_count > 4 {
+        return false;
+    }
+    if !word.chars().all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+        return false;
+    }
+    const BANNED_PREFIXES: &[char] = &[
+        '一', '二', '两', '三', '四', '五', '六', '七', '八', '九', '十',
+        '这', '那', '我', '你', '他', '她', '它', '其', '各', '每', '某',
+        '当', '在', '从', '对', '把', '被', '由', '因', '为', '与', '和', '及', '随', '而', '初', '应', '至',
+        '以', '所', '已', '即', '如', '若', '便', '才', '就', '很', '最', '更', '太', '极', '越', '又', '再', '还', '也', '都', '总', '只', '单', '仅', '并', '向', '往', '朝', '替', '给', '按', '照', '据', '本', '同', '第'
+    ];
+    if let Some(first_char) = word.chars().next() {
+        if BANNED_PREFIXES.contains(&first_char) {
+            return false;
+        }
+    }
+    if pos == "x" {
+        const SURNAMES: &[char] = &[
+            '王', '李', '张', '刘', '陈', '杨', '赵', '黄', '周', '吴', '徐', '孙', '胡', '朱', '高', '林',
+            '何', '郭', '马', '罗', '梁', '宋', '郑', '谢', '韩', '唐', '冯', '于', '董', '萧', '程', '曹',
+            '袁', '邓', '许', '傅', '沈', '曾', '彭', '吕', '苏', '卢', '蒋', '蔡', '贾', '丁', '魏', '薛',
+            '叶', '阎', '余', '潘', '杜', '戴', '夏', '钟', '汪', '田', '任', '姜', '范', '方', '石', '姚',
+            '谭', '廖', '邹', '熊', '金', '陆', '郝', '孔', '白', '崔', '康', '毛', '邱', '秦', '江', '史',
+            '顾', '侯', '邵', '孟', '龙', '万', '段', '钱', '汤', '尹', '黎', '易', '常', '武', '乔', '贺',
+            '赖', '龚', '文'
+        ];
+        if let Some(first_char) = word.chars().next() {
+            return SURNAMES.contains(&first_char) && char_count <= 3;
+        }
+        return false;
+    }
+    pos == "nr" || pos == "nt" || pos == "nz"
+}
+
 /// 独立候选词准入判定（严格遵循 O(1) 成本递增短路）
 #[inline]
 pub fn is_admissible_standalone_candidate(word: &str, pos: &str) -> bool {
@@ -649,11 +725,14 @@ pub fn is_admissible_standalone_candidate(word: &str, pos: &str) -> bool {
     }
     // Step 2: 独立候选必须是名词族、动名词(vn)、英文实体(eng)或成语(i)；
     // 严禁纯动词(v)、形容词(a)、区别词(b)、数词(m)、量词(q)、方位词(f)等独立成标
-    let valid_standalone_pos = pos.starts_with('n') || pos == "vn" || pos.starts_with('t') || pos == "eng" || pos == "i";
+    // 专名新词保护：jieba 常将未在词典收录的 2~4 字中文人名/机构/专名（如“徐冰”）标注为 "x"
+    let is_cjk_proper = is_cjk_proper_candidate(word, pos);
+
+    let valid_standalone_pos = pos.starts_with('n') || pos == "vn" || pos.starts_with('t') || pos == "eng" || pos == "i" || is_cjk_proper;
     if !valid_standalone_pos {
         return false;
     }
-    if is_jieba_tag_non_entity(pos) {
+    if !is_cjk_proper && is_jieba_tag_non_entity(pos) {
         return false;
     }
     // Step 3: 单一数据源壳名词（如“部分”、“情况”、“数据”）与违禁词拦截
@@ -958,13 +1037,14 @@ pub fn g1_verdict(tag: &str) -> Verdict {
         }
     }
 
-    // R-G1-04 hex / hash / 流水号形态
+    // R-G1-04 hex / hash / 流水号 / 代码下划线标识符形态
     // （算法与 omni-text `TextTokenizer::is_hex_or_hash_stem` / `is_serial_filename_token`
     //   等价——omni-core 不能反向依赖 omni-pro，逻辑登记此处为铸造闸权威实现。）
-    if is_hex_or_hash_stem(trimmed) || is_serial_filename_token(trimmed) {
+    // 严禁带下划线的代码/变量标识符（如 MoA_XB教材）作为自然语言标签独立成标
+    if is_hex_or_hash_stem(trimmed) || is_serial_filename_token(trimmed) || trimmed.contains('_') {
         return Verdict::Reject {
             rule: R_G1_04,
-            reason: "hex / hash / 流水号形态",
+            reason: "hex / hash / 流水号 / 代码下划线标识符形态",
         };
     }
 
@@ -1597,6 +1677,14 @@ mod tests {
         assert!(is_shell_noun("habit"));
         assert!(is_shell_noun("problem"));
 
+        // AI 结构化元语言词与排版章节词拦截
+        assert!(is_shell_noun("核心要点"));
+        assert!(is_shell_noun("中心思想"));
+        assert!(is_shell_noun("前言"));
+        assert!(is_shell_noun("产生工作"));
+        assert!(is_shell_noun("文件记录"));
+        assert!(is_shell_noun("高质量"));
+
         // 复合实体非全词匹配，不命中壳名词
         assert!(!is_shell_noun("生活习惯"));
         assert!(!is_shell_noun("网络问题"));
@@ -1606,6 +1694,16 @@ mod tests {
         assert!(is_banned_lexfile("adv.all"));
         assert!(is_banned_lexfile("adj.pert"));
         assert!(!is_banned_lexfile("noun.animal"));
+
+        // is_cjk_char 字符学判定
+        assert!(is_cjk_char('中'));
+        assert!(is_cjk_char('あ'));
+        assert!(is_cjk_char('ア'));
+        assert!(is_cjk_char('한'));
+        assert!(!is_cjk_char('a'));
+        assert!(!is_cjk_char('M'));
+        assert!(!is_cjk_char('м'));
+        assert!(!is_cjk_char('ع'));
     }
 }
 
