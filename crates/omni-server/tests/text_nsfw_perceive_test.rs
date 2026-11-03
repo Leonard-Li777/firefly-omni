@@ -20,6 +20,7 @@ fn setup_test_app() -> Router {
         omw: omni_server::OmwDb::unavailable(),
         vector: Arc::new(omni_server::VectorEngine::in_memory()),
         master_db_path: Arc::new(Mutex::new(None)),
+        target_vectors_dir: None,
         dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
         sherpa: Arc::new(omni_server::SherpaManager::new()),
         moss: Arc::new(omni_server::MossTtsManager::new()),
@@ -260,6 +261,7 @@ async fn test_perceive_soft_porn_scale_pg13() {
 
     let res = perceive_file(&app, &file_path, Some("zh")).await;
 
+    println!("DEBUG_RES: rating={:?}, text_tags={:?}, types={:?}", res.content_rating, res.nsfw_text_tags, res.sensitive_types);
     assert_ne!(res.content_rating.as_deref(), Some("safe"));
     assert!(res.nsfw_text_tags.contains(&"软色情".to_string()));
     assert!(res.nsfw_text_tags.contains(&"PG-13".to_string()) || res.nsfw_text_tags.contains(&"R-15".to_string()));
@@ -299,7 +301,7 @@ async fn test_perceive_special_xp_scale() {
     let res = perceive_file(&app, &file_path, Some("zh")).await;
 
     assert_ne!(res.content_rating.as_deref(), Some("safe"));
-    assert!(res.nsfw_text_tags.contains(&"特殊XP".to_string()));
+    panic!("DEBUG_RES: rating={:?}, text_tags={:?}, types={:?}", res.content_rating, res.nsfw_text_tags, res.sensitive_types);
     assert!(res.nsfw_tags.is_empty());
 }
 
