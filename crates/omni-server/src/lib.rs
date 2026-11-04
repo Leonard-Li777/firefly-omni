@@ -2385,10 +2385,31 @@ async fn perceive_file_handler(
 
     // 内存零耗时推导: NSFW 敏感内容与高置信度标签 (结合 OCR/ASR 提取文本和 CLIP 标签，两层漏斗过滤)
     // 按媒体类型分流：图片/视频走视觉 NSFW 管线（nsfw_tags），文本/文档走文本 NSFW 管线（nsfw_text_tags）
+    //
+    // Gate F4: 图片/视频时拼接 AIGC Prompt 形成专用 inspection_text（严禁混入 effective_text 保护 FTS 物理事实）。
+    // metadata["prompt"] 由 omni-extract 的 extract_clean_prompt() 清洗后挂载，仅含正向 Prompt，负向词已剔除。
+    let inspection_text: String = if is_image || is_video {
+        let aigc_prompt = metadata
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        match (effective_text.trim().is_empty(), aigc_prompt.is_empty()) {
+            (false, false) => format!("{}\n{}", effective_text.trim(), aigc_prompt),
+            (false, true) => effective_text.clone(),
+            (true, false) => aigc_prompt,
+            (true, true) => String::new(),
+        }
+    } else {
+        // 文本/文档路径：直接使用 effective_text，不混入视觉专有 Prompt
+        effective_text.clone()
+    };
+
     let (nsfw_tags, nsfw_text_tags, sensitive_types, content_rating) = if is_pro {
         let (tags, sens, rating) = omni_pro::OmniVisionEngine::derive_nsfw_tags_and_rating_full(
             vision_res.nsfw_probs,
-            &effective_text,
+            &inspection_text,
             &vision_res.clip_tags,
             req.language.as_deref(),
             Some(&file_path),
@@ -2982,8 +3003,9 @@ async fn perceive_file_handler(
             || content_rating.as_deref() == Some("all_ages")
             || content_rating.as_deref().map_or(false, |r| tag_matches_concept(r, Concept::全年龄.code()))
             || nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::全年龄.code()))
-            || (!nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || t == "R-18" || t == "R-18G")
-                && !nsfw_text_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || t == "R-18" || t == "R-18G"))
+            // Gate F3: 严禁裸字符串比较受控码，统一走 tag_matches_concept 路由
+            || (!nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || tag_matches_concept(t, "R-18") || tag_matches_concept(t, "R-18G"))
+                && !nsfw_text_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || tag_matches_concept(t, "R-18") || tag_matches_concept(t, "R-18G")))
     );
     let ram_tags_flat: Vec<String> = if is_all_ages_content {
         ram_tags

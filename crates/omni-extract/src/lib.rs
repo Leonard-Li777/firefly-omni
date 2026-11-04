@@ -214,6 +214,26 @@ impl OmniExtractor {
                 }
             }
             ocr_duration_ms = Some(t_ocr_start.elapsed().as_millis() as u64);
+
+            // AIGC Prompt 专有通道：从 ExifTool 元数据提取正向提示词，落盘至 metadata["prompt"]
+            // 严禁混入 effective_text / markdown_content（会污染有字图物理事实与全文检索）
+            let raw_prompt = exiftool_map
+                .get("Parameters")
+                .or_else(|| exiftool_map.get("parameters"))
+                .or_else(|| exiftool_map.get("Prompt"))
+                .or_else(|| exiftool_map.get("prompt"))
+                .and_then(|v| v.as_str());
+            if let Some(raw) = raw_prompt {
+                let clean = extract_clean_prompt(raw, p);
+                if !clean.is_empty() {
+                    result.metadata["prompt"] = serde_json::Value::String(clean);
+                } else {
+                    tracing::warn!(
+                        "AIGC Prompt extracted but all-negative or unsupported format, discarding: {}",
+                        p.display()
+                    );
+                }
+            }
         }
 
         // 7. 提取音频 Tag 与精细属性 (audio)
@@ -921,9 +941,16 @@ pub fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde
                 if skip_keys.contains(&k.as_str()) || v.is_null() {
                     continue;
                 }
-                // 如果是字符串，限制单字段长度（过滤超过 2KB 的 base64/二进制 hex dump）
+                // 如果是字符串，限制单字段长度：
+                // - AIGC 专有字段（parameters / prompt / workflow）放宽至 64KB，支持长 SD/ComfyUI 提示词；
+                // - 其余字段维持 2KB 门控，过滤 base64/二进制 hex dump 噪声。
                 if let Some(s) = v.as_str() {
-                    if s.len() > 2048 {
+                    let is_aigc_field = matches!(
+                        k.to_lowercase().as_str(),
+                        "parameters" | "prompt" | "workflow" | "positive prompt" | "negative prompt"
+                    );
+                    let max_len = if is_aigc_field { 65536 } else { 2048 };
+                    if s.len() > max_len {
                         continue;
                     }
                 }
@@ -1720,6 +1747,57 @@ pub fn determine_file_group(ext: &str, mime_type: &str) -> &'static str {
     }
 }
 
+/// AIGC Prompt 结构化清洗器（规范 §3.2 / Gate F4）
+///
+/// 覆盖格式矩阵：
+/// - A1111 (SD WebUI)：`<正向提示词>\nNegative prompt: <负向>\nSteps: ...` 明文格式
+/// - ComfyUI / NovelAI：通常在 `parameters` 或 `prompt` chunk 中，格式同 A1111 或 JSON
+/// - Fooocus：Fooocus-style key-value 或类 A1111
+/// - Midjourney / 未知格式：无法识别时返回空字符串 + warn!（严禁原始 EXIF 进入送审链路）
+pub fn extract_clean_prompt(raw: &str, path: &std::path::Path) -> String {
+    let text = raw.trim();
+    // 剥离可能的 "parameters\0" 前缀 (A1111 PNG chunk)
+    let text = text.strip_prefix("parameters").unwrap_or(text).trim();
+    let text = text.strip_prefix('\0').unwrap_or(text).trim();
+
+    // JSON 格式探测 (ComfyUI workflow JSON)
+    if text.starts_with('{') || text.starts_with('[') {
+        // ComfyUI workflow 是节点图 JSON，无法在通用层安全抽取正向文本，标记为 unsupported
+        tracing::warn!(
+            "[extract_clean_prompt] ComfyUI JSON workflow format detected, unsupported for generic extraction, discarding: {}",
+            path.display()
+        );
+        return String::new();
+    }
+
+    // Midjourney 特征检测：以 "--ar" / "--no" / "--v " 等 --flag 开头
+    if text.contains(" --ar ") || text.contains(" --no ") || text.contains(" --v ") || text.starts_with("--") {
+        tracing::warn!(
+            "[extract_clean_prompt] Midjourney-style prompt detected (unsupported), discarding: {}",
+            path.display()
+        );
+        return String::new();
+    }
+
+    // A1111 / NovelAI / Fooocus 文本格式：截取 Negative prompt: 之前的正向部分
+    let mut positive = text;
+    if let Some(neg_pos) = positive.find("Negative prompt:") {
+        positive = &positive[..neg_pos];
+    }
+    if let Some(neg_pos) = positive.find("negative prompt:") {
+        positive = &positive[..neg_pos];
+    }
+    // 截断 Steps: 参数噪声（A1111 格式固定追加）
+    if let Some(steps_pos) = positive.find("Steps:") {
+        positive = &positive[..steps_pos];
+    }
+    if let Some(steps_pos) = positive.find("steps:") {
+        positive = &positive[..steps_pos];
+    }
+
+    positive.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1900,6 +1978,28 @@ mod tests {
         assert!(clean.contains("今天我 寒夜里看雪飘过"));
         assert!(clean.contains("原谅我这一生不羁放纵爱自由"));
     }
+
+    #[test]
+    fn test_extract_clean_prompt_format_matrix() {
+        // A1111: strips negative and steps
+        let a1111 = "score_9, 1girl\nNegative prompt: nsfw, nude\nSteps: 30, ...";
+        let result = extract_clean_prompt(a1111, std::path::Path::new("test.png"));
+        assert_eq!(result.trim(), "score_9, 1girl");
+        assert!(!result.contains("nsfw"));
+
+        // ComfyUI JSON: returns empty + warn
+        let comfy = r#"{"nodes": {"1": {"type": "CLIPTextEncode"}}}"#;
+        let result = extract_clean_prompt(comfy, std::path::Path::new("comfy.png"));
+        assert!(result.is_empty(), "ComfyUI JSON must be discarded");
+
+        // Midjourney: returns empty + warn
+        let mj = "beautiful landscape --ar 16:9 --v 6 --no people";
+        let result = extract_clean_prompt(mj, std::path::Path::new("mj.png"));
+        assert!(result.is_empty(), "Midjourney format must be discarded");
+
+        // NovelAI / Fooocus-style (no special flags)
+        let novel = "masterpiece, best quality\nNegative prompt: lowres, bad anatomy";
+        let result = extract_clean_prompt(novel, std::path::Path::new("novel.png"));
+        assert_eq!(result.trim(), "masterpiece, best quality");
+    }
 }
-
-
