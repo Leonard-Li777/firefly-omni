@@ -1150,6 +1150,9 @@ async fn update_config(
 
         if omni_pro::is_pro_enabled() {
             omni_pro::OmniVisionEngine::set_gemma_mrl_dimension(cfg.mrl_dimension);
+            if !cfg.enable_nsfw_perception {
+                omni_pro::OmniVisionEngine::unload_nsfw_model();
+            }
         }
         save_config_to_disk(&*cfg);
         Json(cfg.clone())
@@ -1271,6 +1274,7 @@ pub fn run_vision_pipeline_on_image(
     enable_visual_tags: bool,
     lang: Option<&str>,
     embedding_profile: &str,
+    enable_nsfw: bool,
 ) -> Result<VisionComputed, String> {
     let t_vision = std::time::Instant::now();
     let mut out = VisionComputed::default();
@@ -1323,9 +1327,13 @@ pub fn run_vision_pipeline_on_image(
             }
         });
 
-        // 3. NSFW 模型 5 分类概率推理
+        // 3. NSFW 模型 5 分类概率推理 (Ticket 03: 仅在插槽激活且就绪时执行推理)
         let h_nsfw = omni_core::timed_spawn!(s, {
-            omni_pro::OmniVisionEngine::run_nsfw_model(img_ref)
+            if enable_nsfw {
+                omni_pro::OmniVisionEngine::run_nsfw_model(img_ref)
+            } else {
+                None
+            }
         });
 
         // 4. 频域水印检测
@@ -1629,6 +1637,7 @@ fn run_vision_pipeline(
     enable_visual_tags: bool,
     lang: Option<&str>,
     embedding_profile: &str,
+    enable_nsfw: bool,
 ) -> VisionComputed {
     let t_vision = std::time::Instant::now();
     let ext = std::path::Path::new(file_path)
@@ -1643,7 +1652,7 @@ fn run_vision_pipeline(
     if is_image {
         match image::open(file_path) {
             Ok(img) => {
-                match run_vision_pipeline_on_image(&img, exif_orient, enable_visual_tags, lang, embedding_profile) {
+                match run_vision_pipeline_on_image(&img, exif_orient, enable_visual_tags, lang, embedding_profile, enable_nsfw) {
                     Ok(mut computed) => {
                         computed.duration_ms = t_vision.elapsed().as_millis() as u64;
                         tracing::info!(
@@ -1962,7 +1971,7 @@ async fn perceive_file_handler(
             let profile = cfg.embedding_profile.clone();
             let vision_res = if is_pro {
                 tokio::task::spawn_blocking(move || {
-                    run_vision_pipeline(&fp, eo.as_deref(), enable_visual_tags, lang.as_deref(), &profile)
+                    run_vision_pipeline(&fp, eo.as_deref(), enable_visual_tags, lang.as_deref(), &profile, cfg.enable_nsfw_perception)
                 })
                 .await
                 .unwrap_or_default()
@@ -2159,6 +2168,7 @@ async fn perceive_file_handler(
                         req.enable_visual_tags.unwrap_or(true),
                         req.language.as_deref(),
                         &cfg.embedding_profile,
+                        cfg.enable_nsfw_perception,
                     ) {
                         Ok(mut rep_vision) => {
                             // 视频领域排他门禁：严格剔除截图细分、摄影照片细分等图片专有维度
@@ -2406,7 +2416,26 @@ async fn perceive_file_handler(
         effective_text.clone()
     };
 
-    let (nsfw_tags, nsfw_text_tags, sensitive_types, content_rating) = if is_pro {
+    // Ticket 03: 原生感知插槽 (perception_nsfw & perception_face)
+    let nsfw_slot_active = cfg.enable_nsfw_perception;
+    let nsfw_model_ready = if is_pro {
+        omni_pro::OmniVisionEngine::resolve_nsfw_model_path().is_some()
+    } else {
+        false
+    };
+
+    let (nsfw_tags, nsfw_text_tags, sensitive_types, content_rating, nsfw_perception) = if !nsfw_slot_active || !nsfw_model_ready {
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            omni_core::PerceptionSlotResult {
+                status: "skipped".to_string(),
+                tags: Vec::new(),
+            },
+        )
+    } else if is_pro {
         let (tags, sens, rating) = omni_pro::OmniVisionEngine::derive_nsfw_tags_and_rating_full(
             vision_res.nsfw_probs,
             &inspection_text,
@@ -2414,15 +2443,43 @@ async fn perceive_file_handler(
             req.language.as_deref(),
             Some(&file_path),
         );
-        if is_image || is_video {
-            // 视觉路径：NSFW 结论写 nsfw_tags，nsfw_text_tags 为空
-            (tags, vec![], sens, rating)
+        let (v_tags, t_tags) = if is_image || is_video {
+            (tags, vec![])
         } else {
-            // 文本/文档路径：NSFW 结论写 nsfw_text_tags，nsfw_tags 为空（避免与视觉引擎字段混淆）
-            (vec![], tags, sens, rating)
-        }
+            (vec![], tags)
+        };
+        let flagged_tags: Vec<String> = v_tags.iter().chain(t_tags.iter())
+            .filter(|t| *t != "全年龄" && *t != "安全")
+            .cloned()
+            .collect();
+        let perc = if !flagged_tags.is_empty() {
+            omni_core::PerceptionSlotResult {
+                status: "flagged".to_string(),
+                tags: flagged_tags,
+            }
+        } else {
+            omni_core::PerceptionSlotResult {
+                status: "clean".to_string(),
+                tags: Vec::new(),
+            }
+        };
+        (v_tags, t_tags, sens, rating, perc)
     } else {
-        (vec!["全年龄".to_string()], vec![], Vec::new(), Some("safe".to_string()))
+        (
+            vec!["全年龄".to_string()],
+            vec![],
+            Vec::new(),
+            Some("safe".to_string()),
+            omni_core::PerceptionSlotResult {
+                status: "clean".to_string(),
+                tags: Vec::new(),
+            },
+        )
+    };
+
+    let face_perception = omni_core::PerceptionSlotResult {
+        status: if cfg.enable_face_perception { "clean".to_string() } else { "skipped".to_string() },
+        tags: Vec::new(),
     };
 
     let nsfw_high_confidence_tags = if is_pro {
@@ -3793,6 +3850,8 @@ async fn perceive_file_handler(
         text_tags: extracted_text_tags,
         video_chunks,
         vector_saved: None,
+        nsfw_perception: Some(nsfw_perception),
+        face_perception: Some(face_perception),
     });
 
     // 统一就地单次原子批量落盘 (Zero-Boomerang IPC)
@@ -5688,7 +5747,7 @@ mod representative_vision_tests {
         let img = image::DynamicImage::new_rgb8(100, 100);
 
         // 2. 测试 classic_light 档位分流与隔离
-        let res_classic = run_vision_pipeline_on_image(&img, None, false, None, "classic_light");
+        let res_classic = run_vision_pipeline_on_image(&img, None, false, None, "classic_light", false);
         assert!(res_classic.is_ok(), "classic_light 模式在关闭视觉打标时必须成功返回");
         let comp_classic = res_classic.unwrap();
         // 验证没有调用 Gemma 视觉塔
@@ -5700,7 +5759,7 @@ mod representative_vision_tests {
         // 在 gemma_unified 下若 Gemma 熔断，必须立即 Fail-Fast 报错
         let gemma = omni_pro::OmniVisionEngine::gemma_engine();
         gemma.circuit_breaker().trip("模拟熔断测试物理隔离".to_string());
-        let res_gemma = run_vision_pipeline_on_image(&img, None, true, None, "gemma_unified");
+        let res_gemma = run_vision_pipeline_on_image(&img, None, true, None, "gemma_unified", false);
         assert!(res_gemma.is_err(), "gemma_unified 档位在 Gemma 熔断时必须 Fail-Fast 报错，严禁降级到 CLIP");
         gemma.circuit_breaker().mark_ready(); // 恢复状态
 

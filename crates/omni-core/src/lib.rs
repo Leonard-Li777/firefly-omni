@@ -149,6 +149,16 @@ pub struct OmniConfig {
     /// MRL 弹性降维维度 (256, 512 或 768，缺省 512)
     #[serde(default = "default_mrl_dimension")]
     pub mrl_dimension: usize,
+    /// 敏感内容合规识别插槽是否激活 (perception_nsfw 插件，Ticket 03)
+    #[serde(default = "default_false")]
+    pub enable_nsfw_perception: bool,
+    /// 人脸特征分析插槽是否激活 (perception_face 插件，Ticket 03)
+    #[serde(default = "default_false")]
+    pub enable_face_perception: bool,
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_audio_analysis_duration() -> u32 {
@@ -184,8 +194,20 @@ impl Default for OmniConfig {
             language: None,
             embedding_profile: "classic_light".to_string(),
             mrl_dimension: 512,
+            enable_nsfw_perception: false,
+            enable_face_perception: false,
         }
     }
+}
+
+/// 原生感知分析插槽结果模型 (Ticket 03)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PerceptionSlotResult {
+    /// 插槽状态: "skipped" (未装配/停用) | "clean" (扫描完成无敏感) | "flagged" (命中风险)
+    pub status: String,
+    /// 命中标签列表
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Omni 引擎内容提取细分耗时基准统计（精确到毫秒）
@@ -616,6 +638,12 @@ pub struct OmniPerceptionResult {
     /// 向量是否由 Omni 内部就地持久化落盘
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_saved: Option<bool>,
+    /// 感知插槽: 敏感内容合规识别 (perception_nsfw，Ticket 03)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nsfw_perception: Option<PerceptionSlotResult>,
+    /// 感知插槽: 人脸特征分析 (perception_face，Ticket 03)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_perception: Option<PerceptionSlotResult>,
 }
 
 /// 视频时序切片实体（30 秒窗口切片）
