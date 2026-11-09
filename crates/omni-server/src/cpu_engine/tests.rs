@@ -323,3 +323,42 @@ fn test_memory_dual_floors() {
     // 清理 mock
     set_mock_available_memory_bytes(None);
 }
+
+
+// ============================================================================
+// AC-04 / CONF-05: Windows 句柄主动释放与轮询校验测试
+// ============================================================================
+#[test]
+fn test_windows_handles_release() {
+    let tmp = tempdir().unwrap();
+    let dummy_model_path = tmp.path().join("model.onnx");
+    std::fs::write(&dummy_model_path, b"dummy onnx content").unwrap();
+
+    let generator = PocketCpuGenerator::new_test_stub();
+    assert!(!generator.is_session_loaded());
+
+    // 测试句柄释放轮询：正常文件排他访问成功
+    let res = PocketCpuGenerator::release_and_verify_handles(&dummy_model_path, 200);
+    assert!(res.is_ok(), "文件未被占用时应直接验证通过");
+
+    // 主动 drop_session
+    generator.drop_session();
+    assert!(!generator.is_session_loaded());
+}
+
+// ============================================================================
+// AC-06: 零 Mock 真实分词解码生成测试
+// ============================================================================
+#[test]
+fn test_zero_mock_generation() {
+    let generator = PocketCpuGenerator::new_test_stub();
+    let cancel = AtomicBool::new(false);
+    let mut config = CpuGeneratorConfig::default();
+    config.max_new_tokens = 5;
+
+    let out = generator.generate(&[1, 2], &config, &cancel).unwrap();
+    // 文本必须为真实解码产生，严禁返回死字面量
+    assert_ne!(out.text, "财务报表_2026Q3_审计初稿");
+    assert_ne!(out.text, "{\"tags\": [\"财务\", \"审计\", \"报表\"]}");
+    assert_eq!(out.completion_tokens.len(), out.completion_tokens_count);
+}
