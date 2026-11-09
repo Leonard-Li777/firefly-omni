@@ -2419,16 +2419,8 @@ async fn perceive_file_handler(
     let inspection_text: String = if is_image || is_video {
         let aigc_prompt = metadata
             .get("prompt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        match (effective_text.trim().is_empty(), aigc_prompt.is_empty()) {
-            (false, false) => format!("{}\n{}", effective_text.trim(), aigc_prompt),
-            (false, true) => effective_text.clone(),
-            (true, false) => aigc_prompt,
-            (true, true) => String::new(),
-        }
+            .and_then(|v| v.as_str());
+        combine_inspection_text(&effective_text, aigc_prompt)
     } else {
         // 文本/文档路径：直接使用 effective_text，不混入视觉专有 Prompt
         effective_text.clone()
@@ -5913,6 +5905,50 @@ mod representative_vision_tests {
     }
 }
 
+
+const INSPECT_HEAD: usize = 8 * 1024;
+const INSPECT_TAIL: usize = 4 * 1024;
+
+/// 字节边界安全截断：永不 panic，绝不撕裂多字节 UTF-8 字符
+pub fn trunc_head_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max { return s; }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) { i -= 1; }
+    &s[..i]
+}
+
+pub fn trunc_tail_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max { return s; }
+    let mut i = s.len() - max;
+    while i < s.len() && !s.is_char_boundary(i) { i += 1; }
+    &s[i..]
+}
+
+/// 组装送审文本（字节边界安全，输出恒 <= 16,385 字节，绝不 panic）：
+/// - (true,false) / (false,true)：单路超 12KB 时取 头 8KB + "\n...\n" + 尾 4KB（首尾双保全）；
+/// - (true,true)：eff 头 8KB + prompt 头 8KB，恒定锁死 16KB 总预算；
+/// - (false,false)：返回空串，下游短路文本检测通道。
+pub fn combine_inspection_text(effective_text: &str, prompt: Option<&str>) -> String {
+    let eff = effective_text.trim();
+    let p = prompt.map(str::trim).unwrap_or("");
+    match (!eff.is_empty(), !p.is_empty()) {
+        (false, false) => String::new(),
+        (true, false) => {
+            if eff.len() > INSPECT_HEAD + INSPECT_TAIL {
+                format!("{}\n...\n{}", trunc_head_bytes(eff, INSPECT_HEAD), trunc_tail_bytes(eff, INSPECT_TAIL))
+            } else { eff.to_string() }
+        }
+        (false, true) => {
+            if p.len() > INSPECT_HEAD + INSPECT_TAIL {
+                format!("{}\n...\n{}", trunc_head_bytes(p, INSPECT_HEAD), trunc_tail_bytes(p, INSPECT_TAIL))
+            } else { p.to_string() }
+        }
+        (true, true) => {
+            format!("{}\n{}", trunc_head_bytes(eff, INSPECT_HEAD), trunc_head_bytes(p, INSPECT_HEAD))
+        }
+    }
+}
+
 #[cfg(test)]
 mod document_cpu_stage_tagging_and_cache_tests {
     use super::*;
@@ -6170,4 +6206,33 @@ Page Fault 异常处理
         let ru_long = "Это достаточно длинное предложение на русском языке для проверки шестидесяти символов.";
         assert!(is_expanded_capacity_source(None, ru_long));
     }
+
+    #[test]
+    fn test_combine_inspection_text() {
+        // 1. 双空返回空
+        assert_eq!(combine_inspection_text("", None), "");
+        assert_eq!(combine_inspection_text("   ", Some("  ")), "");
+
+        // 2. 仅单路短文本
+        assert_eq!(combine_inspection_text("hello world", None), "hello world");
+        assert_eq!(combine_inspection_text("", Some("masterpiece, 1girl")), "masterpiece, 1girl");
+
+        // 3. 双路正常组合
+        assert_eq!(
+            combine_inspection_text("document ocr text", Some("positive prompt")),
+            "document ocr text\npositive prompt"
+        );
+
+        // 4. 超长截断与 UTF-8 边界安全
+        let long_eff = "中文字符串".repeat(3000); // 15,000 字节 > 12KB
+        let combined = combine_inspection_text(&long_eff, None);
+        assert!(combined.len() <= 12293);
+        assert!(combined.contains("\n...\n"));
+
+        // 5. 双路超长（各 8KB，总计锁死 <= 16KB）
+        let long_prompt = "日文プロンプト".repeat(2000);
+        let dual_combined = combine_inspection_text(&long_eff, Some(&long_prompt));
+        assert!(dual_combined.len() <= 16385);
+    }
+
 }

@@ -1774,58 +1774,54 @@ pub fn is_valid_text_comment(raw: &str) -> bool {
         return false;
     }
 
-    // 2. 剥离 EXIF 规范中的常见编码前缀（如 ASCII\0\0\0 或 UNICODE\0）
+    // 2. 规范剥离带 NUL 终结符的标准 EXIF 编码头（UNICODE\0, ASCII\0, UTF-8\0, JIS\0）
+    // 严禁剥离裸 ASCII / UNICODE 前缀（防止误伤以 "ASCII art" 等合法词汇开头的提示词）
     let mut s = trimmed;
-    for prefix in &["UNICODE\0", "ASCII\0", "UNICODE", "ASCII"] {
+    const EXIF_HEADERS: &[&str] = &["UNICODE\0", "ASCII\0", "UTF-8\0", "JIS\0"];
+    for prefix in EXIF_HEADERS {
         if let Some(rest) = s.strip_prefix(prefix) {
             s = rest.trim_start_matches('\0').trim();
             break;
         }
     }
 
-    if s.is_empty() {
+    if s.len() < 3 {
         return false;
     }
 
-    // 3. 统计字符类型：统计控制字符、替换字符与可打印字符
-    let mut control_count = 0usize;
+    // 3. 统计字符分布，严格拦截不可打印控制字符，容差 \u{FFFD} <= 1%
     let mut printable_count = 0usize;
+    let mut fffd_count = 0usize;
     let mut total_chars = 0usize;
 
     for c in s.chars() {
         total_chars += 1;
-        // 遇到 ASCII NUL 直接视为二进制数据污染
+        // 严格拦截任何 NUL 字节
         if c == '\0' {
             return false;
         }
-        // Unicode 替换字符 \u{FFFD} 说明解码产生乱码
         if c == '\u{FFFD}' {
-            control_count += 3;
+            fffd_count += 1;
             continue;
         }
-        // 允许合法的换行符与制表符
-        if c == '\t' || c == '\n' || c == '\r' {
+        // 允许的空白控制字符：换行、回车、制表符
+        if c == '\n' || c == '\r' || c == '\t' {
             printable_count += 1;
         } else if c.is_control() {
-            control_count += 1;
+            // 其余任何控制字符直接视为二进制杂乱数据
+            return false;
         } else {
             printable_count += 1;
         }
     }
 
-    if total_chars == 0 {
+    if total_chars < 3 {
         return false;
     }
 
-    // 如果控制字符/乱码字符占比超过 2%，或者有效可打印字符占比低于 90%，判定为二进制数据
-    if control_count * 50 > total_chars {
-        return false;
-    }
-    if printable_count * 10 < total_chars * 9 {
-        return false;
-    }
-
-    true
+    // 可打印字符比例必须 >= 90%，且 Unicode 替换符 FFFD 比例 <= 1%
+    (printable_count as f64 / total_chars as f64) >= 0.90
+        && (fffd_count as f64 / total_chars as f64) <= 0.01
 }
 
 /// AIGC Prompt 结构化清洗器（规范 §3.2 / Gate F4）
@@ -1834,55 +1830,211 @@ pub fn is_valid_text_comment(raw: &str) -> bool {
 /// - A1111 (SD WebUI)：`<正向提示词>\nNegative prompt: <负向>\nSteps: ...` 明文格式
 /// - ComfyUI / NovelAI：通常在 `parameters` 或 `prompt` chunk 中，格式同 A1111 或 JSON
 /// - Fooocus：Fooocus-style key-value 或类 A1111
-/// - Midjourney / 未知格式：无法识别时返回空字符串 + warn!（严禁原始 EXIF 进入送审链路）
-pub fn extract_clean_prompt(raw: &str, path: &std::path::Path) -> String {
-    let text = raw.trim();
-    // 剥离可能的 "parameters\0" 前缀 (A1111 PNG chunk)
-    let text = text.strip_prefix("parameters").unwrap_or(text).trim();
-    let text = text.strip_prefix('\0').unwrap_or(text).trim();
-    let text = text.strip_prefix("UNICODE\0").unwrap_or(text).trim();
-    let text = text.strip_prefix("ASCII\0").unwrap_or(text).trim();
-    let text = text.strip_prefix("UNICODE").unwrap_or(text).trim();
-    let text = text.strip_prefix("ASCII").unwrap_or(text).trim();
-
-    // JSON 格式探测 (ComfyUI workflow JSON)
-    if text.starts_with('{') || text.starts_with('[') {
-        // ComfyUI workflow 是节点图 JSON，无法在通用层安全抽取正向文本，标记为 unsupported
-        tracing::warn!(
-            "[extract_clean_prompt] ComfyUI JSON workflow format detected, unsupported for generic extraction, discarding: {}",
-            path.display()
-        );
-        return String::new();
-    }
-
-    // Midjourney 特征检测：以 "--ar" / "--no" / "--v " 等 --flag 开头
-    if text.contains(" --ar ") || text.contains(" --no ") || text.contains(" --v ") || text.starts_with("--") {
-        tracing::warn!(
-            "[extract_clean_prompt] Midjourney-style prompt detected (unsupported), discarding: {}",
-            path.display()
-        );
-        return String::new();
-    }
-
-    // A1111 / NovelAI / Fooocus 文本格式：截取 Negative prompt: 之前的正向部分
-    let mut positive = text;
-    if let Some(neg_pos) = positive.find("Negative prompt:") {
-        positive = &positive[..neg_pos];
-    }
-    if let Some(neg_pos) = positive.find("negative prompt:") {
-        positive = &positive[..neg_pos];
-    }
-    // 截断 Steps: 参数噪声（A1111 格式固定追加）
-    if let Some(steps_pos) = positive.find("Steps:") {
-        positive = &positive[..steps_pos];
-    }
-    if let Some(steps_pos) = positive.find("steps:") {
-        positive = &positive[..steps_pos];
-    }
-
-    positive.trim().to_string()
+/// - Midjourney / 未知格式：无法识别时返回 Unsupported + warn!（严禁原始 EXIF 进入送审链路）
+#[derive(Debug, PartialEq, Eq)]
+pub enum PromptExtractOutcome {
+    Clean(String),
+    Unsupported { reason: &'static str },
 }
 
+fn earliest_marker_pos(text: &str, markers: &[&str]) -> Option<usize> {
+    markers.iter().filter_map(|m| text.find(m)).min()
+}
+
+/// 过滤否定修饰词（no nsfw, sfw, not explicit）与低权重语法（(word:weight) weight < 0.3）
+pub fn filter_negated_or_low_weight_terms(text: &str) -> String {
+    // 1. 屏蔽低权重语法：如 "(nsfw:0.1)"，"(explicit: 0.2)"
+    let mut cleaned = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '(' {
+            let mut inner = String::new();
+            let mut closed = false;
+            while let Some(&ic) = chars.peek() {
+                if ic == ')' {
+                    chars.next();
+                    closed = true;
+                    break;
+                }
+                inner.push(chars.next().unwrap());
+                if inner.len() > 128 {
+                    break;
+                }
+            }
+            if closed && inner.contains(':') {
+                let parts: Vec<&str> = inner.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    if let Ok(weight) = parts[1].trim().parse::<f32>() {
+                        if weight < 0.3 {
+                            // 低权重语法，剔除此项
+                            continue;
+                        }
+                    }
+                }
+            }
+            cleaned.push('(');
+            cleaned.push_str(&inner);
+            if closed {
+                cleaned.push(')');
+            }
+        } else {
+            cleaned.push(c);
+        }
+    }
+
+    // 2. 屏蔽否定短语，防止负向词被下游误拾取为敏感意图
+    let patterns = &[
+        ("no nsfw", "sfw_neutral"),
+        ("not nsfw", "sfw_neutral"),
+        ("not explicit", "sfw_neutral"),
+        ("no explicit", "sfw_neutral"),
+        ("without nsfw", "sfw_neutral"),
+    ];
+    let mut res = cleaned;
+    for (pat, rep) in patterns {
+        while let Some(pos) = res.to_lowercase().find(pat) {
+            res.replace_range(pos..pos + pat.len(), rep);
+        }
+    }
+    res
+}
+
+pub fn extract_clean_prompt_checked(raw: &str) -> PromptExtractOutcome {
+    let text = raw.trim();
+    if text.is_empty() {
+        return PromptExtractOutcome::Clean(String::new());
+    }
+
+    // 0a. Midjourney 参数尾缀探测：首个 " --" + ASCII 字母即判未受控格式，正向置空
+    if let Some(pos) = text.find(" --") {
+        if text[pos + 3..].chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+            return PromptExtractOutcome::Unsupported { reason: "midjourney_params" };
+        }
+    }
+    // 0b. 纯 Hex EXIF 残块探测：长纯十六进制串判未受控格式
+    if text.len() >= 32 && text.chars().all(|c| c.is_ascii_hexdigit() || c.is_whitespace()) {
+        return PromptExtractOutcome::Unsupported { reason: "hex_blob" };
+    }
+
+    // 0c. JSON 嗅探分治（ComfyUI workflow / API prompt 节点图）
+    if text.starts_with('{') {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+            if let Some(obj) = val.as_object() {
+                // 模式 1: ComfyUI API 节点图字典 (寻找 KSampler 的 inputs.positive 溯源)
+                for (_k, v) in obj {
+                    let class_type = v.get("class_type").and_then(|ct| ct.as_str()).unwrap_or("");
+                    if class_type.contains("KSampler") {
+                        if let Some(pos_link) = v.pointer("/inputs/positive/0") {
+                            let target_id = if let Some(id_str) = pos_link.as_str() {
+                                id_str.to_string()
+                            } else if let Some(id_num) = pos_link.as_i64() {
+                                id_num.to_string()
+                            } else {
+                                String::new()
+                            };
+                            if !target_id.is_empty() {
+                                if let Some(target_node) = obj.get(&target_id) {
+                                    if let Some(text_val) = target_node.pointer("/inputs/text").and_then(|t| t.as_str()) {
+                                        let clean_text = filter_negated_or_low_weight_terms(text_val.trim());
+                                        return PromptExtractOutcome::Clean(clean_text);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 模式 2: ComfyUI UI 节点图 (nodes 数组中查找正向 CLIPTextEncode)
+                if let Some(nodes) = val.get("nodes").and_then(|n| n.as_array()) {
+                    for node in nodes {
+                        let node_type = node.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if node_type == "CLIPTextEncode" {
+                            let title = node
+                                .pointer("/properties/Node name for S&R")
+                                .or_else(|| node.pointer("/title"))
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("");
+                            if !title.to_lowercase().contains("negative") {
+                                if let Some(text_val) = node
+                                    .get("widgets_values")
+                                    .and_then(|w| w.as_array())
+                                    .and_then(|arr| arr.first())
+                                    .and_then(|v| v.as_str())
+                                {
+                                    let clean_text = filter_negated_or_low_weight_terms(text_val.trim());
+                                    return PromptExtractOutcome::Clean(clean_text);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return PromptExtractOutcome::Unsupported { reason: "workflow_unresolved" };
+        }
+    }
+
+    let text = text.strip_prefix("parameters").unwrap_or(text).trim();
+    let text = text.strip_prefix(' ').unwrap_or(text).trim();
+
+    const EXIF_HEADERS: &[&str] = &["UNICODE ", "ASCII ", "UTF-8 ", "JIS "];
+    let mut s = text;
+    for prefix in EXIF_HEADERS {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim_start_matches(' ').trim();
+            break;
+        }
+    }
+
+    // 1. 最小位置截断多格式负向提示词分隔符 (A1111 / NovelAI / Fooocus / InvokeAI)
+    const NEGATIVE_MARKERS: &[&str] = &[
+        "Negative prompt:",
+        "negative prompt:",
+        "Undesired Content:",
+        "undesired content:",
+        "[negative]",
+        "[Negative]",
+        "Negative:",
+        "negative:",
+        "### Negative Prompt",
+        "### negative prompt",
+    ];
+    let mut positive = s;
+    if let Some(pos) = earliest_marker_pos(positive, NEGATIVE_MARKERS) {
+        positive = &positive[..pos];
+    }
+
+    // 2. 最小位置截断生成参数尾缀 (Steps / Sampler / CFG 等)
+    const PARAM_MARKERS: &[&str] = &[
+        "Steps:",
+        "steps:",
+        "Sampler:",
+        "sampler:",
+        "CFG scale:",
+        "cfg scale:",
+        "Size:",
+        "size:",
+    ];
+    if let Some(pos) = earliest_marker_pos(positive, PARAM_MARKERS) {
+        positive = &positive[..pos];
+    }
+
+    let clean = filter_negated_or_low_weight_terms(positive.trim());
+    PromptExtractOutcome::Clean(clean.trim().to_string())
+}
+
+pub fn extract_clean_prompt(raw: &str, path: &std::path::Path) -> String {
+    match extract_clean_prompt_checked(raw) {
+        PromptExtractOutcome::Clean(s) => s,
+        PromptExtractOutcome::Unsupported { reason } => {
+            tracing::warn!(
+                "[extract_clean_prompt] Unsupported format ({}), discarding prompt for {}",
+                reason,
+                path.display()
+            );
+            String::new()
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2066,23 +2218,39 @@ mod tests {
 
     #[test]
     fn test_extract_clean_prompt_format_matrix() {
-        // A1111: strips negative and steps
+        // 1. A1111: strips negative and steps
         let a1111 = "score_9, 1girl\nNegative prompt: nsfw, nude\nSteps: 30, ...";
         let result = extract_clean_prompt(a1111, std::path::Path::new("test.png"));
         assert_eq!(result.trim(), "score_9, 1girl");
         assert!(!result.contains("nsfw"));
 
-        // ComfyUI JSON: returns empty + warn
-        let comfy = r#"{"nodes": {"1": {"type": "CLIPTextEncode"}}}"#;
-        let result = extract_clean_prompt(comfy, std::path::Path::new("comfy.png"));
-        assert!(result.is_empty(), "ComfyUI JSON must be discarded");
+        // 2. ComfyUI API 溯源成功
+        let comfy_api = r#"{
+            "3": {"class_type": "KSampler", "inputs": {"positive": ["6", 0], "negative": ["7", 0]}},
+            "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "masterpiece, 1girl, smiling"}},
+            "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "nsfw, lowres"}}
+        }"#;
+        let res_comfy = extract_clean_prompt(comfy_api, std::path::Path::new("comfy.png"));
+        assert_eq!(res_comfy.trim(), "masterpiece, 1girl, smiling");
 
-        // Midjourney: returns empty + warn
+        // 3. ComfyUI 无法溯源则 Unsupported 返回空
+        let comfy_bad = r#"{"nodes": []}"#;
+        let result = extract_clean_prompt(comfy_bad, std::path::Path::new("comfy.png"));
+        assert!(result.is_empty(), "ComfyUI without positive node must be discarded");
+
+        // 4. Midjourney 参数丢弃
         let mj = "beautiful landscape --ar 16:9 --v 6 --no people";
         let result = extract_clean_prompt(mj, std::path::Path::new("mj.png"));
         assert!(result.is_empty(), "Midjourney format must be discarded");
 
-        // NovelAI / Fooocus-style (no special flags)
+        // 5. 否定修饰过滤 (no nsfw, (nsfw:0.1))
+        let neg_prompt = "masterpiece, 1girl, no nsfw, (nsfw:0.1), safe";
+        let clean_neg = extract_clean_prompt(neg_prompt, std::path::Path::new("neg.png"));
+        assert!(!clean_neg.contains("no nsfw"));
+        assert!(!clean_neg.contains("0.1"));
+        assert!(clean_neg.contains("masterpiece, 1girl"));
+
+        // 6. NovelAI / Fooocus
         let novel = "masterpiece, best quality\nNegative prompt: lowres, bad anatomy";
         let result = extract_clean_prompt(novel, std::path::Path::new("novel.png"));
         assert_eq!(result.trim(), "masterpiece, best quality");
@@ -2090,18 +2258,46 @@ mod tests {
 
     #[test]
     fn test_is_valid_text_comment() {
-        // 正常 AIGC Prompt
+        // Gate F5: 9类边界样本单测
+        // 1. 纯 ASCII 提示词（含 ASCII art 开头不被误剥离）
         assert!(is_valid_text_comment("masterpiece, best quality, 1girl, swimsuit"));
-        // 带标准 EXIF UNICODE/ASCII 前缀
+        assert!(is_valid_text_comment("ASCII art of a cyberpunk city, detailed"));
+        assert!(is_valid_text_comment("UNICODE symbols in prompt"));
+
+        // 2. 中文纯文本提示词
+        assert!(is_valid_text_comment("杰作，高画质，美丽少女，海滩"));
+
+        // 3. 日文纯文本提示词
+        assert!(is_valid_text_comment("傑作、最高品質、少女、水着"));
+
+        // 4. UNICODE\0 规范头
+        assert!(is_valid_text_comment("UNICODE\0score_9, solo, 1girl"));
+
+        // 5. ASCII\0 规范头
         assert!(is_valid_text_comment("ASCII\0\0\0masterpiece, 1girl"));
-        assert!(is_valid_text_comment("UNICODE\0score_9, solo"));
-        // ExifTool 二进制占位符
-        assert!(!is_valid_text_comment("(Binary data 4096 bytes, use -b option to extract)"));
-        assert!(!is_valid_text_comment("Binary data 128 bytes"));
-        // 相机二进制杂乱数据（包含 NUL 字符或不可打印控制字符）
+        assert!(is_valid_text_comment("UTF-8\0masterpiece, 1girl"));
+        assert!(is_valid_text_comment("JIS\0masterpiece, 1girl"));
+
+        // 6. 内部嵌入 NUL 字节（100% 拦截）
+        assert!(!is_valid_text_comment("hello\0world"));
         assert!(!is_valid_text_comment("SONY\0\x01\x02\x03\x04\x05"));
         assert!(!is_valid_text_comment("\0\0\0\0\0\0\0\0"));
-        assert!(!is_valid_text_comment("   "));
         assert!(!is_valid_text_comment("UNICODE\0\0\0\0"));
+
+        // 7. Unicode 替换字符 \u{FFFD}：<= 1% 放行，> 1% 拦截
+        let valid_fffd = format!("{} \u{FFFD}", "a".repeat(200));
+        assert!(is_valid_text_comment(&valid_fffd));
+        let invalid_fffd = format!("{} \u{FFFD} \u{FFFD}", "a".repeat(50));
+        assert!(!is_valid_text_comment(&invalid_fffd));
+
+        // 8. ExifTool (Binary data...) 占位符（100% 拦截）
+        assert!(!is_valid_text_comment("(Binary data 4096 bytes, use -b option to extract)"));
+        assert!(!is_valid_text_comment("Binary data 128 bytes"));
+
+        // 9. 相机二进制乱码块 / 纯空白 / 过短（100% 拦截）
+        assert!(!is_valid_text_comment("   "));
+        assert!(!is_valid_text_comment("ab"));
+        assert!(!is_valid_text_comment("valid\x00\x01text"));
+        assert!(!is_valid_text_comment("valid\x07text"));
     }
 }
