@@ -75,7 +75,11 @@ impl PocketCpuGenerator {
             Self::create_fallback_tokenizer()
         };
 
-        let model_path = dir.join("model.onnx");
+        let model_path = if dir.join("model_quantized.onnx").exists() {
+            dir.join("model_quantized.onnx")
+        } else {
+            dir.join("model.onnx")
+        };
         let session = if model_path.exists() {
             omni_core::ort_runtime::OmniOrtRuntime::ensure_initialized();
             let sess = omni_core::ort_runtime::OmniOrtRuntime::build_session_with_threads(
