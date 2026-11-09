@@ -41,6 +41,7 @@ use omni_pro::{
     UnmappedStats,
 };
 
+pub mod cpu_engine;
 pub mod routes;
 pub mod text_chunker;
 
@@ -91,6 +92,8 @@ pub struct AppState {
     /// `perceive` 结束时写入 `e_global`，`POST /api/text/tag` 凭 `file_fingerprint` 取用；
     /// 命中即删 + TTL 30 分钟 + LRU 300。进程内共享、不落盘。
     pub anchor_cache: Arc<omni_core::anchor_cache::AnchorCache>,
+    /// 轻量 CPU 生成式推理底座会话槽位 (spec §3.3 / TASK-01)
+    pub cpu_slot: Arc<cpu_engine::CpuSlot>,
 }
 
 #[derive(Deserialize)]
@@ -220,9 +223,11 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/v1/engine/vision/evict", post(engine_vision_evict_handler));
     }
 
-    router
+    let router = router
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
-        .with_state(state)
+        .with_state(state.clone());
+
+    cpu_engine::register_cpu_engine_routes(router, Arc::clone(&state.cpu_slot))
 }
 
 /// 版本信息查询: GET /api/version
@@ -1048,6 +1053,7 @@ pub async fn start_server(
         sherpa,
         moss,
         anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
+        cpu_slot: Arc::new(cpu_engine::CpuSlot::new(None, None)),
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本
