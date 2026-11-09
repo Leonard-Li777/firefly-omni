@@ -2043,6 +2043,24 @@ async fn perceive_file_handler(
             }
             metadata_obj.insert("image".into(), serde_json::Value::Object(img_meta));
 
+            // AIGC Prompt 专有通道：从 ExifTool 元数据提取正向提示词，落盘至 metadata["prompt"]
+            let raw_prompt = exiftool_map
+                .get("Parameters")
+                .or_else(|| exiftool_map.get("parameters"))
+                .or_else(|| exiftool_map.get("Prompt"))
+                .or_else(|| exiftool_map.get("prompt"))
+                .or_else(|| exiftool_map.get("UserComment"))
+                .or_else(|| exiftool_map.get("user_comment"))
+                .or_else(|| exiftool_map.get("Comment"))
+                .or_else(|| exiftool_map.get("comment"))
+                .and_then(|v| v.as_str());
+            if let Some(raw) = raw_prompt {
+                let clean = omni_extract::extract_clean_prompt(raw, p);
+                if !clean.is_empty() {
+                    metadata_obj.insert("prompt".into(), serde_json::Value::String(clean));
+                }
+            }
+
             // 如果提取到了文字识别内容，写入标准的 text_stats（纯图片走 OCR 字段）
             if let Some(text_for_stats) = ocr_text.as_deref().filter(|s| !s.is_empty()) {
                 let lines = text_for_stats.lines().count();
@@ -3262,6 +3280,29 @@ async fn perceive_file_handler(
                     }
                 } else {
                     tags.push(dt);
+                }
+            }
+        }
+
+        // 3.5 AIGC Prompt 提示词提取 (source: "prompt")
+        // 当图片/视频携带正向提示词时，激活文本打标器提取受控概念作为补充标签来源
+        let aigc_prompt = metadata.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if (is_image || is_video) && !aigc_prompt.is_empty() {
+            let prompt_tags = omni_pro::text::TextTagger::tag_text_with_anchor(
+                aigc_prompt,
+                Some("prompt"),
+                vt_ref,
+                true,
+                &[],
+                text_anchor,
+            );
+            for pt in prompt_tags {
+                if let Some(existing) = tags.iter_mut().find(|t| t.code == pt.code || t.name == pt.name) {
+                    if pt.confidence > existing.confidence {
+                        *existing = pt;
+                    }
+                } else {
+                    tags.push(pt);
                 }
             }
         }

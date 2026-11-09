@@ -222,6 +222,10 @@ impl OmniExtractor {
                 .or_else(|| exiftool_map.get("parameters"))
                 .or_else(|| exiftool_map.get("Prompt"))
                 .or_else(|| exiftool_map.get("prompt"))
+                .or_else(|| exiftool_map.get("UserComment").filter(|v| v.as_str().map_or(false, is_valid_text_comment)))
+                .or_else(|| exiftool_map.get("user_comment").filter(|v| v.as_str().map_or(false, is_valid_text_comment)))
+                .or_else(|| exiftool_map.get("Comment").filter(|v| v.as_str().map_or(false, is_valid_text_comment)))
+                .or_else(|| exiftool_map.get("comment").filter(|v| v.as_str().map_or(false, is_valid_text_comment)))
                 .and_then(|v| v.as_str());
             if let Some(raw) = raw_prompt {
                 let clean = extract_clean_prompt(raw, p);
@@ -935,7 +939,7 @@ pub fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde
                 "SourceFile", "ExifToolVersion", "Directory", "FilePermissions",
                 "ThumbnailImage", "PreviewImage", "JpgFromRaw", "OtherImage",
                 "MakerNotes", "MakerNoteSony", "MakerNoteCanon", "MakerNoteNikon",
-                "SonyDateTime2", "SonyToneCurve", "UserComment", "PrintIM"
+                "SonyDateTime2", "SonyToneCurve", "PrintIM"
             ];
             for (k, v) in &first_obj {
                 if skip_keys.contains(&k.as_str()) || v.is_null() {
@@ -945,9 +949,17 @@ pub fn extract_full_exiftool_metadata(p: &Path) -> serde_json::Map<String, serde
                 // - AIGC 专有字段（parameters / prompt / workflow）放宽至 64KB，支持长 SD/ComfyUI 提示词；
                 // - 其余字段维持 2KB 门控，过滤 base64/二进制 hex dump 噪声。
                 if let Some(s) = v.as_str() {
+                    let k_lower = k.to_lowercase();
+                    let is_comment_field = matches!(
+                        k_lower.as_str(),
+                        "usercomment" | "user_comment" | "comment" | "xpcomment"
+                    );
+                    if is_comment_field && !is_valid_text_comment(s) {
+                        continue;
+                    }
                     let is_aigc_field = matches!(
-                        k.to_lowercase().as_str(),
-                        "parameters" | "prompt" | "workflow" | "positive prompt" | "negative prompt"
+                        k_lower.as_str(),
+                        "parameters" | "prompt" | "workflow" | "positive prompt" | "negative prompt" | "usercomment" | "comment"
                     );
                     let max_len = if is_aigc_field { 65536 } else { 2048 };
                     if s.len() > max_len {
@@ -1747,6 +1759,75 @@ pub fn determine_file_group(ext: &str, mime_type: &str) -> &'static str {
     }
 }
 
+/// 判定 Exif 中的 Comment / UserComment 是否为有效纯文本（过滤相机的私有二进制块与乱码）
+pub fn is_valid_text_comment(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // 1. ExifTool 对无法解码的二进制字段输出的标记
+    if trimmed.starts_with("(Binary data ") && trimmed.ends_with(")") {
+        return false;
+    }
+    if trimmed.starts_with("Binary data ") {
+        return false;
+    }
+
+    // 2. 剥离 EXIF 规范中的常见编码前缀（如 ASCII\0\0\0 或 UNICODE\0）
+    let mut s = trimmed;
+    for prefix in &["UNICODE\0", "ASCII\0", "UNICODE", "ASCII"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim_start_matches('\0').trim();
+            break;
+        }
+    }
+
+    if s.is_empty() {
+        return false;
+    }
+
+    // 3. 统计字符类型：统计控制字符、替换字符与可打印字符
+    let mut control_count = 0usize;
+    let mut printable_count = 0usize;
+    let mut total_chars = 0usize;
+
+    for c in s.chars() {
+        total_chars += 1;
+        // 遇到 ASCII NUL 直接视为二进制数据污染
+        if c == '\0' {
+            return false;
+        }
+        // Unicode 替换字符 \u{FFFD} 说明解码产生乱码
+        if c == '\u{FFFD}' {
+            control_count += 3;
+            continue;
+        }
+        // 允许合法的换行符与制表符
+        if c == '\t' || c == '\n' || c == '\r' {
+            printable_count += 1;
+        } else if c.is_control() {
+            control_count += 1;
+        } else {
+            printable_count += 1;
+        }
+    }
+
+    if total_chars == 0 {
+        return false;
+    }
+
+    // 如果控制字符/乱码字符占比超过 2%，或者有效可打印字符占比低于 90%，判定为二进制数据
+    if control_count * 50 > total_chars {
+        return false;
+    }
+    if printable_count * 10 < total_chars * 9 {
+        return false;
+    }
+
+    true
+}
+
 /// AIGC Prompt 结构化清洗器（规范 §3.2 / Gate F4）
 ///
 /// 覆盖格式矩阵：
@@ -1759,6 +1840,10 @@ pub fn extract_clean_prompt(raw: &str, path: &std::path::Path) -> String {
     // 剥离可能的 "parameters\0" 前缀 (A1111 PNG chunk)
     let text = text.strip_prefix("parameters").unwrap_or(text).trim();
     let text = text.strip_prefix('\0').unwrap_or(text).trim();
+    let text = text.strip_prefix("UNICODE\0").unwrap_or(text).trim();
+    let text = text.strip_prefix("ASCII\0").unwrap_or(text).trim();
+    let text = text.strip_prefix("UNICODE").unwrap_or(text).trim();
+    let text = text.strip_prefix("ASCII").unwrap_or(text).trim();
 
     // JSON 格式探测 (ComfyUI workflow JSON)
     if text.starts_with('{') || text.starts_with('[') {
@@ -2001,5 +2086,22 @@ mod tests {
         let novel = "masterpiece, best quality\nNegative prompt: lowres, bad anatomy";
         let result = extract_clean_prompt(novel, std::path::Path::new("novel.png"));
         assert_eq!(result.trim(), "masterpiece, best quality");
+    }
+
+    #[test]
+    fn test_is_valid_text_comment() {
+        // 正常 AIGC Prompt
+        assert!(is_valid_text_comment("masterpiece, best quality, 1girl, swimsuit"));
+        // 带标准 EXIF UNICODE/ASCII 前缀
+        assert!(is_valid_text_comment("ASCII\0\0\0masterpiece, 1girl"));
+        assert!(is_valid_text_comment("UNICODE\0score_9, solo"));
+        // ExifTool 二进制占位符
+        assert!(!is_valid_text_comment("(Binary data 4096 bytes, use -b option to extract)"));
+        assert!(!is_valid_text_comment("Binary data 128 bytes"));
+        // 相机二进制杂乱数据（包含 NUL 字符或不可打印控制字符）
+        assert!(!is_valid_text_comment("SONY\0\x01\x02\x03\x04\x05"));
+        assert!(!is_valid_text_comment("\0\0\0\0\0\0\0\0"));
+        assert!(!is_valid_text_comment("   "));
+        assert!(!is_valid_text_comment("UNICODE\0\0\0\0"));
     }
 }
