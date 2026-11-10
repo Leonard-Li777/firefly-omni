@@ -66,6 +66,15 @@ pub async fn post_tokenize_handler(
     }
 }
 
+/// 协作式取消守卫：当 Future 被 Drop 时自动将取消标志位置为 true (Spec §4.1.3)
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// POST /v1/chat/completions 标准对话补全端点
 pub async fn post_chat_completions_handler(
     State(slot): State<Arc<CpuSlot>>,
@@ -104,11 +113,28 @@ pub async fn post_chat_completions_handler(
         config.temperature = temp.clamp(0.0, 1.0);
     }
 
-    // 3. 执行自回归生成循环 (协作式取消句柄)
+    // 3. 执行自回归生成循环 (在 spawn_blocking 中执行，避免阻塞 Tokio 异步运行时，配合 CancelOnDrop)
     let cancel = Arc::new(AtomicBool::new(false));
-    let output = match slot.execute_generate(&prompt_tokens, &config, &cancel) {
-        Ok(out) => out,
-        Err((code, msg)) => return Err((code, Json(ApiErrorResponse::new("generation_failed", msg, "internal_error")))),
+    let _cancel_guard = CancelOnDrop(Arc::clone(&cancel));
+    let slot_clone = Arc::clone(&slot);
+    let cancel_clone = Arc::clone(&cancel);
+
+    let output_res = tokio::task::spawn_blocking(move || {
+        slot_clone.execute_generate(&prompt_tokens, &config, &cancel_clone)
+    })
+    .await;
+
+    let output = match output_res {
+        Ok(Ok(out)) => out,
+        Ok(Err((code, msg))) => {
+            return Err((code, Json(ApiErrorResponse::new("generation_failed", msg, "internal_error"))));
+        }
+        Err(join_err) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse::new("worker_panic", format!("计算 Worker 发生 Panic: {join_err}"), "internal_error")),
+            ));
+        }
     };
 
     let now = SystemTime::now()

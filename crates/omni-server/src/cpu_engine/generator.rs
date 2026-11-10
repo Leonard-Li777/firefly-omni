@@ -187,6 +187,11 @@ impl PocketCpuGenerator {
             ("3".to_string(), 13),
             ("4".to_string(), 14),
             ("5".to_string(), 15),
+            ("test".to_string(), 20),
+            ("file".to_string(), 21),
+            ("score".to_string(), 22),
+            ("doc".to_string(), 23),
+            ("}".to_string(), 24),
         ];
 
         let model = tokenizers::models::bpe::BPE::builder()
@@ -394,23 +399,8 @@ impl CpuGenerator for PocketCpuGenerator {
             }
         }
 
-        // 真实通过分词器解码文本，杜绝欺诈性 Mock 字符串硬编码返回！
-        let decoded_text = self.decode(&generated_tokens).unwrap_or_default();
-        let text = if decoded_text.is_empty() {
-            if let Some(task_id) = &config.task_id {
-                if task_id == "short-name" {
-                    "{\"name\": \"document\"}".to_string()
-                } else if task_id == "quality-score" {
-                    "{\"score\": 5}".to_string()
-                } else {
-                    "{}".to_string()
-                }
-            } else {
-                String::new()
-            }
-        } else {
-            decoded_text
-        };
+        // 真实通过分词器解码文本，严禁针对 task_id 硬编码假响应！
+        let text = self.decode(&generated_tokens)?;
 
         Ok(GenerationOutput {
             completion_tokens_count: generated_tokens.len(),

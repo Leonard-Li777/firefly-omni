@@ -1047,13 +1047,53 @@ pub async fn start_server(
         search,
         omw,
         vector,
-        master_db_path: Arc::new(Mutex::new(db_path)),
+        master_db_path: Arc::new(Mutex::new(db_path.clone())),
         target_vectors_dir: vectors_dir_opt,
         dimension_policies: Arc::new(std::sync::RwLock::new(initial_policies)),
         sherpa,
         moss,
         anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
-        cpu_slot: Arc::new(cpu_engine::CpuSlot::new(None, None)),
+        cpu_slot: {
+            let (detected_cpu_model_dir, detected_cpu_run_dir) = {
+                let mut model_dir = None;
+                if let Ok(env_path) = std::env::var("FIREFLY_POCKET_CPU_MODEL_DIR") {
+                    let p = PathBuf::from(env_path);
+                    if p.exists() {
+                        model_dir = Some(p);
+                    }
+                }
+                if model_dir.is_none() {
+                    let mut candidates = Vec::new();
+                    if let Some(ref dp) = db_path {
+                        if let Some(parent) = dp.parent() {
+                            candidates.push(parent.join("models").join("pocket-cpu"));
+                        }
+                    }
+                    if let Ok(cwd) = std::env::current_dir() {
+                        candidates.push(cwd.join("build").join("extraResources").join("models").join("pocket-cpu"));
+                        candidates.push(cwd.join("apps").join("desktop").join("build").join("extraResources").join("models").join("pocket-cpu"));
+                    }
+                    for c in candidates {
+                        if c.exists() && (c.join("model_quantized.onnx").exists() || c.join("model.onnx").exists()) {
+                            tracing::info!("[OmniServer] 自动发现 pocket-cpu 真实模型目录: {}", c.display());
+                            model_dir = Some(c);
+                            break;
+                        }
+                    }
+                }
+
+                let mut run_dir = None;
+                if let Ok(env_run) = std::env::var("FIREFLY_RUN_DIR") {
+                    run_dir = Some(PathBuf::from(env_run));
+                } else if let Some(ref dp) = db_path {
+                    if let Some(parent) = dp.parent() {
+                        run_dir = Some(parent.join("run"));
+                    }
+                }
+                (model_dir, run_dir)
+            };
+            Arc::new(cpu_engine::CpuSlot::new(detected_cpu_model_dir, detected_cpu_run_dir))
+        },
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本
