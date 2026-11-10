@@ -22,6 +22,7 @@ fn setup_test_app(config: OmniConfig) -> Router {
         sherpa: Arc::new(omni_server::SherpaManager::new()),
         moss: Arc::new(omni_server::MossTtsManager::new()),
         anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
+        cpu_slot: Arc::new(omni_server::cpu_engine::CpuSlot::new(None, None)),
     };
     create_app_router(state)
 }
