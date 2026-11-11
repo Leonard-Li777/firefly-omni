@@ -31,7 +31,10 @@ fn setup_test_app() -> (Router, Arc<SherpaManager>, Arc<MossTtsManager>) {
         )),
         sherpa: sherpa.clone(),
         moss: moss.clone(),
+        m5: Arc::new(omni_server::M5TtsManager::new()),
         anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
+        target_vectors_dir: None,
+        cpu_slot: Arc::new(omni_server::cpu_engine::CpuSlot::new(None, None)),
     };
     (create_app_router(state), sherpa, moss)
 }

@@ -456,6 +456,87 @@ pub mod vision {
         pub confidence: f32,
     }
 
+    pub const CLIP_TEXT_DIM: usize = 512;
+    pub const CLIP_TEXT_OUTPUT_UNSUPPORTED: &str = "unsupported_text_output";
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct MobileClipVocabStatus {
+        pub status: String,
+        pub valid: bool,
+        pub branch: String,
+        pub reject_reason: Option<String>,
+        pub detail: Option<String>,
+        pub vocab_version: Option<String>,
+        pub vocab_sha256: Option<String>,
+        pub vocab_text_sha256: Option<String>,
+        pub vocab_entry_count: Option<usize>,
+        pub expected_vocab_version: String,
+        pub expected_vocab_sha256: String,
+        pub expected_vocab_text_sha256: String,
+        pub expected_vocab_entry_count: usize,
+        #[serde(skip_serializing)]
+        pub bin_path: Option<std::path::PathBuf>,
+        #[serde(skip_serializing)]
+        pub txt_path: Option<std::path::PathBuf>,
+    }
+
+    pub fn verify_mobileclip_en_vocab() -> MobileClipVocabStatus {
+        MobileClipVocabStatus {
+            status: "vocab_missing".to_string(),
+            valid: false,
+            branch: "none".to_string(),
+            reject_reason: Some("vocab_missing".to_string()),
+            detail: Some("MobileCLIP vocab not available in Community Edition".to_string()),
+            vocab_version: None,
+            vocab_sha256: None,
+            vocab_text_sha256: None,
+            vocab_entry_count: None,
+            expected_vocab_version: "20261111-v1".to_string(),
+            expected_vocab_sha256: String::new(),
+            expected_vocab_text_sha256: String::new(),
+            expected_vocab_entry_count: 246,
+            bin_path: None,
+            txt_path: None,
+        }
+    }
+
+    pub fn clip_text_model_ready(_clip_dir: &Path) -> bool {
+        false
+    }
+
+    pub fn clip_text_vocab_ready(_clip_dir: &Path) -> bool {
+        false
+    }
+
+    pub fn clip_text_session_is_cold() -> bool {
+        true
+    }
+
+    pub fn clip_text_output_verified() -> Option<bool> {
+        None
+    }
+
+    pub fn mobileclip_text_model_ready(_clip_dir: &Path) -> bool {
+        false
+    }
+
+    pub fn mobileclip_tokenizer_ready(_clip_dir: &Path) -> bool {
+        false
+    }
+
+    pub fn mobileclip_text_session_is_cold() -> bool {
+        true
+    }
+
+    pub fn mobileclip_text_output_verified() -> Option<bool> {
+        None
+    }
+
+    pub fn active_clip_image_encoder_label(_lang: Option<&str>) -> &'static str {
+        "none"
+    }
+
     pub struct OmniVisionEngine;
 
     impl OmniVisionEngine {
@@ -568,12 +649,58 @@ pub mod vision {
             _engine_lookup: &std::collections::HashMap<String, String>,
         ) {}
 
+        pub fn try_extract_clip_visual_tags_scored_from_image(
+            _img: &image::DynamicImage,
+            _lang: Option<&str>,
+            _top_k: usize,
+        ) -> Result<Vec<(String, f32)>, String> {
+            Ok(Vec::new())
+        }
+
         pub fn extract_clip_visual_tags_scored_from_image(
             _img: &image::DynamicImage,
             _lang: Option<&str>,
             _top_k: usize,
         ) -> Vec<(String, f32)> {
             Vec::new()
+        }
+
+        pub fn resolve_chinese_clip_model_dir() -> Option<std::path::PathBuf> {
+            None
+        }
+
+        pub fn resolve_mobile_clip_model_dir() -> Option<std::path::PathBuf> {
+            None
+        }
+
+        pub fn resolve_nsfw_model_path() -> Option<std::path::PathBuf> {
+            None
+        }
+
+        pub fn encode_text_with_clip_timed(
+            _text: &str,
+            _clip_dir: &std::path::PathBuf,
+        ) -> Result<(Vec<f32>, u128, u128), &'static str> {
+            Err("model_missing")
+        }
+
+        pub fn encode_text_with_mobileclip_timed(
+            _text: &str,
+            _clip_dir: &std::path::PathBuf,
+        ) -> Result<(Vec<f32>, u128, u128), &'static str> {
+            Err("model_missing")
+        }
+
+        pub fn encode_clip_text_timed(
+            _text: &str,
+            _clip_dir: &std::path::PathBuf,
+            _lang: Option<&str>,
+        ) -> Result<(Vec<f32>, u8, u128, u128), &'static str> {
+            Err("model_missing")
+        }
+
+        pub fn filter_mutual_groups_top1(tags: Vec<String>) -> Vec<String> {
+            tags
         }
 
         pub fn extract_gemma_visual_tags_scored_from_image(
@@ -726,6 +853,14 @@ pub mod vision {
             Vec::new()
         }
 
+        pub fn classify_mutual_exclusive_groups_with_encoder(
+            _image_embedding: &[f32],
+            _image_encoder_id: Option<u8>,
+            _lang: Option<&str>,
+        ) -> Vec<(String, f32, &'static str)> {
+            Vec::new()
+        }
+
         pub fn apply_mutual_exclusion_gating(
             _tags: &mut Vec<String>,
             _clip_mutual_tags: &[(String, f32, &'static str)],
@@ -753,6 +888,26 @@ pub mod vision {
             (Vec::new(), None, Vec::new(), None, None, Vec::new())
         }
 
+        pub fn synthesize_cascade_hypotheses_and_arbitrate_with_encoder(
+            _file_path: &str,
+            _system_dimension_tags: &[String],
+            _ram_tags: &[omni_core::TagChainItem],
+            _morphology_tags: &[String],
+            _nsfw_tags: &[String],
+            _image_embedding: Option<&[f32]>,
+            _image_encoder_id: Option<u8>,
+            _lang: Option<&str>,
+        ) -> (
+            Vec<omni_core::CandidateHypothesisItem>,
+            Option<omni_core::WinningHypothesisItem>,
+            Vec<omni_core::TagChainItem>,
+            Option<String>,
+            Option<String>,
+            Vec<String>,
+        ) {
+            (Vec::new(), None, Vec::new(), None, None, Vec::new())
+        }
+
         pub fn derive_nsfw_high_confidence_tags(
             _tags: &[String],
             _rating: Option<&str>,
@@ -762,7 +917,10 @@ pub mod vision {
     }
 }
 
-pub use vision::{is_nsfw_or_restricted_tag, is_vocab_layer_blocked, OCRBoxResult, OmniVisionEngine};
+pub use vision::{
+    is_nsfw_or_restricted_tag, is_vocab_layer_blocked, MobileClipVocabStatus, OCRBoxResult,
+    OmniVisionEngine,
+};
 
 pub mod hownet {
     use super::*;
@@ -2185,6 +2343,7 @@ pub mod audio {
         pub fn new() -> Self {
             Self
         }
+        pub fn unload(&self) {}
         pub fn is_ready(&self) -> bool {
             false
         }
@@ -2199,6 +2358,61 @@ pub mod audio {
         }
         pub fn extract_voice_codes(&self, _samples_16k: &[f32]) -> Result<Vec<Vec<i16>>, String> {
             Err("Voice extraction not available in Community Edition".to_string())
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct M5VoiceData {
+        pub id: String,
+        pub display_name: String,
+        pub gender: String,
+        pub lang: String,
+        pub desc: String,
+        pub recommended: bool,
+        pub prompt_text: String,
+        pub prompt_token_length: usize,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct M5VoiceSummary {
+        pub id: String,
+        pub display_name: String,
+        pub gender: String,
+        pub lang: String,
+        pub desc: String,
+        pub recommended: bool,
+    }
+
+    pub const M5_DEFAULT_VOICE_ID: &str = "voice_m5_azure_云希";
+
+    pub struct M5TtsManager;
+    impl M5TtsManager {
+        pub fn new() -> Self {
+            Self
+        }
+        pub fn unload(&self) {}
+        pub fn is_ready(&self) -> bool {
+            false
+        }
+        pub fn semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+            Arc::new(tokio::sync::Semaphore::new(1))
+        }
+        pub async fn total_voices(&self) -> usize {
+            0
+        }
+        pub async fn list_voices(&self) -> Vec<M5VoiceSummary> {
+            Vec::new()
+        }
+        pub async fn get_voice(&self, _id: &str) -> Option<M5VoiceData> {
+            None
+        }
+        pub fn synthesize(&self, _text: &str, _voice: &M5VoiceData, _speed: f32) -> Result<SynthResult, String> {
+            Err("M5-TTS is not available in Community Edition".to_string())
+        }
+        pub fn synthesize_with_cancel(&self, _text: &str, _voice: &M5VoiceData, _speed: f32, _cancel_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Result<SynthResult, String> {
+            Err("M5-TTS is not available in Community Edition".to_string())
         }
     }
 }

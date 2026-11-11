@@ -38,7 +38,32 @@ use std::time::Instant;
 
 use tower::ServiceExt;
 
+fn ensure_gemma_test_env() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        if std::env::var_os("GEMMA_MODEL_PATH").is_some()
+            || std::env::var_os("FIREFLY_ACTIVE_MODEL_MOUNTS_FILE").is_some()
+        {
+            return;
+        }
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let candidates = [
+            manifest_dir.join("../../../desktop/build/extraResources/models/gemma"),
+            PathBuf::from("apps/desktop/build/extraResources/models/gemma"),
+            PathBuf::from("../desktop/build/extraResources/models/gemma"),
+        ];
+        for c in candidates {
+            if c.join("model.onnx").is_file() {
+                let canon = std::fs::canonicalize(&c).unwrap_or(c);
+                std::env::set_var("GEMMA_MODEL_PATH", canon);
+                break;
+            }
+        }
+    });
+}
+
 fn setup_test_app(profile: &str) -> axum::Router {
+    ensure_gemma_test_env();
 
     let mut config = OmniConfig::default();
 
@@ -65,6 +90,7 @@ fn setup_test_app(profile: &str) -> axum::Router {
         sherpa: Arc::new(omni_server::SherpaManager::new()),
 
         moss: Arc::new(omni_server::MossTtsManager::new()),
+        m5: Arc::new(omni_server::M5TtsManager::new()),
         anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
 
         // AppState 新增字段后本夹具未同步，导致本文件整份编译失败；
@@ -72,6 +98,7 @@ fn setup_test_app(profile: &str) -> axum::Router {
         // 与 binary_file_perceive_test.rs 保持同一写法（None = 不落盘向量目录）。
 
         target_vectors_dir: None,
+        cpu_slot: Arc::new(omni_server::cpu_engine::CpuSlot::new(None, None)),
 
     };
 
@@ -641,6 +668,7 @@ fn test_ac3_6_official_aspect_ratio_preserving_patches_and_l2_norm() {
 
     use image::DynamicImage;
 
+    ensure_gemma_test_env();
     use omni_pro::vision::gemma::{EmbeddingGemmaEngine, EmbeddingProfile};
 
     // 官方 Gemma4 Unified 契约：长宽比保持缩放到 48 的整数倍、最多 2520 个 16px teacher patch，
@@ -943,6 +971,7 @@ fn test_video_chunks_overlapping_and_boundary_guards() {
 
 async fn test_vision_watchdog_evict_and_recover() {
 
+    ensure_gemma_test_env();
     use omni_pro::vision::gemma::{EmbeddingGemmaEngine, EmbeddingProfile};
 
     let engine = EmbeddingGemmaEngine::new(EmbeddingProfile::GemmaUnified);
@@ -993,6 +1022,7 @@ async fn test_ticket05_t3_run_failure_fallback_and_in_frame_cpu_rebuild() {
 
     };
 
+    ensure_gemma_test_env();
     use omni_pro::vision::gemma::{EmbeddingGemmaEngine, EmbeddingProfile};
 
     // 前置：本用例验证「同帧纯 CPU 重建重跑」，必须有真实视觉权重才能证明产出的是真实向量。
@@ -1073,6 +1103,7 @@ async fn test_ticket05_t3_run_failure_fallback_and_in_frame_cpu_rebuild() {
 
 async fn test_ticket05_t4_multithread_mutex_serialization() {
 
+    ensure_gemma_test_env();
     use omni_pro::vision::gemma::{EmbeddingGemmaEngine, EmbeddingProfile};
 
     assert!(

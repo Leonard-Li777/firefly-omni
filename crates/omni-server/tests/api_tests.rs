@@ -24,7 +24,10 @@ fn setup_test_app_with_geo(geo: Arc<omni_pro::geo::GeoService>) -> Router {
         dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
         sherpa: Arc::new(omni_server::SherpaManager::new()),
         moss: Arc::new(omni_server::MossTtsManager::new()),
+        m5: Arc::new(omni_server::M5TtsManager::new()),
         anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
+        target_vectors_dir: None,
+        cpu_slot: Arc::new(omni_server::cpu_engine::CpuSlot::new(None, None)),
     };
     create_app_router(state)
 }
@@ -45,7 +48,10 @@ fn setup_test_app_with_omw_db(path: &std::path::Path) -> Router {
         dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
         sherpa: Arc::new(omni_server::SherpaManager::new()),
         moss: Arc::new(omni_server::MossTtsManager::new()),
+        m5: Arc::new(omni_server::M5TtsManager::new()),
         anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
+        target_vectors_dir: None,
+        cpu_slot: Arc::new(omni_server::cpu_engine::CpuSlot::new(None, None)),
     };
     create_app_router(state)
 }

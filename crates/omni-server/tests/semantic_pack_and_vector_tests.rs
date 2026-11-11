@@ -22,6 +22,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tower::ServiceExt;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
 /// 构造用于只读包打包的最小 SQLite 语义库二进制
 fn create_test_sqlite_bytes() -> Vec<u8> {
     let conn = Connection::open_in_memory().expect("创建内存数据库失败");
@@ -382,7 +386,10 @@ fn setup_test_app_with_pack_and_vector() -> axum::Router {
         dimension_policies: Arc::new(std::sync::RwLock::new(omni_core::get_default_dimension_policies())),
         sherpa: Arc::new(omni_server::SherpaManager::new()),
         moss: Arc::new(omni_server::MossTtsManager::new()),
+        m5: Arc::new(omni_server::M5TtsManager::new()),
         anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
+        target_vectors_dir: None,
+        cpu_slot: Arc::new(omni_server::cpu_engine::CpuSlot::new(None, None)),
     };
     create_app_router(state)
 }
@@ -679,6 +686,7 @@ fn test_two_stage_resolution_on_real_pack() {
         );
         println!("✅ 真实语义包两阶段反查成功: '{w}' -> code: '{code}', 中文规范展示名: '{name}'");
     }
+}
 }
 
 

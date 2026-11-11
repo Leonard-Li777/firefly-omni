@@ -778,43 +778,49 @@ pub async fn batch_embed_text_handler(
             let embedder = omni_pro::text::BekkoEmbedder::new();
             let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
             let mut vectors = embedder.batch_embed(&text_refs)?;
-            // 确保每个向量维度为 384 并执行 L2 归一化兜底
+            if vectors.len() != text_refs.len() {
+                anyhow::bail!(
+                    "ModelUnavailable: Bekko batch_embed returned {} vectors for {} inputs",
+                    vectors.len(),
+                    text_refs.len()
+                );
+            }
             for v in &mut vectors {
                 if v.len() != 384 {
-                    v.resize(384, 0.0);
+                    anyhow::bail!(
+                        "ModelUnavailable: Bekko vector dim {} != 384",
+                        v.len()
+                    );
                 }
                 let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if norm > 1e-6 {
-                    for x in v.iter_mut() {
-                        *x /= norm;
-                    }
+                if norm <= 1e-6 {
+                    anyhow::bail!("ModelUnavailable: Bekko returned zero-norm vector");
+                }
+                for x in v.iter_mut() {
+                    *x /= norm;
                 }
             }
             Ok((vectors, 384))
         } else {
             let mut vectors = Vec::with_capacity(texts.len());
             for text in texts {
-                let mut v = match omni_pro::OmniVisionEngine::encode_gemma_text(&text) {
-                    Ok(vec) => vec,
-                    Err(e) => {
-                        tracing::warn!("Gemma text embedding failed for text snippet: {e}");
-                        Vec::new()
-                    }
-                };
-
-                // MRL 截断与对齐
-                if v.len() >= target_dim {
-                    v.truncate(target_dim);
-                } else {
-                    v.resize(target_dim, 0.0);
+                let mut v = omni_pro::OmniVisionEngine::encode_gemma_text(&text)?;
+                if v.len() < target_dim {
+                    anyhow::bail!(
+                        "ModelUnavailable: Gemma vector dim {} < target_dim {}",
+                        v.len(),
+                        target_dim
+                    );
                 }
+                v.truncate(target_dim);
 
-                // 强制 L2 归一化
+                // 强制 L2 归一化（拒绝零向量填充假成功）
                 let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if norm > 1e-6 {
-                    for x in v.iter_mut() {
-                        *x /= norm;
-                    }
+                if norm <= 1e-6 {
+                    anyhow::bail!("ModelUnavailable: Gemma returned zero-norm vector");
+                }
+                for x in v.iter_mut() {
+                    *x /= norm;
                 }
 
                 vectors.push(v);
@@ -838,17 +844,41 @@ pub async fn batch_embed_text_handler(
                 error: None,
             }))
         }
-        Ok(Err(err)) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(BatchEmbedTextResponse {
-                vectors: Vec::new(),
-                count: 0,
-                dim: target_dim,
-                profile: active_profile,
-                duration_ms,
-                error: Some(err.to_string()),
-            }),
-        )),
+        Ok(Err(err)) => {
+            let (mapped_status, mapped_code) = map_omni_error_response(&err);
+            let err_text = err.to_string();
+            let status = if mapped_status == StatusCode::NOT_FOUND
+                || mapped_status == StatusCode::SERVICE_UNAVAILABLE
+                || err_text.contains("ModelUnavailable")
+                || err_text.contains("ModelMissing")
+                || err_text.contains("ModelLoadFailed")
+                || err_text.contains("未就绪")
+                || err_text.contains("挂载门禁")
+                || err_text.contains("熔断")
+            {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                mapped_status
+            };
+            let error_message = if status == StatusCode::SERVICE_UNAVAILABLE
+                && !err_text.contains("ModelUnavailable")
+            {
+                format!("ModelUnavailable: {err_text} ({mapped_code})")
+            } else {
+                err_text
+            };
+            Err((
+                status,
+                Json(BatchEmbedTextResponse {
+                    vectors: Vec::new(),
+                    count: 0,
+                    dim: target_dim,
+                    profile: active_profile,
+                    duration_ms,
+                    error: Some(error_message),
+                }),
+            ))
+        }
         Err(join_err) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(BatchEmbedTextResponse {
@@ -976,40 +1006,59 @@ pub async fn embed_clip_text_handler(
     // 模型加载与推理包在 spawn_blocking，避免阻塞 Reactor
     let joined = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let clip_dir = match omni_pro::OmniVisionEngine::resolve_clip_model_dir() {
-            Some(d) => d,
-            None => return Err(("model_missing", default_encoder_id, 0u128, 0u128)),
-        };
-        // 探活检查：根据语言判断 Chinese-CLIP 还是 MobileCLIP
+        use omni_pro::vector_engine::encoder_id;
         if is_zh {
+            let clip_dir = match omni_pro::OmniVisionEngine::resolve_chinese_clip_model_dir() {
+                Some(d) => d,
+                None => return Err(("model_missing", encoder_id::CHINESE_CLIP, 0u128, 0u128)),
+            };
             if !omni_pro::vision::clip_text_model_ready(&clip_dir) {
-                return Err(("model_missing", default_encoder_id, 0u128, 0u128));
+                return Err(("model_missing", encoder_id::CHINESE_CLIP, 0u128, 0u128));
             }
             if !omni_pro::vision::clip_text_vocab_ready(&clip_dir) {
-                return Err(("vocab_missing", default_encoder_id, 0u128, 0u128));
+                return Err(("vocab_missing", encoder_id::CHINESE_CLIP, 0u128, 0u128));
+            }
+            let cold_start = omni_pro::vision::clip_text_session_is_cold();
+            match omni_pro::OmniVisionEngine::encode_text_with_clip_timed(&text, &clip_dir) {
+                Ok((v, load_ms, encode_ms)) => {
+                    Ok((v, encoder_id::CHINESE_CLIP, cold_start, load_ms, encode_ms))
+                }
+                Err(reason) => Err((reason, encoder_id::CHINESE_CLIP, 0u128, 0u128)),
             }
         } else {
+            let vocab_status = omni_pro::vision::verify_mobileclip_en_vocab();
+            let clip_dir = match omni_pro::OmniVisionEngine::resolve_mobile_clip_model_dir() {
+                Some(d) => d,
+                None => {
+                    let reason = match vocab_status.reject_reason.as_deref() {
+                        Some("vocab_hash_mismatch") => "vocab_hash_mismatch",
+                        Some("vocab_version_mismatch") => "vocab_version_mismatch",
+                        _ => "model_missing",
+                    };
+                    return Err((reason, encoder_id::MOBILE_CLIP, 0u128, 0u128));
+                }
+            };
+            if !vocab_status.valid {
+                let reason = match vocab_status.reject_reason.as_deref() {
+                    Some("vocab_hash_mismatch") => "vocab_hash_mismatch",
+                    Some("vocab_version_mismatch") => "vocab_version_mismatch",
+                    _ => "vocab_missing",
+                };
+                return Err((reason, encoder_id::MOBILE_CLIP, 0u128, 0u128));
+            }
             if !omni_pro::vision::mobileclip_text_model_ready(&clip_dir) {
-                return Err(("model_missing", default_encoder_id, 0u128, 0u128));
+                return Err(("model_missing", encoder_id::MOBILE_CLIP, 0u128, 0u128));
             }
             if !omni_pro::vision::mobileclip_tokenizer_ready(&clip_dir) {
-                return Err(("vocab_missing", default_encoder_id, 0u128, 0u128));
+                return Err(("vocab_missing", encoder_id::MOBILE_CLIP, 0u128, 0u128));
             }
-        }
-
-        let cold_start = if is_zh {
-            omni_pro::vision::clip_text_session_is_cold()
-        } else {
-            omni_pro::vision::mobileclip_text_session_is_cold()
-        };
-        let encoded =
-            omni_pro::OmniVisionEngine::encode_clip_text_timed(&text, &clip_dir, lang.as_deref());
-
-        match encoded {
-            Ok((v, encoder_id, load_ms, encode_ms)) => Ok((v, encoder_id, cold_start, load_ms, encode_ms)),
-            // 失败原因由引擎侧直接给出（model_missing/vocab_missing/
-            // unsupported_text_output/load_failed），此处只做透传
-            Err(reason) => Err((reason, default_encoder_id, 0u128, 0u128)),
+            let cold_start = omni_pro::vision::mobileclip_text_session_is_cold();
+            match omni_pro::OmniVisionEngine::encode_text_with_mobileclip_timed(&text, &clip_dir) {
+                Ok((v, load_ms, encode_ms)) => {
+                    Ok((v, encoder_id::MOBILE_CLIP, cold_start, load_ms, encode_ms))
+                }
+                Err(reason) => Err((reason, encoder_id::MOBILE_CLIP, 0u128, 0u128)),
+            }
         }
     })
     .await;
@@ -1315,5 +1364,24 @@ mod tests {
         assert!(omni_pro::vision::mobileclip_tokenizer_ready(&dir));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn batch_embed_text_fails_closed_with_503_when_model_unmounted() {
+        let req = BatchEmbedTextRequest {
+            texts: vec!["这是一段需要编码的测试文本".to_string()],
+            profile: Some("gemma_unified".to_string()),
+            dim: Some(512),
+        };
+        let err = batch_embed_text_handler(Json(req))
+            .await
+            .expect_err("未挂载模型时必须 Fail-Closed 返回 503，严禁返回 200 零向量或伪向量");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        let msg = err.1.error.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("ModelUnavailable") || msg.contains("ModelMissing") || msg.contains("模型") || msg.contains("挂载"),
+            "错误描述必须显式反映模型不可用: {msg}"
+        );
+        assert!(err.1.vectors.is_empty(), "503 响应严禁携带任何零填充向量");
     }
 }

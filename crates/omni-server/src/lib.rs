@@ -47,9 +47,12 @@ pub mod text_chunker;
 
 pub use omni_pro::audio::{
     decode_audio_to_16k_mono, decode_audio_to_16k_mono_bandpass, normalize_ced_audio_event,
-    scale_wav_speed, MossTtsManager, SherpaManager,
+    scale_wav_speed, M5TtsManager, MossTtsManager, SherpaManager, M5_DEFAULT_VOICE_ID,
 };
 pub mod moss_tts {
+    pub use omni_pro::audio::*;
+}
+pub mod m5_tts {
     pub use omni_pro::audio::*;
 }
 pub mod sherpa_manager {
@@ -87,6 +90,8 @@ pub struct AppState {
     pub sherpa: Arc<SherpaManager>,
     /// MOSS-TTS 48kHz RVQ-16 自包含音色管理与合成引擎
     pub moss: Arc<MossTtsManager>,
+    /// M5-TTS 24kHz 轻量极速语音合成引擎 (51 预置音色)
+    pub m5: Arc<M5TtsManager>,
     /// 最近分析文件的全局语义锚点缓存（spec §2.2.6 / §3.3）
     ///
     /// `perceive` 结束时写入 `e_global`，`POST /api/text/tag` 凭 `file_fingerprint` 取用；
@@ -273,6 +278,12 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
         .as_ref()
         .map(|p| p.to_string_lossy().to_string())
         .or_else(|| Some(state.vector.dir().to_string_lossy().to_string()));
+    let mount_manifest = omni_core::plugin_dir::mount_manifest_status();
+    let mobile_clip_vocab = if is_pro {
+        Some(omni_pro::vision::verify_mobileclip_en_vocab())
+    } else {
+        None
+    };
     Json(serde_json::json!({
         "status": "ok",
         "profile": profile,
@@ -287,6 +298,8 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
             "gemma": vision_status.clone(),
             "ram": ram_status.clone(),
         },
+        "mountManifest": mount_manifest,
+        "mobileClipVocab": mobile_clip_vocab,
         "idleTimeoutSeconds": 300,
         "isPro": is_pro,
         "version": env!("CARGO_PKG_VERSION"),
@@ -320,30 +333,38 @@ struct HealthQuery {
 /// - `textModelReady` / `vocabReady`：**只查文件存在与可读，不加载模型**；
 /// - `textOutputVerified`：三态 null（未加载）/ true / false（首次编码结果）。
 fn clip_text_health(lang: Option<&str>) -> serde_json::Value {
-    let clip_dir = omni_pro::OmniVisionEngine::resolve_clip_model_dir();
+    let zh_clip_dir = omni_pro::OmniVisionEngine::resolve_chinese_clip_model_dir();
+    let mobile_clip_dir = omni_pro::OmniVisionEngine::resolve_mobile_clip_model_dir();
     let is_zh = lang.map(|l| l.starts_with("zh")).unwrap_or(true);
-    let (zh_model_ready, zh_vocab_ready) = match clip_dir.as_ref() {
+    let (zh_model_ready, zh_vocab_ready) = match zh_clip_dir.as_ref() {
         Some(dir) => (
             omni_pro::vision::clip_text_model_ready(dir),
             omni_pro::vision::clip_text_vocab_ready(dir),
         ),
         None => (false, false),
     };
-    let (mobile_model_ready, mobile_vocab_ready) = match clip_dir.as_ref() {
+    let (mobile_model_ready, mobile_tokenizer_ready) = match mobile_clip_dir.as_ref() {
         Some(dir) => (
             omni_pro::vision::mobileclip_text_model_ready(dir),
             omni_pro::vision::mobileclip_tokenizer_ready(dir),
         ),
         None => (false, false),
     };
+    let en_vocab_status = omni_pro::vision::verify_mobileclip_en_vocab();
+    let mobile_vocab_ready = mobile_tokenizer_ready && en_vocab_status.valid;
     let zh_verified = omni_pro::vision::clip_text_output_verified();
     let mobile_verified = omni_pro::vision::mobileclip_text_output_verified();
 
     let image_encoder = omni_pro::vision::active_clip_image_encoder_label(lang).to_string();
-    let (text_model_ready, vocab_ready, text_output_verified) = if is_zh {
-        (zh_model_ready, zh_vocab_ready, zh_verified)
+    let (text_model_ready, vocab_ready, text_output_verified, vocab_reject_reason) = if is_zh {
+        (zh_model_ready, zh_vocab_ready, zh_verified, None)
     } else {
-        (mobile_model_ready, mobile_vocab_ready, mobile_verified)
+        (
+            mobile_model_ready,
+            mobile_vocab_ready,
+            mobile_verified,
+            en_vocab_status.reject_reason.clone(),
+        )
     };
     let available = text_model_ready && vocab_ready && text_output_verified != Some(false);
 
@@ -353,6 +374,7 @@ fn clip_text_health(lang: Option<&str>) -> serde_json::Value {
         "textModelReady": text_model_ready,
         "vocabReady": vocab_ready,
         "textOutputVerified": text_output_verified,
+        "vocabRejectReason": vocab_reject_reason,
         "chineseClip": {
             "available": zh_model_ready && zh_vocab_ready && zh_verified != Some(false),
             "imageEncoder": "chinese_clip",
@@ -366,6 +388,8 @@ fn clip_text_health(lang: Option<&str>) -> serde_json::Value {
             "textModelReady": mobile_model_ready,
             "vocabReady": mobile_vocab_ready,
             "textOutputVerified": mobile_verified,
+            "rejectReason": &en_vocab_status.reject_reason,
+            "vocabStatus": &en_vocab_status,
         }
     })
 }
@@ -1039,6 +1063,7 @@ pub async fn start_server(
         );
     }
     let moss = Arc::new(MossTtsManager::new());
+    let m5 = Arc::new(M5TtsManager::new());
     let vectors_dir_opt = Some(vector.dir().to_path_buf());
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),
@@ -1052,35 +1077,18 @@ pub async fn start_server(
         dimension_policies: Arc::new(std::sync::RwLock::new(initial_policies)),
         sherpa,
         moss,
+        m5,
         anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
         cpu_slot: {
-            let (detected_cpu_model_dir, detected_cpu_run_dir) = {
-                let mut model_dir = None;
-                if let Ok(env_path) = std::env::var("FIREFLY_POCKET_CPU_MODEL_DIR") {
-                    let p = PathBuf::from(env_path);
-                    if p.exists() {
-                        model_dir = Some(p);
+            let (detected_cpu_run_dir, detected_cpu_model_dir) = {
+                let model_dir = match omni_core::plugin_dir::resolve_mounted_dir("pocket-cpu-int8-onnx") {
+                    Ok(Some(dir)) => Some(dir),
+                    Ok(None) => None,
+                    Err(err) => {
+                        tracing::warn!("[OmniServer] 挂载门禁拒绝加载 pocket-cpu-int8-onnx: {err}");
+                        None
                     }
-                }
-                if model_dir.is_none() {
-                    let mut candidates = Vec::new();
-                    if let Some(ref dp) = db_path {
-                        if let Some(parent) = dp.parent() {
-                            candidates.push(parent.join("models").join("pocket-cpu"));
-                        }
-                    }
-                    if let Ok(cwd) = std::env::current_dir() {
-                        candidates.push(cwd.join("build").join("extraResources").join("models").join("pocket-cpu"));
-                        candidates.push(cwd.join("apps").join("desktop").join("build").join("extraResources").join("models").join("pocket-cpu"));
-                    }
-                    for c in candidates {
-                        if c.exists() && (c.join("model_quantized.onnx").exists() || c.join("model.onnx").exists()) {
-                            tracing::info!("[OmniServer] 自动发现 pocket-cpu 真实模型目录: {}", c.display());
-                            model_dir = Some(c);
-                            break;
-                        }
-                    }
-                }
+                };
 
                 let mut run_dir = None;
                 if let Ok(env_run) = std::env::var("FIREFLY_RUN_DIR") {
@@ -1090,9 +1098,9 @@ pub async fn start_server(
                         run_dir = Some(parent.join("run"));
                     }
                 }
-                (model_dir, run_dir)
+                (run_dir, model_dir)
             };
-            Arc::new(cpu_engine::CpuSlot::new(detected_cpu_model_dir, detected_cpu_run_dir))
+            Arc::new(cpu_engine::CpuSlot::new(detected_cpu_run_dir, detected_cpu_model_dir))
         },
     };
 
@@ -1361,12 +1369,11 @@ pub fn run_vision_pipeline_on_image(
                     );
                     Ok(tags)
                 } else {
-                    let tags = omni_pro::OmniVisionEngine::extract_clip_visual_tags_scored_from_image(
+                    omni_pro::OmniVisionEngine::try_extract_clip_visual_tags_scored_from_image(
                         img_ref,
                         lang,
                         10,
-                    );
-                    Ok(tags)
+                    )
                 }
             } else {
                 Ok(Vec::new())
@@ -1496,8 +1503,9 @@ pub fn run_vision_pipeline_on_image(
         if let Some(ref emb) = out.image_embedding {
             if embedding_profile != "gemma_unified" {
                 let t_mutual = std::time::Instant::now();
-                out.clip_mutual_tags = omni_pro::OmniVisionEngine::classify_mutual_exclusive_groups(
+                out.clip_mutual_tags = omni_pro::OmniVisionEngine::classify_mutual_exclusive_groups_with_encoder(
                     emb.as_slice(),
+                    out.image_encoder_id,
                     lang,
                 );
                 mutual_ms = t_mutual.elapsed().as_millis() as u64;
@@ -1676,6 +1684,31 @@ pub fn run_vision_pipeline_on_image(
     Ok(out)
 }
 
+fn extract_vocab_error_reason(err: &str) -> Option<&'static str> {
+    if err.contains("vocab_hash_mismatch") {
+        Some("vocab_hash_mismatch")
+    } else if err.contains("vocab_version_mismatch") {
+        Some("vocab_version_mismatch")
+    } else if err.contains("vocab_missing") {
+        Some("vocab_missing")
+    } else if err.contains("model_missing") || err.contains("ModelMissing") {
+        Some("model_missing")
+    } else {
+        None
+    }
+}
+
+fn vision_unavailable_response(err: &str) -> (StatusCode, Json<serde_json::Value>) {
+    let reason = extract_vocab_error_reason(err).unwrap_or("vision_model_unavailable");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": err,
+            "reason": reason,
+        })),
+    )
+}
+
 /// 兼容既有磁盘路径调用的薄包装层
 fn run_vision_pipeline(
     file_path: &str,
@@ -1684,7 +1717,7 @@ fn run_vision_pipeline(
     lang: Option<&str>,
     embedding_profile: &str,
     enable_nsfw: bool,
-) -> VisionComputed {
+) -> Result<VisionComputed, String> {
     let t_vision = std::time::Instant::now();
     let ext = std::path::Path::new(file_path)
         .extension()
@@ -1706,13 +1739,11 @@ fn run_vision_pipeline(
                             file_path,
                             computed.has_text.unwrap_or(false)
                         );
-                        return computed;
+                        return Ok(computed);
                     }
                     Err(e) => {
                         tracing::error!("[OmniServer] 图像视觉感知流水线失败: file={}, err={}", file_path, e);
-                        let mut out = VisionComputed::default();
-                        out.duration_ms = t_vision.elapsed().as_millis() as u64;
-                        return out;
+                        return Err(e);
                     }
                 }
             }
@@ -1727,12 +1758,12 @@ fn run_vision_pipeline(
         out.has_watermark = Some(v_wm_lvl > 0);
         out.watermark_status = Some(v_wm_status.to_string());
         out.duration_ms = t_vision.elapsed().as_millis() as u64;
-        return out;
+        return Ok(out);
     }
 
     let mut out = VisionComputed::default();
     out.duration_ms = t_vision.elapsed().as_millis() as u64;
-    out
+    Ok(out)
 }
 
 use omni_core::arbitrate_tags_by_dimension_policies;
@@ -1954,7 +1985,7 @@ fn build_enriched_document_corpus(
 async fn perceive_file_handler(
     State(state): State<AppState>,
     Json(req): Json<OmniPerceptionRequest>,
-) -> Json<OmniPerceptionResult> {
+) -> Result<Json<OmniPerceptionResult>, (StatusCode, Json<serde_json::Value>)> {
     let cfg = state.config.lock().unwrap().clone();
     let t_start = std::time::Instant::now();
     let file_path = req.file_path.clone();
@@ -2015,24 +2046,35 @@ async fn perceive_file_handler(
             let fp = file_path.clone();
             let eo = exif_orient.clone();
             let profile = cfg.embedding_profile.clone();
+            let mut vision_err: Option<String> = None;
             let vision_res = if is_pro {
-                tokio::task::spawn_blocking(move || {
+                match tokio::task::spawn_blocking(move || {
                     run_vision_pipeline(&fp, eo.as_deref(), enable_visual_tags, lang.as_deref(), &profile, cfg.enable_nsfw_perception)
                 })
                 .await
-                .unwrap_or_default()
+                {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        vision_err = Some(e);
+                        VisionComputed::default()
+                    }
+                    Err(e) => {
+                        vision_err = Some(format!("视觉感知任务 panic: {e}"));
+                        VisionComputed::default()
+                    }
+                }
             } else {
                 VisionComputed::default()
             };
 
-            // 步骤 A3: 文字提取 (仅当 has_text == Some(true) 时才调用 OCR 识别)
+            // 步骤 A3: 文字提取 (仅当 has_text == Some(true) 且视觉流水线未失败时才调用 OCR 识别)
             // Issue 0046 §1：纯图片的 OCR 结果独占 `ocr` 字段，`markdown_content` 严格保持空字符串，
             // 避免把 OCR 文本伪装成「正文」污染排版结构（复合文档方允许原位嵌合 OCR）。
             let markdown_content = String::new();
             let mut ocr_ms = None;
             let mut text_ms = None;
             let mut ocr_text: Option<String> = None;
-            if vision_res.has_text == Some(true) {
+            if vision_err.is_none() && vision_res.has_text == Some(true) {
                 let t_ocr = std::time::Instant::now();
                 let p_buf = p.to_path_buf();
                 let ocr_size = cfg.ocr_model_size.clone();
@@ -2125,6 +2167,7 @@ async fn perceive_file_handler(
             (
                 metadata_ms,
                 vision_res,
+                vision_err,
                 markdown_content,
                 ocr_ms,
                 text_ms,
@@ -2133,8 +2176,11 @@ async fn perceive_file_handler(
                 ocr_text,
             )
         };
-        let (ads_res, (metadata_ms, vision_res, markdown_content, ocr_ms, text_ms, phash, metadata, ocr_text)) =
+        let (ads_res, (metadata_ms, vision_res, vision_err, markdown_content, ocr_ms, text_ms, phash, metadata, ocr_text)) =
             tokio::join!(f_ads, f_img);
+        if let Some(err) = vision_err {
+            return Err(vision_unavailable_response(&err));
+        }
 
         benchmark.record_opt("metadata_ms", if metadata_ms > 0 { Some(metadata_ms) } else { None });
         benchmark.vision_ms = Some(vision_res.duration_ms);
@@ -2166,6 +2212,7 @@ async fn perceive_file_handler(
             let extract_ms = t_extract.elapsed().as_millis() as u64;
 
             let mut v = VisionComputed::default();
+            let mut vision_err: Option<String> = None;
             let mut video_chunks: Vec<omni_core::OmniVideoChunk> = Vec::new();
             let mut video_timings = omni_pro::perceive::VideoProcessTimings::default();
             let mut video_cover_webp_base64: Option<String> = None;
@@ -2273,11 +2320,12 @@ async fn perceive_file_handler(
                         }
                         Err(err) => {
                             tracing::error!("[OmniServer] 视频代表帧视觉感知打标失败: {}", err);
+                            vision_err = Some(err);
                         }
                     }
 
-                    // 3. 视频代表帧 OCR 文本提取 (当画面检测出文字且开启文本分析时)
-                    if v.has_text == Some(true) && req.enable_text_analysis.unwrap_or(cfg.enable_text_analysis) {
+                    // 3. 视频代表帧 OCR 文本提取 (当画面检测出文字且开启文本分析且视觉感知未失败时)
+                    if vision_err.is_none() && v.has_text == Some(true) && req.enable_text_analysis.unwrap_or(cfg.enable_text_analysis) {
                         let t_ocr = std::time::Instant::now();
                         let dyn_img_for_ocr = dyn_img.clone();
                         let ocr_size = cfg.ocr_model_size.clone();
@@ -2387,9 +2435,12 @@ async fn perceive_file_handler(
                 }
             }
 
-            (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings, video_cover_webp_base64, video_rep_ocr, video_ocr_ms)
+            (extract_ms, ext_res, v, vision_err, audio_ms, video_chunks, video_timings, video_cover_webp_base64, video_rep_ocr, video_ocr_ms)
         };
-        let (ads_res, (extract_ms, ext_res, v, audio_ms, video_chunks, video_timings, video_cover_webp_base64, video_rep_ocr, video_ocr_ms)) = tokio::join!(f_ads, f_non_img);
+        let (ads_res, (extract_ms, ext_res, v, vision_err, audio_ms, video_chunks, video_timings, video_cover_webp_base64, video_rep_ocr, video_ocr_ms)) = tokio::join!(f_ads, f_non_img);
+        if let Some(err) = vision_err {
+            return Err(vision_unavailable_response(&err));
+        }
 
         benchmark.extract_ms = Some(extract_ms);
         benchmark.audio_ms = audio_ms;
@@ -2473,14 +2524,21 @@ async fn perceive_file_handler(
     };
 
     // Ticket 03: 原生感知插槽 (perception_nsfw & perception_face)
+    // 严格区分视觉模型 `_shared/nsfw/nsfw-mobilenetv2.onnx` (域 B) 与纯文本底座 `models/nsfw/nsfw_text.ftz` (域 A)：
+    // 仅图片/视频路径要求视觉 NSFW 模型就绪；非视觉文本/文档路径只要启用插槽即可运行内置规则与 FastText 文本底座。
     let nsfw_slot_active = cfg.enable_nsfw_perception;
-    let nsfw_model_ready = if is_pro {
+    let nsfw_visual_ready = if is_pro {
         omni_pro::OmniVisionEngine::resolve_nsfw_model_path().is_some()
     } else {
         false
     };
+    let nsfw_ready_for_media = if is_image || is_video {
+        nsfw_visual_ready
+    } else {
+        true
+    };
 
-    let (nsfw_tags, nsfw_text_tags, sensitive_types, content_rating, nsfw_perception) = if !nsfw_slot_active || !nsfw_model_ready {
+    let (nsfw_tags, nsfw_text_tags, sensitive_types, content_rating, nsfw_perception) = if !nsfw_slot_active || !nsfw_ready_for_media {
         (
             Vec::new(),
             Vec::new(),
@@ -3097,13 +3155,14 @@ async fn perceive_file_handler(
     // 注意：此处在 ram_tags 降级为 flat 前调用，以获取完整 TagChainItem 结构
     // (P3 来源对称：级联主体池同样只消费门禁后存活的 gated_ram_tags)
     let (cascade_candidates, winning_hypothesis, activated_dimension_tags, _smart_name, _content_description, pruned_ambiguous_words) = if is_pro && is_image {
-        omni_pro::OmniVisionEngine::synthesize_cascade_hypotheses_and_arbitrate(
+        omni_pro::OmniVisionEngine::synthesize_cascade_hypotheses_and_arbitrate_with_encoder(
             &file_path,
             &detected_visual_tags,
             &gated_ram_tags,
             &morphology_tags,
             &nsfw_tags,
             image_embedding.as_deref(),
+            image_encoder_id,
             req.language.as_deref(),
         )
     } else {
@@ -4024,7 +4083,7 @@ async fn perceive_file_handler(
         });
     }
 
-    result
+    Ok(result)
 }
 
 /// 受控词表预计算向量表（进程级只读，一次加载全程复用）。
@@ -5098,25 +5157,70 @@ pub struct AudioTtsStatusResponse {
     pub engine: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveTtsEngine {
+    M5,
+    Moss,
+}
+
+fn resolve_active_tts_engine(state: &AppState) -> ActiveTtsEngine {
+    let m5_mounted = matches!(omni_core::plugin_dir::resolve_mounted_dir("m5-tts"), Ok(Some(_)));
+    if state.m5.is_ready() || (m5_mounted && !state.moss.is_ready()) {
+        ActiveTtsEngine::M5
+    } else {
+        ActiveTtsEngine::Moss
+    }
+}
+
+fn build_tts_wav_response(
+    engine_name: &'static str,
+    synth_res: moss_tts::SynthResult,
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "audio/wav")
+        .header(axum::http::header::CONTENT_LENGTH, synth_res.wav_bytes.len().to_string())
+        .header("X-Tts-Engine", engine_name)
+        .header("X-Moss-Hit-Cap", synth_res.hit_cap.to_string())
+        .header("X-Moss-Steps", synth_res.steps.to_string())
+        .body(axum::body::Body::from(synth_res.wav_bytes))
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 /// 查询 TTS 引擎状态: GET /api/audio/tts/status
 async fn audio_tts_status_handler(
     State(state): State<AppState>,
 ) -> Json<AudioTtsStatusResponse> {
-    let ready = state.moss.is_ready();
-    let total_voices = state.moss.total_voices().await;
-    Json(AudioTtsStatusResponse {
-        ready,
-        total_voices,
-        sample_rate: 48000,
-        engine: "moss-tts-nano-int8".to_string(),
-    })
+    match resolve_active_tts_engine(&state) {
+        ActiveTtsEngine::M5 => Json(AudioTtsStatusResponse {
+            ready: state.m5.is_ready(),
+            total_voices: state.m5.total_voices().await,
+            sample_rate: 24000,
+            engine: "m5-tts-50m-int8".to_string(),
+        }),
+        ActiveTtsEngine::Moss => Json(AudioTtsStatusResponse {
+            ready: state.moss.is_ready(),
+            total_voices: state.moss.total_voices().await,
+            sample_rate: 48000,
+            engine: "moss-tts-nano-int8".to_string(),
+        }),
+    }
 }
 
 /// 内存热注册自定义音色特征码: POST /api/audio/tts/register-voice
 async fn audio_tts_register_voice_handler(
     State(state): State<AppState>,
     Json(req): Json<AudioTtsRegisterVoiceRequest>,
-) -> Json<AudioTtsRegisterVoiceResponse> {
+) -> (StatusCode, Json<AudioTtsRegisterVoiceResponse>) {
+    if resolve_active_tts_engine(&state) == ActiveTtsEngine::M5 {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(AudioTtsRegisterVoiceResponse {
+                success: false,
+                error: Some("Voice cloning/registration is only supported by MOSS-TTS, not M5-TTS".to_string()),
+            }),
+        );
+    }
     match state
         .moss
         .register_voice(
@@ -5130,14 +5234,20 @@ async fn audio_tts_register_voice_handler(
         )
         .await
     {
-        Ok(_) => Json(AudioTtsRegisterVoiceResponse {
-            success: true,
-            error: None,
-        }),
-        Err(e) => Json(AudioTtsRegisterVoiceResponse {
-            success: false,
-            error: Some(e),
-        }),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(AudioTtsRegisterVoiceResponse {
+                success: true,
+                error: None,
+            }),
+        ),
+        Err(e) => (
+            StatusCode::OK,
+            Json(AudioTtsRegisterVoiceResponse {
+                success: false,
+                error: Some(e),
+            }),
+        ),
     }
 }
 
@@ -5152,33 +5262,7 @@ async fn audio_tts_chunk_handler(
         return Err((axum::http::StatusCode::BAD_REQUEST, "text cannot be empty".to_string()));
     }
 
-    if !state.moss.is_ready() {
-        return Err((
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "MOSS-TTS engine not ready or model missing".to_string(),
-        ));
-    }
-
     let speed = req.speed.unwrap_or(1.0);
-    let voice_id = req.voice_id.unwrap_or_else(|| "preset_azure_yunxi".to_string());
-
-    // 优先按指定 voice_id 寻址，未找到时平滑 fallback 到默认 preset_azure_yunxi
-    let target_voice = match state.moss.get_voice(&voice_id).await {
-        Some(v) => v,
-        None => match state.moss.get_voice("preset_azure_yunxi").await {
-            Some(v) => v,
-            None => {
-                return Err((
-                    axum::http::StatusCode::NOT_FOUND,
-                    format!("Voice '{}' not found and default preset_azure_yunxi unavailable", voice_id),
-                ));
-            }
-        },
-    };
-
-    let permit = state.moss.semaphore().acquire_owned().await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire tts lock: {}", e)))?;
-
     let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_clone = cancel_flag.clone();
 
@@ -5191,25 +5275,78 @@ async fn audio_tts_chunk_handler(
     }
     let _cancel_guard = CancelOnDrop(cancel_flag);
 
-    let moss = state.moss.clone();
-    let synth_res = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        moss.synthesize_with_cancel(&clean_text, &target_voice, speed, Some(cancel_clone))
-    })
-    .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TTS task panicked: {}", e)))?
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    match resolve_active_tts_engine(&state) {
+        ActiveTtsEngine::M5 => {
+            if !state.m5.is_ready() {
+                return Err((
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "M5-TTS engine not ready or model missing".to_string(),
+                ));
+            }
+            let voice_id = req.voice_id.unwrap_or_else(|| M5_DEFAULT_VOICE_ID.to_string());
+            let target_voice = match state.m5.get_voice(&voice_id).await {
+                Some(v) => v,
+                None => match state.m5.get_voice(M5_DEFAULT_VOICE_ID).await {
+                    Some(v) => v,
+                    None => {
+                        return Err((
+                            axum::http::StatusCode::NOT_FOUND,
+                            format!("Voice '{}' not found and default {} unavailable", voice_id, M5_DEFAULT_VOICE_ID),
+                        ));
+                    }
+                },
+            };
 
-    let response = axum::response::Response::builder()
-        .status(axum::http::StatusCode::OK)
-        .header(axum::http::header::CONTENT_TYPE, "audio/wav")
-        .header(axum::http::header::CONTENT_LENGTH, synth_res.wav_bytes.len().to_string())
-        .header("X-Moss-Hit-Cap", synth_res.hit_cap.to_string())
-        .header("X-Moss-Steps", synth_res.steps.to_string())
-        .body(axum::body::Body::from(synth_res.wav_bytes))
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let permit = state.m5.semaphore().acquire_owned().await
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire tts lock: {}", e)))?;
+            let m5 = state.m5.clone();
+            let synth_res = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                m5.synthesize_with_cancel(&clean_text, &target_voice, speed, Some(cancel_clone))
+            })
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TTS task panicked: {}", e)))?
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    Ok(response)
+            build_tts_wav_response("m5-tts-50m-int8", synth_res)
+        }
+        ActiveTtsEngine::Moss => {
+            if !state.moss.is_ready() {
+                return Err((
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "MOSS-TTS engine not ready or model missing".to_string(),
+                ));
+            }
+
+            let voice_id = req.voice_id.unwrap_or_else(|| "preset_azure_yunxi".to_string());
+            // 优先按指定 voice_id 寻址，未找到时平滑 fallback 到默认 preset_azure_yunxi
+            let target_voice = match state.moss.get_voice(&voice_id).await {
+                Some(v) => v,
+                None => match state.moss.get_voice("preset_azure_yunxi").await {
+                    Some(v) => v,
+                    None => {
+                        return Err((
+                            axum::http::StatusCode::NOT_FOUND,
+                            format!("Voice '{}' not found and default preset_azure_yunxi unavailable", voice_id),
+                        ));
+                    }
+                },
+            };
+
+            let permit = state.moss.semaphore().acquire_owned().await
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire tts lock: {}", e)))?;
+            let moss = state.moss.clone();
+            let synth_res = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                moss.synthesize_with_cancel(&clean_text, &target_voice, speed, Some(cancel_clone))
+            })
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TTS task panicked: {}", e)))?
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            build_tts_wav_response("moss-tts-nano-int8", synth_res)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5346,6 +5483,21 @@ async fn audio_analyze_voice_handler(
     State(state): State<AppState>,
     Json(req): Json<AudioAnalyzeVoiceRequest>,
 ) -> (StatusCode, Json<AudioAnalyzeVoiceResponse>) {
+    if resolve_active_tts_engine(&state) == ActiveTtsEngine::M5 {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(AudioAnalyzeVoiceResponse {
+                success: false,
+                error: Some("Voice cloning/analysis is only supported by MOSS-TTS, not M5-TTS".to_string()),
+                lang: "zh".to_string(),
+                emotion: "neutral".to_string(),
+                text: String::new(),
+                frames: 0,
+                codes: Vec::new(),
+            }),
+        );
+    }
+
     let file_path = req.file_path.trim().to_string();
     if file_path.is_empty() {
         return (
@@ -5494,7 +5646,7 @@ async fn audio_analyze_voice_handler(
 async fn vision_tags_handler(
     State(state): State<AppState>,
     Json(req): Json<VisionTagsRequest>,
-) -> Json<VisionTagsResponse> {
+) -> Result<Json<VisionTagsResponse>, (StatusCode, Json<serde_json::Value>)> {
     let cfg = state.config.lock().unwrap().clone();
     let t_start = std::time::Instant::now();
     let file_path = req.file_path.clone();
@@ -5519,11 +5671,31 @@ async fn vision_tags_handler(
             }
         } else {
             // classic_light 档位：严格只走 CLIP 视觉感知，禁止互通，禁止借道 Gemma
-            tags = omni_pro::OmniVisionEngine::extract_clip_visual_tags(
-                &file_path,
-                req.language.as_deref(),
-                req.top_k.unwrap_or(5),
-            );
+            match image::open(&file_path) {
+                Ok(img) => {
+                    match omni_pro::OmniVisionEngine::try_extract_clip_visual_tags_scored_from_image(
+                        &img,
+                        req.language.as_deref(),
+                        req.top_k.unwrap_or(5),
+                    ) {
+                        Ok(scored) => {
+                            tags = scored.iter().map(|(c, _)| c.clone()).collect();
+                            scored_tags = Some(scored);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[OmniVision] classic_light 视觉感知失败 (file={}): {}",
+                                file_path,
+                                e
+                            );
+                            return Err(vision_unavailable_response(&e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("[OmniVision] classic_light 无法打开图片: {e}");
+                }
+            }
         }
     }
 
@@ -5539,12 +5711,12 @@ async fn vision_tags_handler(
     }
 
     let duration_ms = t_start.elapsed().as_millis() as u64;
-    Json(VisionTagsResponse {
+    Ok(Json(VisionTagsResponse {
         file_path,
         tags,
         scored_tags,
         duration_ms,
-    })
+    }))
 }
 
 /// 单指标图像频域特征检测处理: POST /api/vision/inspect

@@ -32,7 +32,9 @@ fn setup_test_app() -> (Router, Arc<AnchorCache>) {
         )),
         sherpa: Arc::new(omni_server::SherpaManager::new()),
         moss: Arc::new(omni_server::MossTtsManager::new()),
+        m5: Arc::new(omni_server::M5TtsManager::new()),
         anchor_cache: anchor_cache.clone(),
+        cpu_slot: Arc::new(omni_server::cpu_engine::CpuSlot::new(None, None)),
     };
     (create_app_router(state), anchor_cache)
 }

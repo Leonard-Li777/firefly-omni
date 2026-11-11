@@ -61,6 +61,9 @@ pub mod ort_runtime;
 pub use ort_runtime::*;
 pub use ort;
 
+/// 全系统模型目录解析与激活挂载清单单轨门禁 (SSOT Mount Guard)
+pub mod plugin_dir;
+
 /// 本地二进制智能分析与分类引擎 (BinaryLens)
 pub mod binarylens;
 pub use binarylens::{analyze_binary, BinaryAnalysisInfo, BinaryLensError};
