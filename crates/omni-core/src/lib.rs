@@ -60,6 +60,7 @@ pub use error::OmniError;
 pub mod ort_runtime;
 pub use ort_runtime::*;
 pub use ort;
+pub use ffp_crypto;
 
 /// 全系统模型目录解析与激活挂载清单单轨门禁 (SSOT Mount Guard)
 pub mod plugin_dir;

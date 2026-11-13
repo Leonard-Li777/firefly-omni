@@ -61,6 +61,7 @@ pub struct PocketCpuGenerator {
     session: Arc<Mutex<Option<ort::session::Session>>>,
     // 注入 Panic 触发器（专用于 G-06 panic 隔离测试）
     pub inject_panic_on_generate: AtomicBool,
+    pub _payload_guard: Option<omni_core::ffp_crypto::DecryptedPayload>,
 }
 
 impl PocketCpuGenerator {
@@ -122,8 +123,82 @@ impl PocketCpuGenerator {
         }
     }
 
-    /// 从资产目录加载模型与分词器
+    /// 从资产目录加载模型与分词器 (优先 .ffpc 纯内存解密装载，零明文落盘)
     pub fn load_from_dir(dir: &Path, num_threads: usize) -> Result<Self, String> {
+        let current_json_path = dir.join("current.json");
+        let mut loaded_ffpc: Option<(omni_core::ffp_crypto::DecryptedPayload, ort::session::Session, Option<Tokenizer>)> = None;
+
+        if current_json_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&current_json_path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(active_file) = val.get("activeFile").and_then(|v| v.as_str()) {
+                        if active_file.ends_with(".ffpc") {
+                            let ffpc_path = dir.join(active_file);
+                            if ffpc_path.exists() {
+                                tracing::info!("PocketCpuGenerator: 发现加密容器 {:?}，启动纯内存解密与装载", ffpc_path);
+                                match omni_core::ffp_crypto::decrypt_ffpc_payload(
+                                    &ffpc_path,
+                                    "485c04b7",
+                                    "ai_engine_cpu",
+                                    "1.0.0",
+                                ) {
+                                    Ok(payload) => {
+                                        omni_core::ort_runtime::OmniOrtRuntime::ensure_initialized();
+                                        match omni_core::ort_runtime::OmniOrtRuntime::build_session_from_memory(
+                                            payload.onnx_slice(),
+                                            omni_core::ort_runtime::ModelTier::Tier3,
+                                            omni_core::ort_runtime::EpPolicy::CpuOnly,
+                                            num_threads,
+                                        ) {
+                                            Ok(sess) => {
+                                                if let Err(e) = Self::validate_io_signature(&sess) {
+                                                    return Err(format!("Pocket CPU 内存 Session 校验失败: {e}"));
+                                                }
+                                                let tok = if let Some(tok_bytes) = payload.tok_slice() {
+                                                    Tokenizer::from_bytes(tok_bytes).ok()
+                                                } else {
+                                                    None
+                                                };
+                                                loaded_ffpc = Some((payload, sess, tok));
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("PocketCpuGenerator: 内存构建 Session 失败: {:?}，尝试回退", e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("PocketCpuGenerator: 解密 .ffpc 失败: {:?}，尝试回退", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((payload, sess, maybe_tok)) = loaded_ffpc {
+            let tokenizer = if let Some(tok) = maybe_tok {
+                tok
+            } else {
+                let tokenizer_path = dir.join("tokenizer.json");
+                if tokenizer_path.exists() {
+                    Tokenizer::from_file(&tokenizer_path).map_err(|e| format!("加载分词器失败: {e}"))?
+                } else {
+                    Self::create_fallback_tokenizer()
+                }
+            };
+
+            return Ok(Self {
+                model_id: "pocket-cpu-int8",
+                tokenizer: Arc::new(tokenizer),
+                session: Arc::new(Mutex::new(Some(sess))),
+                inject_panic_on_generate: AtomicBool::new(false),
+                _payload_guard: Some(payload),
+            });
+        }
+
+        // 回退分支：传统明文 ONNX 加载（仅用于单测与未加密旧兼容环境）
         let tokenizer_path = dir.join("tokenizer.json");
         let tokenizer = if tokenizer_path.exists() {
             Tokenizer::from_file(&tokenizer_path).map_err(|e| format!("加载分词器失败: {e}"))?
@@ -159,6 +234,7 @@ impl PocketCpuGenerator {
             tokenizer: Arc::new(tokenizer),
             session: Arc::new(Mutex::new(session)),
             inject_panic_on_generate: AtomicBool::new(false),
+            _payload_guard: None,
         })
     }
 
@@ -170,6 +246,7 @@ impl PocketCpuGenerator {
             tokenizer: Arc::new(tokenizer),
             session: Arc::new(Mutex::new(None)),
             inject_panic_on_generate: AtomicBool::new(false),
+            _payload_guard: None,
         }
     }
 
@@ -287,17 +364,57 @@ impl CpuGenerator for PocketCpuGenerator {
                 let shape = vec![batch_size, seq_len];
                 let input_ids_data: Vec<i64> = current_tokens.iter().map(|&t| t as i64).collect();
 
-                let input_ids_tensor = match ort::value::Tensor::from_array((shape, input_ids_data)) {
+                let input_ids_tensor = match ort::value::Tensor::from_array((shape.clone(), input_ids_data)) {
                     Ok(t) => t,
                     Err(e) => return Err(format!("构造 input_ids 张量失败: {e}")),
                 };
 
-                let inputs = match ort::inputs!["input_ids" => input_ids_tensor] {
-                    Ok(inp) => inp,
-                    Err(e) => return Err(format!("装配 inputs 失败: {e}")),
+                let has_pos_ids = session.inputs.iter().any(|i| i.name == "position_ids");
+                let has_attn_mask = session.inputs.iter().any(|i| i.name == "attention_mask");
+
+                let outputs = if has_pos_ids && has_attn_mask {
+                    let pos_data: Vec<i64> = (0..seq_len).collect();
+                    let pos_tensor = match ort::value::Tensor::from_array((shape.clone(), pos_data)) {
+                        Ok(t) => t,
+                        Err(e) => return Err(format!("构造 position_ids 张量失败: {e}")),
+                    };
+                    let mask_data = vec![1i64; seq_len as usize];
+                    let mask_tensor = match ort::value::Tensor::from_array((shape, mask_data)) {
+                        Ok(t) => t,
+                        Err(e) => return Err(format!("构造 attention_mask 张量失败: {e}")),
+                    };
+                    let inps = match ort::inputs![
+                        "input_ids" => input_ids_tensor,
+                        "position_ids" => pos_tensor,
+                        "attention_mask" => mask_tensor,
+                    ] {
+                        Ok(i) => i,
+                        Err(e) => return Err(format!("装配 inputs 失败: {e}")),
+                    };
+                    session.run(inps)
+                } else if has_pos_ids {
+                    let pos_data: Vec<i64> = (0..seq_len).collect();
+                    let pos_tensor = match ort::value::Tensor::from_array((shape, pos_data)) {
+                        Ok(t) => t,
+                        Err(e) => return Err(format!("构造 position_ids 张量失败: {e}")),
+                    };
+                    let inps = match ort::inputs![
+                        "input_ids" => input_ids_tensor,
+                        "position_ids" => pos_tensor,
+                    ] {
+                        Ok(i) => i,
+                        Err(e) => return Err(format!("装配 inputs 失败: {e}")),
+                    };
+                    session.run(inps)
+                } else {
+                    let inps = match ort::inputs!["input_ids" => input_ids_tensor] {
+                        Ok(i) => i,
+                        Err(e) => return Err(format!("装配 inputs 失败: {e}")),
+                    };
+                    session.run(inps)
                 };
 
-                let outputs = match session.run(inputs) {
+                let outputs = match outputs {
                     Ok(out) => out,
                     Err(e) => return Err(format!("ORT 推理失败: {e}")),
                 };
@@ -409,5 +526,42 @@ impl CpuGenerator for PocketCpuGenerator {
             finish_reason,
             prompt_tokens_count: prompt_len,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_pocket_cpu_ffpc_memory_loading() {
+        let cpu_dir = PathBuf::from(r"D:\plugin\_shared\cpu-485c04b7");
+        if !cpu_dir.exists() || !cpu_dir.join("current.json").exists() {
+            eprintln!("跳过测试：未检测到物理 cpu-485c04b7 目录");
+            return;
+        }
+
+        // 验证当前目录下绝对没有明文 ONNX
+        assert!(
+            !cpu_dir.join("model_quantized.onnx").exists(),
+            "安全红线违背：cpu-485c04b7 目录下依然存在明文 model_quantized.onnx！"
+        );
+        assert!(
+            !cpu_dir.join("model.onnx").exists(),
+            "安全红线违背：cpu-485c04b7 目录下依然存在明文 model.onnx！"
+        );
+
+        // 从 .ffpc 纯内存解密加载
+        let gen = PocketCpuGenerator::load_from_dir(&cpu_dir, 2)
+            .expect("必须成功从 .ffpc 加密容器内存加载 Pocket CPU");
+
+        assert!(gen.is_session_loaded(), "ORT 会话必须成功加载进内存");
+        assert!(gen._payload_guard.is_some(), "解密载荷守卫必须有效持有");
+
+        // 测试分词（从加密容器内存里的 Tokenizer Stream 解密加载）
+        let tokens = gen.tokenize("你好，世界").expect("分词必须成功");
+        assert!(!tokens.is_empty(), "分词结果不得为空");
+        println!("Pocket CPU 纯内存解密与装载成功: tokens={:?}", tokens);
     }
 }
