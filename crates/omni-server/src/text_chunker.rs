@@ -18,18 +18,18 @@ static JIEBA: OnceLock<Jieba> = OnceLock::new();
 const PARALLEL_CONJUNCTIONS: &[&str] = &["和", "与", "同", "跟", "及", "以及"];
 const TIGHT_CONTINUING_CONJUNCTIONS: &[&str] = &["而且", "然后", "并且", "于是", "但是", "然而", "从而", "所以"];
 
-/// MOSS-TTS 阶梯扩容切片参数 (PRD-0058 / MOSS-TTS Low Latency Spec §3.1)
+/// MOSS-TTS / M5-TTS 阶梯扩容切片参数 (PRD-0058 / MOSS-TTS Low Latency Spec §3.1)
 pub const HEAD_CHUNK_MIN_LEN: usize = 8;
-pub const HEAD_CHUNK_TARGET_LEN: usize = 12;
-pub const HEAD_CHUNK_MAX_LEN: usize = 18;
+pub const HEAD_CHUNK_TARGET_LEN: usize = 14;
+pub const HEAD_CHUNK_MAX_LEN: usize = 20;
 
-pub const SECOND_CHUNK_MIN_LEN: usize = 20;
-pub const SECOND_CHUNK_TARGET_LEN: usize = 26;
-pub const SECOND_CHUNK_MAX_LEN: usize = 32;
+pub const SECOND_CHUNK_MIN_LEN: usize = 16;
+pub const SECOND_CHUNK_TARGET_LEN: usize = 25;
+pub const SECOND_CHUNK_MAX_LEN: usize = 35;
 
-pub const BODY_CHUNK_MIN_LEN: usize = 35;
-pub const BODY_CHUNK_TARGET_LEN: usize = 50;
-pub const BODY_CHUNK_MAX_LEN: usize = 65; // 物理绝对红线，严防 375 帧截断
+pub const BODY_CHUNK_MIN_LEN: usize = 20;
+pub const BODY_CHUNK_TARGET_LEN: usize = 30;
+pub const BODY_CHUNK_MAX_LEN: usize = 38; // RTF 优化后目标：单句约 8~12s 生成，尽快送达 Web Audio 时间轴
 
 /// 获取或惰性初始化全局 Jieba 实例（多线程零锁并发借用）
 pub fn get_jieba() -> &'static Jieba {
@@ -77,8 +77,10 @@ pub fn char_to_byte_index(text: &str, char_idx: usize) -> usize {
 fn find_pos_split_char_idx(text: &str, max_len: usize, min_safe_len: usize, is_zh: bool) -> usize {
     let total_chars = text.chars().count();
     let safe_end_chars = max_len.min(total_chars);
-    let safe_end_byte = char_to_byte_index(text, safe_end_chars);
-    let search_slice = &text[..safe_end_byte];
+    // 扩展探索窗口 15 个字符，确保分词引擎能够感知跨越边界的二元复合词（如“文件”），杜绝词素中途撕裂
+    let lookahead_chars = (safe_end_chars + 15).min(total_chars);
+    let lookahead_byte = char_to_byte_index(text, lookahead_chars);
+    let search_slice = &text[..lookahead_byte];
 
     if is_zh {
         let jieba = get_jieba();
@@ -101,20 +103,26 @@ fn find_pos_split_char_idx(text: &str, max_len: usize, min_safe_len: usize, is_z
                 .any(|&conj| next_slice.trim_start().starts_with(conj));
 
             // 记录安全区间内的合法词边界（避免截断在专有名词或汉字词素中间）
-            // 护栏：若该边界紧邻后方的词是顺承连词（如“而且/然后/并且/于是/但是/然而/从而/所以”），
-            // 禁止在此断开，否则会将连词孤立在下一句句首
+            // 护栏：若该边界紧邻后方的词是顺承连词，禁止在此断开
             if end_char >= min_safe_len && end_char <= safe_end_chars && !next_is_tight_conj {
                 last_safe_word_boundary = end_char;
+            } else if start_char < safe_end_chars && end_char > safe_end_chars {
+                // 词素跨越截断边界（如“文件”跨越第 32 字符）：
+                // 若仅超界 1~3 字符，优先弹性延展至词尾；否则退守至词首，杜绝腰斩！
+                if end_char <= safe_end_chars + 3 && !next_is_tight_conj {
+                    last_safe_word_boundary = end_char;
+                } else if start_char >= min_safe_len && !next_is_tight_conj {
+                    last_safe_word_boundary = start_char;
+                }
             }
 
             // 1. 语气词（y 如 呢/吧/啊）与时态助词（ule 了、uguo 过）：允许在其后方截断（同样受连词护栏约束）
             let is_post_particle = tag == "y" || tag == "ule" || tag == "uguo";
-            if is_post_particle && end_char >= min_safe_len && end_char <= safe_end_chars && !next_is_tight_conj {
+            if is_post_particle && end_char >= min_safe_len && end_char <= safe_end_chars + 2 && !next_is_tight_conj {
                 best_split_char = end_char;
             }
 
-            // 2. 复句/转折/因果连词（排除并列连词“和/与/同/跟”及紧密顺承连词“而且/然后/并且/于是/但是/然而/从而/所以”）：
-            //    在非紧密连词前方断开
+            // 2. 复句/转折/因果连词：在非紧密连词前方断开
             let is_conjunction = tag == "c"
                 && !PARALLEL_CONJUNCTIONS.contains(&tag_token.word)
                 && !TIGHT_CONTINUING_CONJUNCTIONS.contains(&tag_token.word);
@@ -143,6 +151,9 @@ fn find_pos_split_char_idx(text: &str, max_len: usize, min_safe_len: usize, is_z
             let word_chars = word.chars().count();
             let end_char = char_offset + word_chars;
             if end_char >= min_safe_len && end_char <= safe_end_chars {
+                last_word_boundary = end_char;
+            } else if char_offset < safe_end_chars && end_char > safe_end_chars && end_char <= safe_end_chars + 4 {
+                // 单词弹性延展
                 last_word_boundary = end_char;
             }
             // 优先在单词间隔的空白处截断
@@ -272,6 +283,14 @@ pub fn split_text_chunks(
         return Vec::new();
     }
 
+    // 短文本整体保护：若全文本总字符数 <= 55 且包含 <= 2 个短从句（如例句“你好，欢迎使用...驱动的文件管理！”共 39 字），
+    // 直接保留为完整句子或自然标点聚合，绝不进行生硬词内切分，杜绝二次自回归推理延迟与声学断气
+    let total_clean_chars = trimmed.chars().count();
+    if total_clean_chars <= 55 && clauses.len() <= 2 {
+        let full_text = clauses.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("");
+        return vec![full_text];
+    }
+
     let mut chunks: Vec<String> = Vec::new();
     let mut current_buffer = String::new();
 
@@ -293,8 +312,8 @@ pub fn split_text_chunks(
         };
 
         // A. 极端情况：单个原子段落直接突破 max_len（连续无标点长串）
-        // 首句弹性延展保护：若前 18 字无自然停顿，通过词法边界弹性延展至 22~25 字，严禁在专有名词或英文单词内部硬切补逗号
-        let elastic_clause_max = if is_ladder_mode && chunks.is_empty() { 25 } else { max_len };
+        // 首句弹性延展保护：若前 20 字无自然停顿，通过词法边界弹性延展至 35~40 字，严禁在专有名词或英文单词内部硬切补逗号
+        let elastic_clause_max = if is_ladder_mode && chunks.is_empty() { 40 } else { max_len };
         if clause_chars > elastic_clause_max {
             let current_starts_with_tight_conj = TIGHT_CONTINUING_CONJUNCTIONS
                 .iter()
@@ -312,9 +331,9 @@ pub fn split_text_chunks(
                 clause_str.to_string()
             };
 
-            while remaining.chars().count() > (if is_ladder_mode && chunks.is_empty() { 25 } else { get_thresholds(chunks.len()).2 }) {
+            while remaining.chars().count() > (if is_ladder_mode && chunks.is_empty() { 40 } else { get_thresholds(chunks.len()).2 }) {
                 let (cur_min, cur_target, cur_max) = get_thresholds(chunks.len());
-                let cur_elastic_max = if is_ladder_mode && chunks.is_empty() { 25 } else { cur_max };
+                let cur_elastic_max = if is_ladder_mode && chunks.is_empty() { 40 } else { cur_max };
                 let cur_min_safe = cur_min.max((cur_target as f32 * 0.7) as usize);
                 let split_char_idx = find_pos_split_char_idx(&remaining, cur_elastic_max, cur_min_safe, is_zh);
                 // 强制保底单步推进，杜绝 0 长度死循环
@@ -400,11 +419,11 @@ pub fn split_text_chunks(
             };
 
             let (_, _, new_max) = get_thresholds(chunks.len());
-            let elastic_limit = if is_ladder_mode && chunks.is_empty() { 25 } else { new_max };
+            let elastic_limit = if is_ladder_mode && chunks.is_empty() { 40 } else { new_max };
             if remaining.chars().count() > elastic_limit {
-                while remaining.chars().count() > (if is_ladder_mode && chunks.is_empty() { 25 } else { get_thresholds(chunks.len()).2 }) {
+                while remaining.chars().count() > (if is_ladder_mode && chunks.is_empty() { 40 } else { get_thresholds(chunks.len()).2 }) {
                     let (cur_min, cur_target, cur_max) = get_thresholds(chunks.len());
-                    let cur_elastic_max = if is_ladder_mode && chunks.is_empty() { 25 } else { cur_max };
+                    let cur_elastic_max = if is_ladder_mode && chunks.is_empty() { 40 } else { cur_max };
                     let cur_min_safe = cur_min.max((cur_target as f32 * 0.7) as usize);
                     let split_char_idx = find_pos_split_char_idx(&remaining, cur_elastic_max, cur_min_safe, is_zh);
                     let effective_split = if split_char_idx == 0 || split_char_idx >= remaining.chars().count() {
