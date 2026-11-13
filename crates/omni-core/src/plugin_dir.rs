@@ -280,7 +280,38 @@ fn validate_single_mount(
                         break;
                     }
                 };
-                let fsize = meta.len();
+                let mut fsize = meta.len();
+                if rel == "current.json" {
+                    // 若首文件声明为 current.json 指针，穿透解析其引用的加密容器 (.ffpc) 体积进行权威硬底线核验
+                    if let Ok(raw_json) = fs::read_to_string(&canon_file) {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw_json) {
+                            let mut container_bytes = 0u64;
+                            let mut resolved_containers = Vec::new();
+                            if let Some(act) = val.get("activeFile").and_then(|v| v.as_str()) {
+                                resolved_containers.push(act.to_string());
+                            } else if let Some(map) = val.get("activeFiles").and_then(|v| v.as_object()) {
+                                for v in map.values() {
+                                    if let Some(s) = v.as_str() {
+                                        resolved_containers.push(s.to_string());
+                                    }
+                                }
+                            }
+                            for c_rel in &resolved_containers {
+                                if is_safe_relative_path(c_rel) {
+                                    let c_path = canon_dir.join(c_rel);
+                                    if let Ok(c_meta) = fs::metadata(&c_path) {
+                                        if c_meta.is_file() {
+                                            container_bytes = container_bytes.saturating_add(c_meta.len());
+                                        }
+                                    }
+                                }
+                            }
+                            if container_bytes > 0 {
+                                fsize = container_bytes;
+                            }
+                        }
+                    }
+                }
                 if idx == 0 {
                     if fsize < effective_min_bytes {
                         group_errors.push(format!(
@@ -945,6 +976,69 @@ mod tests {
         let state = load_manifest_from_path(&manifest_path, Some(&shared_b), true);
         assert_eq!(state.status.mode, "manifest_error");
         assert!(state.status.error.unwrap().contains("不一致"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn accepts_current_json_pointing_to_valid_encrypted_container_and_rejects_empty() {
+        let root = make_temp_root("current_json");
+        let shared = root.join("_shared");
+        let bekko = shared.join("bekko-a8m");
+        fs::create_dir_all(&bekko).unwrap();
+
+        // 写入一个 55MB 的加密容器文件
+        let container_name = "model.test_hash.ffpc";
+        write_bytes(&bekko.join(container_name), 55_000_000);
+
+        // 写入指向该容器的 current.json
+        let current_json_path = bekko.join("current.json");
+        let current_json_content = format!(
+            r#"{{"activeFile":"{}","version":"1.0.0"}}"#,
+            container_name
+        );
+        fs::write(&current_json_path, current_json_content).unwrap();
+
+        let manifest_path = root.join("active-mounts.json");
+        let bekko_str = bekko.to_string_lossy().replace('\\', "\\\\");
+        let shared_str = shared.to_string_lossy().replace('\\', "\\\\");
+        let json = format!(
+            r#"{{
+                "version": 1,
+                "sharedDir": "{shared_str}",
+                "strict": true,
+                "mounts": {{
+                    "bekko-a8m": {{
+                        "resourceId": "bekko-a8m",
+                        "moduleId": "engine_classic_light",
+                        "capabilitySlot": "base_embedding",
+                        "dir": "{bekko_str}",
+                        "requiredFileGroups": [["current.json"]],
+                        "minPrimaryFileBytes": 100
+                    }}
+                }}
+            }}"#
+        );
+        fs::write(&manifest_path, json).unwrap();
+
+        // 验证：通过 current.json 穿透解析到 55MB 容器，满足 50MB 硬底线，挂载成功
+        let state_ok = load_manifest_from_path(&manifest_path, Some(&shared), true);
+        assert_eq!(state_ok.status.active_resource_ids, vec!["bekko-a8m"]);
+        assert!(state_ok.valid_mounts.contains_key("bekko-a8m"));
+        assert_eq!(state_ok.valid_mounts["bekko-a8m"].primary_file_bytes, 55_000_000);
+
+        // 篡改测试：将 current.json 指向一个仅 10KB 的伪造容器，必须被 50MB 硬底线精准拒绝
+        let fake_container = "model.fake.ffpc";
+        write_bytes(&bekko.join(fake_container), 10_000);
+        fs::write(
+            &current_json_path,
+            format!(r#"{{"activeFile":"{}","version":"1.0.0"}}"#, fake_container),
+        ).unwrap();
+
+        let state_tampered = load_manifest_from_path(&manifest_path, Some(&shared), true);
+        assert!(state_tampered.valid_mounts.is_empty());
+        assert_eq!(state_tampered.status.rejected_mounts.len(), 1);
+        assert!(state_tampered.status.rejected_mounts[0].reason.contains("50000000"));
 
         let _ = fs::remove_dir_all(&root);
     }
