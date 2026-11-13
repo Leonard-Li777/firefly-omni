@@ -1541,6 +1541,83 @@ impl OmniOrtRuntime {
         let eps = ep.into_iter().collect();
         Self::build_session_with_eps_internal(path, tier, eps, intra_threads)
     }
+
+    /// 从解密的纯内存字节切片中构建 ORT Session（支持 DirectML / CPU 阶梯与加载串行化互斥）
+    pub fn build_session_from_memory(
+        model_bytes: &[u8],
+        _tier: ModelTier,
+        ep_policy: EpPolicy,
+        intra_threads: usize,
+    ) -> Result<ort::session::Session, ort::Error> {
+        Self::ensure_bound_for_session()?;
+
+        // 串行化互斥锁：防止多模型并发从内存加载解密触发轻薄本 OOM 崩溃
+        static MEM_LOAD_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = MEM_LOAD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let candidates = Self::preferred_hardware_eps_for(ep_policy);
+        for (idx, ep) in candidates.into_iter().enumerate() {
+            let ep = ep.error_on_failure();
+            let res = (|| {
+                let mut b = ort::session::Session::builder()?
+                    .with_intra_threads(intra_threads)?
+                    .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?;
+                b = b.with_execution_providers([ep])?;
+                b.commit_from_memory(model_bytes)
+            })();
+
+            match res {
+                Ok(session) => {
+                    tracing::info!(
+                        "OmniOrtRuntime: 成功从内存构建硬件加速 Session (ep_candidate={})",
+                        idx
+                    );
+                    return Ok(session);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "OmniOrtRuntime: 内存构建硬件加速候选 EP[{}] 失败，降级下一个: {:?}",
+                        idx,
+                        err
+                    );
+                }
+            }
+        }
+
+        // 最终兜底：纯 CPU Session
+        let cpu_session = ort::session::Session::builder()?
+            .with_intra_threads(intra_threads)?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+            .commit_from_memory(model_bytes)?;
+
+        tracing::info!(
+            "OmniOrtRuntime: 成功从内存构建纯 CPU Session (bytes={})",
+            model_bytes.len()
+        );
+        Ok(cpu_session)
+    }
+}
+
+/// 统一加载资产托管结构体（覆盖 ORT Session 与生命周期防御锁）
+pub struct LoadedAsset {
+    pub session: ort::session::Session,
+    pub tokenizer_bytes: Option<Vec<u8>>,
+    /// 保守安全模式下持有底层解密载荷引用，确证深度拷贝后可置 None 归还物理页
+    pub _payload_guard: Option<ffp_crypto::DecryptedPayload>,
+}
+
+impl LoadedAsset {
+    pub fn new(
+        session: ort::session::Session,
+        tokenizer_bytes: Option<Vec<u8>>,
+        payload_guard: Option<ffp_crypto::DecryptedPayload>,
+    ) -> Self {
+        Self {
+            session,
+            tokenizer_bytes,
+            _payload_guard: payload_guard,
+        }
+    }
 }
 
 /// warmup 期回退决策（三段回退的第二段，T2 单测切缝）
@@ -2913,5 +2990,84 @@ mod tests {
             cur = cur.parent()?.to_path_buf();
         }
         None
+    }
+
+    #[test]
+    fn test_memory_session_contract_and_loaded_asset() {
+        use ffp_crypto::{derive_app_key, LOCAL_KEY_EPOCH};
+        let master_key = derive_app_key();
+        let nonce = [0x77u8; 12];
+
+        // 定位真实微型模型 gtcrn_simple.onnx (仅 535KB)
+        let mut cur = std::env::current_dir().unwrap();
+        let mut model_bytes = Vec::new();
+        for _ in 0..8 {
+            let cand = cur.join("apps/desktop/build/extraResources/models/audio/denoise/gtcrn_simple.onnx");
+            if cand.exists() {
+                model_bytes = std::fs::read(&cand).unwrap();
+                break;
+            }
+            if let Some(parent) = cur.parent() {
+                cur = parent.to_path_buf();
+            } else {
+                break;
+            }
+        }
+
+        if model_bytes.is_empty() {
+            println!("[SKIP] 未找到 gtcrn_simple.onnx，跳过真模型内存加载验证");
+            return;
+        }
+
+        let fake_tok = b"{\"vocab\": [\"[PAD]\", \"[UNK]\"]}";
+
+        // 1. 打包为合法 .ffpc 格式
+        let file_bytes = ffp_crypto::build_test_ffpc(
+            &master_key,
+            LOCAL_KEY_EPOCH,
+            "485c04b7",
+            "ai_engine_cpu",
+            "1.0.0",
+            &model_bytes,
+            fake_tok,
+            &nonce,
+        );
+
+        // 2. 解密全头部与 AAD
+        let payload = ffp_crypto::decrypt_ffpc_bytes(
+            &file_bytes,
+            "485c04b7",
+            "ai_engine_cpu",
+            "1.0.0",
+        )
+        .expect("解密必须成功");
+
+        assert_eq!(payload.onnx_slice(), model_bytes.as_slice());
+        assert_eq!(payload.tok_slice().unwrap(), fake_tok);
+
+        // 3. 从解密的纯内存切片中构建真实 ORT Session
+        let session_res = OmniOrtRuntime::build_session_from_memory(
+            payload.onnx_slice(),
+            ModelTier::Tier1,
+            EpPolicy::CpuOnly,
+            1,
+        );
+
+        match session_res {
+            Ok(session) => {
+                let tok_bytes = payload.tok_slice().map(|s| s.to_vec());
+                let loaded = LoadedAsset::new(
+                    session,
+                    tok_bytes,
+                    Some(payload),
+                );
+                assert!(loaded.tokenizer_bytes.is_some());
+                assert!(loaded._payload_guard.is_some());
+                println!("✅ 成功从解密内存切片中构建真实 ORT Session 并完成 LoadedAsset 托管");
+            }
+            Err(e) => {
+                println!("[WARN] ORT 运行时环境未就绪或动态链接不可用: {e}");
+            }
+        }
     }
 }

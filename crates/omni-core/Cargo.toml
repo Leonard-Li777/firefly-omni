@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ffp-crypto = { path = "../ffp-crypto" }
+tokio = { workspace = true, features = ["sync"] }
+zeroize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
