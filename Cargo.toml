@@ -9,6 +9,7 @@ members = [
     "crates/omni-node",
     "crates/omni-pro-stub",
     "crates/mupdf-sys",
+    "crates/ffp-crypto",
     "omni-pro",
     "omni-pro/crates/omni-geo",
     "omni-pro/crates/omni-cleanup",
@@ -43,6 +44,10 @@ regex = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.31", features = ["bundled", "serialize"] }
 sha2 = "0.10"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1.8", features = ["derive"] }
+hex = "0.4"
 unicode-normalization = "0.1"
 zstd = "0.13"
 aes-gcm = { version = "0.10", features = ["aes"] }
