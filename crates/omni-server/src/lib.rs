@@ -47,7 +47,8 @@ pub mod text_chunker;
 
 pub use omni_pro::audio::{
     decode_audio_to_16k_mono, decode_audio_to_16k_mono_bandpass, normalize_ced_audio_event,
-    scale_wav_speed, M5TtsManager, MossTtsManager, SherpaManager, M5_DEFAULT_VOICE_ID,
+    scale_wav_speed, CancellationToken, M5TtsManager, MossTtsManager, SherpaManager,
+    SingleSessionCoordinator, M5_DEFAULT_VOICE_ID,
 };
 pub mod moss_tts {
     pub use omni_pro::audio::*;
@@ -164,6 +165,7 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/audio/convert", post(audio_convert_handler))
             .route("/api/audio/analyze-voice", post(audio_analyze_voice_handler))
             .route("/api/audio/tts/chunk", post(audio_tts_chunk_handler))
+            .route("/api/audio/tts/stream", post(audio_tts_stream_handler))
             .route("/api/audio/tts/status", get(audio_tts_status_handler))
             .route("/api/audio/tts/register-voice", post(audio_tts_register_voice_handler))
             .route("/api/audio/tts/scale", post(audio_tts_scale_handler))
@@ -5125,6 +5127,16 @@ pub struct AudioTtsChunkRequest {
     pub speed: Option<f32>,
 }
 
+/// TTS 纯流式合成请求参数 (POST /api/audio/tts/stream)
+#[derive(Debug, serde::Deserialize)]
+pub struct AudioTtsStreamRequest {
+    pub text: String,
+    #[serde(default)]
+    pub voice_id: Option<String>,
+    pub speed: Option<f32>,
+    pub resume_char_start: Option<usize>,
+}
+
 /// 内存热注册音色请求参数
 #[derive(Debug, serde::Deserialize)]
 pub struct AudioTtsRegisterVoiceRequest {
@@ -5277,6 +5289,23 @@ async fn audio_tts_chunk_handler(
 
     match resolve_active_tts_engine(&state) {
         ActiveTtsEngine::M5 => {
+            // 对齐 v1.7.2 规格书与红队裁决 V15-06: 拒绝分块并发抢占活跃流，显式告警并返回 409 JSON
+            if state.m5.coordinator().is_active().await {
+                tracing::warn!(
+                    "[audio_tts_chunk_handler] 检测到活跃的 M5 流式会话，拒绝分块并发，返回 409 Conflict"
+                );
+                let err_body = serde_json::json!({
+                    "code": "ENGINE_BUSY_STREAMING",
+                    "message": "TTS 引擎正处于沉浸式流式朗读中，分块通道暂不可用"
+                });
+                let resp = axum::response::Response::builder()
+                    .status(axum::http::StatusCode::CONFLICT)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&err_body).unwrap()))
+                    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                return Ok(resp);
+            }
+
             if !state.m5.is_ready() {
                 return Err((
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -5347,6 +5376,145 @@ async fn audio_tts_chunk_handler(
             build_tts_wav_response("moss-tts-nano-int8", synth_res)
         }
     }
+}
+
+/// 纯流式 M5-TTS 语音合成处理: POST /api/audio/tts/stream
+/// 对齐 v1.7.2 规格书 §3.4：HTTP Chunked Transfer-Encoding, M5SF 协议, 有界反压通道
+async fn audio_tts_stream_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AudioTtsStreamRequest>,
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    use futures_util::StreamExt;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let clean_text = req.text.replace('\0', " ").trim().to_string();
+    if clean_text.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "text cannot be empty".to_string(),
+        ));
+    }
+
+    if !state.m5.is_ready() {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "M5-TTS engine not ready or model missing".to_string(),
+        ));
+    }
+
+    let voice_id = req.voice_id.unwrap_or_else(|| M5_DEFAULT_VOICE_ID.to_string());
+    let target_voice = match state.m5.get_voice(&voice_id).await {
+        Some(v) => v,
+        None => match state.m5.get_voice(M5_DEFAULT_VOICE_ID).await {
+            Some(v) => v,
+            None => {
+                return Err((
+                    axum::http::StatusCode::NOT_FOUND,
+                    format!(
+                        "Voice '{}' not found and default {} unavailable",
+                        voice_id, M5_DEFAULT_VOICE_ID
+                    ),
+                ));
+            }
+        },
+    };
+
+    let speed = req.speed.unwrap_or(1.0);
+    let resume_char_start = req.resume_char_start.unwrap_or(0);
+
+    // 生成唯一 SessionId: sess_<rand_hex>
+    let session_id = format!(
+        "sess_{:016x}{:016x}",
+        rand::random::<u64>(),
+        rand::random::<u64>()
+    );
+
+    // 抢占式单活调度 (MAX_STREAM_SESSIONS = 1)
+    let handle = state
+        .m5
+        .coordinator()
+        .acquire_or_preempt(session_id.clone())
+        .await;
+
+    // 有界反压通道 (buffer capacity = 2, 对齐规格书 1.0MB 预算)
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(2);
+
+    let m5 = state.m5.clone();
+    let cancel_token = handle.cancel.clone();
+    let sess_id_clone = session_id.clone();
+    let coordinator = state.m5.coordinator();
+
+    tokio::task::spawn_blocking(move || {
+        let res = m5.synthesize_stream_blocking(
+            &sess_id_clone,
+            &clean_text,
+            &target_voice,
+            speed,
+            resume_char_start,
+            cancel_token,
+            tx,
+        );
+        if let Err(err) = res {
+            tracing::error!(
+                "[audio_tts_stream_handler] 会话 {} 执行失败: {}",
+                sess_id_clone,
+                err
+            );
+        }
+    });
+
+    let receiver_stream = ReceiverStream::new(rx).map(move |item| match item {
+        Ok(bytes) => Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(bytes)),
+        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+    });
+
+    struct CleanupSessionOnDrop {
+        coordinator: std::sync::Arc<SingleSessionCoordinator>,
+        session_id: String,
+        cancel_token: CancellationToken,
+    }
+    impl Drop for CleanupSessionOnDrop {
+        fn drop(&mut self) {
+            self.cancel_token.cancel();
+            let coord = self.coordinator.clone();
+            let sid = self.session_id.clone();
+            tokio::spawn(async move {
+                coord.clear_if_current(&sid).await;
+            });
+        }
+    }
+    let cleanup_guard = std::sync::Arc::new(CleanupSessionOnDrop {
+        coordinator,
+        session_id: session_id.clone(),
+        cancel_token: handle.cancel.clone(),
+    });
+
+    let guarded_stream = receiver_stream.map(move |item| {
+        let _keep_alive = &cleanup_guard;
+        item
+    });
+
+    let body = axum::body::Body::from_stream(guarded_stream);
+
+    let res = axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/vnd.m5.stream; version=2",
+        )
+        .header("X-Session-Id", session_id)
+        .header("X-Audio-Sample-Rate", "24000")
+        .header("X-Audio-Channels", "1")
+        .header("X-Audio-Bits", "16")
+        .body(body)
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build response: {}", e),
+            )
+        })?;
+
+    Ok(res)
 }
 
 #[derive(Debug, Clone, Deserialize)]

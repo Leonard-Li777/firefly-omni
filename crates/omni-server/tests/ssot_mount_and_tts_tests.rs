@@ -81,6 +81,29 @@ fn setup_test_app() -> axum::Router {
     create_app_router(state)
 }
 
+fn setup_test_app_with_state() -> (axum::Router, AppState) {
+    let state = AppState {
+        config: Arc::new(Mutex::new(OmniConfig::default())),
+        geo: Arc::new(omni_pro::geo::GeoService::unavailable()),
+        hownet: Arc::new(omni_pro::hownet::OmniHowNetService::unavailable()),
+        search: Arc::new(omni_pro::search::OmniSearchService::default()),
+        omw: OmwDb::unavailable(),
+        vector: Arc::new(VectorEngine::in_memory()),
+        master_db_path: Arc::new(Mutex::new(None)),
+        target_vectors_dir: None,
+        dimension_policies: Arc::new(std::sync::RwLock::new(
+            omni_core::get_default_dimension_policies(),
+        )),
+        sherpa: Arc::new(SherpaManager::new()),
+        moss: Arc::new(MossTtsManager::new()),
+        m5: Arc::new(M5TtsManager::new()),
+        anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
+        cpu_slot: Arc::new(omni_server::cpu_engine::CpuSlot::new(None, None)),
+    };
+    let router = create_app_router(state.clone());
+    (router, state)
+}
+
 fn write_sized_file(path: &Path, len: u64) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
@@ -216,6 +239,50 @@ async fn test_m5_tts_unified_facade_status_501_and_unready_503() {
         .await
         .unwrap();
     assert_eq!(chunk_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // 4.1 M5 未就绪时 /api/audio/tts/stream 显式返回 HTTP 503
+    let stream_unready_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/audio/tts/stream")
+                .header("content-type", "application/json")
+                .body(
+                    Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "text": "你好世界"
+                        }))
+                        .unwrap(),
+                    ),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_unready_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // 4.2 空文本时 /api/audio/tts/stream 显式返回 HTTP 400
+    let stream_bad_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/audio/tts/stream")
+                .header("content-type", "application/json")
+                .body(
+                    Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "text": ""
+                        }))
+                        .unwrap(),
+                    ),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream_bad_resp.status(), StatusCode::BAD_REQUEST);
 
     // 5. /api/v1/engine/status 双向回显挂载清单遥测
     let engine_resp = app
@@ -484,4 +551,131 @@ async fn test_mobileclip_en_vocab_missing_and_tampered_fail_closed_with_503() {
     )
     .unwrap();
     assert_eq!(ver_body["error"], "vocab_version_mismatch");
+}
+
+#[tokio::test]
+async fn test_m5_streaming_active_causes_scheme_a_409_conflict() {
+    if !omni_pro::is_pro_enabled() {
+        return;
+    }
+    let _lock = MANIFEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let shared = temp.path().join("_shared");
+    let m5_dir = shared.join("m5-tts");
+    let sub = m5_dir.join("models/audio/m5");
+    write_sized_file(&sub.join("m5_backbone_step_int8.onnx"), 1_050_000);
+    write_sized_file(&sub.join("c0_head_fp32.onnx"), 512);
+    write_sized_file(&sub.join("tokenizer.json"), 128);
+
+    let manifest_path = temp.path().join("active-mounts.json");
+    let manifest = serde_json::json!({
+        "version": 1,
+        "sharedDir": shared.to_string_lossy(),
+        "strict": true,
+        "mounts": {
+            "m5-tts": {
+                "resourceId": "m5-tts",
+                "moduleId": "tts_m5_onnx",
+                "capabilitySlot": "voice_tts",
+                "dir": m5_dir.to_string_lossy(),
+                "requiredFileGroups": [[
+                    "models/audio/m5/m5_backbone_step_int8.onnx",
+                    "models/audio/m5/c0_head_fp32.onnx",
+                    "models/audio/m5/tokenizer.json"
+                ]],
+                "minPrimaryFileBytes": 1_000_000
+            }
+        }
+    });
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let _env_guard = EnvRestoreGuard::set(&manifest_path, &shared);
+
+    let (app, state) = setup_test_app_with_state();
+
+    // 1. 验证状态接口暴露 M5 身份
+    let status_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/audio/tts/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_resp.status(), StatusCode::OK);
+
+    // 2. 初始未激活流式会话时，chunk 请求由于模型未就绪返回 503
+    let chunk_init_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/audio/tts/chunk")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "text": "测试分块" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chunk_init_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // 3. 激活流式会话
+    let _handle = state
+        .m5
+        .coordinator()
+        .acquire_or_preempt("stream_session_active".to_string())
+        .await;
+    assert!(state.m5.coordinator().is_active().await);
+
+    // 4. 核心断言: 此时发起 Scheme A 分块请求，必须被强行拦截并返回 HTTP 409 Conflict 与规范 JSON
+    let chunk_409_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/audio/tts/chunk")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "text": "测试分块" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chunk_409_resp.status(), StatusCode::CONFLICT);
+    let body_bytes = axum::body::to_bytes(chunk_409_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_json: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body_json["code"], "ENGINE_BUSY_STREAMING");
+
+    // 5. 清理流式会话后，409 解除并恢复常规逻辑 (503)
+    state
+        .m5
+        .coordinator()
+        .clear_if_current("stream_session_active")
+        .await;
+    assert!(!state.m5.coordinator().is_active().await);
+
+    let chunk_restored_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/audio/tts/chunk")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "text": "测试分块" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        chunk_restored_resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }
