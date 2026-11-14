@@ -326,8 +326,8 @@ impl PocketCpuGenerator {
         Tokenizer::new(model)
     }
 
-    /// 4-gram 重复检测：若同一 4-gram 连续出现 3 次，判定为退化重复循环
-    fn check_4gram_repetition(tokens: &[u32]) -> bool {
+    /// 4-gram 重复检测（保留兼容单测）
+    pub fn check_4gram_repetition(tokens: &[u32]) -> bool {
         if tokens.len() < 12 {
             return false;
         }
@@ -336,6 +336,76 @@ impl PocketCpuGenerator {
         let g2 = &tokens[n - 8..n - 4];
         let g1 = &tokens[n - 12..n - 8];
         g1 == g2 && g2 == g3
+    }
+
+    /// 增强型退化重复检测：
+    /// 1. 1-gram 连续重复 4 次（例如连续 4 个 "until" 或标点）
+    /// 2. 2-gram 连续重复 3 次（例如 [A, B, A, B, A, B]）
+    /// 3. 4-gram 连续重复 2 次（例如 [A, B, C, D, A, B, C, D]）
+    pub fn check_repetition_degradation(tokens: &[u32]) -> bool {
+        let n = tokens.len();
+        // 1-gram 重复 4 次
+        if n >= 4
+            && tokens[n - 1] == tokens[n - 2]
+            && tokens[n - 2] == tokens[n - 3]
+            && tokens[n - 3] == tokens[n - 4]
+        {
+            return true;
+        }
+        // 2-gram 重复 3 次
+        if n >= 6
+            && tokens[n - 1] == tokens[n - 3]
+            && tokens[n - 3] == tokens[n - 5]
+            && tokens[n - 2] == tokens[n - 4]
+            && tokens[n - 4] == tokens[n - 6]
+        {
+            return true;
+        }
+        // 4-gram 重复 2 次
+        if n >= 8 {
+            let g1 = &tokens[n - 4..n];
+            let g2 = &tokens[n - 8..n - 4];
+            if g1 == g2 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 检查生成的文本是否已经构成一个完整且闭合的根级 JSON 对象
+    pub fn check_json_completion(text: &str) -> bool {
+        let trimmed = text.trim();
+        if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+            return false;
+        }
+        let mut depth = 0;
+        let mut in_str = false;
+        let mut escape = false;
+        for ch in trimmed.chars() {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if ch == '\\' {
+                escape = true;
+                continue;
+            }
+            if ch == '"' {
+                in_str = !in_str;
+                continue;
+            }
+            if !in_str {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -455,8 +525,8 @@ impl CpuGenerator for PocketCpuGenerator {
                     break;
                 }
 
-                if Self::check_4gram_repetition(&generated_tokens) {
-                    warn!("检测到 4-gram 连续 3 次重复，执行截断保护");
+                if Self::check_repetition_degradation(&generated_tokens) {
+                    warn!("检测到自回归生成重复退化，执行截断保护");
                     finish_reason = FinishReason::Length;
                     break;
                 }
@@ -549,6 +619,16 @@ impl CpuGenerator for PocketCpuGenerator {
 
                 generated_tokens.push(next_token);
                 current_tokens.push(next_token);
+
+                // 结构化任务 JSON 闭合早停：若生成内容已闭合根级 JSON 对象，立即终止生成，避免产生退化垃圾
+                if generated_tokens.len() >= 6 {
+                    if let Ok(partial_text) = self.decode(&generated_tokens) {
+                        if Self::check_json_completion(&partial_text) {
+                            finish_reason = FinishReason::Stop;
+                            break;
+                        }
+                    }
+                }
             }
         } else {
             // 无真实 Session 时的测试桩回退自回归生成
@@ -566,8 +646,8 @@ impl CpuGenerator for PocketCpuGenerator {
                     }
                 }
 
-                if Self::check_4gram_repetition(&generated_tokens) {
-                    warn!("检测到 4-gram 连续 3 次重复，执行截断保护");
+                if Self::check_repetition_degradation(&generated_tokens) {
+                    warn!("检测到自回归生成重复退化，执行截断保护");
                     finish_reason = FinishReason::Length;
                     break;
                 }
