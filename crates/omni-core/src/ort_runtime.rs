@@ -1323,21 +1323,17 @@ impl OmniOrtRuntime {
     /// Windows：走 DML/CPU 分档阶梯（DML 分支施加 DML 专属配置）；
     /// 非 Windows：沿用历史平台 EP 阶梯（macOS CoreML / Linux CUDA），本期不参与 DML 分档，
     /// 因此 `used_dml` 恒为 false（warmup 失败按模型损坏语义上抛，不置 DML 闸）。
-    fn build_with_policy(
-        path: &Path,
-        tier: ModelTier,
-        policy: EpPolicy,
-        intra_threads: usize,
-    ) -> Result<(ort::session::Session, bool), ort::Error> {
+    /// DML 白名单策略校验：仅允许明确列入白名单的视觉/音频模型走 DirectML
+    fn normalize_ep_policy(path: &Path, mut policy: EpPolicy) -> EpPolicy {
         // 【工单 04/05/06 缝合门禁：DML 白名单强校验】
         // 任何声明 DmlAllowlist 的模型路径必须属于 DML_ALLOWLIST_MODELS 事实源规范
-        // （v1 仅 gemma.vision_encoder，匹配 vision_encoder*.onnx 与 vision_model*.onnx）。
+        // （v1 仅 gemma.vision_encoder，匹配 vision_encoder*.onnx、vision_model*.onnx 与加密 visual.*.ffpc）。
         // 违规非白名单模型严禁走 DML，强制降级为 CpuOnly 并打印警告。
-        let mut policy = policy;
         if policy == EpPolicy::DmlAllowlist {
             let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
             let is_allowed = file_name.starts_with("vision_encoder")
                 || file_name.starts_with("vision_model")
+                || (file_name.starts_with("visual.") && file_name.ends_with(".ffpc"))
                 || file_name.starts_with("moss_audio_tokenizer_decode");
             if !is_allowed {
                 tracing::warn!(
@@ -1347,6 +1343,22 @@ impl OmniOrtRuntime {
                 policy = EpPolicy::CpuOnly;
             }
         }
+        policy
+    }
+
+    /// 内存加载互斥锁：防止多模型并发从内存构建 Session 触发轻薄本 OOM 崩溃
+    fn mem_load_lock() -> &'static Mutex<()> {
+        static MEM_LOAD_LOCK: Mutex<()> = Mutex::new(());
+        &MEM_LOAD_LOCK
+    }
+
+    fn build_with_policy(
+        path: &Path,
+        tier: ModelTier,
+        policy: EpPolicy,
+        intra_threads: usize,
+    ) -> Result<(ort::session::Session, bool), ort::Error> {
+        let policy = Self::normalize_ep_policy(path, policy);
 
         if !cfg!(target_os = "windows") {
             let eps = Self::preferred_hardware_eps_for(policy);
@@ -1387,27 +1399,17 @@ impl OmniOrtRuntime {
         Ok((session, false))
     }
 
-    /// 纯 CPU 多线程 Session 构建（三段回退的最终落点）
-    fn build_cpu_session(
-        path: &Path,
+    fn apply_cpu_builder_options(
         intra_threads: usize,
-    ) -> Result<ort::session::Session, ort::Error> {
+    ) -> Result<ort::session::builder::SessionBuilder, ort::Error> {
         ort::session::Session::builder()?
             .with_intra_threads(intra_threads)?
-            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-            .commit_from_file(path)
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
     }
 
-    /// DirectML Session 构建（SPEC §3.2：显式关闭 CPU 静态内存拓扑推导并锁死单序列执行）
-    ///
-    /// `with_memory_pattern(false)`：关闭 CPU 静态内存拓扑推导，交由 D3D12/DML 自适应显存池；
-    /// `with_parallel_execution(false)`：DML EP 明确不支持并发 Run，锁死单序列执行。
-    /// 注：`ort 2.0.0-rc.9` 的 `SessionBuilder` **没有** `with_execution_mode` 方法，
-    /// `with_parallel_execution(false)` 即底层 `ExecutionMode::ORT_SEQUENTIAL`。
-    fn build_dml_session(
-        path: &Path,
+    fn apply_dml_builder_options(
         intra_threads: usize,
-    ) -> Result<ort::session::Session, ort::Error> {
+    ) -> Result<ort::session::builder::SessionBuilder, ort::Error> {
         use ort::execution_providers::ExecutionProvider;
         let dml_ep = ort::execution_providers::DirectMLExecutionProvider::default();
         if !dml_ep.is_available().unwrap_or(false) {
@@ -1425,8 +1427,28 @@ impl OmniOrtRuntime {
             // 于是这里会拿到一个纯 CPU Session 却上报「DML 构建成功 + warmup 定标通过」，
             // 正是 SPEC 明令消灭的「DML 日志虚假 + 静默降级」。改为失败即 Err 后，
             // 该错误会进入 `build_with_policy` 的显式降级分支并 warn。
-            .with_execution_providers([dml_ep.build().error_on_failure()])?
-            .commit_from_file(path)
+            .with_execution_providers([dml_ep.build().error_on_failure()])
+    }
+
+    /// 纯 CPU 多线程 Session 构建（三段回退的最终落点）
+    fn build_cpu_session(
+        path: &Path,
+        intra_threads: usize,
+    ) -> Result<ort::session::Session, ort::Error> {
+        Self::apply_cpu_builder_options(intra_threads)?.commit_from_file(path)
+    }
+
+    /// DirectML Session 构建（SPEC §3.2：显式关闭 CPU 静态内存拓扑推导并锁死单序列执行）
+    ///
+    /// `with_memory_pattern(false)`：关闭 CPU 静态内存拓扑推导，交由 D3D12/DML 自适应显存池；
+    /// `with_parallel_execution(false)`：DML EP 明确不支持并发 Run，锁死单序列执行。
+    /// 注：`ort 2.0.0-rc.9` 的 `SessionBuilder` **没有** `with_execution_mode` 方法，
+    /// `with_parallel_execution(false)` 即底层 `ExecutionMode::ORT_SEQUENTIAL`。
+    fn build_dml_session(
+        path: &Path,
+        intra_threads: usize,
+    ) -> Result<ort::session::Session, ort::Error> {
+        Self::apply_dml_builder_options(intra_threads)?.commit_from_file(path)
     }
 
     /// 统一两阶段执行提供商路由逻辑
@@ -1550,18 +1572,13 @@ impl OmniOrtRuntime {
         intra_threads: usize,
     ) -> Result<ort::session::Session, ort::Error> {
         Self::ensure_bound_for_session()?;
-
-        // 串行化互斥锁：防止多模型并发从内存加载解密触发轻薄本 OOM 崩溃
-        static MEM_LOAD_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = MEM_LOAD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = Self::mem_load_lock().lock().unwrap_or_else(|p| p.into_inner());
 
         let candidates = Self::preferred_hardware_eps_for(ep_policy);
         for (idx, ep) in candidates.into_iter().enumerate() {
             let ep = ep.error_on_failure();
             let res = (|| {
-                let mut b = ort::session::Session::builder()?
-                    .with_intra_threads(intra_threads)?
-                    .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?;
+                let mut b = Self::apply_cpu_builder_options(intra_threads)?;
                 b = b.with_execution_providers([ep])?;
                 b.commit_from_memory(model_bytes)
             })();
@@ -1585,16 +1602,153 @@ impl OmniOrtRuntime {
         }
 
         // 最终兜底：纯 CPU Session
-        let cpu_session = ort::session::Session::builder()?
-            .with_intra_threads(intra_threads)?
-            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-            .commit_from_memory(model_bytes)?;
+        let cpu_session = Self::build_cpu_session_from_memory(model_bytes, intra_threads)?;
 
         tracing::info!(
             "OmniOrtRuntime: 成功从内存构建纯 CPU Session (bytes={})",
             model_bytes.len()
         );
         Ok(cpu_session)
+    }
+
+    /// 纯内存带白名单、DML 三段阶梯回退及实跑 warmup 定标的 Session 构建入口（对应 `.ffpc` 解密内存流）
+    pub fn build_session_verified_from_memory<W>(
+        model_bytes: &[u8],
+        model_label: &Path,
+        tier: ModelTier,
+        ep_policy: EpPolicy,
+        warmup: W,
+    ) -> Result<ort::session::Session, ort::Error>
+    where
+        W: Fn(&ort::session::Session) -> Result<(), ort::Error>,
+    {
+        Self::build_session_verified_from_memory_with_threads(
+            model_bytes,
+            model_label,
+            tier,
+            ep_policy,
+            Self::recommended_intra_threads(),
+            warmup,
+        )
+    }
+
+    /// 纯内存带白名单与 warmup 定标的 Session 构建入口（指定 intra_threads 配额）
+    pub fn build_session_verified_from_memory_with_threads<W>(
+        model_bytes: &[u8],
+        model_label: &Path,
+        tier: ModelTier,
+        ep_policy: EpPolicy,
+        intra_threads: usize,
+        warmup: W,
+    ) -> Result<ort::session::Session, ort::Error>
+    where
+        W: Fn(&ort::session::Session) -> Result<(), ort::Error>,
+    {
+        Self::ensure_bound_for_session()?;
+        // 锁定内存构建区间并在 warmup 前释放，避免 warmup 失败触发 CPU 原地重建时自锁死锁
+        let (session, used_dml) = {
+            let _guard = Self::mem_load_lock().lock().unwrap_or_else(|p| p.into_inner());
+            Self::build_with_policy_from_memory(
+                model_bytes,
+                model_label,
+                tier,
+                ep_policy,
+                intra_threads,
+            )?
+        };
+        finalize_warmup_with_fallback(
+            session,
+            used_dml,
+            warmup,
+            || {
+                let _guard = Self::mem_load_lock().lock().unwrap_or_else(|p| p.into_inner());
+                Self::build_cpu_session_from_memory(model_bytes, intra_threads)
+            },
+            model_label,
+        )
+    }
+
+    fn build_with_policy_from_memory(
+        model_bytes: &[u8],
+        model_label: &Path,
+        _tier: ModelTier,
+        policy: EpPolicy,
+        intra_threads: usize,
+    ) -> Result<(ort::session::Session, bool), ort::Error> {
+        let policy = Self::normalize_ep_policy(model_label, policy);
+
+        if !cfg!(target_os = "windows") {
+            let candidates = Self::preferred_hardware_eps_for(policy);
+            for (idx, ep) in candidates.into_iter().enumerate() {
+                let ep = ep.error_on_failure();
+                let res = (|| {
+                    let b = Self::apply_cpu_builder_options(intra_threads)?;
+                    b.with_execution_providers([ep])?.commit_from_memory(model_bytes)
+                })();
+                match res {
+                    Ok(session) => {
+                        tracing::info!(
+                            "OmniOrtRuntime: 非 Windows 内存构建硬件 Session 成功 (model={}, ep_candidate={})",
+                            model_label.display(),
+                            idx
+                        );
+                        return Ok((session, false));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "OmniOrtRuntime: 非 Windows 内存硬件 EP[{}] 失败，降级下一个 (model={}, err={:?})",
+                            idx,
+                            model_label.display(),
+                            err
+                        );
+                    }
+                }
+            }
+            let session = Self::build_cpu_session_from_memory(model_bytes, intra_threads)?;
+            return Ok((session, false));
+        }
+
+        for kind in resolve_ep_candidates(policy, Self::directml_probe_ok(), directml_disabled()) {
+            match kind {
+                EpKind::Cpu => break,
+                EpKind::DirectMl => match Self::apply_dml_builder_options(intra_threads)
+                    .and_then(|b| b.commit_from_memory(model_bytes))
+                {
+                    Ok(session) => {
+                        tracing::info!(
+                            "OmniOrtRuntime: 成功从内存构建 DirectML Session (model={}, policy={:?}, bytes={})",
+                            model_label.display(),
+                            policy,
+                            model_bytes.len()
+                        );
+                        return Ok((session, true));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "OmniOrtRuntime: 内存 DirectML Session 构建失败，阶梯降级为纯 CPU (model={}, error={:?})",
+                            model_label.display(),
+                            err
+                        );
+                    }
+                },
+            }
+        }
+
+        let session = Self::build_cpu_session_from_memory(model_bytes, intra_threads)?;
+        tracing::info!(
+            "OmniOrtRuntime: 成功从内存构建纯 CPU Session (model={}, policy={:?}, bytes={})",
+            model_label.display(),
+            policy,
+            model_bytes.len()
+        );
+        Ok((session, false))
+    }
+
+    fn build_cpu_session_from_memory(
+        model_bytes: &[u8],
+        intra_threads: usize,
+    ) -> Result<ort::session::Session, ort::Error> {
+        Self::apply_cpu_builder_options(intra_threads)?.commit_from_memory(model_bytes)
     }
 }
 

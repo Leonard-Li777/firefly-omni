@@ -806,6 +806,63 @@ pub fn get_mount_vocab_meta(resource_id: &str) -> Option<MountVocabMeta> {
         .and_then(|m| m.vocab_meta)
 }
 
+fn read_current_json(dir: &Path) -> Option<serde_json::Value> {
+    let raw = fs::read_to_string(dir.join("current.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn join_safe_ffpc_rel(dir: &Path, rel: &str) -> Option<PathBuf> {
+    if !is_safe_relative_path(rel) {
+        return None;
+    }
+    let path = dir.join(rel);
+    if path.is_file() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// 从 `current.json` 的 `activeFiles[key]` 解析激活的加密容器路径
+pub fn resolve_ffpc_active_file(dir: &Path, key: &str) -> Option<PathBuf> {
+    let val = read_current_json(dir)?;
+    let rel = val.get("activeFiles")?.get(key)?.as_str()?;
+    join_safe_ffpc_rel(dir, rel)
+}
+
+/// 从 `current.json` 的单文件指针 `activeFile` 解析激活的加密容器路径
+pub fn resolve_ffpc_single_file(dir: &Path) -> Option<PathBuf> {
+    let val = read_current_json(dir)?;
+    let rel = val.get("activeFile")?.as_str()?;
+    join_safe_ffpc_rel(dir, rel)
+}
+
+/// 轻量读取 `.ffpc` 头部 AAD 元数据，判断容器内是否已打包内嵌分词器（不解密整包载荷）
+pub fn ffpc_has_embedded_tokenizer(ffpc_path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = fs::File::open(ffpc_path) else {
+        return false;
+    };
+    let mut prefix = [0u8; crate::ffp_crypto::header::FIXED_PREFIX_LEN];
+    if f.read_exact(&mut prefix).is_err() {
+        return false;
+    }
+    if prefix[0..4] != crate::ffp_crypto::header::MAGIC_FFPC {
+        return false;
+    }
+    let aad_len = u32::from_le_bytes([prefix[20], prefix[21], prefix[22], prefix[23]]) as usize;
+    if aad_len == 0 || aad_len > crate::ffp_crypto::header::MAX_AAD_LEN {
+        return false;
+    }
+    let mut aad_buf = vec![0u8; aad_len];
+    if f.read_exact(&mut aad_buf).is_err() {
+        return false;
+    }
+    serde_json::from_slice::<crate::ffp_crypto::AadMetadata>(&aad_buf)
+        .map(|meta| meta.tok_len > 0)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
