@@ -362,3 +362,37 @@ fn test_zero_mock_generation() {
     assert_ne!(out.text, "{\"tags\": [\"财务\", \"审计\", \"报表\"]}");
     assert_eq!(out.completion_tokens.len(), out.completion_tokens_count);
 }
+
+#[test]
+fn test_empty_kv_cache_tensor() {
+    use ort::AsPointer;
+    omni_core::ort_runtime::OmniOrtRuntime::ensure_initialized();
+    let allocator = ort::memory::Allocator::default();
+    let shape: Vec<i64> = vec![1, 2, 0, 64];
+    let mut value_ptr: *mut ort::sys::OrtValue = std::ptr::null_mut();
+    let api = ort::api();
+    let status = unsafe {
+        (api.CreateTensorAsOrtValue.unwrap())(
+            allocator.ptr().cast_mut(),
+            shape.as_ptr(),
+            shape.len(),
+            ort::sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            &mut value_ptr,
+        )
+    };
+    if !status.is_null() {
+        let msg = unsafe {
+            let msg_ptr = (api.GetErrorMessage.unwrap())(status);
+            let s = std::ffi::CStr::from_ptr(msg_ptr).to_string_lossy().into_owned();
+            (api.ReleaseStatus.unwrap())(status);
+            s
+        };
+        panic!("CreateTensorAsOrtValue failed: {}", msg);
+    }
+    assert!(!value_ptr.is_null());
+
+    let non_null = std::ptr::NonNull::new(value_ptr).unwrap();
+    let val: ort::value::DynValue = unsafe { ort::value::Value::from_ptr(non_null, None) };
+    assert!(val.is_tensor());
+    println!("Created empty KV cache tensor successfully: {:?}", val.dtype());
+}

@@ -41,7 +41,7 @@ pub struct CpuSlot {
     circuit_breaker: Arc<CircuitBreakerManager>,
     generator: Arc<RwLock<Option<Arc<dyn CpuGenerator>>>>,
     // 独立常驻分词器（保证 POST /v1/tokenize 绝不触发模型加载，P99 <= 5ms）
-    standalone_tokenizer: Arc<PocketCpuGenerator>,
+    standalone_tokenizer: Arc<RwLock<Arc<dyn CpuGenerator>>>,
     // 单飞加载信道与并发排队计数
     load_tx: Arc<Mutex<Option<broadcast::Sender<Result<(), String>>>>>,
     wait_queue_count: Arc<AtomicUsize>,
@@ -80,7 +80,7 @@ impl CpuSlot {
             notify_drain: Arc::new(Notify::new()),
             circuit_breaker,
             generator: Arc::new(RwLock::new(None)),
-            standalone_tokenizer: Arc::new(PocketCpuGenerator::new_test_stub()),
+            standalone_tokenizer: Arc::new(RwLock::new(Arc::new(PocketCpuGenerator::new_test_stub()))),
             load_tx: Arc::new(Mutex::new(None)),
             wait_queue_count: Arc::new(AtomicUsize::new(0)),
             model_dir,
@@ -283,7 +283,8 @@ impl CpuSlot {
             Arc::new(PocketCpuGenerator::new_test_stub())
         };
 
-        *self.generator.write().unwrap() = Some(gen);
+        *self.generator.write().unwrap() = Some(Arc::clone(&gen));
+        *self.standalone_tokenizer.write().unwrap() = Arc::clone(&gen);
         *self.lifecycle.write().unwrap() = SessionLifecycle::Ready;
         *self.admission.write().unwrap() = AdmissionState::Accepting;
         self.touch_active();
@@ -372,9 +373,25 @@ impl CpuSlot {
         let mut counts = Vec::with_capacity(texts.len());
         let mut total_tokens = 0;
 
+        let tok_gen = if let Some(gen) = self.generator.read().unwrap().as_ref() {
+            Arc::clone(gen)
+        } else {
+            // 惰性加载：若未加载过且有 model_dir，尝试只加载分词器
+            if let Some(ref dir) = self.model_dir {
+                let mut guard = self.standalone_tokenizer.write().unwrap();
+                if guard.tokenize("你好").map(|t| t.is_empty()).unwrap_or(true) {
+                    if let Some(tok) = PocketCpuGenerator::load_tokenizer_only(dir) {
+                        *guard = Arc::new(PocketCpuGenerator::new_with_tokenizer(tok));
+                    }
+                }
+                Arc::clone(&*guard)
+            } else {
+                Arc::clone(&*self.standalone_tokenizer.read().unwrap())
+            }
+        };
+
         for text in texts {
-            let tokens = self
-                .standalone_tokenizer
+            let tokens = tok_gen
                 .tokenize(text)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
             total_tokens += tokens.len();

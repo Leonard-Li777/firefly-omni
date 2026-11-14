@@ -91,13 +91,32 @@ pub async fn post_chat_completions_handler(
         }
     };
 
-    // 2. 组装输入文本并计算 Prompt Tokens
+    // 2. 组装输入文本并计算 Prompt Tokens (基于 MNN-Pocket 官方 ChatML 规范)
+    // 严守 MNN-Pocket / Qwen 官方 ChatML 格式 (<|im_start|>{role}\n{content}<|im_end|>\n)，并在末端注入 <|im_start|>assistant\n
     let mut combined_text = String::new();
-    for msg in &payload.messages {
-        combined_text.push_str(&msg.role);
-        combined_text.push_str(": ");
-        combined_text.push_str(&msg.content);
-        combined_text.push('\n');
+    let already_chatml = payload
+        .messages
+        .iter()
+        .any(|m| m.content.contains("<|im_start|>"));
+
+    if already_chatml {
+        for msg in &payload.messages {
+            combined_text.push_str(&msg.content);
+        }
+        if !combined_text.ends_with("<|im_start|>assistant\n")
+            && !combined_text.ends_with("<|im_start|>assistant")
+        {
+            combined_text.push_str("<|im_start|>assistant\n");
+        }
+    } else {
+        for msg in &payload.messages {
+            combined_text.push_str("<|im_start|>");
+            combined_text.push_str(&msg.role);
+            combined_text.push('\n');
+            combined_text.push_str(&msg.content);
+            combined_text.push_str("<|im_end|>\n");
+        }
+        combined_text.push_str("<|im_start|>assistant\n");
     }
 
     let prompt_tokens = match slot.tokenize(&[combined_text]) {
@@ -105,7 +124,18 @@ pub async fn post_chat_completions_handler(
         Err((code, msg)) => return Err((code, Json(ApiErrorResponse::new("tokenize_failed", msg, "invalid_request_error")))),
     };
 
-    let max_tokens = payload.max_tokens.unwrap_or(48);
+    if prompt_tokens.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse::new(
+                "invalid_prompt",
+                "Prompt 分词结果为空，无法执行推理生成".to_string(),
+                "invalid_request_error",
+            )),
+        ));
+    }
+
+    let max_tokens = payload.max_tokens.unwrap_or(128);
     let mut config = CpuGeneratorConfig::default();
     config.task_id = payload.task_id.clone();
     config.max_new_tokens = max_tokens;
