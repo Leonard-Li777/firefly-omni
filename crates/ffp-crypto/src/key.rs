@@ -36,9 +36,12 @@ mod tests {
     fn test_derive_app_key_reconstitution() {
         let key = derive_app_key();
         assert_eq!(key.len(), 32);
-        // debug 模式下应当还原出 Dev Seed
-        let dev_seed = hex::decode("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
-        assert_eq!(key.as_slice(), dev_seed.as_slice());
+        // 若构建环境指定了主密钥，则验证分片重组与环境变量解码 100% 字节一致；未指定时比对 Dev Seed
+        let expected_seed = match std::env::var("FFP_MASTER_KEY_HEX") {
+            Ok(v) if !v.trim().is_empty() => hex::decode(v.trim()).expect("合法 64 字符 hex"),
+            _ => hex::decode("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap(),
+        };
+        assert_eq!(key.as_slice(), expected_seed.as_slice());
     }
 
     #[test]
