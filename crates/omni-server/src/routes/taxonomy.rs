@@ -2812,7 +2812,7 @@ pub fn load_dimension_policies_from_db(
             for (code, policy) in db_policies {
                 policies.insert(code, policy);
             }
-            tracing::info!(
+            tracing::debug!(
                 "[load_dimension_policies_from_db] 成功从主库 system_config 读取并覆盖 {} 条维度策略",
                 count
             );
