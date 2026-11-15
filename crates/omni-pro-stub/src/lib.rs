@@ -2351,10 +2351,10 @@ pub mod audio {
             Arc::new(tokio::sync::Semaphore::new(1))
         }
         pub fn synthesize(&self, _text: &str, _voice: &VoicePromptData, _speed: f32) -> Result<SynthResult, String> {
-            Err("MOSS-TTS is not available in Community Edition".to_string())
+            Err("个性化声音克隆与朗读 is not available in Community Edition".to_string())
         }
         pub fn synthesize_with_cancel(&self, _text: &str, _voice: &VoicePromptData, _speed: f32, _cancel_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Result<SynthResult, String> {
-            Err("MOSS-TTS is not available in Community Edition".to_string())
+            Err("个性化声音克隆与朗读 is not available in Community Edition".to_string())
         }
         pub fn extract_voice_codes(&self, _samples_16k: &[f32]) -> Result<Vec<Vec<i16>>, String> {
             Err("Voice extraction not available in Community Edition".to_string())
@@ -2409,10 +2409,10 @@ pub mod audio {
             None
         }
         pub fn synthesize(&self, _text: &str, _voice: &M5VoiceData, _speed: f32) -> Result<SynthResult, String> {
-            Err("M5-TTS is not available in Community Edition".to_string())
+            Err("极速语音合成与朗读 is not available in Community Edition".to_string())
         }
         pub fn synthesize_with_cancel(&self, _text: &str, _voice: &M5VoiceData, _speed: f32, _cancel_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Result<SynthResult, String> {
-            Err("M5-TTS is not available in Community Edition".to_string())
+            Err("极速语音合成与朗读 is not available in Community Edition".to_string())
         }
     }
 }

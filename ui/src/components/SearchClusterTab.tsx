@@ -198,7 +198,7 @@ const PRESET_DOCUMENTS: IndexedDocument[] = [
   {
     id: 'doc-5',
     title: 'Firefly Omni-Server 离线全模态特征引擎架构规范',
-    searchableText: '系统采用纯 CPU 架构运行，集成 fastText 语种检测、KeyBERT 主题抽取与 bekko-a8m 384d 特征嵌入向量，SLO 控制在 15ms 内。',
+    searchableText: '系统采用纯 CPU 架构运行，集成 fastText 语种检测、KeyBERT 主题抽取与轻量文本语义搜索 384d 特征嵌入向量，SLO 控制在 15ms 内。',
     tags: ['技术', '架构', 'Rust']
   },
   {

@@ -168,7 +168,7 @@ async fn test_m5_tts_unified_facade_status_501_and_unready_503() {
         &axum::body::to_bytes(status_resp.into_body(), usize::MAX).await.unwrap(),
     )
     .unwrap();
-    assert_eq!(status_json["engine"], "m5-tts-50m-int8");
+    assert_eq!(status_json["engine"], "express-voice-24k");
     assert_eq!(status_json["sample_rate"], 24000);
     assert_eq!(status_json["ready"], false);
 

@@ -396,3 +396,35 @@ fn test_empty_kv_cache_tensor() {
     assert!(val.is_tensor());
     println!("Created empty KV cache tensor successfully: {:?}", val.dtype());
 }
+
+#[test]
+fn test_repetition_degradation_detection() {
+    // 1-gram 连续重复 4 次
+    assert!(PocketCpuGenerator::check_repetition_degradation(&[10, 20, 20, 20, 20]));
+    assert!(!PocketCpuGenerator::check_repetition_degradation(&[10, 20, 20, 20]));
+
+    // 2-gram 连续重复 3 次 ([1, 2, 1, 2, 1, 2])
+    assert!(PocketCpuGenerator::check_repetition_degradation(&[1, 2, 1, 2, 1, 2]));
+
+    // 4-gram 连续重复 2 次 ([1, 2, 3, 4, 1, 2, 3, 4])
+    assert!(PocketCpuGenerator::check_repetition_degradation(&[1, 2, 3, 4, 1, 2, 3, 4]));
+
+    // 正常文本不误判
+    assert!(!PocketCpuGenerator::check_repetition_degradation(&[1, 2, 3, 4, 5, 6, 7, 8]));
+}
+
+#[test]
+fn test_json_completion_early_stop() {
+    // 完整闭合的根 JSON 对象
+    assert!(PocketCpuGenerator::check_json_completion(r#"{"score": 8.5}"#));
+    assert!(PocketCpuGenerator::check_json_completion(r#"  { "name": "test_file.txt", "tags": [1, 2] }  "#));
+    assert!(PocketCpuGenerator::check_json_completion(r#"{"criteria": {"technical": 9}}"#));
+
+    // 未闭合的 JSON 对象
+    assert!(!PocketCpuGenerator::check_json_completion(r#"{"score": 8.5"#));
+    assert!(!PocketCpuGenerator::check_json_completion(r#"{"criteria": {"technical": 9}"#));
+
+    // 非 JSON 对象
+    assert!(!PocketCpuGenerator::check_json_completion("until until until until"));
+    assert!(!PocketCpuGenerator::check_json_completion(""));
+}

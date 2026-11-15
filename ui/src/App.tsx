@@ -1663,7 +1663,7 @@ MIME Type: application/pdf
                               <span className="truncate">{selectedFile.apiResponse?.smart_name || selectedFile.fileName}</span>
                             </div>
                             <span className="text-[10px] text-slate-500 mt-1 block">
-                              基于 SlotEngine 纯 CPU 槽位矩阵与 bekko-a8m 交叉打分选出
+                              基于 SlotEngine 纯 CPU 槽位矩阵与轻量文本语义搜索交叉打分选出
                             </span>
                           </div>
 

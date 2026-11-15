@@ -74,7 +74,7 @@ const PRESET_SAMPLES: PresetSample[] = [
     name: '技术架构设计',
     badge: 'Tech',
     fileName: 'OmniServer_架构设计规范_v2.1.0.md',
-    text: `Firefly Omni-Server 离线全模态特征感知引擎技术架构设计规范书 (版本: v2.1.0)。本规范由核心系统架构师李维于2026年3月编写。系统采用纯 CPU 架构运行，整合 fastText 语种分类、KeyBERT 主题无幻觉抽取与 bekko-a8m 384 维密集特征向量模型，单文件处理 SLO 控制在 15ms 以内，基准常驻内存控制在 630MB 阈值之内。`
+    text: `Firefly Omni-Server 离线全模态特征感知引擎技术架构设计规范书 (版本: v2.1.0)。本规范由核心系统架构师李维于2026年3月编写。系统采用纯 CPU 架构运行，整合 fastText 语种分类、KeyBERT 主题无幻觉抽取与轻量文本语义搜索 384 维密集特征向量模型，单文件处理 SLO 控制在 15ms 以内，基准常驻内存控制在 630MB 阈值之内。`
   },
   {
     name: '随记备忘',
@@ -401,7 +401,7 @@ export const TextSlotTab: React.FC = () => {
             <div className="flex items-center justify-between">
               <h3 className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
                 <Layers className="w-3.5 h-3.5 text-purple-400" />
-                384 维密集特征向量切片前瞻 (bekko-a8m)
+                384 维密集特征向量切片前瞻 (轻量文本语义搜索)
               </h3>
               <div className="flex items-center gap-2 text-[11px] font-mono">
                 <span className={vectorDim === 384 ? 'text-emerald-400' : 'text-rose-400'}>

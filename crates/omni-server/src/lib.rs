@@ -1087,7 +1087,7 @@ pub async fn start_server(
                     Ok(Some(dir)) => Some(dir),
                     Ok(None) => None,
                     Err(err) => {
-                        tracing::warn!("[OmniServer] 挂载门禁拒绝加载 pocket-cpu-int8-onnx: {err}");
+                        tracing::warn!("[OmniServer] 挂载门禁拒绝加载 轻量CPU引擎: {err}");
                         None
                     }
                 };
@@ -1339,7 +1339,7 @@ pub fn run_vision_pipeline_on_image(
     if embedding_profile == "gemma_unified" {
         let gemma = omni_pro::OmniVisionEngine::gemma_engine();
         if gemma.circuit_breaker().is_disabled() {
-            return Err("EmbeddingGemma 视觉塔已熔断或禁用，gemma_unified 档位禁止降级到 CLIP".to_string());
+            return Err("高精度全能语义搜索 视觉塔已熔断或禁用，gemma_unified 档位禁止降级到 CLIP".to_string());
         }
     }
 
@@ -1427,7 +1427,7 @@ pub fn run_vision_pipeline_on_image(
                 match omni_pro::OmniVisionEngine::encode_gemma_image(img_ref) {
                     Ok(v) => Ok(Some((v, omni_pro::vector_engine::encoder_id::GEMMA))),
                     Err(e) => {
-                        Err(format!("EmbeddingGemma 图像向量编码失败: {:?}，禁止降级到 CLIP", e))
+                        Err(format!("高精度全能语义搜索 图像向量编码失败: {:?}，禁止降级到 CLIP", e))
                     }
                 }
             } else {
@@ -2599,8 +2599,9 @@ async fn perceive_file_handler(
     };
 
     let nsfw_high_confidence_tags = if is_pro {
+        let combined_tags: Vec<String> = nsfw_tags.iter().chain(nsfw_text_tags.iter()).cloned().collect();
         omni_pro::OmniVisionEngine::derive_nsfw_high_confidence_tags(
-            &nsfw_tags,
+            &combined_tags,
             content_rating.as_deref(),
         )
     } else {
@@ -5208,13 +5209,13 @@ async fn audio_tts_status_handler(
             ready: state.m5.is_ready(),
             total_voices: state.m5.total_voices().await,
             sample_rate: 24000,
-            engine: "m5-tts-50m-int8".to_string(),
+            engine: "express-voice-24k".to_string(),
         }),
         ActiveTtsEngine::Moss => Json(AudioTtsStatusResponse {
             ready: state.moss.is_ready(),
             total_voices: state.moss.total_voices().await,
             sample_rate: 48000,
-            engine: "moss-tts-nano-int8".to_string(),
+            engine: "clone-voice-48k".to_string(),
         }),
     }
 }
@@ -5229,7 +5230,7 @@ async fn audio_tts_register_voice_handler(
             StatusCode::NOT_IMPLEMENTED,
             Json(AudioTtsRegisterVoiceResponse {
                 success: false,
-                error: Some("Voice cloning/registration is only supported by MOSS-TTS, not M5-TTS".to_string()),
+                error: Some("Voice cloning/registration is only supported by 个性化声音克隆与朗读, not 极速语音合成与朗读".to_string()),
             }),
         );
     }
@@ -5309,7 +5310,7 @@ async fn audio_tts_chunk_handler(
             if !state.m5.is_ready() {
                 return Err((
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "M5-TTS engine not ready or model missing".to_string(),
+                    "极速语音合成与朗读 engine not ready or model missing".to_string(),
                 ));
             }
             let voice_id = req.voice_id.unwrap_or_else(|| M5_DEFAULT_VOICE_ID.to_string());
@@ -5337,13 +5338,13 @@ async fn audio_tts_chunk_handler(
             .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TTS task panicked: {}", e)))?
             .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-            build_tts_wav_response("m5-tts-50m-int8", synth_res)
+            build_tts_wav_response("express-voice-24k", synth_res)
         }
         ActiveTtsEngine::Moss => {
             if !state.moss.is_ready() {
                 return Err((
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "MOSS-TTS engine not ready or model missing".to_string(),
+                    "个性化声音克隆与朗读 engine not ready or model missing".to_string(),
                 ));
             }
 
@@ -5373,7 +5374,7 @@ async fn audio_tts_chunk_handler(
             .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TTS task panicked: {}", e)))?
             .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-            build_tts_wav_response("moss-tts-nano-int8", synth_res)
+            build_tts_wav_response("clone-voice-48k", synth_res)
         }
     }
 }
@@ -5398,7 +5399,7 @@ async fn audio_tts_stream_handler(
     if !state.m5.is_ready() {
         return Err((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "M5-TTS engine not ready or model missing".to_string(),
+            "极速语音合成与朗读 engine not ready or model missing".to_string(),
         ));
     }
 
@@ -5656,7 +5657,7 @@ async fn audio_analyze_voice_handler(
             StatusCode::NOT_IMPLEMENTED,
             Json(AudioAnalyzeVoiceResponse {
                 success: false,
-                error: Some("Voice cloning/analysis is only supported by MOSS-TTS, not M5-TTS".to_string()),
+                error: Some("Voice cloning/analysis is only supported by 个性化声音克隆与朗读, not 极速语音合成与朗读".to_string()),
                 lang: "zh".to_string(),
                 emotion: "neutral".to_string(),
                 text: String::new(),

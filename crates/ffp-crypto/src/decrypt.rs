@@ -103,3 +103,70 @@ pub fn decrypt_ffpc_bytes(
         aad.tok_len,
     ))
 }
+
+/// 从 v2 密文容器流中安全解密单个角色流明文 (规格书 §3.2 / §3.3)
+///
+/// 校验步骤：
+/// 1. 解析 v2 Header 并执行全部前置边界门禁 (Magic, 版本, 长度粗筛, slotLen/roleLen 强自洽断言)；
+/// 2. 校验文件总长度是否严格等于 headerLen + plaintextLen + 16 (禁止尾随垃圾追加, N-02)；
+/// 3. 校验密文载荷长度严格等于 header.plaintext_len；
+/// 4. 派生专属 v2 AEAD 子密钥；
+/// 5. 原地解密并认证 Tag，使用 Header 原始字节切片作为 AAD；
+/// 6. 解密后计算明文 SHA-256，强断言与 header.plaintext_sha256 100% 吻合；
+/// 7. 返回解密明文字节 (被 Zeroizing 保护)。
+pub fn decrypt_v2_stream(
+    file_bytes: &[u8],
+    master_key: &[u8; 32],
+) -> Result<Zeroizing<Vec<u8>>, FfpError> {
+    use sha2::{Digest, Sha256};
+    use crate::header::parse_v2_header;
+    use crate::key::derive_v2_aead_sub_key;
+
+    let header = parse_v2_header(file_bytes)?;
+
+    let header_len = header.header_len;
+    let pt_len = header.plaintext_len as usize;
+    let expected_total_len = header_len + pt_len + TAG_LEN;
+
+    if file_bytes.len() != expected_total_len {
+        return Err(FfpError::CiphertextLengthMismatch {
+            declared: header.plaintext_len,
+            actual: (file_bytes.len().saturating_sub(header_len + TAG_LEN)) as u64,
+        });
+    }
+
+    let ct_start = header_len;
+    let ct_end = ct_start + pt_len;
+    let tag_bytes = &file_bytes[ct_end..ct_end + TAG_LEN];
+
+    let sub_key = derive_v2_aead_sub_key(
+        master_key,
+        &header.resource_id_hash,
+        header.slot,
+        header.role,
+        header.key_epoch,
+    );
+
+    let cipher = ChaCha20Poly1305::new_from_slice(&sub_key)
+        .map_err(|_| FfpError::InvalidFormat("初始化 ChaCha20Poly1305 失败".into()))?;
+
+    let nonce = Nonce::from_slice(&header.nonce);
+    let tag = Tag::from_slice(tag_bytes);
+
+    let mut decrypted_storage = Zeroizing::new(file_bytes[ct_start..ct_end].to_vec());
+
+    cipher
+        .decrypt_in_place_detached(nonce, header.aad, &mut decrypted_storage, tag)
+        .map_err(|_| FfpError::AeadDecryptFailed)?;
+
+    // 解密后明文 SHA-256 完整性强断言
+    let mut hasher = Sha256::new();
+    hasher.update(&decrypted_storage);
+    let actual_sha: [u8; 32] = hasher.finalize().into();
+
+    if actual_sha != header.plaintext_sha256 {
+        return Err(FfpError::InvalidFormat("明文 SHA-256 摘要不匹配".into()));
+    }
+
+    Ok(decrypted_storage)
+}

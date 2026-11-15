@@ -4,14 +4,16 @@ pub mod key;
 pub mod payload;
 pub mod decrypt;
 
-pub use decrypt::{decrypt_ffpc_bytes, decrypt_ffpc_payload};
+pub use decrypt::{decrypt_ffpc_bytes, decrypt_ffpc_payload, decrypt_v2_stream};
 pub use error::FfpError;
 pub use header::{
     build_v2_header_bytes, compute_canonical_siblings_digest, parse_v2_header,
     validate_sibling_keys, verify_siblings_digest, AadMetadata, FfpcHeader, FfpcV2Header,
     SiblingEntry, MAX_MODEL_BYTES, MAX_V2_HEADER_LEN, MIN_V2_HEADER_LEN, TAG_LEN,
 };
-pub use key::{derive_app_key, derive_sub_key, LOCAL_KEY_EPOCH};
+pub use key::{
+    derive_app_key, derive_sub_key, derive_v2_aead_sub_key, derive_v2_siv_nonce, LOCAL_KEY_EPOCH,
+};
 pub use payload::DecryptedPayload;
 
 use chacha20poly1305::{
