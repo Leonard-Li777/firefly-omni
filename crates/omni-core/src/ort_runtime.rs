@@ -1205,6 +1205,7 @@ impl OmniOrtRuntime {
 
         #[cfg(target_os = "macos")]
         {
+            use ort::execution_providers::ExecutionProvider;
             let _ = policy;
             let coreml_ep = ort::execution_providers::CoreMLExecutionProvider::default();
             if coreml_ep.is_available().unwrap_or(true) {
@@ -1214,6 +1215,7 @@ impl OmniOrtRuntime {
 
         #[cfg(target_os = "linux")]
         {
+            use ort::execution_providers::ExecutionProvider;
             let _ = policy;
             let cuda_ep = ort::execution_providers::CUDAExecutionProvider::default();
             if cuda_ep.is_available().unwrap_or(false) {
