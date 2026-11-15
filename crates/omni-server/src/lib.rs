@@ -282,7 +282,13 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
         .or_else(|| Some(state.vector.dir().to_string_lossy().to_string()));
     let mount_manifest = omni_core::plugin_dir::mount_manifest_status();
     let mobile_clip_vocab = if is_pro {
-        Some(omni_pro::vision::verify_mobileclip_en_vocab())
+        // 仅当挂载清单实际激活了 mobile-clip 时，才在 Pro 模式下核验英文视觉词表；
+        // 未挂载 mobile-clip（如中文语言 Chinese-CLIP 模式）时直接返回 None，杜绝越界警告与自杀式双向核验阻断
+        if omni_core::plugin_dir::resolve_mounted_dir("mobile-clip").ok().flatten().is_some() {
+            Some(omni_pro::vision::verify_mobileclip_en_vocab())
+        } else {
+            None
+        }
     } else {
         None
     };
