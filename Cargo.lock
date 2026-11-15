@@ -4584,6 +4584,7 @@ dependencies = [
  "ignore",
  "image",
  "jieba-rs",
+ "libc",
  "ndarray 0.16.1",
  "omni-core",
  "omni-extract",
