@@ -3451,6 +3451,7 @@ async fn perceive_file_handler(
         is_audio_or_video: is_video || has_asr || lrc.is_some(),
         language: req.language.clone(),
         dimension_policies: Some(current_policies.clone()),
+        skip_5w_synthesis: req.skip_5w_synthesis.unwrap_or(false),
     };
     let t_fusion = std::time::Instant::now();
     let fusion_outcome = if is_pro {
@@ -3523,26 +3524,43 @@ async fn perceive_file_handler(
         benchmark.record("fusion_embed_calls", perf.embed_calls_est as u64);
     }
 
-    let candidate_hypotheses = if !fusion_outcome.candidate_hypotheses.is_empty() {
+    let skip_5w = req.skip_5w_synthesis.unwrap_or(false);
+
+    let candidate_hypotheses = if skip_5w {
+        Vec::new()
+    } else if !fusion_outcome.candidate_hypotheses.is_empty() {
         fusion_outcome.candidate_hypotheses
     } else {
         cascade_candidates
     };
 
     // 若第三阶段双锚点融合产生了胜出假设，优先更新 winning_hypothesis
-    let winning_hypothesis = candidate_hypotheses
-        .iter()
-        .find(|c| c.is_winner)
-        .map(|c| omni_core::WinningHypothesisItem {
-            prompt_text: c.prompt_text.clone(),
-            confidence: c.confidence,
-        })
-        .or(winning_hypothesis);
+    let winning_hypothesis = if skip_5w {
+        None
+    } else {
+        candidate_hypotheses
+            .iter()
+            .find(|c| c.is_winner)
+            .map(|c| omni_core::WinningHypothesisItem {
+                prompt_text: c.prompt_text.clone(),
+                confidence: c.confidence,
+            })
+            .or(winning_hypothesis)
+    };
 
     // 终局智能重命名与描述：优先取第三阶段双锚点交叉验证胜出者 (Fusion 轨单轨出厂，PRD §7.1.4)
     // 视觉内联旁路已退役，图片路径绝不回退至 text 5W 范畴错配
-    let mut smart_name = fusion_outcome.smart_name.or(if is_image { None } else { text_smart_name });
-    let content_description = fusion_outcome.content_description.or_else(|| if is_image { None } else { text_one_desc.clone() });
+    // 若 skip_5w 为 true，严格置为 None，阻断非图片介质回退取 text_smart_name / text_one_desc
+    let mut smart_name = if skip_5w {
+        None
+    } else {
+        fusion_outcome.smart_name.or(if is_image { None } else { text_smart_name })
+    };
+    let content_description = if skip_5w {
+        None
+    } else {
+        fusion_outcome.content_description.or_else(|| if is_image { None } else { text_one_desc.clone() })
+    };
 
     if let Some(ref bin) = binary_analysis_info {
         if let Some(ref prod) = bin.product_name {
@@ -3966,7 +3984,7 @@ async fn perceive_file_handler(
         keywords: text_keywords,
         entities: text_entities,
         structured_summary: text_summary,
-        one_sentence_desc: text_one_desc,
+        one_sentence_desc: if skip_5w { None } else { text_one_desc },
         name_slots: text_slots,
         // 空文本向量不得遮蔽视觉主向量：gemma 文本塔编码失败时 text_emb 为空向量
         embedding_dense: text_emb
@@ -6265,6 +6283,7 @@ mod representative_vision_tests {
             is_audio_or_video: true,
             language: Some("zh".to_string()),
             dimension_policies: None,
+            skip_5w_synthesis: false,
         };
 
         // 4. 调用融合仲裁引擎

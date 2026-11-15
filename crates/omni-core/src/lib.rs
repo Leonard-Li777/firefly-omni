@@ -285,6 +285,10 @@ pub struct OmniPerceptionRequest {
     /// 是否需要生成缩略图/封面（若已有则传 false，不要求生成）
     #[serde(default)]
     pub generate_thumbnail: Option<bool>,
+    /// 是否跳过 CPU 阶段的 5W 造句（含智能文件名候选题名与内容描述的穷举及向量打分仲裁）
+    /// 缺省为 false，保持既有完全向后兼容语义
+    #[serde(default)]
+    pub skip_5w_synthesis: Option<bool>,
 }
 
 /// 原生多模态感知细分耗时
@@ -718,6 +722,9 @@ pub struct MultimodalContext {
     /// 动态维度执行策略字典 (dim_code -> policy)
     #[serde(default)]
     pub dimension_policies: Option<std::collections::HashMap<String, DimensionExecutionPolicy>>,
+    /// 是否跳过 CPU 阶段的 5W 造句（含智能文件名候选题名与内容描述的穷举及向量打分仲裁）
+    #[serde(default)]
+    pub skip_5w_synthesis: bool,
 }
 
 /// 检查 ASR 语音识别文本是否包含实质语义内容
@@ -1165,7 +1172,9 @@ pub use concepts::TOP_ROOT_CONCEPTS as ROOT_DIMENSION_CONCEPTS;
 #[inline]
 pub fn is_root_dimension(code: &str) -> bool {
     code == "builtin.fileType" // locale-invariant-ok: 历史驼峰兼容
+        || code == "builtin.author" // 兼容作者维度内置别名
         || concepts::Concept::from_code(code).map(|concept_item| concept_item.is_top_root()).unwrap_or(false)
+        || tag_identity::concept_from_code(code).map(|concept_val| concept_val.is_top_root()).unwrap_or(false)
 }
 
 pub use tag_identity::{concept_from_language_code, detect_fact_language, is_image_exclusive_concept, is_image_exclusive_tag};

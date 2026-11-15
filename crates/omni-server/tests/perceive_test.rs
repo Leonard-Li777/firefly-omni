@@ -361,3 +361,103 @@ fn perception_fact_tags_extension_and_category_materialized_paths() {
     assert_eq!(roundtrip_mp3.via_parent_code.as_deref(), Some("builtin.audio_extensions"));
 }
 
+/// 契约 6：skip_5w_synthesis 请求与上下文序列化及缺省值验证
+#[test]
+fn perception_request_and_context_accepts_skip_5w_synthesis() {
+    // 1. OmniPerceptionRequest 序列化与反序列化
+    let req: OmniPerceptionRequest = serde_json::from_value(json!({
+        "file_path": "/test/report.docx",
+        "skip_5w_synthesis": true
+    })).expect("反序列化 skip_5w_synthesis 失败");
+    assert_eq!(req.skip_5w_synthesis, Some(true));
+
+    // 缺省为 None
+    let defaulted: OmniPerceptionRequest = serde_json::from_value(json!({
+        "file_path": "/test/report.docx"
+    })).expect("反序列化缺省 skip_5w_synthesis 失败");
+    assert_eq!(defaulted.skip_5w_synthesis, None);
+
+    // 2. MultimodalContext 序列化与反序列化
+    let ctx = MultimodalContext {
+        file_path: "/test/report.docx".to_string(),
+        file_name: "report.docx".to_string(),
+        skip_5w_synthesis: true,
+        ..Default::default()
+    };
+    let val = serde_json::to_value(&ctx).expect("序列化 MultimodalContext 失败");
+    assert_eq!(val["skip_5w_synthesis"], json!(true));
+
+    let back: MultimodalContext = serde_json::from_value(val).expect("反序列化 MultimodalContext 失败");
+    assert!(back.skip_5w_synthesis);
+
+    // 缺省反序列化为 false
+    let mut default_val = serde_json::to_value(&MultimodalContext::default()).unwrap();
+    if let Some(obj) = default_val.as_object_mut() {
+        obj.remove("skip_5w_synthesis");
+    }
+    let defaulted_ctx: MultimodalContext = serde_json::from_value(default_val).expect("反序列化缺省 MultimodalContext 失败");
+    assert!(!defaulted_ctx.skip_5w_synthesis);
+}
+
+/// 仅供测试的确定性语义向量嵌入器
+struct TestEmbedder;
+
+impl omni_pro::text::TextEmbedder for TestEmbedder {
+    fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        let clean = text.trim();
+        if clean.is_empty() {
+            return Ok(vec![0.0f32; omni_pro::text::EMBEDDING_DIM]);
+        }
+        Ok(omni_pro::text::BekkoEmbedder::deterministic_semantic_embedding(clean))
+    }
+}
+
+/// 契约 7：多模态融合引擎当 skip_5w_synthesis = true 时跳过造句与打分仲裁
+#[test]
+fn fusion_skips_5w_when_skip_5w_synthesis_enabled() {
+    use omni_pro::text::OmniMultimodalFusionEngine;
+    use omni_core::TagChainItem;
+
+    let tag = TagChainItem {
+        code: "builtin.document".to_string(),
+        name: "文档".to_string(),
+        confidence: 0.95,
+        parent_codes: vec!["builtin.file_type".to_string()],
+        via_parent_code: Some("builtin.file_type".to_string()),
+        ..Default::default()
+    };
+
+    let ctx = MultimodalContext {
+        file_path: "/docs/annual_report.docx".to_string(),
+        file_name: "annual_report.docx".to_string(),
+        mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string(),
+        document_text: Some("这是2026年度业务财务总结报告与战略规划全文。".to_string()),
+        text_tags: vec![tag],
+        is_document: true,
+        skip_5w_synthesis: true,
+        ..Default::default()
+    };
+
+    let outcome = OmniMultimodalFusionEngine::fuse_and_arbitrate_with_embedder(
+        &ctx,
+        &TestEmbedder,
+    );
+
+    // 1. 断言智能文件名与描述跳过生成
+    assert!(outcome.smart_name.is_none(), "skip_5w_synthesis 必须使 smart_name 为 None");
+    assert!(outcome.content_description.is_none(), "skip_5w_synthesis 必须使 content_description 为 None");
+    assert!(outcome.candidate_hypotheses.is_empty(), "skip_5w_synthesis 必须使 candidate_hypotheses 为空");
+
+    // 2. 断言全局锚点与受控标签完整保留
+    assert!(outcome.anchor_vector.is_some(), "全局锚点 anchor_vector 必须继续导出注入缓存");
+    assert!(!outcome.fused_tags.is_empty(), "受控标签 fused_tags 必须继续正常产出与归一化");
+
+    // 3. 断言性能与调用指标
+    if let Some(perf) = outcome.perf_breakdown {
+        assert_eq!(perf.arbitrate_embed_ms, 0, "假设打分仲裁耗时必须归零");
+        assert_eq!(perf.candidates_count, 0, "候选假设数必须归零");
+        assert_eq!(perf.embed_calls_est, 1 + perf.candidate_pool_count, "embedding 调用仅计入全局锚点与初轮词池打分");
+    }
+}
+
+
