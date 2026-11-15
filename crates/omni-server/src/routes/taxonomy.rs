@@ -529,19 +529,19 @@ pub struct NodeEvaluationContext<'a> {
 
 /// 受控抽象空洞壳名词 Codes 静态白名单 (Spec §2.3 / ISS-02)
 pub static SHELL_NOUN_CODES: &[&str] = &[
-    "omw.00024720.n", // 状态 (state, status)
-    "omw.00026367.n", // 过程 (process)
-    "omw.00027167.n", // 方式 (manner, way)
-    "omw.00028119.n", // 原因 (reason, cause)
-    "omw.00029378.n", // 方法 (method)
-    "omw.00024073.n", // 条件 (condition)
-    "omw.13941407.n", // 情况 (situation)
-    "omw.00026788.n", // 问题 (problem)
-    "omw.05834839.n", // 问题
-    "omw.05835747.n", // 类型 (type)
-    "omw.13939634.n", // 阶段 (phase, stage)
-    "omw.05836885.n", // 形式 (form)
-    "omw.05837265.n", // 模式 (mode, pattern)
+    "omw.00024720.n", // lint-ignore: raw-code // 状态 (state, status)
+    "omw.00026367.n", // lint-ignore: raw-code // 过程 (process)
+    "omw.00027167.n", // lint-ignore: raw-code // 方式 (manner, way)
+    "omw.00028119.n", // lint-ignore: raw-code // 原因 (reason, cause)
+    "omw.00029378.n", // lint-ignore: raw-code // 方法 (method)
+    "omw.00024073.n", // lint-ignore: raw-code // 条件 (condition)
+    "omw.13941407.n", // lint-ignore: raw-code // 情况 (situation)
+    "omw.00026788.n", // lint-ignore: raw-code // 问题 (problem)
+    "omw.05834839.n", // lint-ignore: raw-code // 问题
+    "omw.05835747.n", // lint-ignore: raw-code // 类型 (type)
+    "omw.13939634.n", // lint-ignore: raw-code // 阶段 (phase, stage)
+    "omw.05836885.n", // lint-ignore: raw-code // 形式 (form)
+    "omw.05837265.n", // lint-ignore: raw-code // 模式 (mode, pattern)
     "builtin.category.abstract_entity",
     "builtin.status",
     "builtin.state",
@@ -898,9 +898,11 @@ pub fn query_taxonomy_tree_fast(
         let code_photo_cat = omni_core::concepts::Concept::摄影照片细分.code();
         let code_text_density = omni_core::concepts::Concept::文字密度.code();
         let code_geo_location = omni_core::concepts::Concept::地理位置.code();
+        let code_author = omni_core::concepts::Concept::作者.code();
 
         let name_content_tags = omni_core::concepts::Concept::内容标签.zh_name();
         let name_geo_location = omni_core::concepts::Concept::地理位置.zh_name();
+        let name_author = omni_core::concepts::Concept::作者.zh_name();
         let name_file_type = omni_core::concepts::Concept::文件类型.zh_name();
         let name_document = omni_core::concepts::Concept::文档.zh_name();
 
@@ -940,8 +942,17 @@ pub fn query_taxonomy_tree_fast(
 
         // 历史兼并副码自愈归一（ISS-01）：将历史 omw.06367879.n 直接归入正统受控码 omw.03833065.n
         for seg in &mut code_segs {
-            if seg == "omw.06367879.n" {
-                *seg = "omw.03833065.n".to_string();
+            if seg == "omw.06367879.n" { // lint-ignore: raw-code
+                *seg = "omw.03833065.n".to_string(); // lint-ignore: raw-code
+            }
+        }
+
+        // 作者受控码统一展示名为正统受控名
+        for (i, seg) in code_segs.iter_mut().enumerate() {
+            if seg == code_author {
+                if i < name_segs.len() && (name_segs[i].is_empty() || name_segs[i] == "未归类") {
+                    name_segs[i] = name_author.to_string();
+                }
             }
         }
 
@@ -989,6 +1000,19 @@ pub fn query_taxonomy_tree_fast(
             if pos > 0 {
                 code_segs.drain(0..pos);
                 if let Some(name_pos) = name_segs.iter().position(|s| s == name_geo_location) {
+                    name_segs.drain(0..name_pos);
+                } else if name_segs.len() > pos {
+                    name_segs.drain(0..pos);
+                }
+            }
+        }
+
+        // 历史错误拓扑自愈：作者为一级独立根维度，若历史脏数据中被误挂在其他维度（如内容标签->人->作者 或 文件类型->作者），
+        // 自动切除前缀，将作者提升为根节点
+        if let Some(pos) = code_segs.iter().position(|s| s == code_author) {
+            if pos > 0 {
+                code_segs.drain(0..pos);
+                if let Some(name_pos) = name_segs.iter().position(|s| s == name_author || s == "作者") {
                     name_segs.drain(0..name_pos);
                 } else if name_segs.len() > pos {
                     name_segs.drain(0..pos);
@@ -1075,6 +1099,12 @@ pub fn query_taxonomy_tree_fast(
                 9999
             } else if seg_code == omni_core::concepts::Concept::文件类型.code() {
                 1
+            } else if seg_code == omni_core::concepts::Concept::文件用途.code() {
+                2
+            } else if seg_code == omni_core::concepts::Concept::文件来源.code() {
+                3
+            } else if seg_code == code_author {
+                4
             } else {
                 0
             };
@@ -2694,8 +2724,9 @@ pub fn query_tag_alias_rows(
 
     let mut rows: Vec<TagAliasRow> = Vec::new();
     while let Some(row) = rows_iter.next()? {
+        let tag_code: String = row.get(0)?;
         rows.push(TagAliasRow {
-            tag_code: row.get(0)?,
+            tag_code,
             lemma: row.get(1)?,
             is_canonical: row.get(2)?,
             n: row.get(3)?,
@@ -3498,14 +3529,15 @@ mod tests {
         assert_eq!(res_invoice.ancestry_matched_code.as_deref(), Some("builtin.file_purpose"));
 
         // Case 3: 受控但父级不匹配 (塔防挂在作者下)
-        let res_td = inspect_single_tag(&conn, "塔防", "builtin.author", "zh-CN");
+        let author_code = omni_core::concepts::Concept::作者.code();
+        let res_td = inspect_single_tag(&conn, "塔防", author_code, "zh-CN");
         assert!(res_td.is_controlled);
         assert!(!res_td.matched_parent);
         assert_eq!(res_td.code.as_deref(), Some("builtin.tower_defense"));
         assert!(res_td.ancestry_matched_code.is_none());
 
         // Case 4: 完全未收录的自定义标签 (张三)
-        let res_custom = inspect_single_tag(&conn, "张三", "builtin.author", "zh-CN");
+        let res_custom = inspect_single_tag(&conn, "张三", author_code, "zh-CN");
         assert!(!res_custom.is_controlled);
         assert!(!res_custom.matched_parent);
         assert!(res_custom.code.is_none());
@@ -3515,8 +3547,8 @@ mod tests {
         let batch_items = vec![
             InspectTagItem { tag_name: "公开".to_string(), target_parent_code: "builtin.security_level".to_string() },
             InspectTagItem { tag_name: "发票".to_string(), target_parent_code: "builtin.file_purpose".to_string() },
-            InspectTagItem { tag_name: "塔防".to_string(), target_parent_code: "builtin.author".to_string() },
-            InspectTagItem { tag_name: "张三".to_string(), target_parent_code: "builtin.author".to_string() },
+            InspectTagItem { tag_name: "塔防".to_string(), target_parent_code: author_code.to_string() },
+            InspectTagItem { tag_name: "张三".to_string(), target_parent_code: author_code.to_string() },
         ];
         let batch_res = inspect_tags_batch(&conn, &batch_items, "zh-CN").unwrap();
         assert_eq!(batch_res.len(), 4);

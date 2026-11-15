@@ -1172,7 +1172,6 @@ pub use concepts::TOP_ROOT_CONCEPTS as ROOT_DIMENSION_CONCEPTS;
 #[inline]
 pub fn is_root_dimension(code: &str) -> bool {
     code == "builtin.fileType" // locale-invariant-ok: 历史驼峰兼容
-        || code == "builtin.author" // 兼容作者维度内置别名
         || concepts::Concept::from_code(code).map(|concept_item| concept_item.is_top_root()).unwrap_or(false)
         || tag_identity::concept_from_code(code).map(|concept_val| concept_val.is_top_root()).unwrap_or(false)
 }
