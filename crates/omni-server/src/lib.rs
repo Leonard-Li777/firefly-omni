@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use tracing::info;
+use tracing::{debug, info};
 
 pub use omni_pro::{
     encoder_id, OmwDb, SemanticPackLoader, VectorEngine, VectorMatch, VECTOR_DIM, VECTOR_DIM_512,
@@ -893,7 +893,7 @@ fn refresh_classifier_map(omw: &OmwDb) {
         return;
     }
     match omw.with_conn(|conn| omni_pro::text::classifier_lookup::hydrate_from_conn(conn)) {
-        Ok(n) if n > 0 => info!("classifier map hydrated: {n} lemma entries"),
+        Ok(n) if n > 0 => debug!("classifier map hydrated: {n} lemma entries"),
         Ok(n) => {
             // 零降级：分表在但零条非空 classifier ⇒ 陈旧/残缺语义包，量词功能将全失
             tracing::error!("[classifier] 语义包 tag_aliases_zh_CN.classifier 全空（{n} 条），拒绝继续运行");
@@ -940,7 +940,7 @@ pub async fn start_server(
             Arc::new(omni_pro::geo::GeoService::from_path(path))
         }
         None => {
-            info!("omni-geo dataset not found or open-core stub mode, geo subsystem starts unavailable");
+            debug!("omni-geo dataset not found or open-core stub mode, geo subsystem starts unavailable");
             Arc::new(omni_pro::geo::GeoService::unavailable())
         }
     };
@@ -1012,11 +1012,11 @@ pub async fn start_server(
                      严禁以 --db-path 所指的桌面业务主库充当 OMW 数据源（该库不含 file_tags/omw_* 语义表）。"
                 );
             }
-            info!("open-core/stub mode: no semantic.pack required, omw subsystem starts unavailable");
+            debug!("open-core/stub mode: no semantic.pack required, omw subsystem starts unavailable");
         }
     }
     if let Some(path) = &db_path {
-        info!(
+        debug!(
             "db-path is reserved for desktop master database ({})",
             path.display()
         );
@@ -1038,7 +1038,7 @@ pub async fn start_server(
 
     let vector = Arc::new(match target_vectors_dir {
         Some(dir) => {
-            tracing::info!("[OmniServer] 向量引擎成功对齐目标路径: {}", dir.display());
+            tracing::debug!("[OmniServer] 向量引擎成功对齐目标路径: {}", dir.display());
             VectorEngine::open(dir).unwrap_or_else(|err| {
                 tracing::warn!("Failed to open vector engine at target path ({err}), falling back to memory");
                 VectorEngine::in_memory()
@@ -1227,7 +1227,7 @@ async fn extract_file_handler(
     let res = match OmniExtractor::extract(&req.file_path, &cfg).await {
         Ok(res) => {
             let cost_ms = t_start.elapsed().as_millis();
-            tracing::info!(
+            tracing::debug!(
                 "[OmniServer] 提取成功: file={}, enable_image_ocr={}, 耗时={}ms",
                 req.file_path,
                 cfg.enable_image_ocr,
@@ -1736,7 +1736,7 @@ fn run_vision_pipeline(
                 match run_vision_pipeline_on_image(&img, exif_orient, enable_visual_tags, lang, embedding_profile, enable_nsfw) {
                     Ok(mut computed) => {
                         computed.duration_ms = t_vision.elapsed().as_millis() as u64;
-                        tracing::info!(
+                        tracing::debug!(
                             "[OmniServer] 图片文本前置检测: file={}, has_text={}",
                             file_path,
                             computed.has_text.unwrap_or(false)
@@ -2399,7 +2399,7 @@ async fn perceive_file_handler(
                 if let serde_json::Value::Object(ref mut map) = ext_res.metadata {
                     if let Some(sv) = sense_voice_result {
                         if omni_core::is_meaningful_asr_text(&sv.text) {
-                            tracing::info!(
+                            tracing::debug!(
                                 "[OmniServer] 音频转录完成: file={}, len={}, lang={:?}, emotion={:?}, audio_ms={:?}",
                                 file_path, sv.text.len(), sv.lang, sv.emotion, audio_ms
                             );
@@ -2414,17 +2414,17 @@ async fn perceive_file_handler(
                                 map.insert("emotion".to_string(), serde_json::Value::String(emo.clone()));
                             }
                         } else {
-                            tracing::info!(
+                            tracing::debug!(
                                 "[OmniServer] 音频转录结果为无实质语义文本或标点噪声，已过滤: file={}, raw_text={:?}",
                                 file_path, sv.text
                             );
                         }
                     } else {
-                        tracing::info!("[OmniServer] 音频转录无语音内容或模型未就绪: file={}", file_path);
+                        tracing::debug!("[OmniServer] 音频转录无语音内容或模型未就绪: file={}", file_path);
                     }
 
                     if !events_result.is_empty() {
-                        tracing::info!(
+                        tracing::debug!(
                             "[OmniServer] 声学事件打标完成: file={}, events={:?}",
                             file_path, events_result
                         );
@@ -3881,7 +3881,7 @@ async fn perceive_file_handler(
 
     benchmark.total_ms = t_start.elapsed().as_millis() as u64;
 
-    tracing::info!(
+    tracing::debug!(
         "[OmniServer] 原生多模态感知完成: file={}, 耗时={}ms, watermark_level={:?}, mosaic_level={:?}, has_text={:?}, visual_tags_count={}, fused_tags_count={}, ram_tags={:?}, geo={:?}",
         file_path,
         benchmark.total_ms,
@@ -3894,7 +3894,7 @@ async fn perceive_file_handler(
         geo_address
     );
 
-    tracing::info!(
+    tracing::debug!(
         "[事实标签抽取:fact_tags] 文件: {}, 产出标签数: {}, 标签: {:?}",
         file_name,
         fact_tags.len(),
@@ -4058,7 +4058,7 @@ async fn perceive_file_handler(
                 let decode_ms = bench.and_then(|b| b.subtasks.get("decode_resize_ms").copied()).unwrap_or(0);
                 let vision_ms = bench.and_then(|b| b.vision_ms).unwrap_or(0);
                 let text_ms = bench.and_then(|b| b.extract_ms).unwrap_or(0);
-                tracing::info!(
+                tracing::debug!(
                     "[PERF_PROFILE] 视频分析完成 | 文件: {} | 切片数: {} | 总耗时: {}ms [抽帧直连: {}ms | 读图解码缩放: {}ms | 视觉塔前向: {}ms | 文本塔前向: {}ms | 向量批量写盘: {}ms]",
                     req.file_path,
                     total_chunks,
@@ -4749,7 +4749,7 @@ async fn search_cluster_handler(
             omni_pro::vector_engine::encoder_id::CLASSIC_384_ALLOWED
         };
 
-        tracing::info!(
+        tracing::debug!(
             "[HAC] 聚类向量档位: profile={}, dim={}, documents={}",
             active_profile,
             target_dim,
@@ -4772,7 +4772,7 @@ async fn search_cluster_handler(
             })
             .count();
         if prefer_count > 0 {
-            tracing::info!(
+            tracing::debug!(
                 "[HAC] {} 份文档无可见语义文本，本次聚类改用文件名/主题词富文本编码（已有槽位不覆盖）",
                 prefer_count
             );
@@ -5586,10 +5586,10 @@ async fn audio_tts_split_chunks_handler(
 ) -> Result<Json<AudioTtsSplitChunksResponse>, (StatusCode, String)> {
     let text = req.text;
     let char_count = text.chars().count();
-    if char_count > 50_000 {
+    if char_count > 2_000_000 {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!("Text length of {} characters exceeds 50000 limit", char_count),
+            format!("Text length of {} characters exceeds 2000000 limit", char_count),
         ));
     }
 

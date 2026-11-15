@@ -279,7 +279,7 @@ pub fn pin_directml_dll(dir: &Path) -> Option<PathBuf> {
         Ok(lib) => {
             // 永久持有句柄：此处 Drop 会 FreeLibrary 卸载，钉死语义即失效
             std::mem::forget(lib);
-            tracing::info!(
+            tracing::debug!(
                 "OmniOrtRuntime: 已以绝对路径钉死 DirectML.dll（防 System32 截胡）: {}",
                 abs.display()
             );
@@ -600,7 +600,7 @@ pub fn probe_ladder(candidates: &[PathBuf]) -> Result<OrtProbeReport, String> {
                     }
                 }
                 let fv = file_version(cand);
-                tracing::info!(
+                tracing::debug!(
                     "OmniOrtRuntime: 运行时 B 预探通过 candidate={} DML符号={} FileVersion={} ORTVersion={} DirectML钉死={}",
                     cand.display(),
                     probe.has_dml_symbol,
@@ -849,7 +849,7 @@ impl OmniOrtRuntime {
                 // 记录预探的 DML 符号结论：`is_available()` 在纯 CPU DLL 上有假阳性历史，
                 // 能力落点必须叠加预探结论（SPEC §7.7）
                 BOUND_DML_CAPABLE.store(report.dml_capable, Ordering::SeqCst);
-                tracing::info!(
+                tracing::debug!(
                     "OmniOrtRuntime: 成功动态加载 ONNX Runtime path={} FileVersion={} DML符号={}",
                     if dll_str.is_empty() {
                         "<os-loader>"
@@ -931,7 +931,7 @@ impl OmniOrtRuntime {
                 }
                 None => "<not-loaded>".to_string(),
             };
-            tracing::info!(
+            tracing::debug!(
                 "OmniOrtRuntime: [RUNTIME-B] path={} FileVersion={} ORTVersion={} DirectML.dll(内存)={} DML符号={} allowlist={:?} 闸={}{}",
                 runtime_b,
                 report.file_version.as_deref().unwrap_or("<unknown>"),
@@ -945,7 +945,7 @@ impl OmniOrtRuntime {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            tracing::info!(
+            tracing::debug!(
                 "OmniOrtRuntime: [RUNTIME-B] path={} FileVersion={} ORTVersion={} DML符号={} 闸={}{}",
                 runtime_b,
                 report.file_version.as_deref().unwrap_or("<unknown>"),
@@ -1105,7 +1105,7 @@ impl OmniOrtRuntime {
             // `is_available()` 仅作候选判定：必须叠加预探的 DML 符号结论，否则纯 CPU DLL 上的
             // 假阳性会让启动日志自相矛盾（SPEC §3.8 / §7.7「DirectML 日志虚假」前科）
             let dml = dml_raw && BOUND_DML_CAPABLE.load(Ordering::SeqCst);
-            tracing::info!(
+            tracing::debug!(
                 "OmniOrtRuntime: EP 能力盘点 CUDA={}, DirectML={}（is_available 原始值={}）",
                 cuda,
                 dml,
@@ -1125,7 +1125,7 @@ impl OmniOrtRuntime {
 
         #[cfg(not(target_os = "windows"))]
         {
-            tracing::info!("OmniOrtRuntime: 非 Windows 平台，EP 能力盘点见 preferred_hardware_eps 探测日志");
+            tracing::debug!("OmniOrtRuntime: 非 Windows 平台，EP 能力盘点见 preferred_hardware_eps 探测日志");
         }
     }
 
@@ -1186,7 +1186,7 @@ impl OmniOrtRuntime {
                     eps.push(
                         ort::execution_providers::DirectMLExecutionProvider::default().build(),
                     );
-                    tracing::info!(
+                    tracing::debug!(
                         "OmniOrtRuntime: DML 进入 EP 阶梯（policy={:?}，闸={}）",
                         policy,
                         if directml_disabled() { "已置位" } else { "未置位" }
@@ -1195,7 +1195,7 @@ impl OmniOrtRuntime {
             }
             if eps.is_empty() {
                 // 显式上报分档落点：严禁静默回退 CPU 后在日志中不可见
-                tracing::info!(
+                tracing::debug!(
                     "OmniOrtRuntime: EP 阶梯无硬件加速候选（policy={:?}，闸={}），走纯 CPU",
                     policy,
                     if directml_disabled() { "已置位" } else { "未置位" }
@@ -1371,7 +1371,7 @@ impl OmniOrtRuntime {
                 EpKind::Cpu => break,
                 EpKind::DirectMl => match Self::build_dml_session(path, intra_threads) {
                     Ok(session) => {
-                        tracing::info!(
+                        tracing::debug!(
                             "OmniOrtRuntime: 成功构建 DirectML Session (model={}, policy={:?})",
                             path.display(),
                             policy
@@ -1391,7 +1391,7 @@ impl OmniOrtRuntime {
         }
         // 阶梯恒以 CPU 收尾（resolve_ep_candidates 保证），此处即纯 CPU 构建点
         let session = Self::build_cpu_session(path, intra_threads)?;
-        tracing::info!(
+        tracing::debug!(
             "OmniOrtRuntime: 成功构建纯 CPU Session (model={}, policy={:?})",
             path.display(),
             policy
@@ -1466,7 +1466,7 @@ impl OmniOrtRuntime {
         if has_hardware_ep {
             match stage1_builder() {
                 Ok(session) => {
-                    tracing::info!(
+                    tracing::debug!(
                         "OmniOrtRuntime: 成功构建硬件加速 Session (model={})",
                         model_name
                     );
@@ -1484,7 +1484,7 @@ impl OmniOrtRuntime {
         }
 
         let cpu_session = stage2_builder()?;
-        tracing::info!(
+        tracing::debug!(
             "OmniOrtRuntime: 成功构建纯 CPU Session (model={})",
             model_name
         );
@@ -1523,7 +1523,7 @@ impl OmniOrtRuntime {
 
             match res {
                 Ok(session) => {
-                    tracing::info!(
+                    tracing::debug!(
                         "OmniOrtRuntime: 成功构建硬件加速 Session (model={}, ep_candidate={})",
                         path_str,
                         idx
@@ -1546,7 +1546,7 @@ impl OmniOrtRuntime {
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
             .commit_from_file(path)?;
 
-        tracing::info!(
+        tracing::debug!(
             "OmniOrtRuntime: 成功构建纯 CPU Session (model={})",
             path_str
         );
@@ -1585,7 +1585,7 @@ impl OmniOrtRuntime {
 
             match res {
                 Ok(session) => {
-                    tracing::info!(
+                    tracing::debug!(
                         "OmniOrtRuntime: 成功从内存构建硬件加速 Session (ep_candidate={})",
                         idx
                     );
@@ -1604,7 +1604,7 @@ impl OmniOrtRuntime {
         // 最终兜底：纯 CPU Session
         let cpu_session = Self::build_cpu_session_from_memory(model_bytes, intra_threads)?;
 
-        tracing::info!(
+        tracing::debug!(
             "OmniOrtRuntime: 成功从内存构建纯 CPU Session (bytes={})",
             model_bytes.len()
         );
@@ -1687,7 +1687,7 @@ impl OmniOrtRuntime {
                 })();
                 match res {
                     Ok(session) => {
-                        tracing::info!(
+                        tracing::debug!(
                             "OmniOrtRuntime: 非 Windows 内存构建硬件 Session 成功 (model={}, ep_candidate={})",
                             model_label.display(),
                             idx
@@ -1715,7 +1715,7 @@ impl OmniOrtRuntime {
                     .and_then(|b| b.commit_from_memory(model_bytes))
                 {
                     Ok(session) => {
-                        tracing::info!(
+                        tracing::debug!(
                             "OmniOrtRuntime: 成功从内存构建 DirectML Session (model={}, policy={:?}, bytes={})",
                             model_label.display(),
                             policy,
@@ -1735,7 +1735,7 @@ impl OmniOrtRuntime {
         }
 
         let session = Self::build_cpu_session_from_memory(model_bytes, intra_threads)?;
-        tracing::info!(
+        tracing::debug!(
             "OmniOrtRuntime: 成功从内存构建纯 CPU Session (model={}, policy={:?}, bytes={})",
             model_label.display(),
             policy,
@@ -1802,7 +1802,7 @@ where
     match warmup(&session) {
         Ok(()) => {
             if used_dml {
-                tracing::info!(
+                tracing::debug!(
                     "OmniOrtRuntime: DML warmup 实跑定标通过 (model={})",
                     model.display()
                 );
