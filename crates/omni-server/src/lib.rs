@@ -154,7 +154,24 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/api/extract/upload", post(extract_multipart_handler))
         // 通用文本打标（spec §3.1）：**刻意注册在基础路由**——非 Pro 构建下须返回
         // 「空数组 + warn」的确定性降级，而不是 404 传输错误，故不能放进下面的 Pro 分支。
-        .route("/api/text/tag", post(text_tag_handler));
+        .route("/api/text/tag", post(text_tag_handler))
+        // 统一模块休眠回收与状态对账端点 (spec §3.4.2)
+        .route(
+            "/v1/modules/:module_id/session",
+            axum::routing::delete(routes::modules::delete_module_session_handler),
+        )
+        .route(
+            "/api/v1/modules/:module_id/session",
+            axum::routing::delete(routes::modules::delete_module_session_handler),
+        )
+        .route(
+            "/v1/modules/:module_id/session/status",
+            get(routes::modules::get_module_session_status_handler),
+        )
+        .route(
+            "/api/v1/modules/:module_id/session/status",
+            get(routes::modules::get_module_session_status_handler),
+        );
 
     // 2. 闭源专业版专享接口 (Closed-Source Pro Endpoints 🔒: 一次开发闭源优先)
     // 依据项目架构准则：除以上四个基础接口外，其余全部归属 Pro 闭源优先体系

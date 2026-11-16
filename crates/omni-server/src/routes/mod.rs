@@ -3,3 +3,4 @@
 pub mod taxonomy;
 pub mod vector;
 pub mod fs_search;
+pub mod modules;

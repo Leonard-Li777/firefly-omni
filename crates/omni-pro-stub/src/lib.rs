@@ -2312,6 +2312,11 @@ pub mod audio {
         pub fn tag_audio(&self, _samples: &[f32], _sample_rate: i32, _top_k: usize) -> Vec<String> {
             Vec::new()
         }
+        pub fn drop_session(&self) {}
+        pub fn unload(&self) {}
+        pub fn is_asr_ready(&self) -> bool {
+            false
+        }
         pub fn is_purification_ready(&self) -> bool {
             false
         }
@@ -2344,6 +2349,7 @@ pub mod audio {
             Self
         }
         pub fn unload(&self) {}
+        pub fn drop_session(&self) {}
         pub fn is_ready(&self) -> bool {
             false
         }
@@ -2393,6 +2399,7 @@ pub mod audio {
             Self
         }
         pub fn unload(&self) {}
+        pub fn drop_session(&self) {}
         pub fn is_ready(&self) -> bool {
             false
         }
