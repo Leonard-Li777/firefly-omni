@@ -425,6 +425,10 @@ jobs:
         env:
           GH_TOKEN: ${{ env.GH_TOKEN }}
           GITHUB_TOKEN: ${{ env.GH_TOKEN }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
 
   # 联动触发 Desktop 发版工作流（自动拉取新版 omni 引擎并更新 lock.json 发版）
   # 按 desktop_build_region 参数决定派发区域：CN / INTL / CN+INTL（默认全部）
@@ -481,4 +485,3 @@ jobs:
             } catch (error) {
               core.setFailed(`❌ 触发 Desktop 发版流水线失败: ${error.message}`);
             }
-
