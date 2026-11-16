@@ -1,8 +1,24 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// 判断候选目录是否含 MuPDF 头文件（bindgen/cc 编译 wrapper 的硬前提）。
+/// 摊平布局 fitz.h 位于 include/mupdf/fitz.h 或 include/fitz.h；按平台布局同理。
+fn has_mupdf_headers(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    dir.join("include/mupdf/fitz.h").is_file()
+        || dir.join("mupdf/fitz.h").is_file()
+        || dir.join("include/fitz.h").is_file()
+        || dir.join("fitz.h").is_file()
+}
 
 fn main() {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+
     // 自动探测并设置预置 libclang 路径，保证 Windows MSVC 与 bindgen 兼容
     let mut clang_cur = env::current_dir().unwrap_or_default();
     for _ in 0..6 {
@@ -33,16 +49,43 @@ fn main() {
     }
 
     if target_dir.is_none() {
+        // 本地 WSL/Linux 开发布局：download-libmupdf.js 按平台产出 build/libmupdf/<os>-<arch>/，
+        // 头文件在 include/mupdf/ 下、静态库为 *.a；发布/CI 则摊平到 presetResources/libmupdf。
+        // 旧逻辑只认 presetResources，导致本地直接 cargo 构建报 mupdf/fitz.h: No such file。
+        let platform_dir = match (target_os.as_str(), target_arch.as_str()) {
+            ("linux", "x86_64") => Some("linux-x86_64"),
+            ("linux", "aarch64") => Some("linux-aarch64"),
+            ("windows", "x86_64") => Some("windows-x86_64"),
+            ("windows", "aarch64") => Some("windows-aarch64"),
+            ("macos", "x86_64") => Some("macos-x86_64"),
+            ("macos", "aarch64") => Some("macos-aarch64"),
+            _ => None,
+        };
         let mut cur = env::current_dir().unwrap_or_default();
         for _ in 0..6 {
             let preset = cur.join("apps/omni/build/presetResources/libmupdf");
-            if preset.exists() {
+            if has_mupdf_headers(&preset) {
                 target_dir = Some(preset);
                 break;
             }
             let preset_rel = cur.join("build/presetResources/libmupdf");
-            if preset_rel.exists() {
+            if has_mupdf_headers(&preset_rel) {
                 target_dir = Some(preset_rel);
+                break;
+            }
+            if let Some(pd) = platform_dir {
+                for lib_root in [
+                    cur.join("apps/omni/build/libmupdf"),
+                    cur.join("build/libmupdf"),
+                ] {
+                    let candidate = lib_root.join(pd);
+                    if has_mupdf_headers(&candidate) {
+                        target_dir = Some(candidate);
+                        break;
+                    }
+                }
+            }
+            if target_dir.is_some() {
                 break;
             }
             if !cur.pop() {
@@ -79,9 +122,6 @@ fn main() {
             }
         }
     }
-
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
     if target_env == "msvc" {
         println!("cargo:rustc-link-lib=dylib=advapi32");

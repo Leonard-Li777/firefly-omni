@@ -2,7 +2,8 @@
  * omni 依赖资源初始化与解压脚本 (setup-extra-resources.js)
  * 检查 extraResources/bin 目录中是否存在已解压文件，
  * 如果不存在，从 presetResources/ 找到匹配当前平台 (exiftool-bin-[platform]-[arch].[ext]) 的压缩包并解压。
- * 同时负责 omni-geo 地理数据集的两级装配：本地 presetResources 优先，缺失时从 GitHub Release 回退下载。
+ * 同时负责 omni-geo 地理数据集的两级装配：本地 presetResources 优先，缺失时经
+ * consume-preset-resources.js 从 firefly-resources 统一资源管线拉取（两步认证下载 + sha256 校验）。
  */
 
 const fs = require('fs')
@@ -96,33 +97,11 @@ async function extractTarGz(tarPath, destDir) {
 }
 
 /**
- * omni-geo 数据集目标仓库：环境变量显式指定 > git origin 解析 > 内置默认
- * 返回形如 "Leonard-Li777/firefly-omni" 的仓库标识
- */
-function resolveGeoRepo() {
-  if (process.env.OMNI_GEO_REPO) {
-    return process.env.OMNI_GEO_REPO
-  }
-  try {
-    const originUrl = execSync('git remote get-url origin', { cwd: path.resolve(__dirname, '..'), windowsHide: true })
-      .toString()
-      .trim()
-    // 支持 https://github.com/<owner>/<repo>.git 与 git@github.com:<owner>/<repo>.git 两种形态
-    const m = originUrl.match(/github\.com[/:]([\w.-]+\/[\w.-]+?)(?:\.git)?$/i)
-    if (m) {
-      return m[1]
-    }
-  } catch (e) {}
-  return 'Leonard-Li777/firefly-omni'
-}
-
-/**
  * 本地候选分发包（阶段一）：omni 自身 preset 优先，其次 monorepo 内 desktop 侧 preset。
  * 背景：资源统一装配流水线（consume-preset-resources.js）按 firefly-resources 标准把
  * geo-<版本>.tar.gz 下载到 apps/desktop/build/presetResources/geo/，apps/omni 自身
- * presetResources/ 历史上从未被写入 geo 目录 —— 只认 omni 自己目录时阶段一恒落空、
- * 阶段二 Release（Leonard-Li777/firefly-omni tag: geo-data）又早已 404，
- * 于是开发态地理子系统永远软不可用（2026-10-14 定位）。
+ * presetResources/ 历史上从未被写入 geo 目录 —— 因此阶段二改为直接调用该消费流水线
+ * 从 firefly-resources 拉取，落盘后即命中本函数第二候选，避免再依赖已 404 的旧 Release。
  */
 function resolveLocalGeoArchives(omniRoot) {
   const presetDirs = [
@@ -150,10 +129,57 @@ function resolveLocalGeoArchives(omniRoot) {
 }
 
 /**
+ * 从 firefly-resources 统一资源管线消费 geo 数据包。
+ * 复用 consume-preset-resources.js 的 lock 驱动 + 两步认证下载 + sha256 校验，
+ * 落盘到 desktop/build/presetResources/geo/（即 resolveLocalGeoArchives 第二候选）。
+ * 只消费 geo 一项（--resource geo）。BOM 重定向到 omni 专属路径：consumer 的 engines 段
+ * 始终按当前平台全量重建，若写 desktop 的共享 BOM 会在跨平台构建时把 win32 资产换成
+ * 当前平台资产，污染 desktop 全量清单——geo 是 data 资源，与引擎 BOM 无关，故隔离。
+ * 生产/CI 强制 sha 校验，开发态沿用 consumer 的缓存命中与截断门禁逻辑。
+ * @returns {boolean} 消费是否成功（退出码 0）
+ */
+function consumeGeoFromFireflyResources() {
+  const consumerScript = path.resolve(
+    __dirname,
+    '../..',
+    'desktop',
+    'pro',
+    'scripts',
+    'consume-preset-resources.js'
+  )
+  if (!fs.existsSync(consumerScript)) {
+    console.warn(`⚠️ [omni-setup] 未找到资源消费脚本，无法从 firefly-resources 拉取 geo: ${consumerScript}`)
+    return false
+  }
+  // 独立 BOM 避免写 desktop 共享 BOM；落盘 preset 目录仍用默认（desktop 缓存，供阶段一命中）
+  const omniGeoBom = path.join(__dirname, '..', 'build', 'extraResources', 'configs', 'geo-resources.bom.json')
+  ensureDir(path.dirname(omniGeoBom))
+  console.log('⬇️ [omni-setup] 本地无地理数据包，从 firefly-resources 消费 geo ...')
+  const res = spawnSync(process.execPath, [consumerScript, '--resource', 'geo', '--bom', omniGeoBom], {
+    cwd: path.resolve(__dirname, '../..'),
+    windowsHide: true,
+    encoding: 'utf8'
+  })
+  if (res.error) {
+    console.warn(`⚠️ [omni-setup] 调用资源消费脚本失败: ${res.error.message}`)
+    return false
+  }
+  if (res.status !== 0) {
+    const tail = `${res.stderr || res.stdout || ''}`.trim().split('\n').slice(-8).join('\n')
+    console.warn(
+      `⚠️ [omni-setup] firefly-resources geo 消费失败（退出码 ${res.status}，服务将以不可用状态软降级）:\n${tail}`
+    )
+    return false
+  }
+  return true
+}
+
+/**
  * omni-geo 地理数据集装配（两级）：
- * 阶段一：build/presetResources/geo/geonames-resources.tar.gz 本地解压；
- * 阶段二：本地缺失时从 firefly-omni GitHub Release (tag: geo-data) 回退下载。
- * 全部落空仅告警不中断——地理子系统运行时以 available:false 软降级。
+ * 阶段一：本地 presetResources/geo/*.tar.gz 存在则直接解压；
+ * 阶段二：本地缺失时经 consume-preset-resources.js 从 firefly-resources 拉取后解压。
+ * 全部落空仅告警不中断——地理子系统运行时以 available:false 软降级；
+ * 但消费/解压失败必须显式告警原因，严禁静默吞掉（AGENTS.md §2 禁止静默降级）。
  */
 async function setupOmniGeoDataset() {
   const omniRoot = path.resolve(__dirname, '..')
@@ -167,26 +193,25 @@ async function setupOmniGeoDataset() {
   }
 
   ensureDir(geoTargetDir)
-  const localArchives = resolveLocalGeoArchives(omniRoot)
 
   // 阶段一：本地分发包存在则直接使用（omni preset 或 desktop preset）
+  let localArchives = resolveLocalGeoArchives(omniRoot)
   let tarPath = localArchives[0]
-  if (!tarPath) {
-    // 阶段二：网络回退下载（firefly-omni 滚动 Release: geo-data）
-    const repo = resolveGeoRepo()
-    const tag = process.env.OMNI_GEO_RELEASE_TAG || 'geo-data'
-    const url = `https://github.com/${repo}/releases/download/${tag}/geonames-resources.tar.gz`
-    console.log(`⬇️ [omni-setup] 本地无地理数据包，开始下载: ${url}`)
-    tarPath = path.join(omniRoot, 'build', 'presetResources', 'geo', 'geonames-resources.tar.gz')
-    ensureDir(path.dirname(tarPath))
-    try {
-      await downloadToFile(url, tarPath)
-    } catch (err) {
-      console.warn(`⚠️ [omni-setup] 地理数据集下载失败（服务将以不可用状态软降级）: ${err.message}`)
+  if (tarPath) {
+    console.log(`📦 [omni-setup] 使用本地地理数据包: ${tarPath}`)
+  } else {
+    // 阶段二：经统一资源管线从 firefly-resources 拉取，落盘后重新扫描本地候选
+    const consumed = consumeGeoFromFireflyResources()
+    if (!consumed) return
+    localArchives = resolveLocalGeoArchives(omniRoot)
+    tarPath = localArchives[0]
+    if (!tarPath) {
+      console.warn(
+        '⚠️ [omni-setup] geo 消费成功但未找到落盘的地理数据包（服务将以不可用状态软降级）'
+      )
       return
     }
-  } else {
-    console.log(`📦 [omni-setup] 使用本地地理数据包: ${tarPath}`)
+    console.log(`📦 [omni-setup] 使用 firefly-resources 拉取的地理数据包: ${tarPath}`)
   }
 
   try {
@@ -195,16 +220,6 @@ async function setupOmniGeoDataset() {
   } catch (err) {
     console.warn(`⚠️ [omni-setup] 地理数据集解压失败（服务将以不可用状态软降级）: ${err.message}`)
   }
-}
-
-/** 简单的 HTTPS 下载器：跟随重定向写入目标文件 */
-async function downloadToFile(url, dest) {
-  const res = await fetch(url, { redirect: 'follow' })
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}: ${url}`)
-  }
-  const buffer = Buffer.from(await res.arrayBuffer())
-  fs.writeFileSync(dest, buffer)
 }
 
 async function setupOmniExtraResources() {
@@ -267,12 +282,21 @@ async function setupOmniExtraResources() {
 }
 
 if (require.main === module) {
-  setupOmniExtraResources()
-    .then(() => setupOmniGeoDataset())
-    .catch(err => {
-      console.error('❌ [omni-setup] 资源设置失败:', err)
+  // --geo-only 仅供 omni:deploy 以同步子进程方式单独装配 geo（避免 async 竞态）；
+  // 只跑 geo 装配，不解压 ffmpeg/exiftool（deploy 有独立的 bin 复制段）。
+  if (process.argv.includes('--geo-only')) {
+    setupOmniGeoDataset().catch(err => {
+      console.error('❌ [omni-setup] 地理数据集装配失败:', err)
       process.exit(1)
     })
+  } else {
+    setupOmniExtraResources()
+      .then(() => setupOmniGeoDataset())
+      .catch(err => {
+        console.error('❌ [omni-setup] 资源设置失败:', err)
+        process.exit(1)
+      })
+  }
 }
 
 module.exports = { setupOmniExtraResources, setupOmniGeoDataset }
