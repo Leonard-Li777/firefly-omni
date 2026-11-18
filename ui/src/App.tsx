@@ -1,16 +1,16 @@
 import React, { useState, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { 
-  FileCode, 
-  UploadCloud, 
-  Activity, 
-  Cpu, 
-  ShieldCheck, 
-  Copy, 
-  Check, 
-  FileText, 
-  Zap, 
-  Settings, 
+import {
+  FileCode,
+  UploadCloud,
+  Activity,
+  Cpu,
+  ShieldCheck,
+  Copy,
+  Check,
+  FileText,
+  Zap,
+  Settings,
   RefreshCw,
   RotateCw,
   Eye,
@@ -38,148 +38,24 @@ import { SearchClusterTab } from './components/SearchClusterTab'
 import { TaxonomyTab } from './components/TaxonomyTab'
 import { isParentMultiSelect } from './components/taxonomy-mutex'
 
-// ---- 离线反向地理编码 (/api/geo/reverse) 相关类型 ----
-interface GeoPointResult {
-  found: boolean
-  country?: string | null
-  province?: string | null
-  city?: string | null
-  distanceKm?: number | null
-}
+// 大文件拆分（工单 14）：类型/常量/工具函数原样搬移至 types.ts / constants.ts / helpers.ts，导入保持行为不变
+import type { ApiResponseData, ExtractionResult, GeoReverseResponse } from './types'
+import { GEO_LANGUAGE_OPTIONS, GEO_PRESETS } from './constants'
+import { getFilePreviewUrl, getPreviewMediaType } from './helpers'
 
-interface GeoReverseResponse {
-  available: boolean
-  datasetVersion?: number
-  results?: GeoPointResult[]
-  reason?: string
-}
-
-// 预置测试坐标组：覆盖城市层 / 中间层 / 海洋未命中 / 脏坐标容错四类场景
-const GEO_PRESETS: Array<{ label: string; value: string }> = [
-  {
-    label: '🇨🇳 中国城市',
-    value: [
-      '22.5431, 114.0579   // 深圳（城市全量层）',
-      '39.9042, 116.4074   // 北京',
-      '31.2304, 121.4737   // 上海',
-      '23.1291, 113.2644   // 广州'
-    ].join('\n')
-  },
-  {
-    label: '🌍 国际城市',
-    value: [
-      '40.7128, -74.0060   // 纽约',
-      '51.5074, -0.1278    // 伦敦',
-      '35.6762, 139.6503   // 东京',
-      '-33.8688, 151.2093 // 悉尼（南半球）'
-    ].join('\n')
-  },
-  {
-    label: '🧪 边界与容错',
-    value: [
-      '22.5431, 114.0579   // 深圳：城市层基准点',
-      '23.1400, 114.0600   // 距深圳约 66km：中间层（仅国家+省）',
-      '0.0000, -140.0000   // 太平洋深处：应未命中',
-      '91.0000, 114.0000   // 纬度越界：单点容错',
-      '22.5400, 200.0000   // 经度越界：单点容错'
-    ].join('\n')
-  }
-]
-
-// 支持的界面语言选项（BCP-47 标签，服务端归一化到基础子码）
-const GEO_LANGUAGE_OPTIONS = ['en', 'zh-CN', 'ja-JP', 'ko-KR', 'fr-FR', 'de-DE', 'es-ES', 'ru-RU', 'pt-PT', 'ar-EG']
-
-export interface TagChainItem {
-  code: string
-  name: string
-  confidence: number
-  /** 所属受控父级 code（三分区契约，用于互斥语义判定） */
-  parent_code?: string
-}
-
-export interface CandidateHypothesisItem {
-  hypothesis: string
-  score: number
-  cosine_global?: number
-  cosine_desc?: number
-  has_cross_modal?: boolean
-  slot_breakdown?: Record<string, string>
-}
-
-interface ApiResponseData {
-  file_path?: string
-  mime_type?: string
-  file_size?: number
-  markdown_content?: string
-  ocr_text?: string
-  metadata?: any
-  phash?: string
-  is_corrupted?: boolean
-  // 三阶段全模态融合结果字段
-  fused_tags?: TagChainItem[]
-  visual_tags?: TagChainItem[]
-  candidate_hypotheses?: CandidateHypothesisItem[]
-  winning_hypothesis?: string
-  smart_name?: string
-  content_description?: string
-  photo_type?: string
-  quality_score?: number
-  aesthetic_score?: number
-  has_watermark?: boolean
-  watermark_level?: number
-  has_mosaic?: boolean
-  mosaic_level?: number
-  security_level?: string
-  workflow_state?: string
-  geo_address?: string
-  benchmark?: any
-}
-
-interface ExtractionResult {
-  fileName: string
-  fileSize: number
-  mimeType: string
-  detectionSource: string
-  phash?: string
-  ocrPlaceholders?: number
-  extractedText?: string
-  status: 'processing' | 'success' | 'error'
-  errorMsg?: string
-  fileObj?: File
-  lastAnalyzedAt?: string
-  apiResponse?: ApiResponseData
-}
-
-// ---- 浏览器可直接预览的多模态文件扩展名集合 (czkawka 结果缩略图) ----
-const PREVIEW_IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif']
-const PREVIEW_VIDEO_EXTS = ['mp4', 'm4v', 'webm', 'ogv', 'ogg', 'mov']
-const PREVIEW_AUDIO_EXTS = ['mp3', 'wav', 'flac', 'aac', 'm4a', 'opus']
-
-const getFileExt = (name: string): string => {
-  const idx = name.lastIndexOf('.')
-  return idx >= 0 ? name.slice(idx + 1).toLowerCase() : ''
-}
-
-type PreviewMediaType = 'image' | 'video' | 'audio' | null
-
-const getPreviewMediaType = (name: string): PreviewMediaType => {
-  const ext = getFileExt(name)
-  if (PREVIEW_IMAGE_EXTS.includes(ext)) return 'image'
-  if (PREVIEW_VIDEO_EXTS.includes(ext)) return 'video'
-  if (PREVIEW_AUDIO_EXTS.includes(ext)) return 'audio'
-  return null
-}
-
-const getFilePreviewUrl = (path: string): string =>
-  `/api/file/preview?path=${encodeURIComponent(path)}`
+export type { TagChainItem, CandidateHypothesisItem } from './types'
 
 export default function App() {
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking')
   const [isPro, setIsPro] = useState<boolean>(false)
   const [geoAvailable, setGeoAvailable] = useState<boolean | null>(null)
   const [cleanupAvailable, setCleanupAvailable] = useState<boolean>(false)
-  const [activeTab, setActiveTab] = useState<'inspector' | 'cleanup' | 'geo' | 'config' | 'text' | 'hownet' | 'search' | 'taxonomy'>('inspector')
-  const [inspectorSection, setInspectorSection] = useState<'all' | 'fused' | 'magika' | 'exif' | 'text' | 'ocr'>('all')
+  const [activeTab, setActiveTab] = useState<
+    'inspector' | 'cleanup' | 'geo' | 'config' | 'text' | 'hownet' | 'search' | 'taxonomy'
+  >('inspector')
+  const [inspectorSection, setInspectorSection] = useState<
+    'all' | 'fused' | 'magika' | 'exif' | 'text' | 'ocr'
+  >('all')
   const [files, setFiles] = useState<ExtractionResult[]>([])
   const [selectedFileIndex, setSelectedFileIndex] = useState<number | null>(null)
   const [copied, setCopied] = useState(false)
@@ -209,8 +85,14 @@ export default function App() {
   const [scanError, setScanError] = useState<string | null>(null)
 
   // Single file inspector
-  const [singleFilePath, setSingleFilePath] = useState<string>('F:\\lilun\\Desktop\\TailwindCSS技术介绍.pdf')
-  const [singleFileResult, setSingleFileResult] = useState<{ phash?: string; is_corrupted?: boolean; file_size?: number } | null>(null)
+  const [singleFilePath, setSingleFilePath] = useState<string>(
+    'F:\\lilun\\Desktop\\TailwindCSS技术介绍.pdf'
+  )
+  const [singleFileResult, setSingleFileResult] = useState<{
+    phash?: string
+    is_corrupted?: boolean
+    file_size?: number
+  } | null>(null)
   const [inspectingSingleFile, setInspectingSingleFile] = useState<boolean>(false)
 
   // Config state
@@ -241,10 +123,12 @@ export default function App() {
     if (local) {
       try {
         const cached = JSON.parse(local)
-        if (cached.enable_document_ocr !== undefined) setEnableDocumentOcr(cached.enable_document_ocr)
+        if (cached.enable_document_ocr !== undefined)
+          setEnableDocumentOcr(cached.enable_document_ocr)
         if (cached.enable_image_ocr !== undefined) setEnableImageOcr(cached.enable_image_ocr)
         if (cached.ocr_model_size) setOcrModelSize(cached.ocr_model_size)
-        if (cached.max_document_ocr_file_size_mb) setMaxDocumentOcrFileSizeMb(cached.max_document_ocr_file_size_mb)
+        if (cached.max_document_ocr_file_size_mb)
+          setMaxDocumentOcrFileSizeMb(cached.max_document_ocr_file_size_mb)
       } catch {
         // Ignore
       }
@@ -257,7 +141,8 @@ export default function App() {
         if (cfg.enable_document_ocr !== undefined) setEnableDocumentOcr(cfg.enable_document_ocr)
         if (cfg.enable_image_ocr !== undefined) setEnableImageOcr(cfg.enable_image_ocr)
         if (cfg.ocr_model_size) setOcrModelSize(cfg.ocr_model_size)
-        if (cfg.max_document_ocr_file_size_mb) setMaxDocumentOcrFileSizeMb(cfg.max_document_ocr_file_size_mb)
+        if (cfg.max_document_ocr_file_size_mb)
+          setMaxDocumentOcrFileSizeMb(cfg.max_document_ocr_file_size_mb)
         localStorage.setItem('omni_config', JSON.stringify(cfg))
       }
     } catch {
@@ -411,7 +296,10 @@ export default function App() {
               } else if (eventName === 'progress') {
                 setScanResult((prev: any) => ({
                   ...prev,
-                  total_scanned: parsed.scanned !== undefined ? parsed.scanned : (parsed.total_scanned || prev?.total_scanned || 0)
+                  total_scanned:
+                    parsed.scanned !== undefined
+                      ? parsed.scanned
+                      : parsed.total_scanned || prev?.total_scanned || 0
                 }))
               } else if (eventName === 'group') {
                 // 实时上屏！把最新发现的重复组动态追加或更新到界面列表！
@@ -425,8 +313,14 @@ export default function App() {
                   } else {
                     newGroups = [parsed, ...existingGroups]
                   }
-                  const newFreed = newGroups.reduce((acc, g) => acc + (g.potential_freed_bytes || 0), 0)
-                  const newRedundant = newGroups.reduce((acc, g) => acc + Math.max(0, (g.files?.length || 0) - 1), 0)
+                  const newFreed = newGroups.reduce(
+                    (acc, g) => acc + (g.potential_freed_bytes || 0),
+                    0
+                  )
+                  const newRedundant = newGroups.reduce(
+                    (acc, g) => acc + Math.max(0, (g.files?.length || 0) - 1),
+                    0
+                  )
                   return {
                     ...prev,
                     duplicate_groups: newGroups,
@@ -556,13 +450,18 @@ export default function App() {
    * 解析多行坐标文本：每行 "纬度, 经度"，支持 // 或 # 行内注释，
    * 分隔符兼容逗号/分号/空白；非法行直接跳过并计入错误提示。
    */
-  const parseGeoCoords = (text: string): { points: Array<{ latitude: number; longitude: number }>; invalidLines: number } => {
+  const parseGeoCoords = (
+    text: string
+  ): { points: Array<{ latitude: number; longitude: number }>; invalidLines: number } => {
     const points: Array<{ latitude: number; longitude: number }> = []
     let invalidLines = 0
 
     for (const rawLine of text.split('\n')) {
       // 剥离行内注释后取坐标段
-      const line = rawLine.replace(/\/\/.*$/, '').replace(/#.*$/, '').trim()
+      const line = rawLine
+        .replace(/\/\/.*$/, '')
+        .replace(/#.*$/, '')
+        .trim()
       if (!line) continue
 
       const parts = line.split(/[,;\s]+/).map(Number)
@@ -680,11 +579,11 @@ export default function App() {
   const processFiles = async (uploadedFiles: File[]) => {
     for (const file of uploadedFiles) {
       const isPdf = file.name.toLowerCase().endsWith('.pdf') || file.type === 'application/pdf'
-      
+
       const newEntry: ExtractionResult = {
         fileName: file.name,
         fileSize: file.size,
-        mimeType: isPdf ? 'application/pdf' : (file.type || 'application/octet-stream'),
+        mimeType: isPdf ? 'application/pdf' : file.type || 'application/octet-stream',
         detectionSource: 'ONNX Magika Neural Network',
         status: 'processing',
         fileObj: file,
@@ -700,17 +599,19 @@ export default function App() {
 
   const analyzeSingleFile = async (file: File, fileIndex: number = 0) => {
     // 立即置该文件为处理中状态，触发 RotateCw 图标 360° 无缝旋转动画
-    setFiles(prev => prev.map((it, idx) => {
-      if (idx === fileIndex || it.fileName === file.name) {
-        return { ...it, status: 'processing' }
-      }
-      return it
-    }))
+    setFiles(prev =>
+      prev.map((it, idx) => {
+        if (idx === fileIndex || it.fileName === file.name) {
+          return { ...it, status: 'processing' }
+        }
+        return it
+      })
+    )
 
     const isPdf = file.name.toLowerCase().endsWith('.pdf') || file.type === 'application/pdf'
     const isImg = file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name)
     const isOffice = /\.(docx|xlsx|pptx|zip|rar|7z)$/i.test(file.name)
-    
+
     let extractedContent = ''
     let computedPhash: string | undefined = undefined
     let realMimeType: string | undefined = undefined
@@ -811,24 +712,26 @@ export default function App() {
       }
     }
 
-    setFiles(prev => prev.map((it, idx) => {
-      if (idx === fileIndex || it.fileName === file.name) {
-        return {
-          ...it,
-          mimeType: realMimeType || rawApiResponse?.mime_type || it.mimeType,
-          phash: computedPhash || rawApiResponse?.phash || it.phash,
-          extractedText: extractedContent || rawApiResponse?.markdown_content || '',
-          apiResponse: rawApiResponse,
-          status: 'success',
-          lastAnalyzedAt: new Date().toLocaleTimeString()
+    setFiles(prev =>
+      prev.map((it, idx) => {
+        if (idx === fileIndex || it.fileName === file.name) {
+          return {
+            ...it,
+            mimeType: realMimeType || rawApiResponse?.mime_type || it.mimeType,
+            phash: computedPhash || rawApiResponse?.phash || it.phash,
+            extractedText: extractedContent || rawApiResponse?.markdown_content || '',
+            apiResponse: rawApiResponse,
+            status: 'success',
+            lastAnalyzedAt: new Date().toLocaleTimeString()
+          }
         }
-      }
-      return it
-    }))
+        return it
+      })
+    )
   }
 
   const parsePdfDocument = async (file: File): Promise<string> => {
-    const cleanTitle = file.name.replace(/\.[^/.]+$/, "").replace(/[_\-]/g, " ")
+    const cleanTitle = file.name.replace(/\.[^/.]+$/, '').replace(/[_\-]/g, ' ')
     return `--- Firefly Omni Extracted PDF Content ---
 File Name: ${file.name}
 Document Standard: Portable Document Format (PDF v1.4)
@@ -865,7 +768,7 @@ MIME Type: application/pdf
   }
 
   const getImageDimensions = (src: string): Promise<{ width: number; height: number }> => {
-    return new Promise((resolve) => {
+    return new Promise(resolve => {
       const img = new Image()
       img.onload = () => resolve({ width: img.width, height: img.height })
       img.onerror = () => resolve({ width: 0, height: 0 })
@@ -877,7 +780,7 @@ MIME Type: application/pdf
     let hash = 0
     const str = `${name}_${size}`
     for (let i = 0; i < str.length; i++) {
-      hash = ((hash << 5) - hash) + str.charCodeAt(i)
+      hash = (hash << 5) - hash + str.charCodeAt(i)
       hash |= 0
     }
     const hex = (Math.abs(hash) * 1664525 + 1013904223).toString(16)
@@ -953,7 +856,9 @@ MIME Type: application/pdf
             <h1 className="font-bold text-lg leading-none bg-gradient-to-r from-amber-400 to-orange-400 bg-clip-text text-transparent">
               Firefly Omni
             </h1>
-            <span className="text-xs text-slate-400">High-Performance Multimodal Engine v0.1.0</span>
+            <span className="text-xs text-slate-400">
+              High-Performance Multimodal Engine v0.1.0
+            </span>
           </div>
         </div>
 
@@ -983,7 +888,9 @@ MIME Type: application/pdf
             >
               <Layers className="w-4 h-4 inline mr-1" />
               <span>文件清理 (Cleanup)</span>
-              <span className="text-[10px] uppercase font-mono font-bold bg-amber-400/20 text-amber-300 border border-amber-400/40 px-1 py-0.2 rounded">PRO</span>
+              <span className="text-[10px] uppercase font-mono font-bold bg-amber-400/20 text-amber-300 border border-amber-400/40 px-1 py-0.2 rounded">
+                PRO
+              </span>
             </button>
           )}
 
@@ -999,7 +906,9 @@ MIME Type: application/pdf
             >
               <MapPin className="w-4 h-4 inline mr-1" />
               <span>Geo 逆编码</span>
-              <span className="text-[10px] uppercase font-mono font-bold bg-amber-400/20 text-amber-300 border border-amber-400/40 px-1 py-0.2 rounded">PRO</span>
+              <span className="text-[10px] uppercase font-mono font-bold bg-amber-400/20 text-amber-300 border border-amber-400/40 px-1 py-0.2 rounded">
+                PRO
+              </span>
             </button>
           )}
 
@@ -1079,8 +988,8 @@ MIME Type: application/pdf
                 serverStatus === 'online'
                   ? 'bg-emerald-500 shadow-sm shadow-emerald-500'
                   : serverStatus === 'checking'
-                  ? 'bg-amber-500 animate-pulse'
-                  : 'bg-rose-500 shadow-sm shadow-rose-500'
+                    ? 'bg-amber-500 animate-pulse'
+                    : 'bg-rose-500 shadow-sm shadow-rose-500'
               }`}
             />
             <span className="capitalize font-mono">
@@ -1171,7 +1080,9 @@ MIME Type: application/pdf
                         <div className="flex items-center space-x-3 overflow-hidden pr-2 flex-1 min-w-0">
                           <FileCode className="w-5 h-5 flex-shrink-0 text-amber-400" />
                           <div className="truncate flex-1 min-w-0">
-                            <p className="text-sm font-medium truncate" title={item.fileName}>{item.fileName}</p>
+                            <p className="text-sm font-medium truncate" title={item.fileName}>
+                              {item.fileName}
+                            </p>
                             <span className="text-xs text-slate-500">
                               {(item.fileSize / 1024).toFixed(1)} KB
                             </span>
@@ -1180,14 +1091,16 @@ MIME Type: application/pdf
 
                         <div className="flex items-center space-x-2 flex-shrink-0">
                           <button
-                            onClick={(e) => {
+                            onClick={e => {
                               e.stopPropagation()
                               if (item.fileObj) analyzeSingleFile(item.fileObj, idx)
                             }}
                             className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-amber-400 border border-slate-700/60 transition-all"
                             title="点击重新触发分析"
                           >
-                            <RotateCw className={`w-3.5 h-3.5 ${item.status === 'processing' ? 'animate-spin text-amber-400' : ''}`} />
+                            <RotateCw
+                              className={`w-3.5 h-3.5 ${item.status === 'processing' ? 'animate-spin text-amber-400' : ''}`}
+                            />
                           </button>
                         </div>
                       </div>
@@ -1205,7 +1118,9 @@ MIME Type: application/pdf
                   <div className="border-b border-slate-800 pb-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                     <div className="min-w-0 flex-1">
                       <h2 className="font-bold text-base text-slate-100 flex items-center">
-                        <span className="truncate flex-1 min-w-0" title={selectedFile.fileName}>{selectedFile.fileName}</span>
+                        <span className="truncate flex-1 min-w-0" title={selectedFile.fileName}>
+                          {selectedFile.fileName}
+                        </span>
                         {selectedFile.apiResponse?.is_corrupted && (
                           <span className="ml-2 px-2 py-0.5 rounded text-[10px] bg-rose-500/20 text-rose-300 border border-rose-500/30 flex items-center flex-shrink-0">
                             <AlertCircle className="w-3 h-3 mr-1" /> 已损坏
@@ -1213,7 +1128,8 @@ MIME Type: application/pdf
                         )}
                       </h2>
                       <p className="text-xs text-slate-400 mt-0.5 font-mono">
-                        大小: {(selectedFile.fileSize / 1024).toFixed(1)} KB | MIME: {selectedFile.mimeType}
+                        大小: {(selectedFile.fileSize / 1024).toFixed(1)} KB | MIME:{' '}
+                        {selectedFile.mimeType}
                       </p>
                     </div>
 
@@ -1289,19 +1205,29 @@ MIME Type: application/pdf
                       </div>
 
                       <button
-                        onClick={() => copyToClipboard(JSON.stringify(selectedFile.apiResponse || selectedFile, null, 2))}
+                        onClick={() =>
+                          copyToClipboard(
+                            JSON.stringify(selectedFile.apiResponse || selectedFile, null, 2)
+                          )
+                        }
                         className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition-all"
                         title="复制完整 JSON 响应"
                       >
-                        {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                        {copied ? (
+                          <Check className="w-4 h-4 text-emerald-400" />
+                        ) : (
+                          <Copy className="w-4 h-4" />
+                        )}
                       </button>
                     </div>
                   </div>
 
                   {/* 4 Distinct Extraction Zones */}
-                  <div className={`grid gap-4 flex-1 min-h-0 overflow-y-auto pr-1 auto-rows-fr ${
-                    inspectorSection === 'all' ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1'
-                  }`}>
+                  <div
+                    className={`grid gap-4 flex-1 min-h-0 overflow-y-auto pr-1 auto-rows-fr ${
+                      inspectorSection === 'all' ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1'
+                    }`}
+                  >
                     {/* Zone 1: Magika 文件类型鉴定区 */}
                     {(inspectorSection === 'all' || inspectorSection === 'magika') && (
                       <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-3 min-h-0 overflow-hidden">
@@ -1317,39 +1243,65 @@ MIME Type: application/pdf
                         <div className="space-y-1.5 text-xs overflow-y-auto flex-1 min-h-0 pr-1">
                           <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                             <span className="text-slate-400">label (类型标识):</span>
-                            <span className="font-mono text-amber-400 font-semibold">{getMagikaMetadata(selectedFile)?.label || selectedFile.fileName.split('.').pop() || 'bin'}</span>
+                            <span className="font-mono text-amber-400 font-semibold">
+                              {getMagikaMetadata(selectedFile)?.label ||
+                                selectedFile.fileName.split('.').pop() ||
+                                'bin'}
+                            </span>
                           </div>
                           <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                             <span className="text-slate-400">mime_type (MIME):</span>
-                            <span className="font-mono text-emerald-400 font-semibold">{getMagikaMetadata(selectedFile)?.mime_type || selectedFile.mimeType}</span>
+                            <span className="font-mono text-emerald-400 font-semibold">
+                              {getMagikaMetadata(selectedFile)?.mime_type || selectedFile.mimeType}
+                            </span>
                           </div>
                           <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                             <span className="text-slate-400">group (分类组):</span>
-                            <span className="font-mono text-sky-400 font-medium">{getMagikaMetadata(selectedFile)?.group || (selectedFile.mimeType.startsWith('image/') ? 'image' : 'document')}</span>
+                            <span className="font-mono text-sky-400 font-medium">
+                              {getMagikaMetadata(selectedFile)?.group ||
+                                (selectedFile.mimeType.startsWith('image/') ? 'image' : 'document')}
+                            </span>
                           </div>
                           <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                             <span className="text-slate-400">name (标准格式名称):</span>
-                            <span className="text-slate-200 font-medium truncate max-w-[180px]">{getMagikaMetadata(selectedFile)?.name || `Format (${selectedFile.mimeType})`}</span>
+                            <span className="text-slate-200 font-medium truncate max-w-[180px]">
+                              {getMagikaMetadata(selectedFile)?.name ||
+                                `Format (${selectedFile.mimeType})`}
+                            </span>
                           </div>
                           <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                             <span className="text-slate-400">score (置信度得分):</span>
-                            <span className="font-mono text-amber-300 font-semibold">{getMagikaMetadata(selectedFile)?.score ? `${(getMagikaMetadata(selectedFile)!.score * 100).toFixed(1)}%` : '99.5%'}</span>
+                            <span className="font-mono text-amber-300 font-semibold">
+                              {getMagikaMetadata(selectedFile)?.score
+                                ? `${(getMagikaMetadata(selectedFile)!.score * 100).toFixed(1)}%`
+                                : '99.5%'}
+                            </span>
                           </div>
 
                           {/* 基础系统文件属性 (basic) */}
                           {selectedFile.apiResponse?.metadata?.basic && (
                             <>
-                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">系统基础元数据</div>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                系统基础元数据
+                              </div>
                               {selectedFile.apiResponse.metadata.basic.createdAt && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">createdAt (创建时间):</span>
-                                  <span className="font-mono text-slate-300">{new Date(selectedFile.apiResponse.metadata.basic.createdAt).toLocaleString()}</span>
+                                  <span className="font-mono text-slate-300">
+                                    {new Date(
+                                      selectedFile.apiResponse.metadata.basic.createdAt
+                                    ).toLocaleString()}
+                                  </span>
                                 </div>
                               )}
                               {selectedFile.apiResponse.metadata.basic.modifiedAt && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">modifiedAt (修改时间):</span>
-                                  <span className="font-mono text-slate-300">{new Date(selectedFile.apiResponse.metadata.basic.modifiedAt).toLocaleString()}</span>
+                                  <span className="font-mono text-slate-300">
+                                    {new Date(
+                                      selectedFile.apiResponse.metadata.basic.modifiedAt
+                                    ).toLocaleString()}
+                                  </span>
                                 </div>
                               )}
                             </>
@@ -1358,29 +1310,43 @@ MIME Type: application/pdf
                           {/* 文档精细元数据 (document) */}
                           {selectedFile.apiResponse?.metadata?.document && (
                             <>
-                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">文档结构元数据</div>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                文档结构元数据
+                              </div>
                               {selectedFile.apiResponse.metadata.document.title && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">title (文档标题):</span>
-                                  <span className="text-amber-300 truncate max-w-[180px]">{String(selectedFile.apiResponse.metadata.document.title)}</span>
+                                  <span className="text-amber-300 truncate max-w-[180px]">
+                                    {String(selectedFile.apiResponse.metadata.document.title)}
+                                  </span>
                                 </div>
                               )}
                               {selectedFile.apiResponse.metadata.document.author && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">author (作者/创建者):</span>
-                                  <span className="text-sky-300 truncate max-w-[180px]">{String(selectedFile.apiResponse.metadata.document.author)}</span>
+                                  <span className="text-sky-300 truncate max-w-[180px]">
+                                    {String(selectedFile.apiResponse.metadata.document.author)}
+                                  </span>
                                 </div>
                               )}
-                              {selectedFile.apiResponse.metadata.document.page_count !== undefined && (
+                              {selectedFile.apiResponse.metadata.document.page_count !==
+                                undefined && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">page_count (总页数):</span>
-                                  <span className="font-mono text-emerald-300 font-bold">{String(selectedFile.apiResponse.metadata.document.page_count)} 页</span>
+                                  <span className="font-mono text-emerald-300 font-bold">
+                                    {String(selectedFile.apiResponse.metadata.document.page_count)}{' '}
+                                    页
+                                  </span>
                                 </div>
                               )}
-                              {selectedFile.apiResponse.metadata.document.word_count !== undefined && (
+                              {selectedFile.apiResponse.metadata.document.word_count !==
+                                undefined && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">word_count (单词/词数):</span>
-                                  <span className="font-mono text-purple-300">{String(selectedFile.apiResponse.metadata.document.word_count)} 词</span>
+                                  <span className="font-mono text-purple-300">
+                                    {String(selectedFile.apiResponse.metadata.document.word_count)}{' '}
+                                    词
+                                  </span>
                                 </div>
                               )}
                             </>
@@ -1389,30 +1355,44 @@ MIME Type: application/pdf
                           {/* 音频/视频精细元数据 (audio / video) */}
                           {selectedFile.apiResponse?.metadata?.audio && (
                             <>
-                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">音频媒体元数据</div>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                音频媒体元数据
+                              </div>
                               <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                 <span className="text-slate-400">duration (时长):</span>
-                                <span className="font-mono text-amber-300">{selectedFile.apiResponse.metadata.audio.duration_formatted || `${selectedFile.apiResponse.metadata.audio.duration_seconds} 秒`}</span>
+                                <span className="font-mono text-amber-300">
+                                  {selectedFile.apiResponse.metadata.audio.duration_formatted ||
+                                    `${selectedFile.apiResponse.metadata.audio.duration_seconds} 秒`}
+                                </span>
                               </div>
                               {selectedFile.apiResponse.metadata.audio.artist && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">artist (艺术家):</span>
-                                  <span className="text-sky-300">{String(selectedFile.apiResponse.metadata.audio.artist)}</span>
+                                  <span className="text-sky-300">
+                                    {String(selectedFile.apiResponse.metadata.audio.artist)}
+                                  </span>
                                 </div>
                               )}
                             </>
                           )}
                           {selectedFile.apiResponse?.metadata?.video && (
                             <>
-                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">视频媒体元数据</div>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                视频媒体元数据
+                              </div>
                               <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                 <span className="text-slate-400">duration (时长):</span>
-                                <span className="font-mono text-amber-300">{selectedFile.apiResponse.metadata.video.duration_formatted || `${selectedFile.apiResponse.metadata.video.duration_seconds} 秒`}</span>
+                                <span className="font-mono text-amber-300">
+                                  {selectedFile.apiResponse.metadata.video.duration_formatted ||
+                                    `${selectedFile.apiResponse.metadata.video.duration_seconds} 秒`}
+                                </span>
                               </div>
                               {selectedFile.apiResponse.metadata.video.resolution && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">resolution (分辨率):</span>
-                                  <span className="font-mono text-emerald-300">{String(selectedFile.apiResponse.metadata.video.resolution)}</span>
+                                  <span className="font-mono text-emerald-300">
+                                    {String(selectedFile.apiResponse.metadata.video.resolution)}
+                                  </span>
                                 </div>
                               )}
                             </>
@@ -1421,41 +1401,69 @@ MIME Type: application/pdf
                           {/* 可执行程序 PE 元数据 (executable) */}
                           {selectedFile.apiResponse?.metadata?.executable && (
                             <>
-                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">可执行程序 PE 元数据</div>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                可执行程序 PE 元数据
+                              </div>
                               {selectedFile.apiResponse.metadata.executable.file_description && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
-                                  <span className="text-slate-400">file_description (程序描述):</span>
-                                  <span className="text-amber-300 font-medium truncate max-w-[200px]">{String(selectedFile.apiResponse.metadata.executable.file_description)}</span>
+                                  <span className="text-slate-400">
+                                    file_description (程序描述):
+                                  </span>
+                                  <span className="text-amber-300 font-medium truncate max-w-[200px]">
+                                    {String(
+                                      selectedFile.apiResponse.metadata.executable.file_description
+                                    )}
+                                  </span>
                                 </div>
                               )}
                               {selectedFile.apiResponse.metadata.executable.company_name && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">company_name (开发厂商):</span>
-                                  <span className="text-sky-300 truncate max-w-[200px]">{String(selectedFile.apiResponse.metadata.executable.company_name)}</span>
+                                  <span className="text-sky-300 truncate max-w-[200px]">
+                                    {String(
+                                      selectedFile.apiResponse.metadata.executable.company_name
+                                    )}
+                                  </span>
                                 </div>
                               )}
                               {selectedFile.apiResponse.metadata.executable.product_name && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">product_name (产品名称):</span>
-                                  <span className="text-emerald-300 truncate max-w-[200px]">{String(selectedFile.apiResponse.metadata.executable.product_name)}</span>
+                                  <span className="text-emerald-300 truncate max-w-[200px]">
+                                    {String(
+                                      selectedFile.apiResponse.metadata.executable.product_name
+                                    )}
+                                  </span>
                                 </div>
                               )}
                               {selectedFile.apiResponse.metadata.executable.file_version && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">file_version (文件版本):</span>
-                                  <span className="font-mono text-purple-300">{String(selectedFile.apiResponse.metadata.executable.file_version)}</span>
+                                  <span className="font-mono text-purple-300">
+                                    {String(
+                                      selectedFile.apiResponse.metadata.executable.file_version
+                                    )}
+                                  </span>
                                 </div>
                               )}
                               {selectedFile.apiResponse.metadata.executable.legal_copyright && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
-                                  <span className="text-slate-400">legal_copyright (版权信息):</span>
-                                  <span className="text-slate-300 text-[11px] truncate max-w-[200px]">{String(selectedFile.apiResponse.metadata.executable.legal_copyright)}</span>
+                                  <span className="text-slate-400">
+                                    legal_copyright (版权信息):
+                                  </span>
+                                  <span className="text-slate-300 text-[11px] truncate max-w-[200px]">
+                                    {String(
+                                      selectedFile.apiResponse.metadata.executable.legal_copyright
+                                    )}
+                                  </span>
                                 </div>
                               )}
                               {selectedFile.apiResponse.metadata.executable.pe_type && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">pe_type (PE 架构):</span>
-                                  <span className="font-mono text-cyan-300">{String(selectedFile.apiResponse.metadata.executable.pe_type)}</span>
+                                  <span className="font-mono text-cyan-300">
+                                    {String(selectedFile.apiResponse.metadata.executable.pe_type)}
+                                  </span>
                                 </div>
                               )}
                             </>
@@ -1464,23 +1472,38 @@ MIME Type: application/pdf
                           {/* 压缩包/镜像元数据 (archive) */}
                           {selectedFile.apiResponse?.metadata?.archive && (
                             <>
-                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">压缩包/磁盘镜像元数据</div>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                压缩包/磁盘镜像元数据
+                              </div>
                               {selectedFile.apiResponse.metadata.archive.format && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">format (压缩格式):</span>
-                                  <span className="font-mono text-amber-300">{String(selectedFile.apiResponse.metadata.archive.format)}</span>
+                                  <span className="font-mono text-amber-300">
+                                    {String(selectedFile.apiResponse.metadata.archive.format)}
+                                  </span>
                                 </div>
                               )}
-                              {selectedFile.apiResponse.metadata.archive.uncompressed_size !== undefined && (
+                              {selectedFile.apiResponse.metadata.archive.uncompressed_size !==
+                                undefined && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">uncompressed (解压尺寸):</span>
-                                  <span className="font-mono text-emerald-300">{formatBytes(Number(selectedFile.apiResponse.metadata.archive.uncompressed_size) || 0)}</span>
+                                  <span className="font-mono text-emerald-300">
+                                    {formatBytes(
+                                      Number(
+                                        selectedFile.apiResponse.metadata.archive.uncompressed_size
+                                      ) || 0
+                                    )}
+                                  </span>
                                 </div>
                               )}
-                              {selectedFile.apiResponse.metadata.archive.file_count !== undefined && (
+                              {selectedFile.apiResponse.metadata.archive.file_count !==
+                                undefined && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">file_count (内部文件数):</span>
-                                  <span className="font-mono text-sky-300">{String(selectedFile.apiResponse.metadata.archive.file_count)} 个</span>
+                                  <span className="font-mono text-sky-300">
+                                    {String(selectedFile.apiResponse.metadata.archive.file_count)}{' '}
+                                    个
+                                  </span>
                                 </div>
                               )}
                             </>
@@ -1489,19 +1512,27 @@ MIME Type: application/pdf
                           {/* 数据库与 AI 模型元数据 (database / model) */}
                           {selectedFile.apiResponse?.metadata?.database && (
                             <>
-                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">数据库结构元数据</div>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                数据库结构元数据
+                              </div>
                               <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                 <span className="text-slate-400">engine (数据库引擎):</span>
-                                <span className="font-mono text-purple-300 font-bold">{String(selectedFile.apiResponse.metadata.database.engine)}</span>
+                                <span className="font-mono text-purple-300 font-bold">
+                                  {String(selectedFile.apiResponse.metadata.database.engine)}
+                                </span>
                               </div>
                             </>
                           )}
                           {selectedFile.apiResponse?.metadata?.model && (
                             <>
-                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">AI / 神经网络模型元数据</div>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                AI / 神经网络模型元数据
+                              </div>
                               <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                 <span className="text-slate-400">format (模型类型):</span>
-                                <span className="font-mono text-cyan-300 font-bold">{String(selectedFile.apiResponse.metadata.model.model_format)}</span>
+                                <span className="font-mono text-cyan-300 font-bold">
+                                  {String(selectedFile.apiResponse.metadata.model.model_format)}
+                                </span>
                               </div>
                             </>
                           )}
@@ -1509,11 +1540,15 @@ MIME Type: application/pdf
                           {/* 字体元数据 (font) */}
                           {selectedFile.apiResponse?.metadata?.font && (
                             <>
-                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">字体资产元数据</div>
+                              <div className="pt-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                字体资产元数据
+                              </div>
                               {selectedFile.apiResponse.metadata.font.font_name && (
                                 <div className="flex justify-between items-center bg-slate-900/60 p-1.5 rounded border border-slate-800">
                                   <span className="text-slate-400">font_name (字体族名):</span>
-                                  <span className="text-amber-300">{String(selectedFile.apiResponse.metadata.font.font_name)}</span>
+                                  <span className="text-amber-300">
+                                    {String(selectedFile.apiResponse.metadata.font.font_name)}
+                                  </span>
                                 </div>
                               )}
                             </>
@@ -1537,9 +1572,17 @@ MIME Type: application/pdf
                         {getFlattenedExifMetadata(selectedFile).length > 0 ? (
                           <div className="space-y-1.5 text-xs overflow-y-auto flex-1 min-h-0 pr-1">
                             {getFlattenedExifMetadata(selectedFile).map(([k, v]) => (
-                              <div key={k} className="flex justify-between items-center bg-slate-900/60 px-2 py-1 rounded border border-slate-800/80 text-[11px]">
+                              <div
+                                key={k}
+                                className="flex justify-between items-center bg-slate-900/60 px-2 py-1 rounded border border-slate-800/80 text-[11px]"
+                              >
                                 <span className="text-slate-400 font-mono">{k}</span>
-                                <span className="font-mono text-sky-200 truncate max-w-[180px]" title={v}>{v}</span>
+                                <span
+                                  className="font-mono text-sky-200 truncate max-w-[180px]"
+                                  title={v}
+                                >
+                                  {v}
+                                </span>
                               </div>
                             ))}
                           </div>
@@ -1565,7 +1608,11 @@ MIME Type: application/pdf
                           </span>
                         </div>
                         <div className="flex-1 min-h-0 overflow-y-auto pr-1 bg-slate-900/80 border border-slate-800 rounded-lg p-3 text-[13px] text-slate-300 leading-relaxed markdown-body">
-                          <ReactMarkdown>{selectedFile.extractedText || selectedFile.apiResponse?.markdown_content || '(未包含文本内容 / Non-text stream)'}</ReactMarkdown>
+                          <ReactMarkdown>
+                            {selectedFile.extractedText ||
+                              selectedFile.apiResponse?.markdown_content ||
+                              '(未包含文本内容 / Non-text stream)'}
+                          </ReactMarkdown>
                         </div>
                       </div>
                     )}
@@ -1586,7 +1633,9 @@ MIME Type: application/pdf
                         {/* Perceptual Hash & OCR Meta Pill */}
                         <div className="grid grid-cols-2 gap-2 text-xs">
                           <div className="bg-slate-900/60 p-2 rounded-lg border border-slate-800">
-                            <span className="text-slate-400 block text-[10px]">感知哈希 (pHash):</span>
+                            <span className="text-slate-400 block text-[10px]">
+                              感知哈希 (pHash):
+                            </span>
                             <span className="font-mono text-purple-300 font-semibold flex items-center mt-0.5">
                               <Hash className="w-3 h-3 mr-1 text-purple-400" />
                               {selectedFile.phash || 'N/A (非图像)'}
@@ -1595,8 +1644,10 @@ MIME Type: application/pdf
                           <div className="bg-slate-900/60 p-2 rounded-lg border border-slate-800">
                             <span className="text-slate-400 block text-[10px]">图像分辨率:</span>
                             <span className="font-mono text-slate-200 mt-0.5 block">
-                              {selectedFile.apiResponse?.metadata?.image?.resolution || 
-                               (selectedFile.apiResponse?.metadata?.image?.width ? `${selectedFile.apiResponse.metadata.image.width}x${selectedFile.apiResponse.metadata.image.height}` : 'N/A')}
+                              {selectedFile.apiResponse?.metadata?.image?.resolution ||
+                                (selectedFile.apiResponse?.metadata?.image?.width
+                                  ? `${selectedFile.apiResponse.metadata.image.width}x${selectedFile.apiResponse.metadata.image.height}`
+                                  : 'N/A')}
                             </span>
                           </div>
                         </div>
@@ -1606,7 +1657,8 @@ MIME Type: application/pdf
                           <span className="text-[10px] font-semibold text-slate-400 mb-1">
                             PP-OCRv6 识别提取结果:
                           </span>
-                          {selectedFile.apiResponse?.markdown_content && selectedFile.apiResponse.markdown_content.trim() ? (
+                          {selectedFile.apiResponse?.markdown_content &&
+                          selectedFile.apiResponse.markdown_content.trim() ? (
                             <textarea
                               readOnly
                               value={selectedFile.apiResponse.markdown_content}
@@ -1615,9 +1667,13 @@ MIME Type: application/pdf
                           ) : (
                             <div className="flex-1 flex flex-col items-center justify-center p-4 bg-slate-900/40 border border-slate-800 rounded-lg text-slate-500 text-xs text-center space-y-1">
                               <AlertCircle className="w-5 h-5 opacity-40 text-purple-400" />
-                              <span className="font-semibold text-slate-400">(未检出 OCR 文字段落 / No OCR Text Detected)</span>
+                              <span className="font-semibold text-slate-400">
+                                (未检出 OCR 文字段落 / No OCR Text Detected)
+                              </span>
                               <span className="text-[10px] text-slate-500 max-w-xs">
-                                真实字符解码依赖 Desktop 原生 ONNX PP-OCRv6 推理服务 (ocr-service.ts)。当未连接 ONNX CTC 张量解码会话时，遵循规范不填充模拟假文本。
+                                真实字符解码依赖 Desktop 原生 ONNX PP-OCRv6 推理服务
+                                (ocr-service.ts)。当未连接 ONNX CTC
+                                张量解码会话时，遵循规范不填充模拟假文本。
                               </span>
                             </div>
                           )}
@@ -1627,9 +1683,11 @@ MIME Type: application/pdf
 
                     {/* Zone 5: 全模态三阶段融合决策与标签体系 (Phase 3 Fused Tags & Arbitration) */}
                     {(inspectorSection === 'all' || inspectorSection === 'fused') && (
-                      <div className={`bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-4 min-h-0 overflow-hidden ${
-                        inspectorSection === 'all' ? 'md:col-span-2' : ''
-                      }`}>
+                      <div
+                        className={`bg-slate-950/70 border border-slate-800 rounded-xl p-4 flex flex-col space-y-4 min-h-0 overflow-hidden ${
+                          inspectorSection === 'all' ? 'md:col-span-2' : ''
+                        }`}
+                      >
                         <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
                           <span className="text-xs font-bold text-emerald-400 flex items-center">
                             <Tag className="w-4 h-4 mr-1.5 text-emerald-400" />
@@ -1660,7 +1718,9 @@ MIME Type: application/pdf
                             </span>
                             <div className="text-xs font-mono font-bold text-slate-100 truncate flex items-center">
                               <Sparkles className="w-3.5 h-3.5 mr-1.5 text-amber-400 flex-shrink-0" />
-                              <span className="truncate">{selectedFile.apiResponse?.smart_name || selectedFile.fileName}</span>
+                              <span className="truncate">
+                                {selectedFile.apiResponse?.smart_name || selectedFile.fileName}
+                              </span>
                             </div>
                             <span className="text-[10px] text-slate-500 mt-1 block">
                               基于 SlotEngine 纯 CPU 槽位矩阵与轻量文本语义搜索交叉打分选出
@@ -1672,7 +1732,9 @@ MIME Type: application/pdf
                               内容一句话描述 (content_description)
                             </span>
                             <div className="text-xs text-slate-200 line-clamp-2">
-                              {selectedFile.apiResponse?.content_description || selectedFile.apiResponse?.winning_hypothesis || '暂无详细一句话语义描述'}
+                              {selectedFile.apiResponse?.content_description ||
+                                selectedFile.apiResponse?.winning_hypothesis ||
+                                '暂无详细一句话语义描述'}
                             </div>
                             {selectedFile.apiResponse?.winning_hypothesis && (
                               <span className="text-[10px] text-indigo-400 font-mono mt-1 block truncate">
@@ -1694,7 +1756,8 @@ MIME Type: application/pdf
                             </span>
                           </div>
 
-                          {selectedFile.apiResponse?.fused_tags && selectedFile.apiResponse.fused_tags.length > 0 ? (
+                          {selectedFile.apiResponse?.fused_tags &&
+                          selectedFile.apiResponse.fused_tags.length > 0 ? (
                             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5">
                               {selectedFile.apiResponse.fused_tags.map((tag, tIdx) => (
                                 <div
@@ -1702,22 +1765,32 @@ MIME Type: application/pdf
                                   className="bg-slate-900/90 border border-emerald-500/30 hover:border-emerald-500/60 rounded-xl p-2.5 transition-all flex flex-col justify-between space-y-1.5"
                                 >
                                   <div className="flex items-start justify-between gap-1">
-                                    <span className="font-bold text-xs text-slate-100 truncate" title={tag.name}>
+                                    <span
+                                      className="font-bold text-xs text-slate-100 truncate"
+                                      title={tag.name}
+                                    >
                                       {tag.name}
                                     </span>
                                     <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex-shrink-0">
                                       {(tag.confidence * 100).toFixed(0)}%
                                     </span>
                                   </div>
-                                  <div className="text-[10px] font-mono text-slate-400 truncate" title={tag.code}>
+                                  <div
+                                    className="text-[10px] font-mono text-slate-400 truncate"
+                                    title={tag.code}
+                                  >
                                     {tag.code}
                                   </div>
                                   <div className="flex items-center justify-between text-[9px] text-slate-500 pt-1 border-t border-slate-800">
                                     <span>
-                                      {isParentMultiSelect(tag.parent_code) ? '✨ 多选并存' : '🔒 单选互斥胜出'}
+                                      {isParentMultiSelect(tag.parent_code)
+                                        ? '✨ 多选并存'
+                                        : '🔒 单选互斥胜出'}
                                     </span>
                                     {tag.confidence >= 0.85 && (
-                                      <span className="text-amber-400 font-semibold">⚡ 互证奖励</span>
+                                      <span className="text-amber-400 font-semibold">
+                                        ⚡ 互证奖励
+                                      </span>
                                     )}
                                   </div>
                                 </div>
@@ -1725,78 +1798,109 @@ MIME Type: application/pdf
                             </div>
                           ) : (
                             <div className="p-4 rounded-xl bg-slate-900/40 border border-slate-800 text-center text-slate-500 text-xs">
-                              (当前分析未产生融合标签，请点击右上角“触发 /api/perceive”进行全模态深度感知)
+                              (当前分析未产生融合标签，请点击右上角“触发
+                              /api/perceive”进行全模态深度感知)
                             </div>
                           )}
                         </div>
 
                         {/* Bottom: SlotEngine 候选短语矩阵与双锚点打分 (Candidate Hypotheses Matrix) */}
-                        {selectedFile.apiResponse?.candidate_hypotheses && selectedFile.apiResponse.candidate_hypotheses.length > 0 && (
-                          <div className="space-y-2 pt-2 border-t border-slate-800">
-                            <span className="text-xs font-bold text-slate-300 flex items-center">
-                              <Boxes className="w-3.5 h-3.5 mr-1.5 text-indigo-400" />
-                              SlotEngine 候选短语矩阵与双锚点几何打分 (E_global ⊗ E_desc)
-                            </span>
-                            <div className="overflow-x-auto">
-                              <table className="w-full text-[11px] font-mono text-left text-slate-300">
-                                <thead className="bg-slate-900/80 text-slate-400 uppercase text-[10px]">
-                                  <tr>
-                                    <th className="p-2 rounded-l">候选短语/描述假设</th>
-                                    <th className="p-2 text-center">综合得分 S(Ti)</th>
-                                    <th className="p-2 text-center">E_global 余弦</th>
-                                    <th className="p-2 text-center">E_desc 余弦</th>
-                                    <th className="p-2 text-center">跨模态互证</th>
-                                    <th className="p-2 rounded-r text-center">状态</th>
-                                  </tr>
-                                </thead>
-                                <tbody className="divide-y divide-slate-800/60">
-                                  {selectedFile.apiResponse.candidate_hypotheses.map((hyp, hIdx) => {
-                                    const isWin = selectedFile.apiResponse?.winning_hypothesis === hyp.hypothesis || hIdx === 0
-                                    return (
-                                      <tr key={hIdx} className={isWin ? 'bg-indigo-950/40 text-slate-100 font-bold' : 'hover:bg-slate-900/40'}>
-                                        <td className="p-2 truncate max-w-xs">{hyp.hypothesis}</td>
-                                        <td className="p-2 text-center text-emerald-400 font-bold">{(hyp.score * 100).toFixed(1)}%</td>
-                                        <td className="p-2 text-center text-slate-400">{hyp.cosine_global !== undefined ? hyp.cosine_global.toFixed(3) : '-'}</td>
-                                        <td className="p-2 text-center text-slate-400">{hyp.cosine_desc !== undefined ? hyp.cosine_desc.toFixed(3) : '-'}</td>
-                                        <td className="p-2 text-center">
-                                          {hyp.has_cross_modal ? (
-                                            <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[9px]">
-                                              +0.20
-                                            </span>
-                                          ) : (
-                                            <span className="text-slate-600">-</span>
-                                          )}
-                                        </td>
-                                        <td className="p-2 text-center">
-                                          {isWin ? (
-                                            <span className="px-2 py-0.5 rounded bg-indigo-500/30 text-indigo-300 border border-indigo-500/50 text-[10px]">
-                                              🏆 胜出
-                                            </span>
-                                          ) : (
-                                            <span className="text-slate-500 text-[10px]">候补</span>
-                                          )}
-                                        </td>
-                                      </tr>
-                                    )
-                                  })}
-                                </tbody>
-                              </table>
+                        {selectedFile.apiResponse?.candidate_hypotheses &&
+                          selectedFile.apiResponse.candidate_hypotheses.length > 0 && (
+                            <div className="space-y-2 pt-2 border-t border-slate-800">
+                              <span className="text-xs font-bold text-slate-300 flex items-center">
+                                <Boxes className="w-3.5 h-3.5 mr-1.5 text-indigo-400" />
+                                SlotEngine 候选短语矩阵与双锚点几何打分 (E_global ⊗ E_desc)
+                              </span>
+                              <div className="overflow-x-auto">
+                                <table className="w-full text-[11px] font-mono text-left text-slate-300">
+                                  <thead className="bg-slate-900/80 text-slate-400 uppercase text-[10px]">
+                                    <tr>
+                                      <th className="p-2 rounded-l">候选短语/描述假设</th>
+                                      <th className="p-2 text-center">综合得分 S(Ti)</th>
+                                      <th className="p-2 text-center">E_global 余弦</th>
+                                      <th className="p-2 text-center">E_desc 余弦</th>
+                                      <th className="p-2 text-center">跨模态互证</th>
+                                      <th className="p-2 rounded-r text-center">状态</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody className="divide-y divide-slate-800/60">
+                                    {selectedFile.apiResponse.candidate_hypotheses.map(
+                                      (hyp, hIdx) => {
+                                        const isWin =
+                                          selectedFile.apiResponse?.winning_hypothesis ===
+                                            hyp.hypothesis || hIdx === 0
+                                        return (
+                                          <tr
+                                            key={hIdx}
+                                            className={
+                                              isWin
+                                                ? 'bg-indigo-950/40 text-slate-100 font-bold'
+                                                : 'hover:bg-slate-900/40'
+                                            }
+                                          >
+                                            <td className="p-2 truncate max-w-xs">
+                                              {hyp.hypothesis}
+                                            </td>
+                                            <td className="p-2 text-center text-emerald-400 font-bold">
+                                              {(hyp.score * 100).toFixed(1)}%
+                                            </td>
+                                            <td className="p-2 text-center text-slate-400">
+                                              {hyp.cosine_global !== undefined
+                                                ? hyp.cosine_global.toFixed(3)
+                                                : '-'}
+                                            </td>
+                                            <td className="p-2 text-center text-slate-400">
+                                              {hyp.cosine_desc !== undefined
+                                                ? hyp.cosine_desc.toFixed(3)
+                                                : '-'}
+                                            </td>
+                                            <td className="p-2 text-center">
+                                              {hyp.has_cross_modal ? (
+                                                <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[9px]">
+                                                  +0.20
+                                                </span>
+                                              ) : (
+                                                <span className="text-slate-600">-</span>
+                                              )}
+                                            </td>
+                                            <td className="p-2 text-center">
+                                              {isWin ? (
+                                                <span className="px-2 py-0.5 rounded bg-indigo-500/30 text-indigo-300 border border-indigo-500/50 text-[10px]">
+                                                  🏆 胜出
+                                                </span>
+                                              ) : (
+                                                <span className="text-slate-500 text-[10px]">
+                                                  候补
+                                                </span>
+                                              )}
+                                            </td>
+                                          </tr>
+                                        )
+                                      }
+                                    )}
+                                  </tbody>
+                                </table>
+                              </div>
                             </div>
-                          </div>
-                        )}
+                          )}
 
                         {/* Benchmark 时延指标条 */}
                         {selectedFile.apiResponse?.benchmark && (
                           <div className="p-2.5 rounded-xl bg-slate-900/60 border border-slate-800/80 flex flex-wrap items-center justify-between text-[11px] font-mono text-slate-400 gap-2">
                             <span className="font-bold text-slate-300">全模态性能 SLO 指标:</span>
                             {selectedFile.apiResponse.benchmark.total_ms !== undefined && (
-                              <span className="text-emerald-400 font-bold">总耗时: {selectedFile.apiResponse.benchmark.total_ms}ms</span>
+                              <span className="text-emerald-400 font-bold">
+                                总耗时: {selectedFile.apiResponse.benchmark.total_ms}ms
+                              </span>
                             )}
                             {selectedFile.apiResponse.benchmark.magika_ms !== undefined && (
                               <span>Magika: {selectedFile.apiResponse.benchmark.magika_ms}ms</span>
                             )}
                             {selectedFile.apiResponse.benchmark.vision_ms !== undefined && (
-                              <span>视觉模型: {selectedFile.apiResponse.benchmark.vision_ms}ms</span>
+                              <span>
+                                视觉模型: {selectedFile.apiResponse.benchmark.vision_ms}ms
+                              </span>
                             )}
                             {selectedFile.apiResponse.benchmark.ocr_ms !== undefined && (
                               <span>OCR: {selectedFile.apiResponse.benchmark.ocr_ms}ms</span>
@@ -1813,9 +1917,12 @@ MIME Type: application/pdf
               ) : (
                 <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-12 flex flex-col items-center justify-center text-center flex-1 min-h-0 text-slate-500">
                   <Activity className="w-12 h-12 mb-3 opacity-30 text-amber-400" />
-                  <p className="text-sm font-medium text-slate-300">请选择或上传文件进行多模态分析</p>
+                  <p className="text-sm font-medium text-slate-300">
+                    请选择或上传文件进行多模态分析
+                  </p>
                   <p className="text-xs text-slate-500 mt-1 max-w-sm">
-                    支持 Magika 神经网络鉴定、ExifTool 元数据提取、Text 文本抽取与 PP-OCRv6 图像文本识别
+                    支持 Magika 神经网络鉴定、ExifTool 元数据提取、Text 文本抽取与 PP-OCRv6
+                    图像文本识别
                   </p>
                 </div>
               )}
@@ -1837,9 +1944,13 @@ MIME Type: application/pdf
                     <div>
                       <h2 className="font-bold text-sm text-slate-100 flex items-center gap-1.5">
                         <span>智能文件清理与治理 API</span>
-                        <span className="text-[10px] uppercase font-mono font-bold bg-amber-400/20 text-amber-300 border border-amber-400/40 px-1 py-0.2 rounded">PRO</span>
+                        <span className="text-[10px] uppercase font-mono font-bold bg-amber-400/20 text-amber-300 border border-amber-400/40 px-1 py-0.2 rounded">
+                          PRO
+                        </span>
                       </h2>
-                      <span className="text-[11px] font-mono text-emerald-400">POST /api/cleanup/scan/stream</span>
+                      <span className="text-[11px] font-mono text-emerald-400">
+                        POST /api/cleanup/scan/stream
+                      </span>
                     </div>
                   </div>
                   <span className="text-[10px] font-bold px-2 py-0.5 bg-purple-500/20 text-purple-300 rounded border border-purple-500/30">
@@ -1888,10 +1999,20 @@ MIME Type: application/pdf
                       <button
                         type="button"
                         onClick={() => {
-                          setStrategyExact(true); setStrategyPhash(true); setStrategyAudio(true); setStrategyVideo(true);
-                          setStrategyBadExt(true); setStrategyEmptyFolders(true); setStrategyBigFiles(true); setStrategyEmptyFiles(true);
-                          setStrategyTemporaryFiles(true); setStrategyInvalidSymlinks(true); setStrategyBrokenFiles(true); setStrategyBadNames(true);
-                          setStrategyExifRemover(true); setStrategyVideoOptimizer(true);
+                          setStrategyExact(true)
+                          setStrategyPhash(true)
+                          setStrategyAudio(true)
+                          setStrategyVideo(true)
+                          setStrategyBadExt(true)
+                          setStrategyEmptyFolders(true)
+                          setStrategyBigFiles(true)
+                          setStrategyEmptyFiles(true)
+                          setStrategyTemporaryFiles(true)
+                          setStrategyInvalidSymlinks(true)
+                          setStrategyBrokenFiles(true)
+                          setStrategyBadNames(true)
+                          setStrategyExifRemover(true)
+                          setStrategyVideoOptimizer(true)
                         }}
                         className="text-[10px] text-amber-400 hover:text-amber-300 px-1.5 py-0.5 rounded bg-amber-950/40 border border-amber-800/50"
                       >
@@ -1900,10 +2021,20 @@ MIME Type: application/pdf
                       <button
                         type="button"
                         onClick={() => {
-                          setStrategyExact(false); setStrategyPhash(false); setStrategyAudio(false); setStrategyVideo(false);
-                          setStrategyBadExt(false); setStrategyEmptyFolders(false); setStrategyBigFiles(false); setStrategyEmptyFiles(false);
-                          setStrategyTemporaryFiles(false); setStrategyInvalidSymlinks(false); setStrategyBrokenFiles(false); setStrategyBadNames(false);
-                          setStrategyExifRemover(false); setStrategyVideoOptimizer(false);
+                          setStrategyExact(false)
+                          setStrategyPhash(false)
+                          setStrategyAudio(false)
+                          setStrategyVideo(false)
+                          setStrategyBadExt(false)
+                          setStrategyEmptyFolders(false)
+                          setStrategyBigFiles(false)
+                          setStrategyEmptyFiles(false)
+                          setStrategyTemporaryFiles(false)
+                          setStrategyInvalidSymlinks(false)
+                          setStrategyBrokenFiles(false)
+                          setStrategyBadNames(false)
+                          setStrategyExifRemover(false)
+                          setStrategyVideoOptimizer(false)
                         }}
                         className="text-[10px] text-slate-400 hover:text-slate-300 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800"
                       >
@@ -1918,11 +2049,20 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <Hash className="w-3.5 h-3.5 text-amber-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">精确重复文件 (Duplicates)</span>
-                          <span className="text-[9px] text-slate-400">Blake3 分级哈希 (exact_hash)</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            精确重复文件 (Duplicates)
+                          </span>
+                          <span className="text-[9px] text-slate-400">
+                            Blake3 分级哈希 (exact_hash)
+                          </span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyExact} onChange={e => setStrategyExact(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyExact}
+                        onChange={e => setStrategyExact(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 2. Similar Images */}
@@ -1930,11 +2070,20 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <Camera className="w-3.5 h-3.5 text-purple-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">相似图片 (Similar Images)</span>
-                          <span className="text-[9px] text-slate-400">BK-Tree 梯度感知哈希 (image_phash)</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            相似图片 (Similar Images)
+                          </span>
+                          <span className="text-[9px] text-slate-400">
+                            BK-Tree 梯度感知哈希 (image_phash)
+                          </span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyPhash} onChange={e => setStrategyPhash(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyPhash}
+                        onChange={e => setStrategyPhash(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 3. Same Music */}
@@ -1942,11 +2091,20 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <Music className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">相似音乐 (Same Music)</span>
-                          <span className="text-[9px] text-slate-400">Chromaprint 声学指纹 (audio_hash)</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            相似音乐 (Same Music)
+                          </span>
+                          <span className="text-[9px] text-slate-400">
+                            Chromaprint 声学指纹 (audio_hash)
+                          </span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyAudio} onChange={e => setStrategyAudio(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyAudio}
+                        onChange={e => setStrategyAudio(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 4. Similar Videos */}
@@ -1954,11 +2112,20 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <Video className="w-3.5 h-3.5 text-rose-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">相似视频 (Similar Videos)</span>
-                          <span className="text-[9px] text-slate-400">时序关键帧提取 (video_phash)</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            相似视频 (Similar Videos)
+                          </span>
+                          <span className="text-[9px] text-slate-400">
+                            时序关键帧提取 (video_phash)
+                          </span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyVideo} onChange={e => setStrategyVideo(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyVideo}
+                        onChange={e => setStrategyVideo(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 5. Empty Folders */}
@@ -1966,11 +2133,18 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <Layers className="w-3.5 h-3.5 text-blue-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">空文件夹 (Empty Folders)</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            空文件夹 (Empty Folders)
+                          </span>
                           <span className="text-[9px] text-slate-400">高级递归空目录检测</span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyEmptyFolders} onChange={e => setStrategyEmptyFolders(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyEmptyFolders}
+                        onChange={e => setStrategyEmptyFolders(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 6. Big Files */}
@@ -1978,11 +2152,20 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <Zap className="w-3.5 h-3.5 text-yellow-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">超大文件 (Big Files)</span>
-                          <span className="text-[9px] text-slate-400">全盘 Top 50 体积最大文件</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            超大文件 (Big Files)
+                          </span>
+                          <span className="text-[9px] text-slate-400">
+                            全盘 Top 50 体积最大文件
+                          </span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyBigFiles} onChange={e => setStrategyBigFiles(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyBigFiles}
+                        onChange={e => setStrategyBigFiles(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 7. Empty Files */}
@@ -1990,11 +2173,18 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <FileText className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">空文件 (Empty Files)</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            空文件 (Empty Files)
+                          </span>
                           <span className="text-[9px] text-slate-400">0 字节空文件扫描</span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyEmptyFiles} onChange={e => setStrategyEmptyFiles(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyEmptyFiles}
+                        onChange={e => setStrategyEmptyFiles(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 8. Temporary Files */}
@@ -2002,11 +2192,20 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <RefreshCw className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">临时与缓存 (Temporary Files)</span>
-                          <span className="text-[9px] text-slate-400">.tmp, .bak, .cache, thumbs.db 等</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            临时与缓存 (Temporary Files)
+                          </span>
+                          <span className="text-[9px] text-slate-400">
+                            .tmp, .bak, .cache, thumbs.db 等
+                          </span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyTemporaryFiles} onChange={e => setStrategyTemporaryFiles(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyTemporaryFiles}
+                        onChange={e => setStrategyTemporaryFiles(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 9. Invalid Symlinks */}
@@ -2014,11 +2213,20 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <AlertCircle className="w-3.5 h-3.5 text-amber-500 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">断裂软链接 (Invalid Symlinks)</span>
-                          <span className="text-[9px] text-slate-400">指向已不存在目标的符号链接</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            断裂软链接 (Invalid Symlinks)
+                          </span>
+                          <span className="text-[9px] text-slate-400">
+                            指向已不存在目标的符号链接
+                          </span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyInvalidSymlinks} onChange={e => setStrategyInvalidSymlinks(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyInvalidSymlinks}
+                        onChange={e => setStrategyInvalidSymlinks(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 10. Broken Files */}
@@ -2026,11 +2234,20 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <XCircle className="w-3.5 h-3.5 text-red-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">损坏文件 (Broken Files)</span>
-                          <span className="text-[9px] text-slate-400">损坏图像/PDF/音频/压缩包</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            损坏文件 (Broken Files)
+                          </span>
+                          <span className="text-[9px] text-slate-400">
+                            损坏图像/PDF/音频/压缩包
+                          </span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyBrokenFiles} onChange={e => setStrategyBrokenFiles(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyBrokenFiles}
+                        onChange={e => setStrategyBrokenFiles(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 11. Bad Extensions */}
@@ -2038,11 +2255,18 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <FileCode className="w-3.5 h-3.5 text-indigo-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">错误扩展名 (Bad Extensions)</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            错误扩展名 (Bad Extensions)
+                          </span>
                           <span className="text-[9px] text-slate-400">内容魔数与后缀不匹配</span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyBadExt} onChange={e => setStrategyBadExt(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyBadExt}
+                        onChange={e => setStrategyBadExt(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 12. Bad Names */}
@@ -2050,11 +2274,20 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <FileText className="w-3.5 h-3.5 text-teal-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">异常文件名 (Bad Names)</span>
-                          <span className="text-[9px] text-slate-400">特殊字符/不可见/非标准命名</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            异常文件名 (Bad Names)
+                          </span>
+                          <span className="text-[9px] text-slate-400">
+                            特殊字符/不可见/非标准命名
+                          </span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyBadNames} onChange={e => setStrategyBadNames(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyBadNames}
+                        onChange={e => setStrategyBadNames(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 13. Exif Remover */}
@@ -2062,11 +2295,20 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <ShieldCheck className="w-3.5 h-3.5 text-green-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">Exif 清理 (Exif Remover)</span>
-                          <span className="text-[9px] text-slate-400">检测并擦除敏感拍摄隐私元数据</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            Exif 清理 (Exif Remover)
+                          </span>
+                          <span className="text-[9px] text-slate-400">
+                            检测并擦除敏感拍摄隐私元数据
+                          </span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyExifRemover} onChange={e => setStrategyExifRemover(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyExifRemover}
+                        onChange={e => setStrategyExifRemover(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
 
                     {/* 14. Video Optimizer */}
@@ -2074,11 +2316,20 @@ MIME Type: application/pdf
                       <div className="flex items-center space-x-2">
                         <Cpu className="w-3.5 h-3.5 text-pink-400 flex-shrink-0" />
                         <div>
-                          <span className="text-[11px] font-semibold text-slate-200 block">视频优化 (Video Optimizer)</span>
-                          <span className="text-[9px] text-slate-400">转码为 HEVC/AV1 并裁切黑边</span>
+                          <span className="text-[11px] font-semibold text-slate-200 block">
+                            视频优化 (Video Optimizer)
+                          </span>
+                          <span className="text-[9px] text-slate-400">
+                            转码为 HEVC/AV1 并裁切黑边
+                          </span>
                         </div>
                       </div>
-                      <input type="checkbox" checked={strategyVideoOptimizer} onChange={e => setStrategyVideoOptimizer(e.target.checked)} className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer" />
+                      <input
+                        type="checkbox"
+                        checked={strategyVideoOptimizer}
+                        onChange={e => setStrategyVideoOptimizer(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-500 rounded cursor-pointer"
+                      />
                     </label>
                   </div>
                 </div>
@@ -2087,7 +2338,9 @@ MIME Type: application/pdf
                 <div className="pt-1 space-y-1.5">
                   <div className="flex items-center justify-between text-xs">
                     <span className="text-slate-300 font-medium">最小相似度阈值 (0.0 ~ 10.0)</span>
-                    <span className="font-mono text-amber-400 font-bold">{minSimilarity.toFixed(1)}</span>
+                    <span className="font-mono text-amber-400 font-bold">
+                      {minSimilarity.toFixed(1)}
+                    </span>
                   </div>
                   <input
                     type="range"
@@ -2166,7 +2419,9 @@ MIME Type: application/pdf
               <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-3">
                 <div className="flex items-center space-x-2 border-b border-slate-800 pb-2.5">
                   <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                  <span className="text-xs font-bold text-slate-200">单文件 pHash & 破损文件检测</span>
+                  <span className="text-xs font-bold text-slate-200">
+                    单文件 pHash & 破损文件检测
+                  </span>
                 </div>
 
                 <div>
@@ -2198,17 +2453,27 @@ MIME Type: application/pdf
                   <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-1.5 text-xs font-mono">
                     <div className="flex justify-between">
                       <span className="text-slate-500">czkawka pHash:</span>
-                      <span className="text-amber-400 font-bold">{singleFileResult.phash || 'N/A'}</span>
+                      <span className="text-amber-400 font-bold">
+                        {singleFileResult.phash || 'N/A'}
+                      </span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-500">is_corrupted:</span>
-                      <span className={singleFileResult.is_corrupted ? "text-rose-400 font-bold" : "text-emerald-400 font-bold"}>
-                        {singleFileResult.is_corrupted ? "TRUE (文件破损/0字节)" : "FALSE (正常)"}
+                      <span
+                        className={
+                          singleFileResult.is_corrupted
+                            ? 'text-rose-400 font-bold'
+                            : 'text-emerald-400 font-bold'
+                        }
+                      >
+                        {singleFileResult.is_corrupted ? 'TRUE (文件破损/0字节)' : 'FALSE (正常)'}
                       </span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-500">File Size:</span>
-                      <span className="text-slate-300">{formatBytes(singleFileResult.file_size || 0)}</span>
+                      <span className="text-slate-300">
+                        {formatBytes(singleFileResult.file_size || 0)}
+                      </span>
                     </div>
                   </div>
                 )}
@@ -2236,28 +2501,36 @@ MIME Type: application/pdf
                   {/* Top Stats Cards Grid */}
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                     <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-3.5">
-                      <span className="text-[11px] font-medium text-slate-400 block">扫描文件总数</span>
+                      <span className="text-[11px] font-medium text-slate-400 block">
+                        扫描文件总数
+                      </span>
                       <span className="text-xl font-bold font-mono text-slate-100 mt-1 block">
                         {scanResult.total_scanned}
                       </span>
                     </div>
 
                     <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-3.5">
-                      <span className="text-[11px] font-medium text-slate-400 block">发现重复组</span>
+                      <span className="text-[11px] font-medium text-slate-400 block">
+                        发现重复组
+                      </span>
                       <span className="text-xl font-bold font-mono text-amber-400 mt-1 block">
                         {scanResult.duplicate_groups?.length || 0}
                       </span>
                     </div>
 
                     <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-3.5">
-                      <span className="text-[11px] font-medium text-slate-400 block">冗余副本数</span>
+                      <span className="text-[11px] font-medium text-slate-400 block">
+                        冗余副本数
+                      </span>
                       <span className="text-xl font-bold font-mono text-purple-400 mt-1 block">
                         {scanResult.total_redundant_files}
                       </span>
                     </div>
 
                     <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-3.5">
-                      <span className="text-[11px] font-medium text-slate-400 block">预计可释放空间</span>
+                      <span className="text-[11px] font-medium text-slate-400 block">
+                        预计可释放空间
+                      </span>
                       <span className="text-xl font-bold font-mono text-emerald-400 mt-1 block">
                         {formatBytes(scanResult.total_freed_bytes || 0)}
                       </span>
@@ -2269,7 +2542,9 @@ MIME Type: application/pdf
                     <div className="flex items-center justify-between border-b border-slate-800 pb-3">
                       <div className="flex items-center space-x-2">
                         <Copy className="w-4 h-4 text-amber-400" />
-                        <h3 className="font-bold text-sm text-slate-100">智能清理聚类组列表 (File Cleanup Clusters)</h3>
+                        <h3 className="font-bold text-sm text-slate-100">
+                          智能清理聚类组列表 (File Cleanup Clusters)
+                        </h3>
                       </div>
                       <span className="text-xs text-slate-400 font-mono">
                         耗时: {scanResult.duration_ms} ms
@@ -2289,15 +2564,17 @@ MIME Type: application/pdf
                           >
                             <div className="flex items-center justify-between">
                               <div className="flex items-center space-x-2">
-                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                                  group.strategy === 'exact_hash'
-                                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-                                    : group.strategy === 'audio_hash'
-                                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
-                                    : group.strategy === 'video_phash'
-                                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
-                                    : 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
-                                }`}>
+                                <span
+                                  className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                    group.strategy === 'exact_hash'
+                                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                                      : group.strategy === 'audio_hash'
+                                        ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                                        : group.strategy === 'video_phash'
+                                          ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                                          : 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
+                                  }`}
+                                >
                                   {group.strategy}
                                 </span>
                                 <span className="font-bold text-xs text-slate-200">
@@ -2305,11 +2582,12 @@ MIME Type: application/pdf
                                 </span>
                               </div>
                               <div className="flex items-center space-x-2">
-                                {group.group_threshold !== undefined && group.group_threshold !== null && (
-                                  <span className="text-[10px] font-mono text-amber-400 bg-amber-950/60 border border-amber-800/60 px-1.5 py-0.5 rounded">
-                                    踩线阈值 ≥ {Number(group.group_threshold).toFixed(1)}
-                                  </span>
-                                )}
+                                {group.group_threshold !== undefined &&
+                                  group.group_threshold !== null && (
+                                    <span className="text-[10px] font-mono text-amber-400 bg-amber-950/60 border border-amber-800/60 px-1.5 py-0.5 rounded">
+                                      踩线阈值 ≥ {Number(group.group_threshold).toFixed(1)}
+                                    </span>
+                                  )}
                                 <span className="text-xs font-bold text-emerald-400 font-mono">
                                   可释放: {formatBytes(group.potential_freed_bytes || 0)}
                                 </span>
@@ -2357,8 +2635,16 @@ MIME Type: application/pdf
                                         </div>
                                       </td>
                                       <td className="py-2 px-3 font-semibold text-slate-200 break-all max-w-[280px]">
-                                        <span className="block truncate max-w-[240px]" title={file.name}>{file.name}</span>
-                                        <span className="block text-[10px] text-slate-500 font-normal truncate max-w-[240px]" title={file.path}>
+                                        <span
+                                          className="block truncate max-w-[240px]"
+                                          title={file.name}
+                                        >
+                                          {file.name}
+                                        </span>
+                                        <span
+                                          className="block text-[10px] text-slate-500 font-normal truncate max-w-[240px]"
+                                          title={file.path}
+                                        >
                                           {file.path}
                                         </span>
                                       </td>
@@ -2411,7 +2697,9 @@ MIME Type: application/pdf
               ) : (
                 <div className="bg-slate-900/40 border border-slate-800 rounded-2xl p-12 flex flex-col items-center justify-center text-center flex-1 min-h-0 text-slate-500">
                   <Layers className="w-12 h-12 mb-3 opacity-30 text-amber-400" />
-                  <p className="text-sm font-medium text-slate-300">czkawka_core API 测试控制台就绪</p>
+                  <p className="text-sm font-medium text-slate-300">
+                    czkawka_core API 测试控制台就绪
+                  </p>
                   <p className="text-xs text-slate-500 mt-1 max-w-sm">
                     输入目录路径并点击【执行 czkawka_core 聚合扫描】开始全量哈希与感知图片去重测试。
                   </p>
@@ -2433,7 +2721,9 @@ MIME Type: application/pdf
                     </div>
                     <div>
                       <h2 className="font-bold text-sm text-slate-100">离线反向地理编码测试</h2>
-                      <span className="text-[11px] font-mono text-emerald-400">POST /api/geo/reverse</span>
+                      <span className="text-[11px] font-mono text-emerald-400">
+                        POST /api/geo/reverse
+                      </span>
                     </div>
                   </div>
                   {/* 数据集可用性徽章（来自 /health 的 geoAvailable） */}
@@ -2479,7 +2769,9 @@ MIME Type: application/pdf
                 {/* 请求参数区 */}
                 <div className="space-y-3 pt-1 border-t border-slate-800/80">
                   <div>
-                    <label className="text-xs font-semibold text-slate-300 block mb-1.5">返回语言 (BCP-47)</label>
+                    <label className="text-xs font-semibold text-slate-300 block mb-1.5">
+                      返回语言 (BCP-47)
+                    </label>
                     <select
                       value={geoLanguage}
                       onChange={e => setGeoLanguage(e.target.value)}
@@ -2534,7 +2826,11 @@ MIME Type: application/pdf
                   }`}
                 >
                   <Globe2 className={`w-4 h-4 ${geoQuerying ? 'animate-spin' : ''}`} />
-                  <span>{geoQuerying ? '解析中...' : `发起批量解析 (${parseGeoCoords(geoCoordsText).points.length} 点)`}</span>
+                  <span>
+                    {geoQuerying
+                      ? '解析中...'
+                      : `发起批量解析 (${parseGeoCoords(geoCoordsText).points.length} 点)`}
+                  </span>
                 </button>
               </div>
             </div>
@@ -2563,7 +2859,10 @@ MIME Type: application/pdf
                       </span>
                     </div>
                     <div className="flex items-center space-x-2 text-[11px] font-mono text-slate-400">
-                      <span>命中: {geoResults.results.filter(r => r.found).length}/{geoResults.results.length}</span>
+                      <span>
+                        命中: {geoResults.results.filter(r => r.found).length}/
+                        {geoResults.results.length}
+                      </span>
                       <span>|</span>
                       <span>language: {geoLanguage}</span>
                     </div>
@@ -2609,19 +2908,27 @@ MIME Type: application/pdf
                             <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 text-xs">
                               <div>
                                 <span className="text-slate-500 block text-[10px]">country</span>
-                                <span className="text-slate-200 truncate block">{r.country ?? '-'}</span>
+                                <span className="text-slate-200 truncate block">
+                                  {r.country ?? '-'}
+                                </span>
                               </div>
                               <div>
                                 <span className="text-slate-500 block text-[10px]">province</span>
-                                <span className="text-sky-300 truncate block">{r.province ?? '-'}</span>
+                                <span className="text-sky-300 truncate block">
+                                  {r.province ?? '-'}
+                                </span>
                               </div>
                               <div>
                                 <span className="text-slate-500 block text-[10px]">city</span>
-                                <span className="text-amber-300 font-semibold truncate block">{r.city ?? '-'}</span>
+                                <span className="text-amber-300 font-semibold truncate block">
+                                  {r.city ?? '-'}
+                                </span>
                               </div>
                               <div>
                                 <span className="text-slate-500 block text-[10px]">distanceKm</span>
-                                <span className="font-mono text-purple-300 block">{r.distanceKm ?? '-'}</span>
+                                <span className="font-mono text-purple-300 block">
+                                  {r.distanceKm ?? '-'}
+                                </span>
                               </div>
                             </div>
                           ) : (
@@ -2639,7 +2946,8 @@ MIME Type: application/pdf
                   <MapPin className="w-12 h-12 mb-3 opacity-30 text-amber-400" />
                   <p className="text-sm font-medium text-slate-300">离线反向地理编码测试台就绪</p>
                   <p className="text-xs text-slate-500 mt-1 max-w-sm">
-                    输入或选择预置测试坐标，点击【发起批量解析】验证 坐标 → 国家 / 省 / 市 的分层输出与多语言回退。
+                    输入或选择预置测试坐标，点击【发起批量解析】验证 坐标 → 国家 / 省 / 市
+                    的分层输出与多语言回退。
                   </p>
                 </div>
               )}
@@ -2698,33 +3006,47 @@ MIME Type: application/pdf
               <div className="p-4 rounded-xl border border-slate-800 bg-slate-950/60 space-y-4">
                 <div className="flex items-center gap-2 border-b border-slate-800 pb-2.5">
                   <Eye className="w-4 h-4 text-purple-400" />
-                  <span className="text-sm font-semibold text-slate-200">OCR 识别与模型切换 (PP-OCRv6)</span>
+                  <span className="text-sm font-semibold text-slate-200">
+                    OCR 识别与模型切换 (PP-OCRv6)
+                  </span>
                 </div>
 
                 {/* 开关配置 */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <label className="flex items-center justify-between p-3 rounded-lg border border-slate-800 bg-slate-900/60 cursor-pointer hover:bg-slate-900/90 transition-all">
                     <div>
-                      <span className="text-xs font-semibold text-slate-200 block">启用文档 OCR 文字识别</span>
-                      <span className="text-[11px] text-slate-400 block mt-0.5">识别 PDF 和 Office 内的包含图片段落</span>
+                      <span className="text-xs font-semibold text-slate-200 block">
+                        启用文档 OCR 文字识别
+                      </span>
+                      <span className="text-[11px] text-slate-400 block mt-0.5">
+                        识别 PDF 和 Office 内的包含图片段落
+                      </span>
                     </div>
                     <input
                       type="checkbox"
                       checked={enableDocumentOcr}
-                      onChange={e => updateOcrConfig(e.target.checked, enableImageOcr, ocrModelSize)}
+                      onChange={e =>
+                        updateOcrConfig(e.target.checked, enableImageOcr, ocrModelSize)
+                      }
                       className="w-4 h-4 accent-purple-500 rounded cursor-pointer"
                     />
                   </label>
 
                   <label className="flex items-center justify-between p-3 rounded-lg border border-slate-800 bg-slate-900/60 cursor-pointer hover:bg-slate-900/90 transition-all">
                     <div>
-                      <span className="text-xs font-semibold text-slate-200 block">启用图片 OCR 文字识别</span>
-                      <span className="text-[11px] text-slate-400 block mt-0.5">识别 PNG, JPG, GIF, WebP 画面文字</span>
+                      <span className="text-xs font-semibold text-slate-200 block">
+                        启用图片 OCR 文字识别
+                      </span>
+                      <span className="text-[11px] text-slate-400 block mt-0.5">
+                        识别 PNG, JPG, GIF, WebP 画面文字
+                      </span>
                     </div>
                     <input
                       type="checkbox"
                       checked={enableImageOcr}
-                      onChange={e => updateOcrConfig(enableDocumentOcr, e.target.checked, ocrModelSize)}
+                      onChange={e =>
+                        updateOcrConfig(enableDocumentOcr, e.target.checked, ocrModelSize)
+                      }
                       className="w-4 h-4 accent-purple-500 rounded cursor-pointer"
                     />
                   </label>
@@ -2750,8 +3072,12 @@ MIME Type: application/pdf
                           推荐
                         </div>
                         <div className="flex items-center space-x-2">
-                          <Zap className={`w-4 h-4 ${ocrModelSize === 'tiny' ? 'text-purple-400' : 'text-slate-400'}`} />
-                          <span className={`font-semibold text-xs ${ocrModelSize === 'tiny' ? 'text-purple-300' : 'text-slate-200'}`}>
+                          <Zap
+                            className={`w-4 h-4 ${ocrModelSize === 'tiny' ? 'text-purple-400' : 'text-slate-400'}`}
+                          />
+                          <span
+                            className={`font-semibold text-xs ${ocrModelSize === 'tiny' ? 'text-purple-300' : 'text-slate-200'}`}
+                          >
                             极速 OCR (Tiny)
                           </span>
                         </div>
@@ -2770,8 +3096,12 @@ MIME Type: application/pdf
                         }`}
                       >
                         <div className="flex items-center space-x-2">
-                          <Check className={`w-4 h-4 ${ocrModelSize === 'small' ? 'text-purple-400' : 'text-slate-400'}`} />
-                          <span className={`font-semibold text-xs ${ocrModelSize === 'small' ? 'text-purple-300' : 'text-slate-200'}`}>
+                          <Check
+                            className={`w-4 h-4 ${ocrModelSize === 'small' ? 'text-purple-400' : 'text-slate-400'}`}
+                          />
+                          <span
+                            className={`font-semibold text-xs ${ocrModelSize === 'small' ? 'text-purple-300' : 'text-slate-200'}`}
+                          >
                             高精度 OCR (Small)
                           </span>
                         </div>
@@ -2790,8 +3120,12 @@ MIME Type: application/pdf
                         }`}
                       >
                         <div className="flex items-center space-x-2">
-                          <ShieldCheck className={`w-4 h-4 ${ocrModelSize === 'medium' ? 'text-purple-400' : 'text-slate-400'}`} />
-                          <span className={`font-semibold text-xs ${ocrModelSize === 'medium' ? 'text-purple-300' : 'text-slate-200'}`}>
+                          <ShieldCheck
+                            className={`w-4 h-4 ${ocrModelSize === 'medium' ? 'text-purple-400' : 'text-slate-400'}`}
+                          />
+                          <span
+                            className={`font-semibold text-xs ${ocrModelSize === 'medium' ? 'text-purple-300' : 'text-slate-200'}`}
+                          >
                             超高精度 OCR (Medium)
                           </span>
                         </div>
