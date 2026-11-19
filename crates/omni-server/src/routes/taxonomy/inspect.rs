@@ -396,8 +396,21 @@ pub fn load_dimension_policies_from_db(
         return policies;
     }
 
-    let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .unwrap();
+    // 工单09 · 连接治理收尾：直连业务主库必须经 Seam A 收口点
+    // open_omni_readonly_connection（busy_timeout(5000) + 只读 PRAGMA 套装），
+    // 根治 Node 主进程写入时直接抛 SQLITE_BUSY；原裸 Connection::open_with_flags
+    // 既绕过收口（红线4 禁各模块重复连接实现）又缺 busy_timeout。
+    // 禁 .unwrap()：连接失败降级返回默认策略并 logger.warn 上报，不得 panic。
+    let conn = match super::connection::open_omni_readonly_connection(path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "[Inspect] 打开业务主库失败，维度策略降级为默认值: {}",
+                e
+            );
+            return policies;
+        }
+    };
 
     let val_str: Result<String, _> = conn.query_row(
         "SELECT value FROM system_config WHERE key = 'DIMENSION_POLICIES' LIMIT 1",
