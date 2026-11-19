@@ -404,6 +404,8 @@ pub fn query_taxonomy_tree_fast(
                 "builtin".to_string()
             } else if seg_code.starts_with("omw.") {
                 "omw".to_string()
+            } else if seg_code.starts_with("hownet.") {
+                "hownet".to_string()
             } else if seg_code.starts_with("_ext.") {
                 "_ext".to_string()
             } else {

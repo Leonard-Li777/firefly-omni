@@ -279,14 +279,24 @@ pub fn query_taxonomy_tree(
                         .map(|(code, (canonical, _))| (code.clone(), canonical.clone()))
                         .collect();
                     if super::utils::table_exists(&master_conn, "file_tags_private") {
-                        if let Ok(mut pstmt) = master_conn.prepare("SELECT code, name FROM file_tags_private") {
-                            if let Ok(prows) = pstmt.query_map([], |row| {
+                        match master_conn.prepare("SELECT code, name FROM file_tags_private") {
+                            Ok(mut pstmt) => match pstmt.query_map([], |row| {
                                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                             }) {
-                                for (code, name) in prows.flatten() {
-                                    display_map.entry(code).or_insert(name);
+                                Ok(prows) => {
+                                    for (code, name) in prows.flatten() {
+                                        display_map.entry(code).or_insert(name);
+                                    }
                                 }
-                            }
+                                Err(e) => tracing::warn!(
+                                    "[TaxonomyTree] 读取 file_tags_private 展示名失败: {}",
+                                    e
+                                ),
+                            },
+                            Err(e) => tracing::warn!(
+                                "[TaxonomyTree] 准备 file_tags_private 查询失败: {}",
+                                e
+                            ),
                         }
                     }
 
@@ -308,106 +318,143 @@ pub fn query_taxonomy_tree(
                         )
                     };
 
-                    if let Ok(mut stmt) = master_conn.prepare(&select_sql) {
-                        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-                        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                            let fp: String = row.get(0)?;
-                            let tag_code: String = row.get(1)?;
-                            let via: String = row.get(2).unwrap_or_default();
-                            let code_chain: String = row.get(3).unwrap_or_default();
-                            // 模型 B 无 name_path：name_chain 置空，展示名统一由 display_map 按 code_path 段序译出
-                            Ok((fp, tag_code, via, String::new(), code_chain))
-                        });
+                    match master_conn.prepare(&select_sql) {
+                        Ok(mut stmt) => {
+                            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+                            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                                let fp: String = row.get(0)?;
+                                let tag_code: String = row.get(1)?;
+                                let via: String = row.get(2).unwrap_or_default();
+                                let code_chain: String = row.get(3).unwrap_or_default();
+                                // 模型 B 无 name_path：name_chain 置空，展示名统一由 display_map 按 code_path 段序译出
+                                Ok((fp, tag_code, via, String::new(), code_chain))
+                            });
 
-                        if let Ok(rows) = rows {
-                            for r in rows.flatten() {
-                                let (fp, tag_code, via, name_chain, code_chain) = r;
-                                direct_files.entry(tag_code.clone()).or_default().insert(fp.clone());
+                            match rows {
+                                Ok(rows) => {
+                                    for r in rows.flatten() {
+                                        let (fp, tag_code, via, name_chain, code_chain) = r;
+                                        direct_files.entry(tag_code.clone()).or_default().insert(fp.clone());
 
-                                let has_name_chain = !name_chain.trim().is_empty();
-                                let has_code_chain = !code_chain.trim().is_empty();
-                                if has_name_chain || has_code_chain {
-                                    let name_segs: Vec<String> = if has_name_chain {
-                                        name_chain
-                                            .split('/')
-                                            .map(|s| s.trim().to_string())
-                                            .filter(|s| !s.is_empty() && s != omni_core::concepts::Concept::内容标签.zh_name() && s != omni_core::concepts::Concept::内容标签.code())
-                                            .collect()
-                                    } else {
-                                        // 模型 B：按 code_path 段序经 display_map 实时回译展示名
-                                        code_chain
-                                            .split('/')
-                                            .map(|s| s.trim())
-                                            .filter(|s| !s.is_empty() && *s != omni_core::concepts::Concept::内容标签.code())
-                                            .map(|s| display_map.get(s).cloned().unwrap_or_else(|| s.to_string()))
-                                            .collect()
-                                    };
-                                    let code_segs: Vec<String> = if has_code_chain {
-                                        code_chain
-                                            .split('/')
-                                            .map(|s| s.trim().to_string())
-                                            .filter(|s| !s.is_empty() && s != omni_core::concepts::Concept::内容标签.zh_name() && s != omni_core::concepts::Concept::内容标签.code())
-                                            .collect()
-                                    } else {
-                                        Vec::new()
-                                    };
-
-                                    let num_segs = code_segs.len().max(name_segs.len());
-                                    if num_segs > 0 {
-                                        let mut first_seg_code = if !code_segs.is_empty() && !code_segs[0].is_empty() {
-                                            code_segs[0].clone()
-                                        } else if num_segs == 1 {
-                                            tag_code.clone()
-                                        } else {
-                                            format!("builtin.cat.{}", name_segs[0])
-                                        };
-
-                                        if first_seg_code == "builtin.fileType" {
-                                            first_seg_code = omni_core::concepts::Concept::文件类型.code().to_string();
-                                        }
-
-                                        let is_root_dim = omni_core::is_root_dimension(&first_seg_code);
-
-                                        let (mut prev_code, start_idx) = if is_root_dim {
-                                            (first_seg_code, 1)
-                                        } else {
-                                            (omni_core::concepts::Concept::内容标签.code().to_string(), 0)
-                                        };
-
-                                        for i in start_idx..num_segs {
-                                            let seg_code = if i < code_segs.len() && !code_segs[i].is_empty() {
-                                                code_segs[i].clone()
-                                            } else if i == num_segs - 1 {
-                                                tag_code.clone()
-                                            } else if i < name_segs.len() {
-                                                format!("builtin.cat.{}", name_segs[i])
+                                        let has_name_chain = !name_chain.trim().is_empty();
+                                        let has_code_chain = !code_chain.trim().is_empty();
+                                        if has_name_chain || has_code_chain {
+                                            let name_segs: Vec<String> = if has_name_chain {
+                                                name_chain
+                                                    .split('/')
+                                                    .map(|s| s.trim().to_string())
+                                                    .filter(|s| !s.is_empty() && s != omni_core::concepts::Concept::内容标签.zh_name() && s != omni_core::concepts::Concept::内容标签.code())
+                                                    .collect()
                                             } else {
-                                                tag_code.clone()
+                                                // 模型 B：按 code_path 段序经 display_map 实时回译展示名
+                                                code_chain
+                                                    .split('/')
+                                                    .map(|s| s.trim())
+                                                    .filter(|s| !s.is_empty() && *s != omni_core::concepts::Concept::内容标签.code())
+                                                    .map(|s| display_map.get(s).cloned().unwrap_or_else(|| s.to_string()))
+                                                    .collect()
+                                            };
+                                            let code_segs: Vec<String> = if has_code_chain {
+                                                code_chain
+                                                    .split('/')
+                                                    .map(|s| s.trim().to_string())
+                                                    .filter(|s| !s.is_empty() && s != omni_core::concepts::Concept::内容标签.zh_name() && s != omni_core::concepts::Concept::内容标签.code())
+                                                    .collect()
+                                            } else {
+                                                Vec::new()
                                             };
 
-                                            let seg_name = if i < name_segs.len() && !name_segs[i].is_empty() {
-                                                name_segs[i].clone()
-                                            } else if let Some(n) = node_map.get(&seg_code) {
-                                                n.name.clone()
-                                            } else if let Some(n) = display_map.get(&seg_code) {
-                                                // 语义包 + file_tags_private 实时译出的展示名（模型 B 无 name_path）
-                                                n.clone()
-                                            } else if let Some((canonical, _)) = alias_map.get(&seg_code) {
-                                                canonical.clone()
-                                            } else {
+                                            let num_segs = code_segs.len().max(name_segs.len());
+                                            if num_segs > 0 {
+                                                let mut first_seg_code = if !code_segs.is_empty() && !code_segs[0].is_empty() {
+                                                    code_segs[0].clone()
+                                                } else if num_segs == 1 {
+                                                    tag_code.clone()
+                                                } else {
+                                                    format!("builtin.cat.{}", name_segs[0])
+                                                };
+
+                                                if first_seg_code == "builtin.fileType" {
+                                                    first_seg_code = omni_core::concepts::Concept::文件类型.code().to_string();
+                                                }
+
+                                                let is_root_dim = omni_core::is_root_dimension(&first_seg_code);
+
+                                                let (mut prev_code, start_idx) = if is_root_dim {
+                                                    (first_seg_code, 1)
+                                                } else {
+                                                    (omni_core::concepts::Concept::内容标签.code().to_string(), 0)
+                                                };
+
+                                                for i in start_idx..num_segs {
+                                                    let seg_code = if i < code_segs.len() && !code_segs[i].is_empty() {
+                                                        code_segs[i].clone()
+                                                    } else if i == num_segs - 1 {
+                                                        tag_code.clone()
+                                                    } else if i < name_segs.len() {
+                                                        format!("builtin.cat.{}", name_segs[i])
+                                                    } else {
+                                                        tag_code.clone()
+                                                    };
+
+                                                    let seg_name = if i < name_segs.len() && !name_segs[i].is_empty() {
+                                                        name_segs[i].clone()
+                                                    } else if let Some(n) = node_map.get(&seg_code) {
+                                                        n.name.clone()
+                                                    } else if let Some(n) = display_map.get(&seg_code) {
+                                                        // 语义包 + file_tags_private 实时译出的展示名（模型 B 无 name_path）
+                                                        n.clone()
+                                                    } else if let Some((canonical, _)) = alias_map.get(&seg_code) {
+                                                        canonical.clone()
+                                                    } else {
+                                                        let lang = locale.split('-').next().unwrap_or("zh");
+                                                        omni_core::tag_identity::tag_display(&seg_code, lang)
+                                                    };
+
+                                                    if !node_map.contains_key(&seg_code) {
+                                                        node_map.insert(
+                                                            seg_code.clone(),
+                                                            TaxonomyNode {
+                                                                code: seg_code.clone(),
+                                                                name: seg_name.clone(),
+                                                                parent_code: Some(prev_code.clone()),
+                                                                parent_codes: vec![prev_code.clone()],
+                                                                source: "chain".to_string(),
+                                                                sort_order: 9999,
+                                                                file_count: 0,
+                                                                files: Vec::new(),
+                                                                children: Vec::new(),
+                                                                code_path: None,
+                                                                name_path: None,
+                                                            },
+                                                        );
+                                                    }
+
+                                                    if prev_code != seg_code {
+                                                        let children = parent_to_children.entry(prev_code.clone()).or_default();
+                                                        if !children.contains(&seg_code) {
+                                                            children.push(seg_code.clone());
+                                                        }
+                                                    }
+                                                    prev_code = seg_code;
+                                                }
+                                            }
+                                        } else if !via.trim().is_empty() && via != tag_code {
+                                            if !node_map.contains_key(&tag_code) {
                                                 let lang = locale.split('-').next().unwrap_or("zh");
-                                                omni_core::tag_identity::tag_display(&seg_code, lang)
-                                            };
-
-                                            if !node_map.contains_key(&seg_code) {
+                                                let name = display_map
+                                                    .get(&tag_code)
+                                                    .cloned()
+                                                    .or_else(|| alias_map.get(&tag_code).map(|(c, _)| c.clone()))
+                                                    .unwrap_or_else(|| omni_core::tag_identity::tag_display(&tag_code, lang));
                                                 node_map.insert(
-                                                    seg_code.clone(),
+                                                    tag_code.clone(),
                                                     TaxonomyNode {
-                                                        code: seg_code.clone(),
-                                                        name: seg_name.clone(),
-                                                        parent_code: Some(prev_code.clone()),
-                                                        parent_codes: vec![prev_code.clone()],
-                                                        source: "chain".to_string(),
+                                                        code: tag_code.clone(),
+                                                        name,
+                                                        parent_code: Some(via.clone()),
+                                                        parent_codes: vec![via.clone()],
+                                                        source: "rel".to_string(),
                                                         sort_order: 9999,
                                                         file_count: 0,
                                                         files: Vec::new(),
@@ -417,48 +464,23 @@ pub fn query_taxonomy_tree(
                                                     },
                                                 );
                                             }
-
-                                            if prev_code != seg_code {
-                                                let children = parent_to_children.entry(prev_code.clone()).or_default();
-                                                if !children.contains(&seg_code) {
-                                                    children.push(seg_code.clone());
-                                                }
+                                            let children = parent_to_children.entry(via.clone()).or_default();
+                                            if !children.contains(&tag_code) {
+                                                children.push(tag_code.clone());
                                             }
-                                            prev_code = seg_code;
                                         }
                                     }
-                                } else if !via.trim().is_empty() && via != tag_code {
-                                    if !node_map.contains_key(&tag_code) {
-                                        let lang = locale.split('-').next().unwrap_or("zh");
-                                        let name = display_map
-                                            .get(&tag_code)
-                                            .cloned()
-                                            .or_else(|| alias_map.get(&tag_code).map(|(c, _)| c.clone()))
-                                            .unwrap_or_else(|| omni_core::tag_identity::tag_display(&tag_code, lang));
-                                        node_map.insert(
-                                            tag_code.clone(),
-                                            TaxonomyNode {
-                                                code: tag_code.clone(),
-                                                name,
-                                                parent_code: Some(via.clone()),
-                                                parent_codes: vec![via.clone()],
-                                                source: "rel".to_string(),
-                                                sort_order: 9999,
-                                                file_count: 0,
-                                                files: Vec::new(),
-                                                children: Vec::new(),
-                                                code_path: None,
-                                                name_path: None,
-                                            },
-                                        );
-                                    }
-                                    let children = parent_to_children.entry(via.clone()).or_default();
-                                    if !children.contains(&tag_code) {
-                                        children.push(tag_code.clone());
-                                    }
                                 }
+                                Err(e) => tracing::warn!(
+                                    "[TaxonomyTree] 读取模型 B 标签关系行失败: {}",
+                                    e
+                                ),
                             }
                         }
+                        Err(e) => tracing::warn!(
+                            "[TaxonomyTree] 准备模型 B 标签关系查询失败: {}",
+                            e
+                        ),
                     }
                 }
             }
