@@ -236,80 +236,75 @@ pub fn query_taxonomy_tree(
     if let Some(path) = master_db_path {
         if path.exists() {
             if let Ok(master_conn) = open_omni_readonly_connection(path) {
-                let has_ftr: bool = master_conn
-                    .query_row(
-                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file_tag_relations'",
-                        [],
-                        |_| Ok(true),
-                    )
-                    .unwrap_or(false);
+                // 模型 B 唯一路径：物化路径已外迁至微型字典 tag_paths，ftr 仅保留 path_id。
+                // 移除热路径 PRAGMA table_info 与 ftr.code_path / ftr.name_path 直读（Spec §2.5.3）。
+                // 缺 tag_paths 表时显式 warn 并跳过该段文件归属装配，严禁静默吞异常。
+                if !super::utils::table_exists(&master_conn, "tag_paths") {
+                    tracing::warn!(
+                        "[TaxonomyTree] 业务主库缺少 tag_paths 表（模型 B 唯一路径字典），跳过 file_tag_relations 文件归属装配"
+                    );
+                } else {
+                    let has_wf: bool = super::utils::table_exists(&master_conn, "workspace_files");
 
-                if has_ftr {
-                    let mut has_code_path = false;
-                    let mut has_name_path = false;
-                    if let Ok(mut col_stmt) = master_conn.prepare("PRAGMA table_info(file_tag_relations)") {
-                        if let Ok(rows) = col_stmt.query_map([], |r| r.get::<_, String>(1)) {
-                            for col in rows.flatten() {
-                                if col == "code_path" {
-                                    has_code_path = true;
-                                } else if col == "name_path" {
-                                    has_name_path = true;
+                    let mut where_clauses: Vec<String> = Vec::new();
+                    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+
+                    if has_wf {
+                        where_clauses.push("wf.status = 1".to_string());
+                        if let Some(ws_id) = workspace_id {
+                            where_clauses.push("wf.workspace_id = ?".to_string());
+                            params.push(rusqlite::types::Value::Integer(ws_id));
+                        }
+
+                        if let Some(prefix) = directory_prefix {
+                            let clean_prefix = prefix.trim();
+                            if !clean_prefix.is_empty() {
+                                let sep = if clean_prefix.contains('\\') { '\\' } else { '/' };
+                                let prefix_pattern = if clean_prefix.ends_with('/') || clean_prefix.ends_with('\\') {
+                                    format!("{}%", clean_prefix)
+                                } else {
+                                    format!("{}{}%", clean_prefix, sep)
+                                };
+                                where_clauses.push("(wf.path LIKE ? OR wf.path = ?)".to_string());
+                                params.push(rusqlite::types::Value::Text(prefix_pattern));
+                                params.push(rusqlite::types::Value::Text(clean_prefix.to_string()));
+                            }
+                        }
+                    }
+
+                    // 展示名由语义包 alias_map（受控）+ 业务主库 file_tags_private（非受控 _ext.*/user.*）实时译出，
+                    // 不再依赖已删除的 ftr.name_path。
+                    let mut display_map: HashMap<String, String> = alias_map
+                        .iter()
+                        .map(|(code, (canonical, _))| (code.clone(), canonical.clone()))
+                        .collect();
+                    if super::utils::table_exists(&master_conn, "file_tags_private") {
+                        if let Ok(mut pstmt) = master_conn.prepare("SELECT code, name FROM file_tags_private") {
+                            if let Ok(prows) = pstmt.query_map([], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            }) {
+                                for (code, name) in prows.flatten() {
+                                    display_map.entry(code).or_insert(name);
                                 }
                             }
                         }
                     }
 
-                    let has_wf: bool = master_conn
-                        .query_row(
-                            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workspace_files'",
-                            [],
-                            |_| Ok(true),
-                        )
-                        .unwrap_or(false);
-
-                    let mut where_clauses = vec!["wf.status = 1".to_string()];
-                    let mut params: Vec<rusqlite::types::Value> = Vec::new();
-
-                    if let Some(ws_id) = workspace_id {
-                        where_clauses.push("wf.workspace_id = ?".to_string());
-                        params.push(rusqlite::types::Value::Integer(ws_id));
-                    }
-
-                    if let Some(prefix) = directory_prefix {
-                        let clean_prefix = prefix.trim();
-                        if !clean_prefix.is_empty() {
-                            let sep = if clean_prefix.contains('\\') { '\\' } else { '/' };
-                            let prefix_pattern = if clean_prefix.ends_with('/') || clean_prefix.ends_with('\\') {
-                                format!("{}%", clean_prefix)
-                            } else {
-                                format!("{}{}%", clean_prefix, sep)
-                            };
-                            where_clauses.push("(wf.path LIKE ? OR wf.path = ?)".to_string());
-                            params.push(rusqlite::types::Value::Text(prefix_pattern));
-                            params.push(rusqlite::types::Value::Text(clean_prefix.to_string()));
-                        }
-                    }
-
-                    let col_name_expr = if has_name_path { "ftr.name_path" } else { "''" };
-                    let col_code_expr = if has_code_path { "ftr.code_path" } else { "''" };
-
-                    let select_sql = if has_wf && !params.is_empty() {
+                    // 统一经 ftr.path_id JOIN tag_paths 取 tp.code_path（模型 B 唯一路径）
+                    let select_sql = if has_wf && !where_clauses.is_empty() {
                         format!(
-                            "SELECT DISTINCT ftr.file_fingerprint, ftr.tag_code, ftr.via_parent_code, {}, {} \
+                            "SELECT ftr.file_fingerprint, ftr.tag_code, ftr.via_parent_code, tp.code_path \
                              FROM file_tag_relations ftr \
+                             JOIN tag_paths tp ON tp.path_id = ftr.path_id \
                              JOIN workspace_files wf ON wf.file_fingerprint = ftr.file_fingerprint \
                              WHERE {}",
-                            col_name_expr,
-                            col_code_expr,
                             where_clauses.join(" AND ")
                         )
                     } else {
-                        let col_name_raw = if has_name_path { "name_path" } else { "''" };
-                        let col_code_raw = if has_code_path { "code_path" } else { "''" };
                         format!(
-                            "SELECT file_fingerprint, tag_code, via_parent_code, {}, {} FROM file_tag_relations",
-                            col_name_raw,
-                            col_code_raw
+                            "SELECT ftr.file_fingerprint, ftr.tag_code, ftr.via_parent_code, tp.code_path \
+                             FROM file_tag_relations ftr \
+                             JOIN tag_paths tp ON tp.path_id = ftr.path_id"
                         )
                     };
 
@@ -319,9 +314,9 @@ pub fn query_taxonomy_tree(
                             let fp: String = row.get(0)?;
                             let tag_code: String = row.get(1)?;
                             let via: String = row.get(2).unwrap_or_default();
-                            let name_chain: String = row.get(3).unwrap_or_default();
-                            let code_chain: String = row.get(4).unwrap_or_default();
-                            Ok((fp, tag_code, via, name_chain, code_chain))
+                            let code_chain: String = row.get(3).unwrap_or_default();
+                            // 模型 B 无 name_path：name_chain 置空，展示名统一由 display_map 按 code_path 段序译出
+                            Ok((fp, tag_code, via, String::new(), code_chain))
                         });
 
                         if let Ok(rows) = rows {
@@ -339,7 +334,13 @@ pub fn query_taxonomy_tree(
                                             .filter(|s| !s.is_empty() && s != omni_core::concepts::Concept::内容标签.zh_name() && s != omni_core::concepts::Concept::内容标签.code())
                                             .collect()
                                     } else {
-                                        Vec::new()
+                                        // 模型 B：按 code_path 段序经 display_map 实时回译展示名
+                                        code_chain
+                                            .split('/')
+                                            .map(|s| s.trim())
+                                            .filter(|s| !s.is_empty() && *s != omni_core::concepts::Concept::内容标签.code())
+                                            .map(|s| display_map.get(s).cloned().unwrap_or_else(|| s.to_string()))
+                                            .collect()
                                     };
                                     let code_segs: Vec<String> = if has_code_chain {
                                         code_chain
@@ -388,6 +389,9 @@ pub fn query_taxonomy_tree(
                                                 name_segs[i].clone()
                                             } else if let Some(n) = node_map.get(&seg_code) {
                                                 n.name.clone()
+                                            } else if let Some(n) = display_map.get(&seg_code) {
+                                                // 语义包 + file_tags_private 实时译出的展示名（模型 B 无 name_path）
+                                                n.clone()
                                             } else if let Some((canonical, _)) = alias_map.get(&seg_code) {
                                                 canonical.clone()
                                             } else {
@@ -426,9 +430,10 @@ pub fn query_taxonomy_tree(
                                 } else if !via.trim().is_empty() && via != tag_code {
                                     if !node_map.contains_key(&tag_code) {
                                         let lang = locale.split('-').next().unwrap_or("zh");
-                                        let name = alias_map
+                                        let name = display_map
                                             .get(&tag_code)
-                                            .map(|(c, _)| c.clone())
+                                            .cloned()
+                                            .or_else(|| alias_map.get(&tag_code).map(|(c, _)| c.clone()))
                                             .unwrap_or_else(|| omni_core::tag_identity::tag_display(&tag_code, lang));
                                         node_map.insert(
                                             tag_code.clone(),

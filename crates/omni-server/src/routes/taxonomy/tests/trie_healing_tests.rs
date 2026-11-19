@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod cases {
+    use super::super::{insert_ftr_rows_b, setup_model_b_master_conn};
     use crate::routes::taxonomy::*;
     use rusqlite::Connection;
 
@@ -23,40 +24,25 @@ fn test_inverted_trie_direct_and_logical_parent_file_count_axiom() {
         )
         .unwrap();
 
-    let master_conn = Connection::open_in_memory().unwrap();
-    master_conn
-        .execute_batch(
-            "CREATE TABLE workspace_files (
-            file_fingerprint TEXT PRIMARY KEY,
-            path TEXT NOT NULL,
-            workspace_id INTEGER NOT NULL DEFAULT 1,
-            status INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE file_tag_relations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_fingerprint TEXT NOT NULL,
-            tag_code TEXT NOT NULL,
-            code_path TEXT,
-            name_path TEXT
-        );",
-        )
-        .unwrap();
-
+    let master_conn = setup_model_b_master_conn();
     master_conn
         .execute_batch(
             "INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
         ('fp_1', 'D:\\files\\img1.jpg', 1, 1),
         ('fp_2', 'D:\\files\\img2.jpg', 1, 1),
         ('fp_3', 'D:\\files\\img3.png', 1, 1),
-        ('fp_4', 'D:\\files\\story.txt', 1, 1);
-
-        INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-        ('fp_1', 'builtin.uncensored', '/builtin.file_type/builtin.image/builtin.censorship/builtin.uncensored', '/文件类型/图片/打码程度/无码'),
-        ('fp_2', 'builtin.uncensored', '/builtin.file_type/builtin.image/builtin.censorship/builtin.uncensored', '/文件类型/图片/打码程度/无码'),
-        ('fp_3', 'builtin.image', '/builtin.file_type/builtin.image', '/文件类型/图片'),
-        ('fp_4', 'builtin.novel', '', '');",
+        ('fp_4', 'D:\\files\\story.txt', 1, 1);",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_1", "builtin.uncensored", "/builtin.file_type/builtin.image/builtin.censorship/builtin.uncensored", "/文件类型/图片/打码程度/无码"),
+            ("fp_2", "builtin.uncensored", "/builtin.file_type/builtin.image/builtin.censorship/builtin.uncensored", "/文件类型/图片/打码程度/无码"),
+            ("fp_3", "builtin.image", "/builtin.file_type/builtin.image", "/文件类型/图片"),
+            ("fp_4", "builtin.novel", "", ""),
+        ],
+    );
 
     let resp = query_taxonomy_tree_fast(
         &pack_conn,
@@ -120,33 +106,23 @@ fn test_inverted_trie_direct_and_logical_parent_file_count_axiom() {
 #[test]
 fn test_inverted_trie_scope_filter() {
     let pack_conn = Connection::open_in_memory().unwrap();
-    let master_conn = Connection::open_in_memory().unwrap();
+    let master_conn = setup_model_b_master_conn();
     master_conn
         .execute_batch(
-            "CREATE TABLE workspace_files (
-            file_fingerprint TEXT PRIMARY KEY,
-            path TEXT NOT NULL,
-            workspace_id INTEGER NOT NULL DEFAULT 1,
-            status INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE file_tag_relations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_fingerprint TEXT NOT NULL,
-            tag_code TEXT NOT NULL,
-            code_path TEXT,
-            name_path TEXT
-        );
-        INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
+            "INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
         ('fp_a', 'D:\\ws1\\sub\\a.jpg', 1, 1),
         ('fp_b', 'D:\\ws1\\other\\b.jpg', 1, 1),
-        ('fp_c', 'D:\\ws2\\sub\\c.jpg', 2, 1);
-
-        INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-        ('fp_a', 'builtin.image', '/builtin.file_type/builtin.image', '/文件类型/图片'),
-        ('fp_b', 'builtin.image', '/builtin.file_type/builtin.image', '/文件类型/图片'),
-        ('fp_c', 'builtin.image', '/builtin.file_type/builtin.image', '/文件类型/图片');",
+        ('fp_c', 'D:\\ws2\\sub\\c.jpg', 2, 1);",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_a", "builtin.image", "/builtin.file_type/builtin.image", "/文件类型/图片"),
+            ("fp_b", "builtin.image", "/builtin.file_type/builtin.image", "/文件类型/图片"),
+            ("fp_c", "builtin.image", "/builtin.file_type/builtin.image", "/文件类型/图片"),
+        ],
+    );
 
     let resp = query_taxonomy_tree_fast(
         &pack_conn,
@@ -171,31 +147,21 @@ fn test_inverted_trie_scope_filter() {
 #[test]
 fn test_inverted_trie_cross_branch_isolation_and_paths() {
     let pack_conn = Connection::open_in_memory().unwrap();
-    let master_conn = Connection::open_in_memory().unwrap();
+    let master_conn = setup_model_b_master_conn();
     master_conn
         .execute_batch(
-            "CREATE TABLE workspace_files (
-            file_fingerprint TEXT PRIMARY KEY,
-            path TEXT NOT NULL,
-            workspace_id INTEGER NOT NULL DEFAULT 1,
-            status INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE file_tag_relations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_fingerprint TEXT NOT NULL,
-            tag_code TEXT NOT NULL,
-            code_path TEXT,
-            name_path TEXT
-        );
-        INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
+            "INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
         ('fp_img', 'D:\\ws1\\a.jpg', 1, 1),
-        ('fp_vid', 'D:\\ws1\\b.mp4', 1, 1);
-
-        INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-        ('fp_img', 'builtin.uncensored', '/builtin.file_type/builtin.image/builtin.censorship/builtin.uncensored', '/文件类型/图片/打码程度/无码'),
-        ('fp_vid', 'builtin.uncensored', '/builtin.file_type/builtin.video/builtin.censorship/builtin.uncensored', '/文件类型/视频/打码程度/无码');",
+        ('fp_vid', 'D:\\ws1\\b.mp4', 1, 1);",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_img", "builtin.uncensored", "/builtin.file_type/builtin.image/builtin.censorship/builtin.uncensored", "/文件类型/图片/打码程度/无码"),
+            ("fp_vid", "builtin.uncensored", "/builtin.file_type/builtin.video/builtin.censorship/builtin.uncensored", "/文件类型/视频/打码程度/无码"),
+        ],
+    );
 
     let resp = query_taxonomy_tree_fast(
         &pack_conn,
@@ -283,25 +249,21 @@ fn test_inverted_trie_healing_and_fact_dimension_independence() {
     )
     .unwrap();
 
-    let master_conn = rusqlite::Connection::open_in_memory().unwrap();
+    let master_conn = setup_model_b_master_conn();
     master_conn
         .execute_batch(
-            r#"
-        CREATE TABLE file_tag_relations (
-            file_fingerprint TEXT NOT NULL,
-            tag_code TEXT NOT NULL,
-            via_parent_code TEXT,
-            code_path TEXT NOT NULL DEFAULT '',
-            name_path TEXT NOT NULL DEFAULT '',
-            depth INTEGER NOT NULL DEFAULT 1
-        );
-        INSERT INTO file_tag_relations (file_fingerprint, tag_code, via_parent_code, code_path, name_path, depth) VALUES
-            ('fp_1', 'omw.01704761.a', 'builtin.security_level', '/builtin.content_tags/builtin.security_level/omw.01704761.a', '/内容标签/安全等级/公开', 3),
-            ('fp_1', 'builtin.chinese', 'builtin.language_segmentation', '/builtin.content_tags/builtin.language_segmentation/builtin.chinese', '/内容标签/语言细分/中文', 3),
-            ('fp_1', '_ext.he.9ec86979', 'builtin.content_tags', '/builtin.content_tags/_ext.he.9ec86979', '/内容标签/合歆', 2);
-        "#,
+            "INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
+            ('fp_1', 'D:\\files\\fact.txt', 1, 1);",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_1", "omw.01704761.a", "/builtin.content_tags/builtin.security_level/omw.01704761.a", "/内容标签/安全等级/公开"),
+            ("fp_1", "builtin.chinese", "/builtin.content_tags/builtin.language_segmentation/builtin.chinese", "/内容标签/语言细分/中文"),
+            ("fp_1", "_ext.he.9ec86979", "/builtin.content_tags/_ext.he.9ec86979", "/内容标签/合歆"),
+        ],
+    );
 
     let resp = query_taxonomy_tree_fast(&conn, "zh-CN", None, &master_conn, false, None, None).unwrap();
 
@@ -381,37 +343,27 @@ fn test_fast_path_backfills_pack_sort_order_for_roots_and_children() {
         )
         .unwrap();
 
-    let master_conn = Connection::open_in_memory().unwrap();
+    let master_conn = setup_model_b_master_conn();
     master_conn
         .execute_batch(
-            "CREATE TABLE workspace_files (
-            file_fingerprint TEXT PRIMARY KEY,
-            path TEXT NOT NULL,
-            workspace_id INTEGER NOT NULL DEFAULT 1,
-            status INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE file_tag_relations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_fingerprint TEXT NOT NULL,
-            tag_code TEXT NOT NULL,
-            code_path TEXT,
-            name_path TEXT
-        );
-        INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
+            "INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
             ('fp_1', 'D:\\\\files\\\\a.txt', 1, 1),
             ('fp_2', 'D:\\\\files\\\\b.txt', 1, 1),
             ('fp_3', 'D:\\\\files\\\\c.txt', 1, 1),
             ('fp_4', 'D:\\\\files\\\\d.txt', 1, 1),
-            ('fp_5', 'D:\\\\files\\\\e.txt', 1, 1);
-
-        INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-            ('fp_1', 'builtin.image', '/builtin.file_type/builtin.image', '/文件类型/图片'),
-            ('fp_2', 'builtin.novel', '/builtin.file_type/builtin.novel', '/文件类型/小说'),
-            ('fp_3', 'builtin.article', '/builtin.file_type/builtin.article', '/文件类型/文章'),
-            ('fp_4', 'builtin.zhangsan', '/hownet.000000043396.n/builtin.zhangsan', '/作者/张三'),
-            ('fp_5', 'builtin.foo', '/builtin.content_tags/builtin.foo', '/内容标签/未知');",
+            ('fp_5', 'D:\\\\files\\\\e.txt', 1, 1);",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_1", "builtin.image", "/builtin.file_type/builtin.image", "/文件类型/图片"),
+            ("fp_2", "builtin.novel", "/builtin.file_type/builtin.novel", "/文件类型/小说"),
+            ("fp_3", "builtin.article", "/builtin.file_type/builtin.article", "/文件类型/文章"),
+            ("fp_4", "builtin.zhangsan", "/hownet.000000043396.n/builtin.zhangsan", "/作者/张三"),
+            ("fp_5", "builtin.foo", "/builtin.content_tags/builtin.foo", "/内容标签/未知"),
+        ],
+    );
 
     let resp = query_taxonomy_tree_fast(
         &pack_conn,
@@ -449,30 +401,21 @@ fn test_fast_path_backfills_pack_sort_order_for_roots_and_children() {
 #[test]
 fn test_fast_path_without_pack_file_tags_keeps_hardcoded_sort_order() {
     let pack_conn = Connection::open_in_memory().unwrap();
-    let master_conn = Connection::open_in_memory().unwrap();
+    let master_conn = setup_model_b_master_conn();
     master_conn
         .execute_batch(
-            "CREATE TABLE workspace_files (
-            file_fingerprint TEXT PRIMARY KEY,
-            path TEXT NOT NULL,
-            workspace_id INTEGER NOT NULL DEFAULT 1,
-            status INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE file_tag_relations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_fingerprint TEXT NOT NULL,
-            tag_code TEXT NOT NULL,
-            code_path TEXT,
-            name_path TEXT
-        );
-        INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
+            "INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
             ('fp_1', 'D:\\\\files\\\\a.txt', 1, 1),
-            ('fp_2', 'D:\\\\files\\\\b.txt', 1, 1);
-        INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-            ('fp_1', 'builtin.image', '/builtin.file_type/builtin.image', '/文件类型/图片'),
-            ('fp_2', 'builtin.foo', '/builtin.content_tags/builtin.foo', '/内容标签/未知');",
+            ('fp_2', 'D:\\\\files\\\\b.txt', 1, 1);",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_1", "builtin.image", "/builtin.file_type/builtin.image", "/文件类型/图片"),
+            ("fp_2", "builtin.foo", "/builtin.content_tags/builtin.foo", "/内容标签/未知"),
+        ],
+    );
 
     let resp = query_taxonomy_tree_fast(
         &pack_conn,
@@ -506,30 +449,21 @@ fn test_fast_path_without_pack_file_tags_keeps_hardcoded_sort_order() {
 #[test]
 fn test_inverted_trie_healing_pseudo_content_tags() {
     let pack_conn = Connection::open_in_memory().unwrap();
-    let master_conn = Connection::open_in_memory().unwrap();
+    let master_conn = setup_model_b_master_conn();
     master_conn
         .execute_batch(
-            "CREATE TABLE workspace_files (
-            file_fingerprint TEXT PRIMARY KEY,
-            path TEXT NOT NULL,
-            workspace_id INTEGER NOT NULL DEFAULT 1,
-            status INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE file_tag_relations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_fingerprint TEXT NOT NULL,
-            tag_code TEXT NOT NULL,
-            code_path TEXT,
-            name_path TEXT
-        );
-        INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
+            "INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
             ('fp_cam', 'D:\\\\files\\\\cam.jpg', 1, 1),
-            ('fp_txt', 'D:\\\\files\\\\txt.png', 1, 1);
-        INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-            ('fp_cam', '_ext.camera_canon', '/builtin.content_tags/builtin.photography_categories/_ext.camera_canon', '/内容标签/摄影照片细分/Canon EOS 5D Mark II'),
-            ('fp_txt', 'builtin.tiny_text', '/builtin.content_tags/builtin.text_density/builtin.tiny_text', '/内容标签/文字密度/微量文本');",
+            ('fp_txt', 'D:\\\\files\\\\txt.png', 1, 1);",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_cam", "_ext.camera_canon", "/builtin.content_tags/builtin.photography_categories/_ext.camera_canon", "/内容标签/摄影照片细分/Canon EOS 5D Mark II"),
+            ("fp_txt", "builtin.tiny_text", "/builtin.content_tags/builtin.text_density/builtin.tiny_text", "/内容标签/文字密度/微量文本"),
+        ],
+    );
 
     let resp = query_taxonomy_tree_fast(
         &pack_conn,

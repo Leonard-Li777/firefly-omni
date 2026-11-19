@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod cases {
-    use super::super::setup_test_master_and_pack_conns;
+    use super::super::{insert_ftr_rows_b, setup_test_master_and_pack_conns};
     use crate::routes::taxonomy::*;
     use rusqlite::Connection;
 
@@ -32,12 +32,16 @@ fn test_taxonomy_tree_action_flattening_ac1() {
         .execute_batch(
             "INSERT INTO workspace_files (file_fingerprint, path) VALUES
                 ('fp_1', 'D:\\files\\f1.txt'),
-                ('fp_2', 'D:\\files\\f2.txt');
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_1', 'action.delete', '/builtin.category.action/action.replace/action.change/action.modify/action.delete', '/动作生产/更换/改变/修改/删除'),
-                ('fp_2', 'action.search', '/builtin.category.action/action.research/action.deep_research/action.discover/action.search', '/动作生产/研究/深入研究/发掘/搜索');",
+                ('fp_2', 'D:\\files\\f2.txt');",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_1", "action.delete", "/builtin.category.action/action.replace/action.change/action.modify/action.delete", "/动作生产/更换/改变/修改/删除"),
+            ("fp_2", "action.search", "/builtin.category.action/action.research/action.deep_research/action.discover/action.search", "/动作生产/研究/深入研究/发掘/搜索"),
+        ],
+    );
 
     let resp =
         query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None)
@@ -78,11 +82,18 @@ fn test_taxonomy_tree_omw_verb_flattening_ac2() {
     master_conn
         .execute_batch(
             "INSERT INTO workspace_files (file_fingerprint, path) VALUES
-                ('fp_1', 'D:\\files\\code.rs');
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_1', 'action.debug_test', '/omw.00109535.v/hownet.skeleton.anti/action.debug_test', '/改变/反/调测');",
+                ('fp_1', 'D:\\files\\code.rs');",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[(
+            "fp_1",
+            "action.debug_test",
+            "/omw.00109535.v/hownet.skeleton.anti/action.debug_test",
+            "/改变/反/调测",
+        )],
+    );
 
     let resp =
         query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None)
@@ -129,16 +140,20 @@ fn test_taxonomy_tree_noun_hierarchy_preservation_ac3() {
                 ('fp_l2', 'D:\\files\\l2.pdf'),
                 ('fp_l3', 'D:\\files\\l3.pdf'),
                 ('fp_l4', 'D:\\files\\l4.pdf'),
-                ('fp_l5', 'D:\\files\\l5.pdf');
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_l1', 'domain.study', '/domain.study', '/学习资料'),
-                ('fp_l2', 'domain.discipline', '/domain.study/domain.discipline', '/学习资料/学科领域'),
-                ('fp_l3', 'domain.biology', '/domain.study/domain.discipline/domain.biology', '/学习资料/学科领域/生物'),
-                ('fp_l4', 'domain.organism', '/domain.study/domain.discipline/domain.biology/domain.organism', '/学习资料/学科领域/生物/有机体'),
-                ('fp_l5', 'domain.person', '/domain.study/domain.discipline/domain.biology/domain.organism/domain.person', '/学习资料/学科领域/生物/有机体/个人'),
-                ('fp_1', 'domain.villain', '/domain.study/domain.discipline/domain.biology/domain.organism/domain.person/domain.villain', '/学习资料/学科领域/生物/有机体/个人/坏人');",
+                ('fp_l5', 'D:\\files\\l5.pdf');",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_l1", "domain.study", "/domain.study", "/学习资料"),
+            ("fp_l2", "domain.discipline", "/domain.study/domain.discipline", "/学习资料/学科领域"),
+            ("fp_l3", "domain.biology", "/domain.study/domain.discipline/domain.biology", "/学习资料/学科领域/生物"),
+            ("fp_l4", "domain.organism", "/domain.study/domain.discipline/domain.biology/domain.organism", "/学习资料/学科领域/生物/有机体"),
+            ("fp_l5", "domain.person", "/domain.study/domain.discipline/domain.biology/domain.organism/domain.person", "/学习资料/学科领域/生物/有机体/个人"),
+            ("fp_1", "domain.villain", "/domain.study/domain.discipline/domain.biology/domain.organism/domain.person/domain.villain", "/学习资料/学科领域/生物/有机体/个人/坏人"),
+        ],
+    );
 
     let resp =
         query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None)
@@ -192,11 +207,18 @@ fn test_taxonomy_tree_hownet_skeleton_noun_action_flattening_ac4() {
     master_conn
         .execute_batch(
             "INSERT INTO workspace_files (file_fingerprint, path) VALUES
-                ('fp_1', 'D:\\files\\3d.blend');
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_1', 'action.render', '/builtin.category.action/hownet.act/hownet.do/action.recreate/action.render', '/动作生产/行动/作/再造/渲染');",
+                ('fp_1', 'D:\\files\\3d.blend');",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[(
+            "fp_1",
+            "action.render",
+            "/builtin.category.action/hownet.act/hownet.do/action.recreate/action.render",
+            "/动作生产/行动/作/再造/渲染",
+        )],
+    );
 
     let resp =
         query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None)
@@ -231,12 +253,16 @@ fn test_taxonomy_tree_verb_direct_file_preservation_ac5() {
         .execute_batch(
             "INSERT INTO workspace_files (file_fingerprint, path) VALUES
                 ('fp_1', 'D:\\files\\f1.txt'),
-                ('fp_2', 'D:\\files\\f2.txt');
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_1', 'action.delete', '/builtin.category.action/action.modify/action.delete', '/动作生产/修改/删除'),
-                ('fp_2', 'action.modify', '/builtin.category.action/action.modify', '/动作生产/修改');",
+                ('fp_2', 'D:\\files\\f2.txt');",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_1", "action.delete", "/builtin.category.action/action.modify/action.delete", "/动作生产/修改/删除"),
+            ("fp_2", "action.modify", "/builtin.category.action/action.modify", "/动作生产/修改"),
+        ],
+    );
 
     let resp =
         query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None)
@@ -274,12 +300,16 @@ fn test_taxonomy_tree_multi_branch_collision_file_count_axiom_ac6() {
         .execute_batch(
             "INSERT INTO workspace_files (file_fingerprint, path) VALUES
                 ('fp_1', 'D:\\files\\f1.txt'),
-                ('fp_2', 'D:\\files\\f2.txt');
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_1', 'action.sync', '/builtin.category.action/action.branch_a/action.sync', '/动作生产/分支A/同步'),
-                ('fp_2', 'action.sync', '/builtin.category.action/action.branch_b/action.sync', '/动作生产/分支B/同步');",
+                ('fp_2', 'D:\\files\\f2.txt');",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_1", "action.sync", "/builtin.category.action/action.branch_a/action.sync", "/动作生产/分支A/同步"),
+            ("fp_2", "action.sync", "/builtin.category.action/action.branch_b/action.sync", "/动作生产/分支B/同步"),
+        ],
+    );
 
     let resp =
         query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None)
@@ -316,12 +346,16 @@ fn test_taxonomy_tree_shell_noun_bypass_ac7() {
         .execute_batch(
             "INSERT INTO workspace_files (file_fingerprint, path) VALUES
                 ('fp_doc', 'D:\\files\\work.docx'),
-                ('fp_1', 'D:\\files\\doc.docx');
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_doc', 'doc.work', '/doc.work', '/工作文档'),
-                ('fp_1', 'status.done', '/doc.work/omw.00024720.n/status.done', '/工作文档/状态/处理完毕');",
+                ('fp_1', 'D:\\files\\doc.docx');",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_doc", "doc.work", "/doc.work", "/工作文档"),
+            ("fp_1", "status.done", "/doc.work/omw.00024720.n/status.done", "/工作文档/状态/处理完毕"),
+        ],
+    );
 
     let resp =
         query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None)
@@ -355,11 +389,18 @@ fn test_taxonomy_tree_function_word_rejection_ac8() {
     master_conn
         .execute_batch(
             "INSERT INTO workspace_files (file_fingerprint, path) VALUES
-                ('fp_1', 'D:\\files\\f1.txt');
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_1', 'func.some_particle', '/builtin.category.function_word/func.some_particle', '/虚词/的');",
+                ('fp_1', 'D:\\files\\f1.txt');",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[(
+            "fp_1",
+            "func.some_particle",
+            "/builtin.category.function_word/func.some_particle",
+            "/虚词/的",
+        )],
+    );
 
     let resp =
         query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None)
@@ -389,12 +430,16 @@ fn test_taxonomy_tree_noun_tops_bypass_ac9() {
         .execute_batch(
             "INSERT INTO workspace_files (file_fingerprint, path) VALUES
                 ('fp_prop', 'D:\\files\\prop.pdf'),
-                ('fp_1', 'D:\\files\\contract.pdf');
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_prop', 'omw.13329641.n', '/omw.00032613.n/omw.13329641.n', '/所有/财产'),
-                ('fp_1', 'tag.contract', '/omw.00032613.n/omw.13329641.n/tag.contract', '/所有/财产/转让合同');",
+                ('fp_1', 'D:\\files\\contract.pdf');",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_prop", "omw.13329641.n", "/omw.00032613.n/omw.13329641.n", "/所有/财产"),
+            ("fp_1", "tag.contract", "/omw.00032613.n/omw.13329641.n/tag.contract", "/所有/财产/转让合同"),
+        ],
+    );
 
     let resp =
         query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None)
@@ -443,13 +488,17 @@ fn test_taxonomy_tree_parent_child_duplicate_name_folding_ac10() {
             "INSERT INTO workspace_files (file_fingerprint, path) VALUES
                 ('fp_cap_direct', 'D:\\files\\capital.txt'),
                 ('fp_cap_b', 'D:\\files\\capital_b.txt'),
-                ('fp_money', 'D:\\files\\money.txt');
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_cap_direct', 'omw.13353607.n', '/omw.13353607.n', '/资本'),
-                ('fp_cap_b', 'omw.13353858.n', '/omw.13353607.n/omw.13353858.n', '/资本/资本'),
-                ('fp_money', 'omw.13354154.n', '/omw.13353607.n/omw.13353858.n/omw.13354154.n', '/资本/资本/钱财');",
+                ('fp_money', 'D:\\files\\money.txt');",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_cap_direct", "omw.13353607.n", "/omw.13353607.n", "/资本"),
+            ("fp_cap_b", "omw.13353858.n", "/omw.13353607.n/omw.13353858.n", "/资本/资本"),
+            ("fp_money", "omw.13354154.n", "/omw.13353607.n/omw.13353858.n/omw.13354154.n", "/资本/资本/钱财"),
+        ],
+    );
 
     let resp =
         query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None)
@@ -508,13 +557,17 @@ fn test_taxonomy_tree_single_novel_deduplication_and_loop_prevention() {
             "INSERT INTO workspace_files (file_fingerprint, path) VALUES
                 ('fp_novel_legacy', 'D:\\files\\novel1.txt'),
                 ('fp_novel_canonical', 'D:\\files\\novel2.txt'),
-                ('fp_novel_loop', 'D:\\files\\novel3.txt');
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_novel_legacy', 'omw.06367879.n', '/builtin.e_book/builtin.e_book_segmentation/omw.06367879.n', '/电子书/电子书细分/小说'),
-                ('fp_novel_canonical', 'omw.03833065.n', '/builtin.e_book/builtin.e_book_segmentation/omw.03833065.n', '/电子书/电子书细分/小说'),
-                ('fp_novel_loop', 'omw.03833065.n', '/builtin.e_book/builtin.e_book_segmentation/omw.03833065.n/builtin.theme/omw.03833065.n', '/电子书/电子书细分/小说/题材/小说');",
+                ('fp_novel_loop', 'D:\\files\\novel3.txt');",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[
+            ("fp_novel_legacy", "omw.06367879.n", "/builtin.e_book/builtin.e_book_segmentation/omw.06367879.n", "/电子书/电子书细分/小说"),
+            ("fp_novel_canonical", "omw.03833065.n", "/builtin.e_book/builtin.e_book_segmentation/omw.03833065.n", "/电子书/电子书细分/小说"),
+            ("fp_novel_loop", "omw.03833065.n", "/builtin.e_book/builtin.e_book_segmentation/omw.03833065.n/builtin.theme/omw.03833065.n", "/电子书/电子书细分/小说/题材/小说"),
+        ],
+    );
 
     let resp =
         query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, true, None, None)
@@ -578,25 +631,50 @@ fn test_content_tags_single_child_collapse_and_default_mode_safety() {
     master_conn
         .execute_batch(
             "CREATE TABLE workspace_files (
-                file_fingerprint TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_fingerprint TEXT NOT NULL UNIQUE,
                 path TEXT NOT NULL,
                 workspace_id INTEGER NOT NULL DEFAULT 1,
                 status INTEGER NOT NULL DEFAULT 1
             );
-            CREATE TABLE file_tag_relations (
+            -- 模型 B：files.id / tag_paths / ftr(path_id, WITHOUT ROWID) / file_tags_private
+            CREATE TABLE files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_fingerprint TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE tag_paths (
+                path_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                leaf_code TEXT NOT NULL,
+                via_parent_code TEXT NOT NULL DEFAULT '',
+                code_path TEXT NOT NULL UNIQUE,
+                depth INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE file_tag_relations (
                 file_fingerprint TEXT NOT NULL,
                 tag_code TEXT NOT NULL,
-                code_path TEXT,
-                name_path TEXT
+                via_parent_code TEXT NOT NULL DEFAULT '',
+                path_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (file_fingerprint, tag_code, via_parent_code)
+            ) WITHOUT ROWID;
+            CREATE TABLE file_tags_private (
+                code TEXT PRIMARY KEY,
+                name TEXT NOT NULL
             );
             INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
-                ('fp_1', 'D:\\files\\throne.jpg', 1, 1);
-
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_1', 'omw.throne.n', '/builtin.content_tags/omw.furniture.n/omw.seat.n/omw.throne.n', '/内容标签/家具/座位/宝座');",
+                ('fp_1', 'D:\\files\\throne.jpg', 1, 1);",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[(
+            "fp_1",
+            "omw.throne.n",
+            "/builtin.content_tags/omw.furniture.n/omw.seat.n/omw.throne.n",
+            "/内容标签/家具/座位/宝座",
+        )],
+    );
 
     let resp1 = query_taxonomy_tree_fast(
         &pack_conn,
@@ -629,11 +707,18 @@ fn test_content_tags_single_child_collapse_and_default_mode_safety() {
     master_conn
         .execute_batch(
             "INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
-                ('fp_2', 'D:\\files\\sofa.jpg', 1, 1);
-            INSERT INTO file_tag_relations (file_fingerprint, tag_code, code_path, name_path) VALUES
-                ('fp_2', 'omw.sofa.n', '/builtin.content_tags/omw.furniture.n/omw.seat.n/omw.sofa.n', '/内容标签/家具/座位/沙发');",
+                ('fp_2', 'D:\\files\\sofa.jpg', 1, 1);",
         )
         .unwrap();
+    insert_ftr_rows_b(
+        &master_conn,
+        &[(
+            "fp_2",
+            "omw.sofa.n",
+            "/builtin.content_tags/omw.furniture.n/omw.seat.n/omw.sofa.n",
+            "/内容标签/家具/座位/沙发",
+        )],
+    );
 
     let resp2 = query_taxonomy_tree_fast(
         &pack_conn,

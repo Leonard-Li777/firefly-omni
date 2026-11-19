@@ -17,35 +17,14 @@ pub fn query_taxonomy_tree_fast(
     let t_start = std::time::Instant::now();
     let lang = locale.split('-').next().unwrap_or("zh");
 
-    // 1. 检查主库中表与列的存在性
-    let has_ftr: bool = master_conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file_tag_relations'",
-            [],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-
-    if !has_ftr {
-        return Ok(TaxonomyTreeResponse {
-            locale: locale.to_string(),
-            root_nodes: Vec::new(),
-            total_nodes: 0,
-        });
-    }
-
-    let mut has_code_path = false;
-    let mut has_name_path = false;
-    if let Ok(mut col_stmt) = master_conn.prepare("PRAGMA table_info(file_tag_relations)") {
-        if let Ok(rows) = col_stmt.query_map([], |r| r.get::<_, String>(1)) {
-            for col in rows.flatten() {
-                if col == "code_path" {
-                    has_code_path = true;
-                } else if col == "name_path" {
-                    has_name_path = true;
-                }
-            }
-        }
+    // 1. 模型 B 唯一路径：物化路径已外迁至微型字典 tag_paths，file_tag_relations 仅保留 4B 外键 path_id。
+    // 热路径不再做 PRAGMA table_info(file_tag_relations) / sqlite_master 模型探测（Spec §2.5.3）。
+    // 缺 tag_paths 表属 schema 缺失，必须 tracing::warn! 显式上报并返回错误，严禁静默吞异常降级为空树。
+    if !table_exists(master_conn, "tag_paths") {
+        tracing::warn!(
+            "[TaxonomyTreeFast] 业务主库缺少 tag_paths 表（模型 B 唯一路径字典），无法建树"
+        );
+        anyhow::bail!("[TaxonomyTreeFast] 业务主库缺少 tag_paths 表（模型 B 必需）");
     }
 
     let has_wf: bool = master_conn
@@ -94,137 +73,140 @@ pub fn query_taxonomy_tree_fast(
         }
     }
 
-    // Seam B · tag_paths 快路探测（工单08 · 消费方改造，只读端）：
-    // 目标态下完整物化路径存微型字典 tag_paths.code_path（模型 B）。写入端 ensureTagPath 属独立
-    // 「路径模型 A→B 迁移」工单，本函数仅做只读消费，不触碰写入端（避免两套并行写入）。
-    //
-    // 快路生效条件（三者同时满足）：① tag_paths 表存在；② 且有数据；③ file_tag_relations 含 `path_id` 列。
-    // 生效时用 `LEFT JOIN tag_paths` 经 `ftr.path_id` 取 `tp.code_path`（混合/部分迁移行在 `has_code_path` 时回退 `ftr.code_path`），
-    // 路径字典通常仅数千行，JOIN 代价远低于逐行重算路径；空表或无 `path_id` 列时安全回退模型 A。
-    let tag_paths_populated: bool = master_conn
-        .query_row(
-            "SELECT CASE WHEN (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tag_paths') > 0 \
-             THEN (SELECT COUNT(*) FROM tag_paths) > 0 ELSE 0 END",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|v| v > 0)
-        .unwrap_or(false);
+    // Seam B · 模型 B 唯一路径收敛：物化路径一律经 `ftr.path_id JOIN tag_paths tp` 取 `tp.code_path`。
+    // 已彻底删除模型 A 的 has_code_path / has_name_path 分支、ftr.code_path 直读与
+    // COALESCE(ftr.code_path) 兜底；展示名改由「语义包 tag_aliases_{lang} + 业务主库
+    // file_tags_private」按 code_path 段序实时回译（不依赖已删除的 ftr.name_path）。
 
-    // 快路：tag_paths 有数据时，路径改由 JOIN tag_paths 经 ftr.path_id 取（模型 B）；
-    // 回退：否则用 ftr.code_path 直读（模型 A）。ftr.path_id 在目标态为外键，存量库无此列时快路自然关闭。
-    let use_tag_paths_fast = tag_paths_populated
-        && master_conn
-            .prepare("PRAGMA table_info(file_tag_relations)")
-            .ok()
-            .and_then(|mut s| {
-                s.query_map([], |r| r.get::<_, String>(1))
-                    .ok()
-                    .map(|rows| rows.flatten().any(|c| c == "path_id"))
-            })
-            .unwrap_or(false);
-    if use_tag_paths_fast {
-        tracing::info!(
-            "[TaxonomyTreeFast] tag_paths 快路生效（模型 B：ftr.path_id JOIN tag_paths.code_path）"
-        );
-    } else if tag_paths_populated {
+    // Seam B · 模型 B 清 rowid（防 WITHOUT ROWID 报错 & VACUUM 错位）：
+    // has_wf 分支取 wf.id（文件级唯一）；!has_wf 分支强制 JOIN files 取 f.id，与 has_wf 语义对齐。
+    // 模型 B 的 file_tag_relations 为 WITHOUT ROWID，ftr.rowid 物理不存在，故彻底删除该回退分支，
+    // 主库既无 workspace_files 又无 files 时显式 warn + 返回错误（禁静默吞）。
+    if !has_wf && !table_exists(master_conn, "files") {
         tracing::warn!(
-            "[TaxonomyTreeFast] tag_paths 有数据但 file_tag_relations 缺 path_id 列，回退 code_path 直读（模型 A）"
+            "[TaxonomyTreeFast] 主库缺少 workspace_files 与 files 表，无法取文件级 id（模型 B 禁用 ftr.rowid）"
         );
+        anyhow::bail!("[TaxonomyTreeFast] 主库缺少 workspace_files 与 files 表（模型 B 必需）");
     }
 
-    // 路径列表达式 + JOIN 子句：快路（模型 B）经 ftr.path_id LEFT JOIN tag_paths 取 code_path
-    // （当混合库同时存在 code_path 列时优先 tp.code_path、否则回退 ftr.code_path，避免 path_id NULL 漏行）；
-    // 纯模型 A 用 ftr.code_path 直读。name_path 在模型 B 的 ftr 中已移除，统一取 ''（展示名后续由 tag_aliases 解析）。
-    let code_path_expr = if use_tag_paths_fast {
-        if has_code_path {
-            "COALESCE(tp.code_path, ftr.code_path, '')".to_string()
-        } else {
-            "COALESCE(tp.code_path, '')".to_string()
-        }
-    } else if has_code_path {
-        "ftr.code_path".to_string()
-    } else {
-        "''".to_string()
-    };
-    let name_path_expr = if use_tag_paths_fast || !has_name_path {
-        "''".to_string()
-    } else {
-        "ftr.name_path".to_string()
-    };
-    let tag_paths_join = if use_tag_paths_fast {
-        " LEFT JOIN tag_paths tp ON tp.path_id = ftr.path_id "
-    } else {
-        " "
-    };
-
-    // Seam B · !has_wf 分支 rowid 修复：
-    // 旧实现取 `ftr.rowid`（file_tag_relations 主键含 tag_code/via_parent_code → 同一文件多 tag
-    // 产生多行不同 rowid），使 RoaringBitmap 按「关系行」计数而非按「文件」计数，导致 file_count 虚高。
-    // 当主库存在 files 表时 JOIN files 取 `f.rowid`（文件级唯一），与 has_wf 分支的 `wf.rowid` 语义对齐；
-    // 仅当精简测试夹具既无 workspace_files 又无 files 表时 warn 后回退 `ftr.rowid`。
-    let has_files: bool = !has_wf && table_exists(master_conn, "files");
-    if !has_wf && !has_files {
-        tracing::warn!(
-            "[TaxonomyTreeFast] 主库缺少 workspace_files 与 files 表，回退 ftr.rowid（仅兼容精简测试夹具）"
-        );
-    }
+    // 统一列序：path_id, code_path, 文件级 id, file_fingerprint。
+    // 仅对唯一 path_id 建 Trie，故不再逐行取 tag_code（由 code_path 末段即 leaf_code 推导）。
     let select_sql = if has_wf && !where_clauses.is_empty() {
         format!(
-            "SELECT DISTINCT wf.rowid, ftr.file_fingerprint, ftr.tag_code, {}, {} \
-             FROM file_tag_relations ftr{}\
+            "SELECT ftr.path_id, tp.code_path, wf.id, ftr.file_fingerprint \
+             FROM file_tag_relations ftr \
+             JOIN tag_paths tp ON tp.path_id = ftr.path_id \
              JOIN workspace_files wf ON wf.file_fingerprint = ftr.file_fingerprint \
              WHERE {}",
-            code_path_expr,
-            name_path_expr,
-            tag_paths_join,
             where_clauses.join(" AND ")
         )
     } else if has_wf {
         format!(
-            "SELECT DISTINCT wf.rowid, ftr.file_fingerprint, ftr.tag_code, {}, {} \
-             FROM file_tag_relations ftr{}\
-             JOIN workspace_files wf ON wf.file_fingerprint = ftr.file_fingerprint",
-            code_path_expr,
-            name_path_expr,
-            tag_paths_join
-        )
-    } else if has_files {
-        format!(
-            "SELECT DISTINCT f.rowid, ftr.file_fingerprint, ftr.tag_code, {}, {} \
-             FROM file_tag_relations ftr{}\
-             JOIN files f ON f.file_fingerprint = ftr.file_fingerprint",
-            code_path_expr,
-            name_path_expr,
-            tag_paths_join
+            "SELECT ftr.path_id, tp.code_path, wf.id, ftr.file_fingerprint \
+             FROM file_tag_relations ftr \
+             JOIN tag_paths tp ON tp.path_id = ftr.path_id \
+             JOIN workspace_files wf ON wf.file_fingerprint = ftr.file_fingerprint"
         )
     } else {
         format!(
-            "SELECT ftr.rowid, ftr.file_fingerprint, ftr.tag_code, {}, {} \
-             FROM file_tag_relations ftr{}",
-            code_path_expr,
-            name_path_expr,
-            tag_paths_join
+            "SELECT ftr.path_id, tp.code_path, f.id, ftr.file_fingerprint \
+             FROM file_tag_relations ftr \
+             JOIN tag_paths tp ON tp.path_id = ftr.path_id \
+             JOIN files f ON f.file_fingerprint = ftr.file_fingerprint"
         )
     };
 
     let mut stmt = master_conn.prepare(&select_sql)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
-        let raw_id: i64 = row.get(0)?;
-        let fp: String = row.get(1)?;
-        let tag_code: String = row.get(2)?;
-        let code_path: String = row.get(3).unwrap_or_default();
-        let name_path: String = row.get(4).unwrap_or_default();
-        Ok((raw_id, fp, tag_code, code_path, name_path))
+        let path_id: i64 = row.get(0)?;
+        let code_path: String = row.get(1)?;
+        let raw_id: i64 = row.get(2)?;
+        let fp: String = row.get(3)?;
+        Ok((path_id, code_path, raw_id, fp))
     })?;
+
+    // 2.1 按唯一 path_id 预聚合（模型 B 核心提速）：几十万关系行先压缩为数千个唯一 path_id，
+    // 每行的文件级 id 并入对应 RoaringBitmap，file_fingerprint 单独保序收集（供 include_files 输出）。
+    let mut path_agg: HashMap<i64, (String, roaring::RoaringBitmap)> = HashMap::new();
+    let mut path_fps: HashMap<i64, HashSet<String>> = HashMap::new();
+    let mut all_path_codes: HashSet<String> = HashSet::new();
+    for r in rows.flatten() {
+        let (path_id, code_path, raw_id, fp) = r;
+        if fp.trim().is_empty() {
+            continue;
+        }
+        let entry = path_agg
+            .entry(path_id)
+            .or_insert_with(|| (code_path.clone(), roaring::RoaringBitmap::new()));
+        if raw_id >= 0 && raw_id <= (u32::MAX as i64) {
+            entry.1.insert(raw_id as u32);
+        } else {
+            tracing::error!("[Omni] 检测到非法文件整型 ID（path_id={}）: {}", path_id, raw_id);
+        }
+        path_fps.entry(path_id).or_default().insert(fp);
+        for seg in code_path.split('/').filter(|s| !s.is_empty()) {
+            all_path_codes.insert(seg.to_string());
+        }
+    }
+
+    // 2.2 展示名映射：语义包受控别名 canonical + 业务主库 file_tags_private（非受控 _ext.*/user.* 兜底）。
+    // 模型 B 已删除 ftr.name_path，段序译名全部实时回译，严禁静默吞异常。
+    let mut resolved_names: HashMap<String, String> = HashMap::new();
+    let target_table = omni_pro::resolve_tag_aliases_table(locale);
+    let all_path_codes: Vec<String> = all_path_codes.into_iter().collect();
+    if !all_path_codes.is_empty() {
+        if table_exists(conn, target_table) {
+            for chunk in all_path_codes.chunks(200) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT tag_code, lemma FROM {target_table} WHERE is_canonical = 1 AND tag_code IN ({placeholders})"
+                );
+                if let Ok(mut stmt) = conn.prepare(&sql) {
+                    let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+                    if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    }) {
+                        for (c, l) in rows.flatten() {
+                            resolved_names.insert(c, l);
+                        }
+                    }
+                }
+            }
+        }
+        // 非受控 _ext.* / user.* 展示名统一查 file_tags_private（不依赖已删除的 ftr.name_path）
+        if table_exists(master_conn, "file_tags_private") {
+            for chunk in all_path_codes.chunks(200) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT code, name FROM file_tags_private WHERE code IN ({placeholders})"
+                );
+                if let Ok(mut stmt) = master_conn.prepare(&sql) {
+                    let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+                    if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    }) {
+                        for (c, n) in rows.flatten() {
+                            resolved_names.entry(c).or_insert(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let mut node_map: HashMap<String, TrieNode> = HashMap::new();
 
-    // 2. 遍历活跃记录，自顶向下构建前缀树 Trie
-    for r in rows.flatten() {
-        let (raw_id, fp, tag_code, raw_code_path, raw_name_path) = r;
-        if fp.trim().is_empty() || tag_code.trim().is_empty() {
+    // 2. 仅对唯一 path_id 各做一次 code_path.split('/') 建 Trie（模型 B 核心提速）：
+    // path_agg 已把几十万关系行压成数千条唯一 path_id，逐行切串开销从 O(关系行数) 降为 O(唯一 path_id 数)。
+    // 按 path_id 升序保证装配顺序确定（与写入顺序一致，避免 HashMap 随机序影响同码辩论归属）。
+    let mut agg_entries: Vec<_> = path_agg.iter().collect();
+    agg_entries.sort_by_key(|(path_id, _)| **path_id);
+    for (path_id, (raw_code_path, bitmap)) in agg_entries {
+        let fps = path_fps.get(path_id);
+        // code_path 末段即 leaf_code（模型 B tag_paths.leaf_code 锚点），无需逐行读 ftr.tag_code
+        let tag_code = raw_code_path.rsplit('/').next().unwrap_or("").to_string();
+        if tag_code.trim().is_empty() {
             continue;
         }
 
@@ -238,20 +220,16 @@ pub fn query_taxonomy_tree_fast(
         let code_geo_location = omni_core::concepts::Concept::地理位置.code();
         let code_author = omni_core::concepts::Concept::作者.code();
 
-        let name_content_tags = omni_core::concepts::Concept::内容标签.zh_name();
         let name_geo_location = omni_core::concepts::Concept::地理位置.zh_name();
         let name_author = omni_core::concepts::Concept::作者.zh_name();
         let name_file_type = omni_core::concepts::Concept::文件类型.zh_name();
         let name_document = omni_core::concepts::Concept::文档.zh_name();
 
         // 悲观数据兜底 (M-3)：若 code_path 为空，回退虚拟挂载至 /{code_content_tags}/{tag_code}
-        let (eff_code_path, eff_name_path) = if raw_code_path.trim().is_empty() {
-            (
-                format!("/{}/{}", code_content_tags, tag_code),
-                format!("/{}/{}", name_content_tags, tag_code),
-            )
+        let eff_code_path = if raw_code_path.trim().is_empty() {
+            format!("/{}/{}", code_content_tags, tag_code)
         } else {
-            (raw_code_path, raw_name_path)
+            raw_code_path.clone()
         };
 
         let mut code_segs: Vec<String> = eff_code_path
@@ -260,16 +238,15 @@ pub fn query_taxonomy_tree_fast(
             .filter(|s| !s.is_empty())
             .collect();
 
-        let mut name_segs: Vec<String> = eff_name_path
-            .split('/')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        // 模型 B 无 ftr.name_path：按 code_path 段序从 resolved_names（语义包 + file_tags_private）实时回译展示名
+        let mut name_segs: Vec<String> = code_segs
+            .iter()
+            .map(|seg| resolved_names.get(seg).cloned().unwrap_or_else(|| seg.clone()))
             .collect();
 
         if code_segs.is_empty() {
             code_segs.push(code_content_tags.to_string());
             code_segs.push(tag_code.clone());
-            name_segs.push(name_content_tags.to_string());
             name_segs.push(tag_code.clone());
         }
 
@@ -480,16 +457,14 @@ pub fn query_taxonomy_tree_fast(
 
             // 【捍卫真实父与逻辑父文件计数公理 (M-1)】
             // 中间祖先节点 (逻辑父) direct_files 初始化为 ∅
-            // 唯有路径末级命中节点才累加 direct_files
+            // 唯有路径末级命中节点才并入该 path_id 预聚合的整块 RoaringBitmap（一次 OR，非逐关系行 insert）
             if i == seg_len - 1 {
                 if let Some(target_node) = node_map.get_mut(&curr_code_path) {
-                    if raw_id >= 0 && raw_id <= (u32::MAX as i64) {
-                        target_node.direct_bitmap.insert(raw_id as u32);
-                    } else {
-                        tracing::error!("[Omni] 检测到非法文件整型 ID: {}", raw_id);
-                    }
+                    target_node.direct_bitmap |= bitmap;
                     if include_files {
-                        target_node.direct_files.insert(fp.clone());
+                        if let Some(fps) = fps {
+                            target_node.direct_files.extend(fps.iter().cloned());
+                        }
                     }
                 }
             }
@@ -543,29 +518,8 @@ pub fn query_taxonomy_tree_fast(
         }
     }
 
-    // 3. 按需查词 (P95 <= 5ms)：仅对 Trie 树涉及的活跃节点批量向 tag_aliases_{lang} 查词
-    let mut resolved_names: HashMap<String, String> = HashMap::new();
-    let target_table = omni_pro::resolve_tag_aliases_table(locale);
-    let has_target_table = table_exists(conn, target_table);
-
-    if has_target_table && !all_codes.is_empty() {
-        for chunk in all_codes.chunks(200) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
-                "SELECT tag_code, lemma FROM {target_table} WHERE is_canonical = 1 AND tag_code IN ({placeholders})"
-            );
-            if let Ok(mut stmt) = conn.prepare(&sql) {
-                let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
-                if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                }) {
-                    for (c, l) in rows.flatten() {
-                        resolved_names.insert(c, l);
-                    }
-                }
-            }
-        }
-    }
+    // 3. 展示名已在 2.2 阶段按唯一 path_id 的 code_path 段序批量回译完毕
+    // （语义包 tag_aliases_{lang} canonical + 业务主库 file_tags_private），无需再按 all_codes 二次查词。
 
     // 5. 顶层根节点过滤与排序输出（节点结构转换与子树装配委托 tree_assemble）
     let mut roots = Vec::new();
