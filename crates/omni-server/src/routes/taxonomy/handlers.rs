@@ -4,11 +4,9 @@ use axum::{
 };
 use crate::AppState;
 use super::types::*;
-use super::connection::*;
 use super::tree_query::*;
 use super::alias_query::*;
 use super::inspect::*;
-use super::utils::*;
 
 /// 获取分类树：GET /api/v1/taxonomy/tree?locale={locale}&root={root}
 pub async fn taxonomy_tree_handler(

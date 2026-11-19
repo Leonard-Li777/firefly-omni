@@ -2,9 +2,8 @@ use axum::{extract::State, Json};
 use rusqlite::Connection;
 use crate::AppState;
 use super::types::*;
-use super::connection::*;
 use super::utils::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub fn inspect_single_tag(
     conn: &Connection,
@@ -120,11 +119,21 @@ fn inspect_single_tag_internal(
     // 2. 针对候选条目拉取直接 parent_codes 并运行祖先闭包检测
     let fetch_parent_codes = |c: &str| -> Vec<String> {
         let sql = "SELECT parent_codes FROM file_tags WHERE code = ?1";
-        if let Ok(raw) = conn.query_row(sql, [c], |row| row.get::<_, Option<String>>(0)) {
-            if let Some(json_str) = raw {
-                if let Ok(parsed) = serde_json::from_str::<Vec<String>>(&json_str) {
-                    return parsed;
+        match conn.query_row(sql, [c], |row| row.get::<_, Option<String>>(0)) {
+            Ok(Some(json_str)) => match serde_json::from_str::<Vec<String>>(&json_str) {
+                Ok(parsed) => return parsed,
+                Err(e) => {
+                    tracing::warn!(
+                        "[Inspect] 解析 parent_codes JSON 失败 (code={}): {}",
+                        c,
+                        e
+                    );
                 }
+            },
+            Ok(None) => {}
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => {
+                tracing::warn!("[Inspect] 查询 parent_codes 失败 (code={}): {}", c, e);
             }
         }
         Vec::new()
@@ -393,6 +402,10 @@ pub fn load_dimension_policies_from_db(
         return policies;
     };
     if !path.exists() {
+        tracing::warn!(
+            "[Inspect] 业务主库路径不存在，维度策略降级为默认值: {}",
+            path.display()
+        );
         return policies;
     }
 
@@ -418,11 +431,30 @@ pub fn load_dimension_policies_from_db(
         |row| row.get(0),
     );
 
-    if let Ok(raw) = val_str {
-        if let Ok(db_policies) = serde_json::from_str::<HashMap<String, omni_core::DimensionExecutionPolicy>>(&raw) {
-            for (code, policy) in db_policies {
-                policies.insert(code, policy);
+    match val_str {
+        Ok(raw) => {
+            match serde_json::from_str::<HashMap<String, omni_core::DimensionExecutionPolicy>>(&raw) {
+                Ok(db_policies) => {
+                    for (code, policy) in db_policies {
+                        policies.insert(code, policy);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[Inspect] 解析 system_config.DIMENSION_POLICIES JSON 失败，沿用默认策略: {}",
+                        e
+                    );
+                }
             }
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            // 未配置自定义维度策略时正常沿用内置默认策略
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[Inspect] 读取 system_config.DIMENSION_POLICIES 失败，沿用默认策略: {}",
+                e
+            );
         }
     }
     policies
