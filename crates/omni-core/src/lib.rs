@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+/// SQLite 数据库工具
+///
+/// 连接级 PRAGMA 的跨 crate 唯一权威实现（工单09 · 单一收口），
+/// 被 omni-server（taxonomy/connection.rs）与 omni-hownet（db.rs）共用。
+pub mod db_sqlite;
+pub use db_sqlite::apply_readonly_pragmas;
+
 /// 受控标签跨语言身份（别名 → code）
 pub mod tag_identity;
 pub use tag_identity::is_controlled_code;

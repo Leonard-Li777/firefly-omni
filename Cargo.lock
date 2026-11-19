@@ -4468,6 +4468,7 @@ name = "omni-hownet"
 version = "0.1.9"
 dependencies = [
  "anyhow",
+ "omni-core",
  "rusqlite",
  "serde",
  "serde_json",
