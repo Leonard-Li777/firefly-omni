@@ -134,7 +134,7 @@ pub struct OmniConfig {
     /// 文档 OCR 识别数量上限（Office 内嵌图数 / PDF 页数），0 表示不识别，-1 表示不限，默认 3
     pub max_document_ocr_items: i32,
     pub enable_image_ocr: bool,
-    /// OCR 识别模型精度/尺寸 ('tiny' | 'small' | 'medium')
+    /// OCR 识别模型精度/尺寸 ('tiny' | 'small')
     pub ocr_model_size: String,
     /// 文本提取上限（KB）。有符号以承接前端 `-1` 表"不限"：<= 0 -> usize::MAX，杜绝 422 与乘法溢出
     pub max_content_size_kb: i32,

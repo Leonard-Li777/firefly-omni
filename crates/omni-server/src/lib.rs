@@ -2317,12 +2317,15 @@ async fn perceive_file_handler(
                     .unwrap_or(omni_pro::perceive::VIDEO_SOFT_TOKEN_BUDGET_DEFAULT);
                 // 预算模型必须知道 ASR 真实会跑多久：ASR 成本是 min(A, D)·r，不是 D·r。
                 // 这里与下方 ASR 分支取同一个上限（请求值 → 全局配置），保证两边同源。
-                // 视频伴音 ASR 预算优先读逐请求 `video_asr_duration_sec`（0 = 显式关闭，传 0.0 原样保留），
+                // 视频伴音 ASR 预算优先读逐请求 `video_asr_duration_sec`（enable_asr == Some(false) 或 0 恒传 0.0），
                 // 未传才回退 audio_analysis_duration / 全局配置；绝不再写死 425s。
-                let audio_cap_for_budget = req
-                    .video_asr_duration_sec
-                    .or(req.audio_analysis_duration)
-                    .unwrap_or(cfg.audio_analysis_duration) as f64;
+                let audio_cap_for_budget = if req.enable_asr == Some(false) {
+                    0.0
+                } else {
+                    req.video_asr_duration_sec
+                        .or(req.audio_analysis_duration)
+                        .unwrap_or(cfg.audio_analysis_duration) as f64
+                };
                                 let quota_opt = req.video_frame_quota_max;
                 let cut_sens_opt = req.video_cut_sensitivity.as_deref().map(|s| omni_pro::perceive::VideoCutSensitivity::from_str_opt(Some(s)));
                 let max_analyze_sec_opt = req.video_max_analyze_sec;
