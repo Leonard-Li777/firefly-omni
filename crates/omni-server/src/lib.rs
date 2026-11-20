@@ -19,8 +19,8 @@ use omni_core::{
     AudioConvertRequest, AudioConvertResponse, AudioTranscribeRequest, AudioTranscribeResponse,
     DuplicateFixRequest, DuplicateFixResponse, DuplicateScanRequest, DuplicateScanResponse,
     FsAdsRequest, FsAdsResponse, OmniConfig, OmniExtractionResult, OmniPerceptionBenchmark,
-    OmniPerceptionRequest, OmniPerceptionResult, VisionInspectRequest, VisionInspectResponse,
-    VisionTagsRequest, VisionTagsResponse,
+    OmniPerceptionRequest, OmniPerceptionResult, RequestOverrideProvider, RequestOverrides,
+    VisionInspectRequest, VisionInspectResponse, VisionTagsRequest, VisionTagsResponse,
 };
 use omni_extract::OmniExtractor;
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,33 @@ pub struct AppState {
 #[derive(Deserialize)]
 pub struct ExtractRequest {
     pub file_path: String,
+    #[serde(default)]
+    pub extract_pages: Option<i32>,
+    #[serde(default)]
+    pub enable_image_ocr: Option<bool>,
+    #[serde(default)]
+    pub ocr_model_size: Option<String>,
+    #[serde(default)]
+    pub max_document_ocr_items: Option<i32>,
+    #[serde(default)]
+    pub max_content_size_kb: Option<i32>,
+    #[serde(default, alias = "enableCover")]
+    pub enable_office_cover: Option<bool>,
+}
+
+impl RequestOverrideProvider for ExtractRequest {
+    fn apply_overrides(&self, cfg: &mut OmniConfig) {
+        RequestOverrides {
+            max_content_size_kb: self.max_content_size_kb,
+            enable_image_ocr: self.enable_image_ocr,
+            ocr_model_size: self.ocr_model_size.clone(),
+            max_document_ocr_items: self.max_document_ocr_items,
+            extract_pages: self.extract_pages,
+            enable_office_cover: self.enable_office_cover,
+            ..Default::default()
+        }
+        .apply_to(cfg)
+    }
 }
 
 #[derive(Deserialize)]
@@ -112,6 +139,19 @@ pub struct FilePreviewRequest {
     pub path: String,
     #[serde(default, alias = "skipIfExists")]
     pub skip_if_exists: Option<bool>,
+    /// Office 封面开关（`enableCover` 为历史别名），优先级高于全局 cfg
+    #[serde(default, alias = "enableCover")]
+    pub enable_office_cover: Option<bool>,
+}
+
+impl RequestOverrideProvider for FilePreviewRequest {
+    fn apply_overrides(&self, cfg: &mut OmniConfig) {
+        RequestOverrides {
+            enable_office_cover: self.enable_office_cover,
+            ..Default::default()
+        }
+        .apply_to(cfg)
+    }
 }
 
 /// 桌面业务主库刷新请求体: POST /api/reconnect（`dbPath` = 桌面业务主库路径）
@@ -828,8 +868,11 @@ async fn cover_handler(
 
     let path = PathBuf::from(&req.path);
 
-    // 检查是否开启了 Office 完整封面截图选项 (LibreOffice)
-    let enable_office_cover = state.config.lock().map(|c| c.enable_office_cover).unwrap_or(false);
+    // 逐请求遮蔽全局 cfg：GET /api/cover 优先消费 req.enable_office_cover，
+    // 未传时才回退全局配置；绝不触碰其它全局字段，也不触发模型装卸。
+    let global_cfg = state.config.lock().map(|c| c.clone()).unwrap_or_default();
+    let cfg = global_cfg.with_request_overrides(&req);
+    let enable_office_cover = cfg.enable_office_cover;
 
     // 交由 CoverRenderer 按扩展名路由：
     // 对于 Office 文档，内部会默认先解压提取压缩包中的首张图；无图时仅在 enable_office_cover = true 时才执行 LO 渲染
@@ -1245,7 +1288,9 @@ async fn extract_file_handler(
     State(state): State<AppState>,
     Json(req): Json<ExtractRequest>,
 ) -> Json<OmniExtractionResult> {
-    let cfg = state.config.lock().unwrap().clone();
+    let global_cfg = state.config.lock().unwrap().clone();
+    // 单向遮蔽全局 cfg：本请求逐请求覆盖字段仅存活于局部 cfg，绝不污染全局配置。
+    let cfg = global_cfg.with_request_overrides(&req);
     let t_start = std::time::Instant::now();
     let res = match OmniExtractor::extract(&req.file_path, &cfg).await {
         Ok(res) => {
@@ -1354,6 +1399,7 @@ pub fn run_vision_pipeline_on_image(
     lang: Option<&str>,
     embedding_profile: &str,
     enable_nsfw: bool,
+    enable_image_ocr: bool,
 ) -> Result<VisionComputed, String> {
     let t_vision = std::time::Instant::now();
     let mut out = VisionComputed::default();
@@ -1379,8 +1425,13 @@ pub fn run_vision_pipeline_on_image(
     // 多核并行：7 大视觉算子零拷贝只读引用借用 &img_ref，独立计时
     let scope_res = std::thread::scope(|s| -> Result<(), String> {
         // 1. 文本探活 (DBNet / MobileNet 骨干)
+        // [V11-03] 关闭图片 OCR 时必须在任何模型初始化前短路，零 DBNet 调用、零 Session 加载。
         let h_text = omni_core::timed_spawn!(s, {
-            omni_pro::OmniVisionEngine::fast_detect_has_text(img_ref)
+            if enable_image_ocr {
+                omni_pro::OmniVisionEngine::fast_detect_has_text(img_ref)
+            } else {
+                false
+            }
         });
 
         // 2. 视觉语义标签 (Chinese-CLIP / Mobile-CLIP / EmbeddingGemma)
@@ -1742,6 +1793,7 @@ fn run_vision_pipeline(
     lang: Option<&str>,
     embedding_profile: &str,
     enable_nsfw: bool,
+    enable_image_ocr: bool,
 ) -> Result<VisionComputed, String> {
     let t_vision = std::time::Instant::now();
     let ext = std::path::Path::new(file_path)
@@ -1756,7 +1808,7 @@ fn run_vision_pipeline(
     if is_image {
         match image::open(file_path) {
             Ok(img) => {
-                match run_vision_pipeline_on_image(&img, exif_orient, enable_visual_tags, lang, embedding_profile, enable_nsfw) {
+                match run_vision_pipeline_on_image(&img, exif_orient, enable_visual_tags, lang, embedding_profile, enable_nsfw, enable_image_ocr) {
                     Ok(mut computed) => {
                         computed.duration_ms = t_vision.elapsed().as_millis() as u64;
                         tracing::debug!(
@@ -2011,7 +2063,10 @@ async fn perceive_file_handler(
     State(state): State<AppState>,
     Json(req): Json<OmniPerceptionRequest>,
 ) -> Result<Json<OmniPerceptionResult>, (StatusCode, Json<serde_json::Value>)> {
-    let cfg = state.config.lock().unwrap().clone();
+    let global_cfg = state.config.lock().unwrap().clone();
+    // 单向遮蔽全局 cfg：后续全链路（DBNet / 纯图 OCR / 代表帧 OCR / NSFW / 人脸 / 视频视觉 / ASR）
+    // 统一只读本请求局部 cfg，彻底切断多工作区并发串扰；双 OnceLock OCR 槽位保持常驻零卸载。
+    let cfg = global_cfg.with_request_overrides(&req);
     let t_start = std::time::Instant::now();
     let file_path = req.file_path.clone();
 
@@ -2074,7 +2129,7 @@ async fn perceive_file_handler(
             let mut vision_err: Option<String> = None;
             let vision_res = if is_pro {
                 match tokio::task::spawn_blocking(move || {
-                    run_vision_pipeline(&fp, eo.as_deref(), enable_visual_tags, lang.as_deref(), &profile, cfg.enable_nsfw_perception)
+                    run_vision_pipeline(&fp, eo.as_deref(), enable_visual_tags, lang.as_deref(), &profile, cfg.enable_nsfw_perception, cfg.enable_image_ocr)
                 })
                 .await
                 {
@@ -2099,7 +2154,7 @@ async fn perceive_file_handler(
             let mut ocr_ms = None;
             let mut text_ms = None;
             let mut ocr_text: Option<String> = None;
-            if vision_err.is_none() && vision_res.has_text == Some(true) {
+            if cfg.enable_image_ocr && vision_err.is_none() && vision_res.has_text == Some(true) {
                 let t_ocr = std::time::Instant::now();
                 let p_buf = p.to_path_buf();
                 let ocr_size = cfg.ocr_model_size.clone();
@@ -2243,7 +2298,10 @@ async fn perceive_file_handler(
             let mut video_cover_webp_base64: Option<String> = None;
             let mut video_rep_ocr: Option<String> = None;
             let mut video_ocr_ms: Option<u64> = None;
-            if is_video && is_pro {
+            // [V12-E11] 视频逐帧预算仅在明确开启视觉分析时进入；false 时彻底跳过抽帧与代表帧视觉感知，
+            // 绝不被 perceive.rs 内部的 `.clamp(5, 240)` 强行重开为 5 帧。ASR 分支在本块之外独立执行。
+            let enable_video_visual = req.enable_video_visual_analysis.unwrap_or(true);
+            if is_video && is_pro && enable_video_visual {
                 let (v_wm_lvl, v_wm_status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(&file_path));
                 v.watermark_level = Some(v_wm_lvl);
                 v.has_watermark = Some(v_wm_lvl > 0);
@@ -2259,8 +2317,11 @@ async fn perceive_file_handler(
                     .unwrap_or(omni_pro::perceive::VIDEO_SOFT_TOKEN_BUDGET_DEFAULT);
                 // 预算模型必须知道 ASR 真实会跑多久：ASR 成本是 min(A, D)·r，不是 D·r。
                 // 这里与下方 ASR 分支取同一个上限（请求值 → 全局配置），保证两边同源。
+                // 视频伴音 ASR 预算优先读逐请求 `video_asr_duration_sec`（0 = 显式关闭，传 0.0 原样保留），
+                // 未传才回退 audio_analysis_duration / 全局配置；绝不再写死 425s。
                 let audio_cap_for_budget = req
-                    .audio_analysis_duration
+                    .video_asr_duration_sec
+                    .or(req.audio_analysis_duration)
                     .unwrap_or(cfg.audio_analysis_duration) as f64;
                                 let quota_opt = req.video_frame_quota_max;
                 let cut_sens_opt = req.video_cut_sensitivity.as_deref().map(|s| omni_pro::perceive::VideoCutSensitivity::from_str_opt(Some(s)));
@@ -2305,6 +2366,7 @@ async fn perceive_file_handler(
                         req.language.as_deref(),
                         &cfg.embedding_profile,
                         cfg.enable_nsfw_perception,
+                        cfg.enable_image_ocr,
                     ) {
                         Ok(mut rep_vision) => {
                             // 视频领域排他门禁：严格剔除截图细分、摄影照片细分等图片专有维度
@@ -2350,7 +2412,7 @@ async fn perceive_file_handler(
                     }
 
                     // 3. 视频代表帧 OCR 文本提取 (当画面检测出文字且开启文本分析且视觉感知未失败时)
-                    if vision_err.is_none() && v.has_text == Some(true) && req.enable_text_analysis.unwrap_or(cfg.enable_text_analysis) {
+                    if cfg.enable_image_ocr && vision_err.is_none() && v.has_text == Some(true) && req.enable_text_analysis.unwrap_or(cfg.enable_text_analysis) {
                         let t_ocr = std::time::Instant::now();
                         let dyn_img_for_ocr = dyn_img.clone();
                         let ocr_size = cfg.ocr_model_size.clone();
@@ -2378,30 +2440,40 @@ async fn perceive_file_handler(
             // 仅在音视频文件且 enable_asr 未显式关闭时执行纯内存声学流水线
             // 纯乐谱格式（mid/midi）无语音波形且缺乏音色库，显式排除在 ASR 之外
             let is_not_pure_midi = !matches!(ext.as_str(), "mid" | "midi");
+            // 逐请求时长：视频取 video_asr_duration_sec，纯音频取 audio_analysis_duration；
+            // 显式 0 表示"本次不跑 ASR"，必须在任何解码/模型调用前短路（杜绝 ffmpeg -t 0 空跑）。
+            let requested_asr_duration = if is_video {
+                req.video_asr_duration_sec
+                    .or(req.audio_analysis_duration)
+                    .unwrap_or(cfg.audio_analysis_duration)
+            } else {
+                req.audio_analysis_duration.unwrap_or(cfg.audio_analysis_duration)
+            };
             let should_transcribe = is_audio_or_video
                 && is_not_pure_midi
-                && req.enable_asr.unwrap_or(true);
+                && req.enable_asr.unwrap_or(true)
+                && requested_asr_duration > 0;
 
             if should_transcribe {
                 let t_audio = std::time::Instant::now();
-                // 优先使用请求中传入的截取时长，否则读取全局配置
-                let requested_audio_duration =
-                    req.audio_analysis_duration.unwrap_or(cfg.audio_analysis_duration);
-                // D2 联动（2026-10-24 裁决）：视频侧已按 90s 向量预算截断时，ASR 必须收敛到同一上限。
-                // 否则视频截在 3531s、ASR 却跑完整 2h（7200 × 0.112 = 806s），85s 可用预算被直接打穿。
-                // 未截断 / 时长未知（None）时保持原行为，不擅自裁剪用户请求的时长。
-                // ASR 时长严格按两阶段解耦的 audio_analysis_duration_sec 截断，避免误用全片视频时长
-                let duration_seconds = match video_timings.audio_analysis_duration_sec.or(video_timings.analysis_duration_sec) {
-                    Some(limit) if limit.is_finite() && limit > 0.0 => {
-                        requested_audio_duration.min(limit.round().max(1.0) as u32)
+                // 纯音频按请求 `audio_analysis_duration` 截断（上限为预算求解给出的 425s），
+                // 彻底废除"纯音频无视请求写死吃满 425s"的历史缺陷。
+                let duration_seconds = if is_audio {
+                    requested_asr_duration.min(omni_pro::perceive::max_audio_analysis_duration_sec() as u32)
+                } else {
+                    // D2 联动（2026-10-24 裁决）：视频侧已按 90s 向量预算截断时，ASR 必须收敛到同一上限。
+                    // 否则视频截在 3531s、ASR 却跑完整 2h（7200 × 0.112 = 806s），85s 可用预算被直接打穿。
+                    match video_timings.audio_analysis_duration_sec.or(video_timings.analysis_duration_sec) {
+                        Some(limit) if limit.is_finite() && limit > 0.0 => {
+                            requested_asr_duration.min(limit.round().max(1.0) as u32)
+                        }
+                        _ => requested_asr_duration,
                     }
-                    // 纯音频：没有画面要抢预算，直接吃满 90s 向量预算（≈425s）。
-                    // 「语音识别时长」设置只约束视频——否则纯音频会被同一个 30s 上限锁死。
-                    _ if is_audio => {
-                        omni_pro::perceive::max_audio_analysis_duration_sec() as u32
-                    }
-                    _ => requested_audio_duration,
                 };
+                // 双保险：预算求解恒不为 0，为 0 时直接跳过，杜绝空跑 `ffmpeg -t 0`。
+                if duration_seconds == 0 {
+                    audio_ms = Some(0);
+                } else {
                 let file_path_for_audio = file_path.clone();
                 let sherpa_engine = state.sherpa.clone();
 
@@ -2458,6 +2530,7 @@ async fn perceive_file_handler(
                         map.insert("audio_events".to_string(), serde_json::Value::Array(events_json));
                     }
                 }
+                } // duration_seconds != 0：真实解码与转录分支
             }
 
             (extract_ms, ext_res, v, vision_err, audio_ms, video_chunks, video_timings, video_cover_webp_base64, video_rep_ocr, video_ocr_ms)
@@ -6208,7 +6281,7 @@ mod representative_vision_tests {
         let img = image::DynamicImage::new_rgb8(100, 100);
 
         // 2. 测试 classic_light 档位分流与隔离
-        let res_classic = run_vision_pipeline_on_image(&img, None, false, None, "classic_light", false);
+        let res_classic = run_vision_pipeline_on_image(&img, None, false, None, "classic_light", false, true);
         assert!(res_classic.is_ok(), "classic_light 模式在关闭视觉打标时必须成功返回");
         let comp_classic = res_classic.unwrap();
         // 验证没有调用 Gemma 视觉塔
@@ -6220,7 +6293,7 @@ mod representative_vision_tests {
         // 在 gemma_unified 下若 Gemma 熔断，必须立即 Fail-Fast 报错
         let gemma = omni_pro::OmniVisionEngine::gemma_engine();
         gemma.circuit_breaker().trip("模拟熔断测试物理隔离".to_string());
-        let res_gemma = run_vision_pipeline_on_image(&img, None, true, None, "gemma_unified", false);
+        let res_gemma = run_vision_pipeline_on_image(&img, None, true, None, "gemma_unified", false, true);
         assert!(res_gemma.is_err(), "gemma_unified 档位在 Gemma 熔断时必须 Fail-Fast 报错，严禁降级到 CLIP");
         gemma.circuit_breaker().mark_ready(); // 恢复状态
 

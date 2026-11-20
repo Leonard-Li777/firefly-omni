@@ -136,7 +136,11 @@ pub struct OmniConfig {
     pub enable_image_ocr: bool,
     /// OCR 识别模型精度/尺寸 ('tiny' | 'small' | 'medium')
     pub ocr_model_size: String,
-    pub max_content_size_kb: usize,
+    /// 文本提取上限（KB）。有符号以承接前端 `-1` 表"不限"：<= 0 -> usize::MAX，杜绝 422 与乘法溢出
+    pub max_content_size_kb: i32,
+    /// PDF 预切片页数（<= 0 / -1 全本，> 0 仅抽前 N 页后再交 anydoc 解析）
+    #[serde(default = "default_extract_pages")]
+    pub extract_pages: i32,
     pub max_file_size_mb: u64,
     /// 分析模式: 'simple' (极速分类) | 'document' (快速文档摘要) | 'full' (标准 AI 分析)
     pub analysis_mode: String,
@@ -188,6 +192,36 @@ fn default_mrl_dimension() -> usize {
     512
 }
 
+fn default_extract_pages() -> i32 {
+    -1
+}
+
+/// 逐请求覆盖源：由 `omni-server` 的 `ExtractRequest` / `FilePreviewRequest` /
+/// `OmniPerceptionRequest` 各自实现，使 `OmniConfig::with_request_overrides` 统一遮蔽全局 cfg。
+pub trait RequestOverrideProvider {
+    fn apply_overrides(&self, cfg: &mut OmniConfig);
+}
+
+impl OmniConfig {
+    /// 单一事实源：把 KB 上限换算为字节。`<= 0` 明确表"不限"，返回 `usize::MAX`；
+    /// 正值用 `saturating_mul` 防溢出。严禁在调用方直接 `* 1024`。
+    pub fn max_content_bytes(&self) -> usize {
+        if self.max_content_size_kb <= 0 {
+            usize::MAX
+        } else {
+            (self.max_content_size_kb as usize).saturating_mul(1024)
+        }
+    }
+
+    /// 返回被逐请求覆盖后的局部 cfg，调用方以 `let cfg = cfg.with_request_overrides(&req);`
+    /// 单向遮蔽全局配置。绝不触发任何模型装卸（双 `OnceLock` OCR 槽位保持常驻）。
+    pub fn with_request_overrides<T: RequestOverrideProvider>(&self, req: &T) -> Self {
+        let mut cfg = self.clone();
+        req.apply_overrides(&mut cfg);
+        cfg
+    }
+}
+
 impl Default for OmniConfig {
     fn default() -> Self {
         Self {
@@ -196,6 +230,7 @@ impl Default for OmniConfig {
             enable_image_ocr: false,
             ocr_model_size: "tiny".to_string(),
             max_content_size_kb: 30,
+            extract_pages: -1,
             max_file_size_mb: 100,
             analysis_mode: "full".to_string(),
             reuse_basic_analysis_data: true,
@@ -267,7 +302,34 @@ pub struct OmniPerceptionRequest {
     #[serde(default)]
     pub enable_text_analysis: Option<bool>,
     #[serde(default)]
-    pub max_content_size_kb: Option<usize>,
+    pub max_content_size_kb: Option<i32>,
+    /// 图片 OCR 开关（false 时全链路 OCR/DBNet 在模型初始化前短路）
+    #[serde(default)]
+    pub enable_image_ocr: Option<bool>,
+    /// OCR 模型尺寸（仅 'tiny' | 'small' 生效，非法值回退 'tiny'；复用双常驻槽位零卸载）
+    #[serde(default)]
+    pub ocr_model_size: Option<String>,
+    /// 文档 OCR 项数（>= -1 生效；0 关闭，正值限数，-1 不限）
+    #[serde(default)]
+    pub max_document_ocr_items: Option<i32>,
+    /// PDF 预切片页数（<= 0 / -1 全本，> 0 仅抽前 N 页）
+    #[serde(default)]
+    pub extract_pages: Option<i32>,
+    /// Office 封面开关（`enable_cover` 为历史别名）
+    #[serde(default, alias = "enable_cover")]
+    pub enable_office_cover: Option<bool>,
+    /// 视频伴音 ASR 时长（秒，仅视频 0 号切片读取，范围 [0, 180]）
+    #[serde(default)]
+    pub video_asr_duration_sec: Option<u32>,
+    /// 视频逐帧视觉分析开关（false 时彻底跳过抽帧与代表帧视觉感知，不受 clamp(5,240) 覆盖）
+    #[serde(default)]
+    pub enable_video_visual_analysis: Option<bool>,
+    /// 敏感内容感知开关（仅可向下收窄，绝不卸载全局 NSFW_SESSION）
+    #[serde(default)]
+    pub enable_nsfw_perception: Option<bool>,
+    /// 人脸感知开关（仅可向下收窄）
+    #[serde(default)]
+    pub enable_face_perception: Option<bool>,
     /// 自定义音频截取时长（秒，缺省时读取 OmniConfig.audio_analysis_duration）
     #[serde(default)]
     pub audio_analysis_duration: Option<u32>,
@@ -296,6 +358,78 @@ pub struct OmniPerceptionRequest {
     /// 缺省为 false，保持既有完全向后兼容语义
     #[serde(default)]
     pub skip_5w_synthesis: Option<bool>,
+}
+
+/// 逐请求覆盖值的统一载体。`omni-server` 三类请求体各自映射为此结构后套用同一套校验，
+/// 确保 `perceive` / `extract` / `cover` 三条链路的 `cfg` 遮蔽口径字节级一致。
+#[derive(Debug, Clone, Default)]
+pub struct RequestOverrides {
+    pub max_content_size_kb: Option<i32>,
+    pub enable_image_ocr: Option<bool>,
+    pub ocr_model_size: Option<String>,
+    pub max_document_ocr_items: Option<i32>,
+    pub extract_pages: Option<i32>,
+    pub enable_office_cover: Option<bool>,
+    pub enable_nsfw_perception: Option<bool>,
+    pub enable_face_perception: Option<bool>,
+}
+
+impl RequestOverrides {
+    /// 应用覆盖：全程只改内存中的计算分支/档位选择，绝不加载或卸载任何模型。
+    pub fn apply_to(&self, cfg: &mut OmniConfig) {
+        if let Some(v) = self.max_content_size_kb {
+            cfg.max_content_size_kb = v;
+        }
+        if let Some(v) = self.enable_image_ocr {
+            cfg.enable_image_ocr = v;
+        }
+        if let Some(ref v) = self.ocr_model_size {
+            match v.as_str() {
+                "tiny" | "small" => cfg.ocr_model_size = v.clone(),
+                _ => eprintln!(
+                    "[omni-core] 非法 ocr_model_size={:?}，仅支持 tiny/small，回退 tiny",
+                    v
+                ),
+            }
+        }
+        if let Some(v) = self.max_document_ocr_items {
+            if v >= -1 {
+                cfg.max_document_ocr_items = v;
+            } else {
+                eprintln!("[omni-core] 非法 max_document_ocr_items={}，忽略", v);
+            }
+        }
+        if let Some(v) = self.extract_pages {
+            cfg.extract_pages = v;
+        }
+        if let Some(v) = self.enable_office_cover {
+            cfg.enable_office_cover = v;
+        }
+        // 仅可向下收窄：全局未激活时请求无法强开，单请求 false 只跳过本请求推理，
+        // 绝不卸载/改动全局 NSFW/人脸会话生命周期。
+        if let Some(v) = self.enable_nsfw_perception {
+            cfg.enable_nsfw_perception = cfg.enable_nsfw_perception && v;
+        }
+        if let Some(v) = self.enable_face_perception {
+            cfg.enable_face_perception = cfg.enable_face_perception && v;
+        }
+    }
+}
+
+impl RequestOverrideProvider for OmniPerceptionRequest {
+    fn apply_overrides(&self, cfg: &mut OmniConfig) {
+        RequestOverrides {
+            max_content_size_kb: self.max_content_size_kb,
+            enable_image_ocr: self.enable_image_ocr,
+            ocr_model_size: self.ocr_model_size.clone(),
+            max_document_ocr_items: self.max_document_ocr_items,
+            extract_pages: self.extract_pages,
+            enable_office_cover: self.enable_office_cover,
+            enable_nsfw_perception: self.enable_nsfw_perception,
+            enable_face_perception: self.enable_face_perception,
+        }
+        .apply_to(cfg)
+    }
 }
 
 /// 原生多模态感知细分耗时
@@ -1038,6 +1172,63 @@ pub fn to_native_path_str<P: AsRef<std::path::Path>>(path: P) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_max_content_bytes_unlimited_and_overflow_safe() {
+        let mut cfg = OmniConfig::default();
+        assert_eq!(cfg.max_content_bytes(), 30 * 1024);
+
+        cfg.max_content_size_kb = -1;
+        assert_eq!(cfg.max_content_bytes(), usize::MAX);
+
+        cfg.max_content_size_kb = 0;
+        assert_eq!(cfg.max_content_bytes(), usize::MAX);
+
+        cfg.max_content_size_kb = i32::MAX;
+        assert_eq!(cfg.max_content_bytes(), (i32::MAX as usize).saturating_mul(1024));
+    }
+
+    #[test]
+    fn test_request_overrides_shadow_global_cfg_without_model_ops() {
+        let cfg = OmniConfig::default();
+        let req: OmniPerceptionRequest = serde_json::from_str(
+            r#"{
+                "file_path": "/tmp/x.png",
+                "max_content_size_kb": -1,
+                "enable_image_ocr": false,
+                "ocr_model_size": "small",
+                "max_document_ocr_items": 0,
+                "extract_pages": 2,
+                "enable_office_cover": false,
+                "enable_nsfw_perception": false,
+                "enable_face_perception": false
+            }"#,
+        )
+        .expect("deserialize overrides");
+
+        let shadowed = cfg.with_request_overrides(&req);
+        assert_eq!(shadowed.max_content_bytes(), usize::MAX);
+        assert!(!shadowed.enable_image_ocr);
+        assert_eq!(shadowed.ocr_model_size, "small");
+        assert_eq!(shadowed.max_document_ocr_items, 0);
+        assert_eq!(shadowed.extract_pages, 2);
+        assert!(!shadowed.enable_office_cover);
+        assert!(!shadowed.enable_nsfw_perception);
+        assert!(!shadowed.enable_face_perception);
+        // 全局 cfg 不被污染，双 OnceLock 槽位生命周期不受影响
+        assert_eq!(cfg.max_content_size_kb, 30);
+        assert!(cfg.enable_text_analysis);
+    }
+
+    #[test]
+    fn test_invalid_ocr_model_size_falls_back_to_tiny() {
+        let cfg = OmniConfig::default();
+        let req: OmniPerceptionRequest = serde_json::from_str(
+            r#"{"file_path":"/tmp/x.pdf","ocr_model_size":"medium"}"#,
+        )
+        .expect("deserialize request");
+        assert_eq!(cfg.with_request_overrides(&req).ocr_model_size, "tiny");
+    }
 
     /// 票 05 契约测试：TagChainItem A/B 两轴语义正交分离（漂移④终结）
     /// - A 轴：parent_codes 树状 DAG 多父数组

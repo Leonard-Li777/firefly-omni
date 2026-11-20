@@ -90,7 +90,7 @@ impl OmniExtractor {
         let mut ocr_duration_ms: Option<u64> = None;
 
         if should_extract_content {
-            let max_bytes = config.max_content_size_kb * 1024;
+            let max_bytes = config.max_content_bytes();
 
             if is_pdf || is_office {
                 let t_doc_start = std::time::Instant::now();
@@ -206,14 +206,17 @@ impl OmniExtractor {
             }
             result.metadata["image"] = serde_json::Value::Object(img_meta);
 
-            // 所有图片均尝试 OCR 提取，底层由 fast_detect_has_text 毫秒级探测并跳过无字图片
-            let t_ocr_start = std::time::Instant::now();
-            if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text_with_size(p, &config.ocr_model_size) {
-                if !ocr_text.trim().is_empty() {
-                    result.markdown_content = ocr_text;
+            // 图片 OCR 必须在任何模型初始化（fast_detect_has_text / get_or_init）之前短路：
+            // 关闭时零 OCR 调用、零 Session 加载，杜绝多工作区串扰与冷启动抖动。
+            if config.enable_image_ocr {
+                let t_ocr_start = std::time::Instant::now();
+                if let Ok(ocr_text) = OmniVisionEngine::recognize_ocr_text_with_size(p, &config.ocr_model_size) {
+                    if !ocr_text.trim().is_empty() {
+                        result.markdown_content = ocr_text;
+                    }
                 }
+                ocr_duration_ms = Some(t_ocr_start.elapsed().as_millis() as u64);
             }
-            ocr_duration_ms = Some(t_ocr_start.elapsed().as_millis() as u64);
 
             // AIGC Prompt 专有通道：从 ExifTool 元数据提取正向提示词，落盘至 metadata["prompt"]
             // 严禁混入 effective_text / markdown_content（会污染有字图物理事实与全文检索）
@@ -1056,6 +1059,57 @@ fn extract_plain_text(path: &Path, max_bytes: usize) -> Result<String> {
 }
 
 
+/// `extract_pages` 预切片产生的临时 PDF 文件的 RAII 守卫：任何早退路径都会清理临时文件，
+/// 避免"PDF 分页只提取前 N 页"特性在系统临时目录持续堆积垃圾。
+struct TempPdfSlice(Option<std::path::PathBuf>);
+
+impl Drop for TempPdfSlice {
+    fn drop(&mut self) {
+        if let Some(ref p) = self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// 借助 `omni-extract/Cargo.toml` 既有 `lopdf` 依赖把 PDF 预切片为"仅前 N 页"的临时文件。
+/// `pages <= 0`（含前端 `-1` 表不限）返回 `None` 走全本；仅在 `pages > 0` 且确实存在更多页时切片。
+/// 任何失败显式 `warn` 上报后回退全本，绝不静默吞异常。
+fn slice_pdf_first_n_pages(path: &Path, pages: i32) -> Option<std::path::PathBuf> {
+    if pages <= 0 {
+        return None;
+    }
+    let mut doc = match lopdf::Document::load(path) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("PDF 分页预切片加载失败，回退全本: {}", e);
+            return None;
+        }
+    };
+    let page_numbers: Vec<u32> = doc.get_pages().into_keys().collect();
+    let keep = pages as usize;
+    if page_numbers.len() <= keep {
+        return None;
+    }
+    let to_delete: Vec<u32> = page_numbers.into_iter().skip(keep).collect();
+    doc.delete_pages(&to_delete);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!(
+        "ff_pdf_slice_{}_{}_{}.pdf",
+        std::process::id(),
+        nanos,
+        keep
+    ));
+    if let Err(e) = doc.save(&tmp) {
+        warn!("PDF 分页预切片落盘失败，回退全本: {}", e);
+        return None;
+    }
+    Some(tmp)
+}
+
 /// 原生文档提纯解析器 (支持 PDF/DOC/DOCX/EPUB/PPT/PPTX/HTML/XLS/XLSX 等格式毫秒级解析并输出 Markdown，对于 DOCX/PDF 优先提取原生文本层，并在文本层不足且开启 OCR 时分页/分图 OCR 且动态按上限提前终止)
 fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConfig) -> Result<(String, serde_json::Value, Option<u64>)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
@@ -1115,7 +1169,10 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
     // 2. 对于 PDF 文档：先用 pdf-inspector 检查类型，再决定是否需要 anydoc 解析
     if ext == "pdf" {
         let mut base_text = String::new();
-        let pdf_type_res = pdf_inspector::detect_pdf_type(path).ok();
+        // 逐请求 extract_pages 预切片：解析/探活/OCR 统一消费切片后的文件，RAII 自动清理临时件
+        let page_slice = TempPdfSlice(slice_pdf_first_n_pages(path, config.extract_pages));
+        let parse_path = page_slice.0.as_deref().unwrap_or(path);
+        let pdf_type_res = pdf_inspector::detect_pdf_type(parse_path).ok();
         let is_text_pdf = matches!(pdf_type_res.as_ref().map(|r| r.pdf_type), Some(pdf_inspector::PdfType::TextBased));
         let is_scanned = matches!(pdf_type_res.as_ref().map(|r| r.pdf_type), Some(pdf_inspector::PdfType::Scanned));
 
@@ -1130,8 +1187,8 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
             return Ok((String::new(), meta, None));
         }
 
-        // 非纯扫描件，或开启了 OCR：尝试提取 anydoc 基础 Markdown 文本层
-        if let Ok(markdown) = anydoc::to_markdown(path) {
+        // 非纯扫描件，或开启了 OCR：尝试提取 anydoc 基础 Markdown 文本层（仅前 N 页）
+        if let Ok(markdown) = anydoc::to_markdown(parse_path) {
             base_text = markdown;
         }
         let raw_len = base_text.trim().len();
@@ -1163,7 +1220,7 @@ fn extract_pdf_content_and_meta(path: &Path, max_bytes: usize, config: &OmniConf
             let page_limit = if max_ocr_pages < 0 { 0usize } else { max_ocr_pages as usize };
 
             let t_pdf_ocr_start = std::time::Instant::now();
-            if let Ok(page_images) = omni_pro::CoverRenderer::render_pdf_page_images(path, page_limit) {
+            if let Ok(page_images) = omni_pro::CoverRenderer::render_pdf_page_images(parse_path, page_limit) {
                 if !page_images.is_empty() {
                     tracing::info!(
                         "PDF 包含 {} 页待 OCR 扫描页面，开始执行原生 MuPDF + PP-OCRv6 极速识别",
@@ -1284,7 +1341,11 @@ fn extract_docx_with_embedded_image_ocr(path: &Path, max_bytes: usize, config: &
     // 2. 遍历 ZIP 提取 word/media/ 下的所有嵌入图片，根据 max_document_ocr_items 及 max_bytes 限制提取识别
     let mut image_ocr_map = HashMap::new();
     let max_ocr_items = config.max_document_ocr_items;
-    let max_limit_bytes = if config.max_content_size_kb > 0 { config.max_content_size_kb * 1024 } else { 0 };
+    let max_limit_bytes = if config.max_content_size_kb > 0 {
+        config.max_content_bytes()
+    } else {
+        0
+    };
 
     if max_ocr_items != 0 {
         let mut recognized_count = 0;
@@ -2299,5 +2360,67 @@ mod tests {
         assert!(!is_valid_text_comment("ab"));
         assert!(!is_valid_text_comment("valid\x00\x01text"));
         assert!(!is_valid_text_comment("valid\x07text"));
+    }
+
+    fn make_five_page_pdf(path: &std::path::Path) {
+        use lopdf::{dictionary, Object};
+
+        let mut doc = lopdf::Document::new();
+        let pages_id = doc.new_object_id();
+        let mut page_ids = Vec::new();
+        for _ in 0..5 {
+            let page_id = doc.new_object_id();
+            doc.objects.insert(
+                page_id,
+                dictionary! {
+                    "Type" => "Page",
+                    "Parent" => pages_id,
+                    "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+                }
+                .into(),
+            );
+            page_ids.push(Object::Reference(page_id));
+        }
+        doc.objects.insert(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages",
+                "Kids" => page_ids,
+                "Count" => 5,
+            }
+            .into(),
+        );
+        let catalog_id = doc.new_object_id();
+        doc.objects.insert(
+            catalog_id,
+            dictionary! { "Type" => "Catalog", "Pages" => pages_id }.into(),
+        );
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        doc.save(path).expect("save fixture pdf");
+    }
+
+    #[test]
+    fn test_extract_pages_slices_pdf_and_caps_beyond_total() {
+        let mut src = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        src.push(format!("ff_extract_pages_fixture_{}_{}.pdf", std::process::id(), nanos));
+        make_five_page_pdf(&src);
+
+        // > 0：仅前 2 页
+        let sliced = slice_pdf_first_n_pages(&src, 2).expect("slice should succeed");
+        let sliced_doc = lopdf::Document::load(&sliced).expect("load sliced pdf");
+        assert_eq!(sliced_doc.get_pages().len(), 2);
+        let _ = std::fs::remove_file(&sliced);
+
+        // <= 0 / -1：全本，不产生临时切片
+        assert!(slice_pdf_first_n_pages(&src, -1).is_none());
+        assert!(slice_pdf_first_n_pages(&src, 0).is_none());
+        // 超过总页数：不切片，直接全本
+        assert!(slice_pdf_first_n_pages(&src, 10).is_none());
+
+        let _ = std::fs::remove_file(&src);
     }
 }
