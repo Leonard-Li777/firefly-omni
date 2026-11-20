@@ -1,6 +1,7 @@
 use rusqlite::Connection;
 
 mod ac_tree_tests;
+mod bench_100k_tree_tests;
 mod policy_tests;
 mod trie_healing_tests;
 
