@@ -150,45 +150,112 @@ pub fn query_taxonomy_tree_fast(
         }
     }
 
-    // 2.2 展示名映射：语义包受控别名 canonical + 业务主库 file_tags_private（非受控 _ext.*/user.* 兜底）。
-    // 模型 B 已删除 ftr.name_path，段序译名全部实时回译，严禁静默吞异常。
+    // 2.2 展示名映射（三层级联，对齐 alias_query.rs slice 03 契约，杜绝向 UI 暴露裸 omw.*/hownet.* code）：
+    //   ① 目标语言分表 tag_aliases_{locale}（is_canonical 优先，次选同表高频词形）
+    //   ② 业务主库 file_tags_private（非受控 _ext.*/user.* 兜底）
+    //   ③ 英文母本 tag_aliases_en_US 展示级联（仅对①②仍未命中的 code 生效，避免 OMW 上位词缺中译时露出裸 code）
     let mut resolved_names: HashMap<String, String> = HashMap::new();
     let target_table = omni_pro::resolve_tag_aliases_table(locale);
     let all_path_codes: Vec<String> = all_path_codes.into_iter().collect();
     if !all_path_codes.is_empty() {
-        if table_exists(conn, target_table) {
-            for chunk in all_path_codes.chunks(200) {
+        let fill_from_alias_table = |table_name: &str,
+                                     codes: &[String],
+                                     out: &mut HashMap<String, String>| {
+            if codes.is_empty() || !table_exists(conn, table_name) {
+                return;
+            }
+            for chunk in codes.chunks(200) {
                 let placeholders = vec!["?"; chunk.len()].join(",");
                 let sql = format!(
-                    "SELECT tag_code, lemma FROM {target_table} WHERE is_canonical = 1 AND tag_code IN ({placeholders})"
+                    "SELECT tag_code, lemma FROM {table_name} \
+                     WHERE tag_code IN ({placeholders}) \
+                     ORDER BY is_canonical DESC, count DESC, lemma ASC"
                 );
-                if let Ok(mut stmt) = conn.prepare(&sql) {
-                    let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
-                    if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    }) {
-                        for (c, l) in rows.flatten() {
-                            resolved_names.insert(c, l);
+                match conn.prepare(&sql) {
+                    Ok(mut stmt) => {
+                        let params: Vec<&dyn rusqlite::ToSql> =
+                            chunk.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+                        match stmt.query_map(params.as_slice(), |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        }) {
+                            Ok(rows) => {
+                                for (c, l) in rows.flatten() {
+                                    if !l.trim().is_empty() {
+                                        out.entry(c).or_insert(l);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[TaxonomyTreeFast] 查询展示名分表 {table_name} 失败: {e}"
+                                );
+                            }
                         }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[TaxonomyTreeFast] 预编译展示名分表 {table_name} SQL 失败: {e}"
+                        );
                     }
                 }
             }
+        };
+
+        // ① 目标语言分表
+        fill_from_alias_table(target_table, &all_path_codes, &mut resolved_names);
+
+        // ② 展示级联兜底：目标语言缺失词条时优先回退语义包 en-US 母本，杜绝 UI 暴露裸 omw.* / hownet.* 代码
+        //    （置身于 file_tags_private 之前，防止历史脏行把裸 code 写入 file_tags_private.name 截胡 en-US 兜底）
+        const EN_ALIAS_TABLE: &str = "tag_aliases_en_US";
+        if target_table != EN_ALIAS_TABLE {
+            let missing_after_target: Vec<String> = all_path_codes
+                .iter()
+                .filter(|c| !resolved_names.contains_key(*c))
+                .cloned()
+                .collect();
+            fill_from_alias_table(EN_ALIAS_TABLE, &missing_after_target, &mut resolved_names);
         }
-        // 非受控 _ext.* / user.* 展示名统一查 file_tags_private（不依赖已删除的 ftr.name_path）
-        if table_exists(master_conn, "file_tags_private") {
-            for chunk in all_path_codes.chunks(200) {
+
+        // ③ 非受控 _ext.* / user.* 展示名统一查 file_tags_private（不依赖已删除的 ftr.name_path）
+        let still_missing: Vec<String> = all_path_codes
+            .iter()
+            .filter(|c| !resolved_names.contains_key(*c))
+            .cloned()
+            .collect();
+        if !still_missing.is_empty() && table_exists(master_conn, "file_tags_private") {
+            for chunk in still_missing.chunks(200) {
                 let placeholders = vec!["?"; chunk.len()].join(",");
                 let sql = format!(
                     "SELECT code, name FROM file_tags_private WHERE code IN ({placeholders})"
                 );
-                if let Ok(mut stmt) = master_conn.prepare(&sql) {
-                    let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
-                    if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    }) {
-                        for (c, n) in rows.flatten() {
-                            resolved_names.entry(c).or_insert(n);
+                match master_conn.prepare(&sql) {
+                    Ok(mut stmt) => {
+                        let params: Vec<&dyn rusqlite::ToSql> =
+                            chunk.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+                        match stmt.query_map(params.as_slice(), |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        }) {
+                            Ok(rows) => {
+                                for (c, n) in rows.flatten() {
+                                    let trimmed = n.trim();
+                                    if !trimmed.is_empty() && trimmed != c {
+                                        resolved_names
+                                            .entry(c)
+                                            .or_insert_with(|| trimmed.to_string());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[TaxonomyTreeFast] 查询 file_tags_private 展示名失败: {e}"
+                                );
+                            }
                         }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[TaxonomyTreeFast] 预编译 file_tags_private 查询失败: {e}"
+                        );
                     }
                 }
             }

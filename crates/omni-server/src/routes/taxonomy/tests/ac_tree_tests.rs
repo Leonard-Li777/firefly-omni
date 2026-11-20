@@ -753,4 +753,106 @@ fn test_content_tags_single_child_collapse_and_default_mode_safety() {
     assert!(has_throne, "聚拢目录下必须包含宝座分支");
     assert!(has_sofa, "聚拢目录下必须包含沙发分支");
 }
+
+/// 断言【展示级联兜底：目标语言缺失词条时按同表非 canonical -> en-US 级联，严禁向 UI 暴露裸 omw.* code】
+#[test]
+fn test_taxonomy_tree_missing_locale_falls_back_to_en_us_no_raw_code() {
+    let (pack_conn, master_conn) = setup_test_master_and_pack_conns();
+
+    pack_conn
+        .execute_batch(
+            "CREATE TABLE tag_aliases_en_US (
+                tag_code TEXT NOT NULL,
+                lemma TEXT NOT NULL,
+                is_canonical INTEGER NOT NULL DEFAULT 1,
+                n INTEGER DEFAULT 0,
+                count INTEGER DEFAULT 0,
+                PRIMARY KEY (tag_code, lemma)
+            );
+            INSERT INTO file_tags (code, pos) VALUES
+                ('omw.00235435.n', 'n'),
+                ('omw.start_leaf.n', 'n'),
+                ('omw.install_leaf.n', 'n'),
+                ('omw.08649345.n', 'n'),
+                ('omw.noncanon_zh.n', 'n');
+            -- zh-CN 中缺失 omw.00235435.n 和 omw.08649345.n；omw.noncanon_zh.n 仅有 is_canonical=0 词条
+            INSERT INTO tag_aliases_zh_CN (tag_code, lemma, is_canonical, count) VALUES
+                ('omw.start_leaf.n', '启动', 1, 10),
+                ('omw.install_leaf.n', '安装', 1, 10),
+                ('omw.noncanon_zh.n', '非规范中文', 0, 5);
+            -- en-US 母本补齐缺失的 OMW 规范名
+            INSERT INTO tag_aliases_en_US (tag_code, lemma, is_canonical, count) VALUES
+                ('omw.00235435.n', 'beginning', 1, 2),
+                ('omw.08649345.n', 'side', 1, 91),
+                ('omw.noncanon_zh.n', 'noncanon_en', 1, 1);",
+        )
+        .unwrap();
+
+    master_conn
+        .execute_batch(
+            "INSERT INTO workspace_files (file_fingerprint, path, workspace_id, status) VALUES
+                ('fp_1', 'D:\\files\\a.txt', 1, 1),
+                ('fp_2', 'D:\\files\\b.txt', 1, 1),
+                ('fp_3', 'D:\\files\\c.txt', 1, 1),
+                ('fp_4', 'D:\\files\\d.txt', 1, 1);
+            INSERT INTO files (file_fingerprint) VALUES ('fp_1'), ('fp_2'), ('fp_3'), ('fp_4');
+            INSERT INTO tag_paths (path_id, leaf_code, via_parent_code, code_path, depth) VALUES
+                (1, 'omw.start_leaf.n', 'omw.00235435.n', '/builtin.content_tags/omw.00235435.n/omw.start_leaf.n', 3),
+                (2, 'omw.install_leaf.n', 'omw.00235435.n', '/builtin.content_tags/omw.00235435.n/omw.install_leaf.n', 3),
+                (3, 'omw.08649345.n', 'builtin.content_tags', '/builtin.content_tags/omw.08649345.n', 2),
+                (4, 'omw.noncanon_zh.n', 'builtin.content_tags', '/builtin.content_tags/omw.noncanon_zh.n', 2);
+            INSERT INTO file_tag_relations (file_fingerprint, tag_code, via_parent_code, path_id, created_at, updated_at) VALUES
+                ('fp_1', 'omw.start_leaf.n', 'omw.00235435.n', 1, 1, 1),
+                ('fp_2', 'omw.install_leaf.n', 'omw.00235435.n', 2, 1, 1),
+                ('fp_3', 'omw.08649345.n', 'builtin.content_tags', 3, 1, 1),
+                ('fp_4', 'omw.noncanon_zh.n', 'builtin.content_tags', 4, 1, 1);
+            -- 模拟历史脏数据：file_tags_private 中把裸 code 本身当作 name，绝不能截胡 en-US 展示级联兜底
+            INSERT INTO file_tags_private (code, name) VALUES
+                ('omw.00235435.n', 'omw.00235435.n');",
+        )
+        .unwrap();
+
+    let resp = query_taxonomy_tree_fast(&pack_conn, "zh-CN", None, &master_conn, false, Some(1), None)
+        .expect("query_taxonomy_tree_fast failed");
+
+    let root = resp
+        .root_nodes
+        .iter()
+        .find(|n| n.code == "builtin.content_tags")
+        .expect("内容标签根节点必须存在");
+
+    fn assert_no_raw_code(nodes: &[TaxonomyNode]) {
+        for n in nodes {
+            assert!(
+                !n.name.starts_with("omw.") && !n.name.starts_with("hownet."),
+                "严禁向 UI 暴露裸受控代码: code={}, name={}",
+                n.code,
+                n.name
+            );
+            assert_no_raw_code(&n.children);
+        }
+    }
+    assert_no_raw_code(&root.children);
+
+    let parent_node = root
+        .children
+        .iter()
+        .find(|n| n.code == "omw.00235435.n")
+        .expect("omw.00235435.n 父节点应存在");
+    assert_eq!(parent_node.name, "beginning", "缺失 zh-CN 译名时应级联回退 en-US 规范名");
+
+    let leaf_node = root
+        .children
+        .iter()
+        .find(|n| n.code == "omw.08649345.n")
+        .expect("omw.08649345.n 叶子节点应存在");
+    assert_eq!(leaf_node.name, "side", "缺失 zh-CN 译名的叶子节点应级联回退 en-US 规范名");
+
+    let noncanon_node = root
+        .children
+        .iter()
+        .find(|n| n.code == "omw.noncanon_zh.n")
+        .expect("omw.noncanon_zh.n 节点应存在");
+    assert_eq!(noncanon_node.name, "非规范中文", "目标语言存在非 canonical 词条时应优先使用目标语言词条");
+}
 }
