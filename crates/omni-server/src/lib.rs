@@ -989,6 +989,15 @@ pub async fn start_server(
     mrl_dimension: Option<usize>,
     vectors_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    // 桌面端在检测到 DirectML 原生崩溃（进程 abort，Windows 退出码 0xC0000409 等）后，
+    // 会携带该环境变量重启本进程，强制改用纯 CPU 执行视觉塔。DirectML 的原生异常
+    // （如并发 Run / 驱动 AV）无法被 Rust 捕获，进程会直接 abort，导致视频切片永久丢失；
+    // 该闸门是崩溃后的确定性 CPU 兜底，保证同一视频在重试时能真正产出切片。
+    if std::env::var("OMNI_DISABLE_DML").ok().as_deref() == Some("1") {
+        omni_core::ort_runtime::disable_directml(
+            "OMNI_DISABLE_DML=1（桌面端检测到 DirectML 原生崩溃后强制 CPU 兜底）",
+        );
+    }
     let mut initial_config = load_config_from_disk();
     if let Some(profile) = embedding_profile {
         initial_config.embedding_profile = profile;
