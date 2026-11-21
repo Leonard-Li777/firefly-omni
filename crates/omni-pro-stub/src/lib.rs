@@ -2348,6 +2348,10 @@ pub mod audio {
         pub fn new() -> Self {
             Self
         }
+        pub fn new_deferred() -> Self {
+            Self
+        }
+        pub fn warmup(&self) {}
         pub fn unload(&self) {}
         pub fn drop_session(&self) {}
         pub fn is_ready(&self) -> bool {
@@ -2398,6 +2402,10 @@ pub mod audio {
         pub fn new() -> Self {
             Self
         }
+        pub fn new_deferred() -> Self {
+            Self
+        }
+        pub fn warmup(&self) {}
         pub fn unload(&self) {}
         pub fn drop_session(&self) {}
         pub fn is_ready(&self) -> bool {

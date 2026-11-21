@@ -1130,8 +1130,10 @@ pub async fn start_server(
             "[OmniServer] ONNX Runtime 运行时 B 绑定失败，全部 ONNX 推理将不可用: {err}"
         );
     }
-    let moss = Arc::new(MossTtsManager::new());
-    let m5 = Arc::new(M5TtsManager::new());
+    // 启动期仅同步加载轻量音色元数据，数百 MB 加密 TTS ONNX 模型交由下方后台预热任务异步加载，
+    // 严禁阻塞 Axum HTTP 端口监听导致桌面端探活超时。
+    let moss = Arc::new(MossTtsManager::new_deferred());
+    let m5 = Arc::new(M5TtsManager::new_deferred());
     let vectors_dir_opt = Some(vector.dir().to_path_buf());
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),
@@ -1184,6 +1186,29 @@ pub async fn start_server(
                 "omni-geo dataset pre-warm finished in {:.2}s (available: {})",
                 start.elapsed().as_secs_f32(),
                 available
+            );
+        });
+    }
+
+    // 启动即后台异步预热 TTS 引擎（M5 / MOSS）：在 HTTP 端口就绪后于独立阻塞线程解密加载 ONNX 权重，
+    // 避免 300MB+ 加密模型同步阻塞 TcpListener::bind 触发桌面端 80s 探活超时强杀
+    {
+        let m5 = state.m5.clone();
+        let moss = state.moss.clone();
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let (m5_ready, moss_ready) = tokio::task::spawn_blocking(move || {
+                m5.warmup();
+                moss.warmup();
+                (m5.is_ready(), moss.is_ready())
+            })
+            .await
+            .unwrap_or((false, false));
+            info!(
+                "omni-tts background pre-warm finished in {:.2}s (m5_ready: {}, moss_ready: {})",
+                start.elapsed().as_secs_f32(),
+                m5_ready,
+                moss_ready
             );
         });
     }
