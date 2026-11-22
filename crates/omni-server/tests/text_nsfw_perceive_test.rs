@@ -27,6 +27,12 @@ fn setup_test_app() -> Router {
         m5: Arc::new(omni_server::M5TtsManager::new()),
         anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
         cpu_slot: Arc::new(omni_server::cpu_engine::CpuSlot::new(None, None)),
+        instance_id: omni_server::service_discovery::generate_uuid_v4(),
+        revision: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        actual_port: omni_server::OMNI_DEFAULT_PORT_START,
+        user_data_dir: None,
+        status_broadcast: tokio::sync::broadcast::channel(32).0,
+        shutdown_tx: tokio::sync::watch::channel(false).0,
     };
     create_app_router(state)
 }

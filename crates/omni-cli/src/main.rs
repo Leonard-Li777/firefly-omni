@@ -24,7 +24,7 @@ struct Cli {
 enum Commands {
     /// 启动 HTTP API 与 Web UI 服务
     Serve {
-        #[arg(short, long, default_value = "127.0.0.1:9190")]
+        #[arg(short, long, default_value = "127.0.0.1:38200")]
         addr: String,
         /// 桌面端 SQLite 业务主库路径（业务持久化操作；缺省时主库软不可用）
         #[arg(long)]
@@ -41,6 +41,9 @@ enum Commands {
         /// 向量存储目录 vectors/ 路径（缺省时自动对齐 --db-path 父目录下的 vectors/）
         #[arg(long)]
         vectors_path: Option<String>,
+        /// 服务发现文件根目录（缺省时取 FIREFLY_USER_DATA_DIR 或 --db-path 父目录，写入 <dir>/run/omni-config.json）
+        #[arg(long)]
+        discovery_dir: Option<String>,
     },
     /// 提取指定文件的信息与 Markdown 文本
     Extract {
@@ -65,12 +68,30 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Serve { addr, db_path, pack_path, embedding_profile, mrl_dimension, vectors_path }) => {
+        Some(Commands::Serve {
+            addr,
+            db_path,
+            pack_path,
+            embedding_profile,
+            mrl_dimension,
+            vectors_path,
+            discovery_dir,
+        }) => {
             let socket_addr: SocketAddr = addr.parse()?;
             let db_path = db_path.as_deref().map(std::path::PathBuf::from);
             let pack_path = pack_path.as_deref().map(std::path::PathBuf::from);
             let vectors_path = vectors_path.as_deref().map(std::path::PathBuf::from);
-            let res = omni_server::start_server(socket_addr, db_path, pack_path, embedding_profile.clone(), *mrl_dimension, vectors_path).await;
+            let discovery_dir = discovery_dir.as_deref().map(std::path::PathBuf::from);
+            let res = omni_server::start_server(
+                socket_addr,
+                db_path,
+                pack_path,
+                embedding_profile.clone(),
+                *mrl_dimension,
+                vectors_path,
+                discovery_dir,
+            )
+            .await;
             omni_extract::shutdown_exiftool_daemon();
             res?;
         }

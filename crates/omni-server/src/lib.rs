@@ -43,7 +43,12 @@ use omni_pro::{
 
 pub mod cpu_engine;
 pub mod routes;
+pub mod service_discovery;
 pub mod text_chunker;
+
+pub use service_discovery::{
+    OmniDiscoveryFileV1, OmniStatusEvent, OMNI_DEFAULT_PORT_END, OMNI_DEFAULT_PORT_START,
+};
 
 pub use omni_pro::audio::{
     decode_audio_to_16k_mono, decode_audio_to_16k_mono_bandpass, normalize_ced_audio_event,
@@ -100,6 +105,68 @@ pub struct AppState {
     pub anchor_cache: Arc<omni_core::anchor_cache::AnchorCache>,
     /// 轻量 CPU 生成式推理底座会话槽位 (spec §3.3 / TASK-01)
     pub cpu_slot: Arc<cpu_engine::CpuSlot>,
+    /// 本服务实例启动期生成的唯一 UUID v4（防 OS PID 复用）
+    pub instance_id: String,
+    /// 本实例状态/配置变更单调递增版本号 (u64)
+    pub revision: Arc<std::sync::atomic::AtomicU64>,
+    /// 实际绑定的监听端口（bind-first 滑动后）
+    pub actual_port: u16,
+    /// 所属 Desktop userData 目录（用于写入 `<userData>/run/omni-config.json` 与同源校验）
+    pub user_data_dir: Option<PathBuf>,
+    /// SSE 状态广播通道（容量 32）
+    pub status_broadcast: tokio::sync::broadcast::Sender<OmniStatusEvent>,
+    /// 优雅停机通知通道（零额外依赖等价 CancellationToken，触发所有 SSE 流立即下发 stopping 并闭合）
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl AppState {
+    /// 构造当前权威 `OmniStatusEvent` 快照（不推进 revision）
+    pub fn build_status_event(&self, status: &str) -> OmniStatusEvent {
+        let cfg = self.config.lock().unwrap().clone();
+        let master_db_path = self
+            .master_db_path
+            .lock()
+            .ok()
+            .and_then(|p| p.clone())
+            .map(|p| p.to_string_lossy().to_string());
+        let target_vectors_dir = self
+            .target_vectors_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .or_else(|| Some(self.vector.dir().to_string_lossy().to_string()));
+        let user_data_dir = self
+            .user_data_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
+
+        OmniStatusEvent {
+            status: status.to_string(),
+            pid: std::process::id(),
+            instance_id: self.instance_id.clone(),
+            revision: self.revision.load(std::sync::atomic::Ordering::SeqCst),
+            port: self.actual_port,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            profile: cfg.embedding_profile,
+            mrl_dimension: cfg.mrl_dimension,
+            user_data_dir,
+            master_db_path,
+            target_vectors_dir,
+        }
+    }
+
+    /// 原子递增 `revision` 并向所有在线 SSE 订阅者广播状态事件
+    pub fn publish_status_event(&self, status: &str) -> OmniStatusEvent {
+        self.revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let evt = self.build_status_event(status);
+        let _ = self.status_broadcast.send(evt.clone());
+        evt
+    }
+
+    /// 触发停机广播：先推 `stopping` 终帧，再置 `shutdown_tx = true` 闭合全部在途 SSE 流
+    pub fn trigger_shutdown(&self) {
+        self.publish_status_event("stopping");
+        let _ = self.shutdown_tx.send(true);
+    }
 }
 
 #[derive(Deserialize)]
@@ -189,6 +256,8 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/api/version", get(version_handler))
         .route("/api/v1/engine/status", get(engine_status_handler))
+        .route("/api/v1/omni/events", get(omni_status_events_handler))
+        .route("/api/omni/events", get(omni_status_events_handler))
         .route("/api/config", get(get_config).post(update_config).put(update_config))
         .route("/api/extract", post(extract_file_handler))
         .route("/api/extract/upload", post(extract_multipart_handler))
@@ -349,8 +418,17 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
     } else {
         None
     };
+    let user_data_dir = state
+        .user_data_dir
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string());
     Json(serde_json::json!({
         "status": "ok",
+        "pid": std::process::id(),
+        "instanceId": state.instance_id,
+        "revision": state.revision.load(std::sync::atomic::Ordering::SeqCst),
+        "port": state.actual_port,
+        "userDataDir": user_data_dir,
         "profile": profile,
         "mrlDimension": mrl_dim,
         "visionStatus": vision_status,
@@ -373,11 +451,23 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
     }))
 }
 
+/// Omni 状态推送 SSE 端点：GET /api/v1/omni/events & GET /api/omni/events
+async fn omni_status_events_handler(
+    State(state): State<AppState>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    Sse::new(service_discovery::build_omni_status_sse_stream(state)).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text(""),
+    )
+}
+
 /// 显式驱逐视觉显存/内存: POST /api/v1/engine/vision/evict (spec §4.3)
-async fn engine_vision_evict_handler() -> Json<serde_json::Value> {
+async fn engine_vision_evict_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     if omni_pro::is_pro_enabled() {
         omni_pro::OmniVisionEngine::evict_gemma_vision();
     }
+    state.publish_status_event("ok");
     Json(serde_json::json!({
         "status": "ok",
         "evicted": true,
@@ -648,6 +738,8 @@ async fn reconnect_omw_handler(
         .as_ref()
         .map(|p| p.to_string_lossy().to_string())
         .or_else(|| Some(state.vector.dir().to_string_lossy().to_string()));
+
+    state.publish_status_event("ok");
 
     Json(serde_json::json!({
         "status": "ok",
@@ -988,6 +1080,7 @@ pub async fn start_server(
     embedding_profile: Option<String>,
     mrl_dimension: Option<usize>,
     vectors_path: Option<PathBuf>,
+    discovery_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     // 桌面端在检测到 DirectML 原生崩溃（进程 abort，Windows 退出码 0xC0000409 等）后，
     // 会携带该环境变量重启本进程，强制改用纯 CPU 执行视觉塔。DirectML 的原生异常
@@ -1144,6 +1237,16 @@ pub async fn start_server(
     let moss = Arc::new(MossTtsManager::new_deferred());
     let m5 = Arc::new(M5TtsManager::new_deferred());
     let vectors_dir_opt = Some(vector.dir().to_path_buf());
+
+    // bind-first 顺序原子绑定：默认段 38200..=38219 冲突时自动顺延，显式非默认端口单点绑定不滑动
+    info!("firefly-omni Axum HTTP server v{} binding on {}", env!("CARGO_PKG_VERSION"), addr);
+    let (listener, actual_port) = service_discovery::bind_first_listener(addr).await?;
+    let instance_id = service_discovery::generate_uuid_v4();
+    let resolved_user_data_dir =
+        service_discovery::resolve_discovery_user_data_dir(discovery_dir.as_ref(), db_path.as_ref());
+    let (status_broadcast, _) = tokio::sync::broadcast::channel::<OmniStatusEvent>(32);
+    let (shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
+
     let state = AppState {
         config: Arc::new(Mutex::new(initial_config)),
         geo,
@@ -1181,11 +1284,18 @@ pub async fn start_server(
             };
             Arc::new(cpu_engine::CpuSlot::new(detected_cpu_run_dir, detected_cpu_model_dir))
         },
+        instance_id: instance_id.clone(),
+        revision: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        actual_port,
+        user_data_dir: resolved_user_data_dir.clone(),
+        status_broadcast,
+        shutdown_tx,
     };
 
     // 启动即后台预热地理索引：避免首次用户查询承担秒级冷加载成本
     {
         let geo = state.geo.clone();
+        let state_bg = state.clone();
         tokio::spawn(async move {
             let start = std::time::Instant::now();
             let available = tokio::task::spawn_blocking(move || geo.is_available())
@@ -1196,6 +1306,7 @@ pub async fn start_server(
                 start.elapsed().as_secs_f32(),
                 available
             );
+            state_bg.publish_status_event("ok");
         });
     }
 
@@ -1204,6 +1315,7 @@ pub async fn start_server(
     {
         let m5 = state.m5.clone();
         let moss = state.moss.clone();
+        let state_bg = state.clone();
         tokio::spawn(async move {
             let start = std::time::Instant::now();
             let (m5_ready, moss_ready) = tokio::task::spawn_blocking(move || {
@@ -1219,32 +1331,45 @@ pub async fn start_server(
                 m5_ready,
                 moss_ready
             );
+            state_bg.publish_status_event("ok");
         });
     }
 
-    let app = create_app_router(state);
+    let app = create_app_router(state.clone());
 
-    info!("firefly-omni Axum HTTP server v{} starting on {}", env!("CARGO_PKG_VERSION"), addr);
-    let mut retry_count = 0;
-    let listener = loop {
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => break l,
-            Err(e) if retry_count < 10 => {
-                retry_count += 1;
-                tracing::warn!(
-                    "firefly-omni failed to bind to {} ({}), retrying in 1s (attempt {}/10)...",
-                    addr, e, retry_count
+    // 绑定成功后双通道发布：① stdout FIREFLY_READY <1ms 快路径；② <userData>/run/omni-config.json 退避原子写盘
+    service_discovery::emit_firefly_ready_stdout(actual_port, std::process::id(), &instance_id);
+    if let Some(ref ud_dir) = resolved_user_data_dir {
+        let discovery_payload = service_discovery::build_discovery_payload_from_state(&state);
+        match service_discovery::write_discovery_file(ud_dir, &discovery_payload) {
+            Ok(written_path) => {
+                info!(
+                    "firefly-omni discovery file published: {} (port={}, instanceId={})",
+                    written_path.display(),
+                    actual_port,
+                    instance_id
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            Err(e) => {
-                tracing::error!("firefly-omni failed to bind to {} after {} attempts: {}", addr, retry_count, e);
-                return Err(e.into());
+            Err(err) => {
+                tracing::warn!(
+                    "[OmniServer] 写入服务发现文件失败 ({}): {}",
+                    ud_dir.display(),
+                    err
+                );
             }
         }
-    };
+    }
+
+    info!(
+        "firefly-omni Axum HTTP server v{} listening on 127.0.0.1:{} (instanceId={})",
+        env!("CARGO_PKG_VERSION"),
+        actual_port,
+        instance_id
+    );
+
+    let shutdown_state = state.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             // 当由 Electron / Node.js 宿主显式配置 OMNI_WATCH_STDIN=1 拉起时，监听 stdin EOF
             // 默认情况下（独立运行、后台守护、CLI）仅响应 Ctrl+C 信号，杜绝无终端环境下直接读到 EOF 导致的误退出
             let watch_stdin = std::env::var("OMNI_WATCH_STDIN").map(|v| v == "1").unwrap_or(false);
@@ -1271,8 +1396,23 @@ pub async fn start_server(
                     tracing::info!("firefly-omni received Ctrl+C, shutting down gracefully.");
                 }
             }
+            // 通知全部在途 SSE 连接立即下发 stopping 终帧并闭合，防止 axum 优雅停机挂死
+            shutdown_state.trigger_shutdown();
         })
         .await?;
+
+    // 优雅退出后按 pid 自删 <userData>/run/omni-config.json
+    if let Some(ref ud_dir) = resolved_user_data_dir {
+        if let Err(err) =
+            service_discovery::revoke_discovery_file(ud_dir, std::process::id(), Some(&instance_id))
+        {
+            tracing::warn!(
+                "[OmniServer] 优雅退出自删发现文件失败 ({}): {}",
+                ud_dir.display(),
+                err
+            );
+        }
+    }
     omni_extract::shutdown_exiftool_daemon();
     Ok(())
 }
@@ -1311,7 +1451,10 @@ async fn update_config(
             }
         }
         save_config_to_disk(&*cfg);
-        Json(cfg.clone())
+        let cloned = cfg.clone();
+        drop(cfg);
+        state.publish_status_event("ok");
+        Json(cloned)
     } else {
         Json(cfg.clone())
     }

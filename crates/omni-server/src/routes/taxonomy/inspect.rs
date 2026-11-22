@@ -468,7 +468,9 @@ pub async fn reload_policies_handler(
     let count = new_policies.len();
     if let Ok(mut lock) = state.dimension_policies.write() {
         *lock = new_policies;
+        drop(lock);
         tracing::info!("[reload_policies_handler] 策略重载成功，当前激活策略数: {}", count);
+        state.publish_status_event("ok");
         Json(ReloadPoliciesResponse {
             success: true,
             count,
