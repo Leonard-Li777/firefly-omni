@@ -2,12 +2,15 @@ name: omni-ce-release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - release
+    paths:
+      - 'Cargo.toml'
+      - 'crates/**'
   workflow_dispatch:
     inputs:
       version_tag:
-        description: '发布版本号（如 v0.1.0）'
+        description: '发布版本号（如 v0.1.0，留空则读取 Cargo.toml）'
         required: false
         default: ''
 
@@ -244,11 +247,25 @@ jobs:
           echo "ARTIFACT_PATH=dist/${{ matrix.artifact_name }}" >> $GITHUB_ENV
           ls -lh
 
+      - name: 解析发布版本号（从 Cargo.toml 或 inputs，禁止使用 github.ref_name）
+        id: resolve_tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.version_tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            VER=$(node scripts/get-version.js)
+            TAG="v${VER}"
+          fi
+          echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
+
       - name: 发布到 GitHub Release（开源版）
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.version_tag || github.ref_name }}
-          name: Firefly Omni Open-Source ${{ github.event.inputs.version_tag || github.ref_name }}
+          tag_name: ${{ steps.resolve_tag.outputs.tag_name }}
+          name: Firefly Omni Open-Source ${{ steps.resolve_tag.outputs.tag_name }}
           draft: false
           prerelease: false
           files: ${{ env.ARTIFACT_PATH }}

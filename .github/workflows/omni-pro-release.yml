@@ -1,6 +1,12 @@
 name: omni-pro-release
 
 on:
+  push:
+    branches:
+      - release
+    paths:
+      - 'Cargo.toml'
+      - 'crates/**'
   # 手动触发，构建并发布 Pro 版到统一资源中心
   workflow_dispatch:
     inputs:
@@ -8,15 +14,6 @@ on:
         description: '发布版本号（如 v0.1.0），留空则使用 Cargo.toml 中的版本'
         required: false
         default: ''
-      desktop_build_region:
-        description: '构建完成后联动触发 Desktop 发版的区域（默认 CN+INTL 全部触发）'
-        required: false
-        type: choice
-        default: 'CN+INTL'
-        options:
-          - 'CN'
-          - 'INTL'
-          - 'CN+INTL'
 
 # 防止同一分支并发构建
 concurrency:
@@ -46,37 +43,47 @@ jobs:
         with:
           node-version: '24.15.0'
 
-      - name: 计算并更新 Cargo.toml 版本
+      - name: 计算版本（release 分支严禁自动 commit/push，仅读取 Cargo.toml 既有版本）
         id: bump
         shell: bash
+        env:
+          TARGET_INPUT: ${{ github.event.inputs.version_tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-
-          TARGET_INPUT="${{ github.event.inputs.version_tag }}"
-          NEW_VER=$(node scripts/bump-version.js "$TARGET_INPUT")
-          TAG_NAME="v$NEW_VER"
-
-          echo "version=$NEW_VER" >> $GITHUB_OUTPUT
-          echo "version_tag=$TAG_NAME" >> $GITHUB_OUTPUT
-          echo "📌 计算目标版本: $NEW_VER ($TAG_NAME)"
-
-          if [ -n "$(git status --porcelain Cargo.toml)" ]; then
-            echo "📝 检测到 Cargo.toml 版本发生变化，提交更改..."
-            git add Cargo.toml
-            git commit -m "chore(release): bump version to $TAG_NAME [skip ci]"
-            git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
-            git push origin HEAD:${{ github.ref_name }} --tags
+          if [ "$REF_NAME" = "release" ]; then
+            NEW_VER=$(node scripts/get-version.js)
+            TAG_NAME="v$NEW_VER"
+            echo "version=$NEW_VER" >> "$GITHUB_OUTPUT"
+            echo "version_tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+            echo "📌 [release 只读模式] 使用 Cargo.toml 既有版本: $NEW_VER ($TAG_NAME)，禁止向 release 产生独立提交"
           else
-            echo "ℹ️ Cargo.toml 版本无变化。"
-            if ! git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+            NEW_VER=$(node scripts/bump-version.js "$TARGET_INPUT")
+            TAG_NAME="v$NEW_VER"
+
+            echo "version=$NEW_VER" >> "$GITHUB_OUTPUT"
+            echo "version_tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+            echo "📌 计算目标版本: $NEW_VER ($TAG_NAME)"
+
+            if [ -n "$(git status --porcelain Cargo.toml)" ]; then
+              echo "📝 检测到 Cargo.toml 版本发生变化，提交更改..."
+              git add Cargo.toml
+              git commit -m "chore(release): bump version to $TAG_NAME [skip ci]"
               git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
-              git push origin "$TAG_NAME"
+              git push origin HEAD:"$REF_NAME" --tags
+            else
+              echo "ℹ️ Cargo.toml 版本无变化。"
+              if ! git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+                git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
+                git push origin "$TAG_NAME"
+              fi
             fi
           fi
 
           SHA=$(git rev-parse HEAD)
-          echo "commit_sha=$SHA" >> $GITHUB_OUTPUT
+          echo "commit_sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "📌 提交 SHA: $SHA"
 
   build:
@@ -123,12 +130,41 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - name: 检出代码（含 Pro 私有子模块）
+      - name: 检出 Omni 主仓（不自动递归子模块）
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.bump-version.outputs.commit_sha }}
-          token: ${{ secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRO_SUBMODULE_TOKEN || secrets.SUBMODULE_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
-          submodules: recursive
+          submodules: false
+
+      - name: 解析 omni-pro gitlink SHA（git ls-tree 四重断言）
+        id: resolve_omni_pro
+        shell: bash
+        run: |
+          ENTRY=$(git ls-tree HEAD omni-pro)
+          [ -n "$ENTRY" ] || { echo "::error::未找到 omni-pro gitlink"; exit 1; }
+          MODE=$(echo "$ENTRY" | awk '{print $1}')
+          TYPE=$(echo "$ENTRY" | awk '{print $2}')
+          SHA=$(echo "$ENTRY" | awk '{print $3}')
+          [ "$MODE" = "160000" ] && [ "$TYPE" = "commit" ] && [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::omni-pro gitlink 四重断言失败: $ENTRY"; exit 1;
+          }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: 精确检出私有子模块 omni-pro 并二次校验 HEAD
+        uses: actions/checkout@v4
+        with:
+          repository: Leonard-Li777/firefly-omni-pro
+          path: omni-pro
+          ref: ${{ steps.resolve_omni_pro.outputs.sha }}
+          token: ${{ secrets.PRO_SUBMODULE_TOKEN }}
+
+      - name: 二次校验 omni-pro HEAD
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ steps.resolve_omni_pro.outputs.sha }}
+        run: |
+          ACTUAL=$(git -C omni-pro rev-parse HEAD)
+          [ "$ACTUAL" = "$EXPECTED_SHA" ] || { echo "::error::omni-pro HEAD 漂移: $ACTUAL != $EXPECTED_SHA"; exit 1; }
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -399,19 +435,21 @@ jobs:
       - name: 克隆统一资源中心
         shell: bash
         run: |
-          git clone --depth 1 --branch main \
+          git clone --depth 1 --branch master \
             "https://x-access-token:${GH_TOKEN}@github.com/Leonard-Li777/firefly-resources.git" \
             "$GITHUB_WORKSPACE/unisource-repo"
 
       - name: 解析发布版本
         shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.version_tag }}
         run: |
-          if [ -n "${{ github.event.inputs.version_tag }}" ]; then
-            VERSION="${{ github.event.inputs.version_tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            VERSION="$INPUT_TAG"
           else
             VERSION="v$(node scripts/get-version.js)"
           fi
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "📌 聚合发布版本: ${VERSION}"
 
       - name: 发布到统一资源中心
@@ -429,59 +467,3 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-
-  # 联动触发 Desktop 发版工作流（自动拉取新版 omni 引擎并更新 lock.json 发版）
-  # 按 desktop_build_region 参数决定派发区域：CN / INTL / CN+INTL（默认全部）
-  # 仅首次派发携带 update_omni_lock=true，避免多次派发并发竞争写 preset-resources.lock.json
-  trigger-desktop-release:
-    name: 联动触发 Desktop 发版流水线
-    needs: [publish-pro, bump-version]
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        region: ${{ fromJSON(format('[{0}]', github.event.inputs.desktop_build_region == 'CN' && '"CN"' || (github.event.inputs.desktop_build_region == 'INTL' && '"INTL"' || '"CN","INTL"'))) }}
-    steps:
-      - name: 触发 Desktop 仓库工作流 (firefly-ai-folder-desktop-release.yml)
-        uses: actions/github-script@v7
-        env:
-          NEW_OMNI_VERSION: ${{ needs.bump-version.outputs.version_tag }}
-          REGION: ${{ matrix.region }}
-          # CN 派发始终是首个触发；单选 INTL 时它是唯一派发，同样需要携带 lock 同步
-          IS_FIRST_DISPATCH: ${{ matrix.region == 'CN' || github.event.inputs.desktop_build_region == 'INTL' }}
-          HAS_CUSTOM_PAT: ${{ !!(secrets.PRO_SUBMODULE_TOKEN || secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.PAT || secrets.GH_PAT) }}
-        with:
-          # github-script v7 运行时不再暴露 @octokit/rest，自定义 Token 必须通过 github-token 输入注入
-          github-token: ${{ secrets.PRO_SUBMODULE_TOKEN || secrets.UNISOURCE_RELEASE_TOKEN || secrets.PRIVATE_MONOREPO_PAT || secrets.PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
-          script: |
-            const targetOwner = 'Leonard-Li777';
-            const targetRepo = 'firefly-ai-folder-desktop';
-            const workflowId = 'firefly-ai-folder-desktop-release.yml';
-            const omniVersion = process.env.NEW_OMNI_VERSION || '';
-            const region = process.env.REGION || 'CN';
-            // 仅 CN（首个矩阵分支）携带 update_omni_lock，INTL 复用 CN 已同步好的 lock，避免并发竞争
-            const updateOmniLock = process.env.IS_FIRST_DISPATCH === 'true';
-
-            core.info(`🚀 Omni 发布完毕！正在触发桌面端发版流水线: ${targetOwner}/${targetRepo} -> ${workflowId}`);
-            core.info(`📌 Omni 引擎版本: ${omniVersion} | 构建区域: ${region} | 同步 lock: ${updateOmniLock}`);
-
-            if (process.env.HAS_CUSTOM_PAT !== 'true') {
-              core.warning('⚠️ 未配置跨仓库 PAT（PRO_SUBMODULE_TOKEN / UNISOURCE_RELEASE_TOKEN 等），回退使用 GITHUB_TOKEN，跨仓库触发可能返回 401/403。');
-            }
-
-            try {
-              await github.rest.actions.createWorkflowDispatch({
-                owner: targetOwner,
-                repo: targetRepo,
-                workflow_id: workflowId,
-                ref: 'master',
-                inputs: {
-                  update_omni_lock: updateOmniLock,
-                  build_region: region,
-                  download_latest_llama: true
-                }
-              });
-              core.info('✅ 成功触发 Desktop 发版工作流！');
-            } catch (error) {
-              core.setFailed(`❌ 触发 Desktop 发版流水线失败: ${error.message}`);
-            }
