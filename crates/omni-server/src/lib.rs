@@ -310,6 +310,8 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/geo/reverse", post(geo_reverse_handler))
             .route("/api/hownet/describe", post(hownet_describe_handler))
             .route("/api/text/analyze", post(text_analyze_handler))
+            // 原生多模态敏感内容鉴别 API（支持纯文本 FastText+nsfw-l3、本地文件、Base64 图片 nsfw-mobilenetv2）
+            .route("/api/text/nsfw", post(routes::nsfw::nsfw_assert_handler))
             .route("/api/search/index", post(search_index_handler))
             .route("/api/search/hybrid", post(search_hybrid_handler))
             .route("/api/search/cluster", post(search_cluster_handler))
