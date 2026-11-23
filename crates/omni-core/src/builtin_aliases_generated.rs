@@ -2,7 +2,7 @@
 // Omni 受控标签别名表 (Builtin Aliases Generated)
 // 由 scripts/taxonomy/generate-controlled-concepts.ts 自动生成，请勿手动编辑！
 // 单一事实源: file-dimension-source.ts + curated-model-aliases.json
-// 条目总数: 2117 对
+// 条目总数: 2115 对
 // =====================================================================
 
 pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
@@ -173,7 +173,6 @@ pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("Chinese font", "Chinese font"),
     ("Chinese-Style Ink Wash", "Chinese-Style Ink Wash"),
     ("chm", "chm"),
-    ("City", "City"),
     ("cjs", "cjs"),
     ("cl", "cl"),
     ("class", "class"),
@@ -2072,7 +2071,6 @@ pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("邪教组织", "Cult Organizations"),
     ("邮件附件", "Email Attachment"),
     ("邻里情色", "Neighborhood Erotica"),
-    ("都市", "City"),
     ("都市情欲", "Urban Lust"),
     ("都市情色", "Urban Erotica"),
     ("配置文件", "Configuration file"),
