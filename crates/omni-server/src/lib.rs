@@ -5242,7 +5242,7 @@ async fn search_cluster_handler(
 async fn audio_transcribe_handler(
     State(state): State<AppState>,
     Json(req): Json<AudioTranscribeRequest>,
-) -> Json<AudioTranscribeResponse> {
+) -> Result<Json<AudioTranscribeResponse>, (StatusCode, String)> {
     let cfg = state.config.lock().unwrap().clone();
     let t_start = std::time::Instant::now();
     let file_path = req.file_path.clone();
@@ -5253,16 +5253,33 @@ async fn audio_transcribe_handler(
     let sherpa_engine = state.sherpa.clone();
 
     // Step 1: 优先通过 SherpaManager 进程内转录 (纯内存解码 -> GTCRN 降噪 -> VAD -> SenseVoice ASR + CED-mini 打标)
-    let (sv_opt, mut events) = tokio::task::spawn_blocking(move || {
+    let (sv_opt, mut events, audio_duration_sec) = tokio::task::spawn_blocking(move || -> Result<(Option<omni_pro::audio::SenseVoiceResult>, Vec<String>, Option<f64>), String> {
         let path = std::path::Path::new(&file_path_c);
         if let Some(samples) = decode_audio_to_16k_mono(path, Some(duration_seconds)) {
-            sherpa_engine.process_audio_pipeline_full(&samples, 16000)
+            let ms = (samples.len() as u64 * 1000) / 16000;
+            let dur_sec = if ms > 0 { Some(ms as f64 / 1000.0) } else { None };
+            // 超短音频 (<0.1s) 无需进入 ASR 模型推理，安全返回空文本与真实时长
+            if samples.len() < 1600 {
+                return Ok((None, Vec::new(), dur_sec));
+            }
+            // 模型未就绪或加载失败时显式报错（映射 HTTP 500），严禁伪装为「真静音 200」
+            if !sherpa_engine.is_asr_ready() && !sherpa_engine.ensure_recognizer() {
+                return Err("ASR model not ready or failed to initialize".to_string());
+            }
+            let (sv, evs) = sherpa_engine.process_audio_pipeline_full(&samples, 16000);
+            Ok((sv, evs, dur_sec))
         } else {
-            (None, Vec::new())
+            Ok((None, Vec::new(), None))
         }
     })
     .await
-    .unwrap_or((None, Vec::new()));
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("ASR transcription task panicked: {}", e),
+        )
+    })?
+    .map_err(|msg| (StatusCode::INTERNAL_SERVER_ERROR, msg))?;
 
     let mut transcript = sv_opt
         .as_ref()
@@ -5312,14 +5329,15 @@ async fn audio_transcribe_handler(
     }
 
     let duration_ms = t_start.elapsed().as_millis() as u64;
-    Json(AudioTranscribeResponse {
+    Ok(Json(AudioTranscribeResponse {
         file_path,
         transcript,
         events,
         language: detected_lang,
         emotion: detected_emotion,
         duration_ms,
-    })
+        audio_duration_sec,
+    }))
 }
 
 /// 音频标准化转换接口: POST /api/audio/convert

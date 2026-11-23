@@ -966,6 +966,9 @@ pub struct AudioTranscribeResponse {
     #[serde(default)]
     pub emotion: Option<String>,
     pub duration_ms: u64,
+    /// 本次实际解码送入 ASR 的真实音频时长（秒，受 duration_seconds 截断窗口约束；解码失败或 <1ms 时为 None）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_duration_sec: Option<f64>,
 }
 
 /// 音频转标准格式请求 (16kHz Mono PCM WAV + 降噪): POST /api/audio/convert

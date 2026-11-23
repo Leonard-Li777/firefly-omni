@@ -159,10 +159,16 @@ async fn test_audio_transcribe_endpoint_silent_and_short() {
         .await
         .unwrap();
 
-    assert_eq!(resp_silent.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp_silent.into_body(), usize::MAX).await.unwrap();
-    let res: AudioTranscribeResponse = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(res.transcript, None);
+    // 模型就绪时返回 200 且 transcript 为 None + audio_duration_sec = Some(1.0)；
+    // 模型未就绪（纯单测无权重环境）必须返回 HTTP 500，严禁将模型不可用伪装为「真静音 200」
+    if resp_silent.status() == StatusCode::OK {
+        let bytes = axum::body::to_bytes(resp_silent.into_body(), usize::MAX).await.unwrap();
+        let res: AudioTranscribeResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(res.transcript, None);
+        assert_eq!(res.audio_duration_sec, Some(1.0));
+    } else {
+        assert_eq!(resp_silent.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     // 2. 超短音频转录请求 (<0.1s)
     let short_path = temp_dir.path().join("transcribe_short.wav");
@@ -189,6 +195,31 @@ async fn test_audio_transcribe_endpoint_silent_and_short() {
     let bytes_short = axum::body::to_bytes(resp_short.into_body(), usize::MAX).await.unwrap();
     let res_short: AudioTranscribeResponse = serde_json::from_slice(&bytes_short).unwrap();
     assert_eq!(res_short.transcript, None);
+    // 0.0375s (600 samples @ 16kHz) -> 整数截断 37ms -> 0.037s 真实音频时长
+    assert_eq!(res_short.audio_duration_sec, Some(0.037));
+
+    // 3. 损坏/非音频输入应返回 audio_duration_sec = None（供上层与真静音区分）
+    let bogus_path = temp_dir.path().join("not_audio.wav");
+    std::fs::write(&bogus_path, b"not a valid audio container").unwrap();
+    let req_bogus = serde_json::json!({
+        "file_path": bogus_path.to_str().unwrap()
+    });
+    let resp_bogus = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/audio/transcribe")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req_bogus).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_bogus.status(), StatusCode::OK);
+    let bytes_bogus = axum::body::to_bytes(resp_bogus.into_body(), usize::MAX).await.unwrap();
+    let res_bogus: AudioTranscribeResponse = serde_json::from_slice(&bytes_bogus).unwrap();
+    assert_eq!(res_bogus.transcript, None);
+    assert_eq!(res_bogus.audio_duration_sec, None);
 }
 
 #[tokio::test]
