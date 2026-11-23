@@ -10063,7 +10063,6 @@ impl Concept {
             "builtin.yml" => Some(Concept::yml),
             "builtin.zig" => Some(Concept::zig),
             "builtin.zip" => Some(Concept::zip),
-            "builtin.author" => Some(Concept::作者),
             "builtin.background" => Some(Concept::背景),
             "builtin.text" => Some(Concept::文本),
             "builtin.document" => Some(Concept::文档),
