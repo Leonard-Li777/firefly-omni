@@ -613,6 +613,42 @@ pub mod vision {
             true
         }
 
+        pub fn fast_detect_has_text_with_size(_img: &image::DynamicImage, _model_size: &str) -> bool {
+            true
+        }
+
+        pub fn warmup_gemma_text() -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        pub fn warmup_gemma_vision() -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        pub fn is_gemma_text_resident() -> bool {
+            false
+        }
+
+        pub fn warmup_ocr(_model_size: &str) -> bool {
+            false
+        }
+
+        pub fn warmup_nsfw() -> bool {
+            false
+        }
+
+        pub fn is_nsfw_model_loaded() -> bool {
+            false
+        }
+
+        pub fn warmup_ram() -> bool {
+            false
+        }
+
+        pub fn warmup_clip_vision(_lang: Option<&str>) -> bool {
+            false
+        }
+
         pub fn recognize_ocr_text_with_size<P: AsRef<Path>>(_image_path: P, _model_size: &str) -> anyhow::Result<String> {
             Ok(String::new())
         }
@@ -755,6 +791,17 @@ pub mod vision {
 
         pub fn encode_gemma_text(_text: &str) -> anyhow::Result<Vec<f32>> {
             Ok(Vec::new())
+        }
+
+        pub fn encode_gemma_texts(
+            texts: &[&str],
+            _cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![Vec::new(); texts.len()])
+        }
+
+        pub fn gemma_cache_identity() -> Option<super::text::EmbedCacheIdentity> {
+            None
         }
 
         pub fn encode_gemma_image(_img: &image::DynamicImage) -> anyhow::Result<Vec<f32>> {
@@ -1142,6 +1189,7 @@ pub mod text {
 
     pub struct TextTokenizer;
     impl TextTokenizer {
+        pub fn warmup() {}
         pub fn extract_candidate_keywords(_text: &str, _lang: &str) -> Vec<String> {
             Vec::new()
         }
@@ -1150,8 +1198,39 @@ pub mod text {
         }
     }
 
+    pub const SHORT_TOKEN_BUCKET_MAX_LEN: usize = 32;
+    pub const EMBED_MICRO_BATCH_CAP: usize = 64;
+    pub const SHORT_TERM_EMBED_LRU_BUDGET_BYTES: usize = 6 * 1024 * 1024;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct EmbedCacheIdentity {
+        pub encoder_id: u8,
+        pub dim: usize,
+        pub model_revision: u64,
+    }
+
     pub trait TextEmbedder: Send + Sync {
         fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>>;
+        fn supports_true_batch(&self) -> bool {
+            false
+        }
+        fn cache_identity(&self) -> Option<EmbedCacheIdentity> {
+            None
+        }
+        fn embed_texts(
+            &self,
+            texts: &[&str],
+            cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                if cancel_flag.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+                    anyhow::bail!("text embedding cancelled");
+                }
+                out.push(self.embed_text(text)?);
+            }
+            Ok(out)
+        }
         fn keybert_candidate_cap(&self) -> usize {
             0
         }
@@ -1161,6 +1240,9 @@ pub mod text {
     impl BekkoEmbedder {
         pub fn new() -> Self {
             Self
+        }
+        pub fn warmup_session() -> anyhow::Result<bool> {
+            Ok(false)
         }
         pub fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
             Ok(vec![0.0f32; EMBEDDING_DIM])
@@ -1233,6 +1315,8 @@ pub mod text {
         omni_core::tag_thresholds::OBJECTIVE_TEXT_PRIOR_CONFIDENCE;
     pub const CONTROLLED_TEXT_TAG_CONFIDENCE: f32 = 0.90;
 
+    pub const EXT_CODE_PREFIX: &str = "_ext.";
+
     /// 全文本打标器存根 (Ticket 01)
     pub struct TextTagger;
 
@@ -1261,6 +1345,36 @@ pub mod text {
             _allow_new_tags: bool,
             _exclude_names: &[String],
             _anchor: Option<(&dyn TextEmbedder, &[f32])>,
+        ) -> Vec<omni_core::TagChainItem> {
+            Vec::new()
+        }
+
+        pub fn build_tag_candidates(
+            _text: &str,
+            _source_kind: Option<&str>,
+            _vector_table: Option<&PrecomputedVectorTable>,
+            _allow_new_tags: bool,
+            _exclude_names: &[String],
+        ) -> Vec<omni_core::TagChainItem> {
+            Vec::new()
+        }
+
+        pub fn apply_anchor_cosine_gate_with_context(
+            _candidates: &mut Vec<omni_core::TagChainItem>,
+            _source_kind: Option<&str>,
+            _allow_new_tags: bool,
+            _text: &str,
+            _cached_anchor: Option<(&dyn TextEmbedder, &[f32])>,
+            _anchor_context_text: Option<&str>,
+            _context_embedder: Option<&dyn TextEmbedder>,
+            _cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+        ) -> Option<Vec<f32>> {
+            None
+        }
+
+        pub fn finalize_tag_candidates_with_source(
+            _candidates: Vec<omni_core::TagChainItem>,
+            _source_kind: Option<&str>,
         ) -> Vec<omni_core::TagChainItem> {
             Vec::new()
         }

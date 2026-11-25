@@ -146,17 +146,13 @@ pub async fn fast_recognize_handler(
     let res = tokio::task::spawn_blocking(move || {
         let embedder = omni_pro::text::BekkoEmbedder::new();
 
-        static GLOBAL_VECTOR_TABLE: std::sync::OnceLock<Option<omni_pro::text::PrecomputedVectorTable>> =
-            std::sync::OnceLock::new();
-        let vector_table_ref = GLOBAL_VECTOR_TABLE.get_or_init(|| {
-            omni_pro::semantic_loader::SemanticPackLoader::load_dense_embeddings().ok()
-        });
+        let vector_table_ref = crate::global_text_vector_table_arc();
 
         match state.omw.with_conn(|conn| {
             Ok(omni_pro::text::FastTagRecognizer::recognize(
                 &ctx,
                 Some(conn),
-                vector_table_ref.as_ref(),
+                vector_table_ref.as_deref(),
                 &embedder,
             ))
         }) {
@@ -166,7 +162,7 @@ pub async fn fast_recognize_handler(
                 omni_pro::text::FastTagRecognizer::recognize(
                     &ctx,
                     None,
-                    vector_table_ref.as_ref(),
+                    vector_table_ref.as_deref(),
                     &embedder,
                 )
             }

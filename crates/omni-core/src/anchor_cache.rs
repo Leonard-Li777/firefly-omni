@@ -170,6 +170,58 @@ impl AnchorCache {
         }
     }
 
+    /// 只读查询锚点（**命中仅刷新 LRU 不删条目**）。使用 `Instant::now()` 作为 TTL 基准。
+    pub fn get(&self, fingerprint: &str, encoder_id: u8, dim: usize) -> AnchorLookup {
+        self.get_with_now(fingerprint, encoder_id, dim, Instant::now())
+    }
+
+    /// 只读查询锚点（可注入 `now`，供 TTL 确定性单测；命中刷新 LRU，过期或同源失配才清理并报原因）。
+    pub fn get_with_now(
+        &self,
+        fingerprint: &str,
+        encoder_id: u8,
+        dim: usize,
+        now: Instant,
+    ) -> AnchorLookup {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let Some((entry_ref, _)) = inner.map.get(fingerprint) else {
+            return AnchorLookup::Missing;
+        };
+
+        let expired = now
+            .checked_duration_since(entry_ref.updated_at)
+            .map(|elapsed| elapsed > self.ttl)
+            .unwrap_or(false);
+        if expired {
+            inner.map.remove(fingerprint);
+            return AnchorLookup::Expired;
+        }
+        if entry_ref.encoder_id != encoder_id {
+            let cached = entry_ref.encoder_id;
+            inner.map.remove(fingerprint);
+            return AnchorLookup::EncoderMismatch {
+                cached,
+                current: encoder_id,
+            };
+        }
+        if entry_ref.dim != dim {
+            let cached = entry_ref.dim;
+            inner.map.remove(fingerprint);
+            return AnchorLookup::DimMismatch {
+                cached,
+                current: dim,
+            };
+        }
+
+        let cloned = entry_ref.anchor_vector.clone();
+        inner.seq += 1;
+        let next_seq = inner.seq;
+        if let Some((_, seq_ref)) = inner.map.get_mut(fingerprint) {
+            *seq_ref = next_seq;
+        }
+        AnchorLookup::Hit(cloned)
+    }
+
     /// 取用锚点（**命中即删**）。使用 `Instant::now()` 作为 TTL 基准。
     pub fn take(&self, fingerprint: &str, encoder_id: u8, dim: usize) -> AnchorLookup {
         self.take_with_now(fingerprint, encoder_id, dim, Instant::now())
@@ -355,5 +407,37 @@ mod tests {
             .as_deref(),
             Some("anchor_dim_mismatch(cached=384, current=512)")
         );
+    }
+
+    #[test]
+    fn get_preserves_entry_and_refreshes_lru_order() {
+        let cache = AnchorCache::new(2, Duration::from_secs(60));
+        let t0 = Instant::now();
+        cache.put("fp-a", entry(0.1, BEKKO, 384, t0));
+        cache.put("fp-b", entry(0.2, BEKKO, 384, t0));
+
+        // 只读 get "fp-a" 不删除且刷新 LRU 序号，随后 put "fp-c" 必须淘汰 "fp-b"
+        assert!(matches!(cache.get_with_now("fp-a", BEKKO, 384, t0), AnchorLookup::Hit(_)));
+        assert!(matches!(cache.get_with_now("fp-a", BEKKO, 384, t0), AnchorLookup::Hit(_)));
+        cache.put("fp-c", entry(0.3, BEKKO, 384, t0));
+
+        assert_eq!(cache.get_with_now("fp-b", BEKKO, 384, t0), AnchorLookup::Missing);
+        assert!(matches!(cache.get_with_now("fp-a", BEKKO, 384, t0), AnchorLookup::Hit(_)));
+        assert!(matches!(cache.get_with_now("fp-c", BEKKO, 384, t0), AnchorLookup::Hit(_)));
+
+        // 过期与同源失配时清理条目并报告具体原因
+        assert_eq!(
+            cache.get_with_now("fp-a", GEMMA, 384, t0),
+            AnchorLookup::EncoderMismatch {
+                cached: BEKKO,
+                current: GEMMA
+            }
+        );
+        assert_eq!(cache.get_with_now("fp-a", BEKKO, 384, t0), AnchorLookup::Missing);
+        assert_eq!(
+            cache.get_with_now("fp-c", BEKKO, 384, t0 + Duration::from_secs(61)),
+            AnchorLookup::Expired
+        );
+        assert_eq!(cache.get_with_now("fp-c", BEKKO, 384, t0), AnchorLookup::Missing);
     }
 }

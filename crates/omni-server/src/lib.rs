@@ -256,6 +256,7 @@ pub fn create_app_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/api/version", get(version_handler))
         .route("/api/v1/engine/status", get(engine_status_handler))
+        .route("/api/v1/engine/warmup", post(engine_warmup_handler))
         .route("/api/v1/omni/events", get(omni_status_events_handler))
         .route("/api/omni/events", get(omni_status_events_handler))
         .route("/api/config", get(get_config).post(update_config).put(update_config))
@@ -509,6 +510,199 @@ async fn engine_vision_evict_handler(State(state): State<AppState>) -> Json<serd
         "status": "ok",
         "evicted": true,
     }))
+}
+
+fn warmup_default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineWarmupRequest {
+    #[serde(default = "warmup_default_true")]
+    pub text_and_lexicon: bool,
+    #[serde(default)]
+    pub vision_tower: bool,
+    #[serde(default)]
+    pub nsfw_detector: bool,
+    #[serde(default)]
+    pub image_ocr: bool,
+    #[serde(default)]
+    pub ocr_model_size: Option<String>,
+}
+
+impl Default for EngineWarmupRequest {
+    fn default() -> Self {
+        Self {
+            text_and_lexicon: true,
+            vision_tower: false,
+            nsfw_detector: false,
+            image_ocr: false,
+            ocr_model_size: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineWarmupResponse {
+    /// 必要底座（激活文本塔 + Trie + 全局向量表 + 语义图）全部就绪为 true；Open-Core 返回 false
+    pub ready: bool,
+    pub text_ready: bool,
+    pub trie_ready: bool,
+    pub vector_table_ready: bool,
+    pub semantic_graph_ready: bool,
+    pub vision_ready: bool,
+    pub nsfw_ready: bool,
+    pub ocr_ready: bool,
+    pub warmup_ms: u64,
+    pub warnings: Vec<String>,
+}
+
+/// 批量分析前显式同步预热接口: POST /api/v1/engine/warmup (Spec §2.1 / §3.1)
+///
+/// 全部重型探测与模型构建均封装于 `spawn_blocking`，绝不阻塞 Tokio async worker；
+/// 无论 Pro 或 Open-Core 模式均返回确定性 `EngineWarmupResponse`（非 404）。
+async fn engine_warmup_handler(
+    State(state): State<AppState>,
+    payload: Option<Json<EngineWarmupRequest>>,
+) -> Json<EngineWarmupResponse> {
+    let t0 = std::time::Instant::now();
+    let req = payload.map(|Json(v)| v).unwrap_or_default();
+
+    if !omni_pro::is_pro_enabled() {
+        return Json(EngineWarmupResponse {
+            ready: false,
+            text_ready: false,
+            trie_ready: false,
+            vector_table_ready: false,
+            semantic_graph_ready: false,
+            vision_ready: false,
+            nsfw_ready: false,
+            ocr_ready: false,
+            warmup_ms: t0.elapsed().as_millis() as u64,
+            warnings: vec!["omni_pro disabled".to_string()],
+        });
+    }
+
+    let (profile, cfg_ocr_size) = {
+        let cfg = state.config.lock().unwrap_or_else(|e| e.into_inner());
+        (cfg.embedding_profile.clone(), cfg.ocr_model_size.clone())
+    };
+    let state_clone = state.clone();
+
+    let res = tokio::task::spawn_blocking(move || {
+        let mut warnings: Vec<String> = Vec::new();
+        let mut text_ready = false;
+        let mut trie_ready = false;
+        let mut vector_table_ready = false;
+        let mut semantic_graph_ready = false;
+        let mut vision_ready = false;
+        let mut nsfw_ready = false;
+        let mut ocr_ready = false;
+
+        let is_gemma = profile == "gemma_unified";
+
+        if req.text_and_lexicon {
+            omni_pro::text::TextTokenizer::warmup();
+            trie_ready = true;
+
+            vector_table_ready = global_text_vector_table_arc().is_some();
+            if !vector_table_ready {
+                warnings.push("vector_table_unavailable".to_string());
+            }
+
+            semantic_graph_ready = state_clone.omw.semantic_graph().is_some();
+            if !semantic_graph_ready {
+                warnings.push("semantic_graph_unavailable".to_string());
+            }
+
+            if is_gemma {
+                match omni_pro::OmniVisionEngine::warmup_gemma_text() {
+                    Ok(_) => text_ready = true,
+                    Err(e) => warnings.push(format!("gemma_text_warmup_failed: {e}")),
+                }
+            } else {
+                match omni_pro::text::BekkoEmbedder::warmup_session() {
+                    Ok(_) => text_ready = true,
+                    Err(e) => warnings.push(format!("bekko_text_warmup_failed: {e}")),
+                }
+            }
+        }
+
+        if req.vision_tower {
+            if is_gemma {
+                match omni_pro::OmniVisionEngine::warmup_gemma_vision() {
+                    Ok(_) => vision_ready = true,
+                    Err(e) => warnings.push(format!("gemma_vision_warmup_failed: {e}")),
+                }
+            } else {
+                let clip_ok = omni_pro::OmniVisionEngine::warmup_clip_vision(None);
+                let _ram_ok = omni_pro::OmniVisionEngine::warmup_ram();
+                vision_ready = clip_ok;
+                if !clip_ok {
+                    warnings.push("clip_vision_warmup_unavailable".to_string());
+                }
+            }
+        }
+
+        if req.nsfw_detector {
+            let _ = omni_pro::text::FastTextNsfwClassifier::reload_config();
+            nsfw_ready = omni_pro::OmniVisionEngine::warmup_nsfw();
+            if !nsfw_ready {
+                warnings.push("nsfw_model_warmup_unavailable".to_string());
+            }
+        }
+
+        if req.image_ocr {
+            let target_size = req
+                .ocr_model_size
+                .as_deref()
+                .filter(|s| *s == "tiny" || *s == "small")
+                .unwrap_or_else(|| {
+                    if cfg_ocr_size == "small" {
+                        "small"
+                    } else {
+                        "tiny"
+                    }
+                });
+            ocr_ready = omni_pro::OmniVisionEngine::warmup_ocr(target_size);
+            if !ocr_ready {
+                warnings.push(format!("ocr_warmup_unavailable ({target_size})"));
+            }
+        }
+
+        let ready = !req.text_and_lexicon
+            || (text_ready && trie_ready && vector_table_ready && semantic_graph_ready);
+
+        EngineWarmupResponse {
+            ready,
+            text_ready,
+            trie_ready,
+            vector_table_ready,
+            semantic_graph_ready,
+            vision_ready,
+            nsfw_ready,
+            ocr_ready,
+            warmup_ms: t0.elapsed().as_millis() as u64,
+            warnings,
+        }
+    })
+    .await
+    .unwrap_or_else(|e| EngineWarmupResponse {
+        ready: false,
+        text_ready: false,
+        trie_ready: false,
+        vector_table_ready: false,
+        semantic_graph_ready: false,
+        vision_ready: false,
+        nsfw_ready: false,
+        ocr_ready: false,
+        warmup_ms: t0.elapsed().as_millis() as u64,
+        warnings: vec![format!("warmup_spawn_blocking_failed: {e}")],
+    });
+
+    Json(res)
 }
 
 
@@ -1471,36 +1665,44 @@ async fn update_config(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
 ) -> Json<OmniConfig> {
-    let mut cfg = state.config.lock().unwrap();
-    if let Ok(new_cfg) = serde_json::from_value::<OmniConfig>(payload.clone()) {
-        let prev_profile = cfg.embedding_profile.clone();
-        let prev_mrl = cfg.mrl_dimension;
+    {
+        let mut cfg = state.config.lock().unwrap();
+        if let Ok(new_cfg) = serde_json::from_value::<OmniConfig>(payload.clone()) {
+            let prev_profile = cfg.embedding_profile.clone();
+            let prev_mrl = cfg.mrl_dimension;
 
-        *cfg = new_cfg;
+            *cfg = new_cfg;
 
-        // 若传入 payload 未显式指定 embedding_profile，保留当前激活档位，杜绝被 serde default 降级覆盖
-        if payload.get("embedding_profile").is_none() {
-            cfg.embedding_profile = prev_profile;
-        }
-        // 若传入 payload 未显式指定 mrl_dimension，保留当前 MRL 维度
-        if payload.get("mrl_dimension").is_none() {
-            cfg.mrl_dimension = prev_mrl;
-        }
-
-        if omni_pro::is_pro_enabled() {
-            omni_pro::OmniVisionEngine::set_gemma_mrl_dimension(cfg.mrl_dimension);
-            if !cfg.enable_nsfw_perception {
-                omni_pro::OmniVisionEngine::unload_nsfw_model();
+            // 若传入 payload 未显式指定 embedding_profile，保留当前激活档位，杜绝被 serde default 降级覆盖
+            if payload.get("embedding_profile").is_none() {
+                cfg.embedding_profile = prev_profile.clone();
             }
+            let profile_changed = cfg.embedding_profile != prev_profile;
+            // 若传入 payload 未显式指定 mrl_dimension，保留当前 MRL 维度
+            if payload.get("mrl_dimension").is_none() {
+                cfg.mrl_dimension = prev_mrl;
+            }
+
+            if omni_pro::is_pro_enabled() {
+                omni_pro::OmniVisionEngine::set_gemma_mrl_dimension(cfg.mrl_dimension);
+                if !cfg.enable_nsfw_perception {
+                    omni_pro::OmniVisionEngine::unload_nsfw_model();
+                }
+            }
+            save_config_to_disk(&*cfg);
+            let cloned = cfg.clone();
+            drop(cfg);
+            if profile_changed && omni_pro::is_pro_enabled() {
+                tokio::task::spawn_blocking(|| {
+                    let _ = reload_global_text_vector_table();
+                });
+            }
+            state.publish_status_event("ok");
+            return Json(cloned);
         }
-        save_config_to_disk(&*cfg);
-        let cloned = cfg.clone();
-        drop(cfg);
-        state.publish_status_event("ok");
-        Json(cloned)
-    } else {
-        Json(cfg.clone())
     }
+    let cfg = state.config.lock().unwrap();
+    Json(cfg.clone())
 }
 
 /// 处理本地 JSON 文件路径提取请求: POST /api/extract { "file_path": "/path/to/file" }
@@ -1621,6 +1823,29 @@ pub fn run_vision_pipeline_on_image(
     enable_nsfw: bool,
     enable_image_ocr: bool,
 ) -> Result<VisionComputed, String> {
+    run_vision_pipeline_on_image_with_ocr_size(
+        inspect_img,
+        exif_orient,
+        enable_visual_tags,
+        lang,
+        embedding_profile,
+        enable_nsfw,
+        enable_image_ocr,
+        None,
+    )
+}
+
+/// 带同会话 `ocr_model_size` 透传的多核零拷贝并行视觉感知流水线（消除探活固定 tiny 造成的切档抖动）
+pub fn run_vision_pipeline_on_image_with_ocr_size(
+    inspect_img: &image::DynamicImage,
+    exif_orient: Option<&str>,
+    enable_visual_tags: bool,
+    lang: Option<&str>,
+    embedding_profile: &str,
+    enable_nsfw: bool,
+    enable_image_ocr: bool,
+    ocr_model_size: Option<&str>,
+) -> Result<VisionComputed, String> {
     let t_vision = std::time::Instant::now();
     let mut out = VisionComputed::default();
 
@@ -1644,11 +1869,12 @@ pub fn run_vision_pipeline_on_image(
 
     // 多核并行：7 大视觉算子零拷贝只读引用借用 &img_ref，独立计时
     let scope_res = std::thread::scope(|s| -> Result<(), String> {
+        let ocr_size_ref = ocr_model_size.unwrap_or("tiny");
         // 1. 文本探活 (DBNet / MobileNet 骨干)
         // [V11-03] 关闭图片 OCR 时必须在任何模型初始化前短路，零 DBNet 调用、零 Session 加载。
         let h_text = omni_core::timed_spawn!(s, {
             if enable_image_ocr {
-                omni_pro::OmniVisionEngine::fast_detect_has_text(img_ref)
+                omni_pro::OmniVisionEngine::fast_detect_has_text_with_size(img_ref, ocr_size_ref)
             } else {
                 false
             }
@@ -2014,6 +2240,7 @@ fn run_vision_pipeline(
     embedding_profile: &str,
     enable_nsfw: bool,
     enable_image_ocr: bool,
+    ocr_model_size: Option<&str>,
 ) -> Result<VisionComputed, String> {
     let t_vision = std::time::Instant::now();
     let ext = std::path::Path::new(file_path)
@@ -2028,7 +2255,16 @@ fn run_vision_pipeline(
     if is_image {
         match image::open(file_path) {
             Ok(img) => {
-                match run_vision_pipeline_on_image(&img, exif_orient, enable_visual_tags, lang, embedding_profile, enable_nsfw, enable_image_ocr) {
+                match run_vision_pipeline_on_image_with_ocr_size(
+                    &img,
+                    exif_orient,
+                    enable_visual_tags,
+                    lang,
+                    embedding_profile,
+                    enable_nsfw,
+                    enable_image_ocr,
+                    ocr_model_size,
+                ) {
                     Ok(mut computed) => {
                         computed.duration_ms = t_vision.elapsed().as_millis() as u64;
                         tracing::debug!(
@@ -2370,10 +2606,20 @@ async fn perceive_file_handler(
             let fp = file_path.clone();
             let eo = exif_orient.clone();
             let profile = cfg.embedding_profile.clone();
+            let ocr_size_opt = cfg.ocr_model_size.clone();
             let mut vision_err: Option<String> = None;
             let vision_res = if is_pro {
                 match tokio::task::spawn_blocking(move || {
-                    run_vision_pipeline(&fp, eo.as_deref(), enable_visual_tags, lang.as_deref(), &profile, cfg.enable_nsfw_perception, cfg.enable_image_ocr)
+                    run_vision_pipeline(
+                        &fp,
+                        eo.as_deref(),
+                        enable_visual_tags,
+                        lang.as_deref(),
+                        &profile,
+                        cfg.enable_nsfw_perception,
+                        cfg.enable_image_ocr,
+                        Some(ocr_size_opt.as_str()),
+                    )
                 })
                 .await
                 {
@@ -2623,6 +2869,7 @@ async fn perceive_file_handler(
                     let rep_profile = cfg.embedding_profile.clone();
                     let rep_nsfw = cfg.enable_nsfw_perception;
                     let rep_ocr_en = cfg.enable_image_ocr;
+                    let rep_ocr_size = cfg.ocr_model_size.clone();
                     let (webp_b64_opt, rep_vision_res, dyn_img) = tokio::task::spawn_blocking(move || {
                         let webp_b64 = match omni_pro::cover::raw_to_webp(
                             rep_rgb_owned.as_raw(),
@@ -2640,7 +2887,7 @@ async fn perceive_file_handler(
                             }
                         };
                         let dyn_img = image::DynamicImage::ImageRgb8(rep_rgb_owned);
-                        let rep_res = run_vision_pipeline_on_image(
+                        let rep_res = run_vision_pipeline_on_image_with_ocr_size(
                             &dyn_img,
                             None,
                             enable_vis_tags,
@@ -2648,6 +2895,7 @@ async fn perceive_file_handler(
                             &rep_profile,
                             rep_nsfw,
                             rep_ocr_en,
+                            Some(rep_ocr_size.as_str()),
                         );
                         (webp_b64, rep_res, dyn_img)
                     })
@@ -3733,7 +3981,8 @@ async fn perceive_file_handler(
             let text_anchor = text_emb_clone
                 .as_ref()
                 .map(|v| (text_embedder.as_ref(), v.as_slice()));
-            let vt_ref = global_text_vector_table();
+            let vt_arc = global_text_vector_table_arc();
+            let vt_ref = vt_arc.as_deref();
 
             let mut tags: Vec<omni_core::TagChainItem> = Vec::new();
             // 1. ASR / LRC 提取 (source: "asr")
@@ -3902,8 +4151,8 @@ async fn perceive_file_handler(
     //
     // - 只暂存 `e_global` 单锚：批 A 阈值与批 B 门控都是「与全局锚点的余弦」；
     //   融合引擎内部的描述锚点/段落向量是瞬时量，**严禁**缓存（会迅速突破内存红线）；
-    // - 无指纹（调用方未传）或无锚点（非 Pro / 编码失败）⇒ 不写入，返送侧走降级；
-    // - 编码器身份取 `encoder_id::BEKKO`：融合锚点恒由 `BekkoEmbedder`（384d）产出。
+    // - 无指纹（调用方未传）或无锚点（非 Pro / 编码失败）⇒ 不写入，返送侧按分轨重建/降级；
+    // - 编码器身份取 `target_encoder_id`（`GEMMA` vs `BEKKO`），按当前生效嵌入档位对齐。
     let (target_encoder_id, _) = if is_gemma {
         (omni_core::encoder_id::GEMMA, cfg.mrl_dimension)
     } else {
@@ -4545,23 +4794,64 @@ async fn perceive_file_handler(
     Ok(result)
 }
 
-/// 受控词表预计算向量表（进程级只读，一次加载全程复用）。
-///
-/// `perceive` 的文本打标与 `POST /api/text/tag` **必须共用同一实例**——若各自持有
-/// `OnceLock`，同一张表会被加载两遍（内存翻倍）且两处口径可能因加载时点不同而分叉。
-fn global_text_vector_table() -> Option<&'static omni_pro::text::PrecomputedVectorTable> {
-    static GLOBAL_TEXT_VECTOR_TABLE: std::sync::OnceLock<
-        Option<omni_pro::text::PrecomputedVectorTable>,
-    > = std::sync::OnceLock::new();
-    GLOBAL_TEXT_VECTOR_TABLE
-        .get_or_init(|| {
-            omni_pro::text::PrecomputedVectorTable::discover_table_path()
-                .and_then(|p| omni_pro::text::PrecomputedVectorTable::load_from_file(p).ok())
-        })
-        .as_ref()
+/// 受控词表预计算向量表（进程级唯一单实例 `RwLock<Option<Arc<...>>>`，`perceive`、`/api/text/tag` 与 `/api/taxonomy/fast-recognize` 共享并支持重加载）。
+static GLOBAL_TEXT_VECTOR_TABLE: std::sync::RwLock<
+    Option<std::sync::Arc<omni_pro::text::PrecomputedVectorTable>>,
+> = std::sync::RwLock::new(None);
+static GLOBAL_VT_BUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn load_global_text_vector_table_inner() -> Option<omni_pro::text::PrecomputedVectorTable> {
+    omni_pro::text::PrecomputedVectorTable::discover_table_path()
+        .and_then(|p| omni_pro::text::PrecomputedVectorTable::load_from_file(p).ok())
+        .or_else(|| omni_pro::semantic_loader::SemanticPackLoader::load_dense_embeddings().ok())
 }
 
-/// LLM 产物返送打标请求体: POST /api/text/tag（spec §3.1）
+pub(crate) fn global_text_vector_table_arc(
+) -> Option<std::sync::Arc<omni_pro::text::PrecomputedVectorTable>> {
+    {
+        let guard = GLOBAL_TEXT_VECTOR_TABLE
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ref vt) = *guard {
+            return Some(Arc::clone(vt));
+        }
+    }
+    let _build_guard = GLOBAL_VT_BUILD_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    {
+        let guard = GLOBAL_TEXT_VECTOR_TABLE
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ref vt) = *guard {
+            return Some(Arc::clone(vt));
+        }
+    }
+    let loaded = load_global_text_vector_table_inner()?;
+    let arc = Arc::new(loaded);
+    let mut guard = GLOBAL_TEXT_VECTOR_TABLE
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = Some(Arc::clone(&arc));
+    Some(arc)
+}
+
+pub(crate) fn reload_global_text_vector_table() -> bool {
+    let _build_guard = GLOBAL_VT_BUILD_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(loaded) = load_global_text_vector_table_inner() else {
+        return false;
+    };
+    let arc = Arc::new(loaded);
+    let mut guard = GLOBAL_TEXT_VECTOR_TABLE
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = Some(arc);
+    true
+}
+
+/// LLM 产物返送打标请求体: POST /api/text/tag（spec §3.3）
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextTagRequest {
@@ -4583,6 +4873,12 @@ pub struct TextTagRequest {
     /// 文本来源种类（"multimodal_desc" | "document" | "summary" 等）
     #[serde(default)]
     pub source_kind: Option<String>,
+    /// 线上键 mediaKind: "image"|"video"|"audio"|"document"|"text"|"code"
+    #[serde(default)]
+    pub media_kind: Option<String>,
+    /// 线上键 anchorContextText（Tier 3 无缓存锚点时用于即时编码锚点并回填 AnchorCache）
+    #[serde(default)]
+    pub anchor_context_text: Option<String>,
 }
 
 /// 判定是否应采用篇章扩容打标模式（上限 20 个标签，0.30 稀释门限）
@@ -4599,31 +4895,91 @@ pub fn is_expanded_capacity_source(source_kind: Option<&str>, text: &str) -> boo
     }
 }
 
-/// 通用文本打标 API: POST /api/text/tag（spec §2.2 / §3.1）
+/// 全媒体视觉排他过滤：非视觉介质（文档/文本/代码/音频或 resolved_source_kind == "document"）严禁输出视觉专有标签
+fn filter_text_tag_visual_exclusivity(
+    tags: &mut Vec<omni_core::TagChainItem>,
+    media_kind: Option<&str>,
+    resolved_source_kind: &str,
+) {
+    let is_non_visual_media = matches!(
+        media_kind,
+        Some("document") | Some("text") | Some("code") | Some("audio")
+    );
+    if is_non_visual_media || resolved_source_kind == "document" {
+        tags.retain(|t| {
+            !omni_core::tag_identity::is_visual_exclusive_tag(&t.name)
+                && !omni_core::tag_identity::is_visual_exclusive_tag(&t.code)
+                && !omni_core::tag_identity::is_image_exclusive_tag(&t.name)
+        });
+    }
+}
+
+fn build_text_tag_headers(
+    degraded: bool,
+    gate_evaluated: bool,
+    degrade_reason: Option<&str>,
+) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-omni-tag-degraded"),
+        HeaderValue::from_static(if degraded { "true" } else { "false" }),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-omni-tag-gate-evaluated"),
+        HeaderValue::from_static(if gate_evaluated { "true" } else { "false" }),
+    );
+    if let Some(reason) = degrade_reason {
+        if let Ok(hv) = HeaderValue::from_str(reason) {
+            headers.insert(
+                axum::http::header::HeaderName::from_static("x-omni-tag-degrade-reason"),
+                hv,
+            );
+        }
+    }
+    headers
+}
+
+struct TextTagCancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for TextTagCancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 通用文本打标 API: POST /api/text/tag（spec §2.3 / §3.3）
 ///
-/// 底座复用 `TextTagger`（受控反查 → 派生 `_ext.*` → 置信度标定 → 去重限 8），
-/// 本接口**仅叠加**「锚点余弦 ≥ 0.55」这一批 B 新增判据；过滤发生在截断之前。
+/// 4 步精确流水线 + 权威响应头（`X-Omni-Tag-Degraded` / `X-Omni-Tag-Gate-Evaluated`）+
+/// `CancelOnDrop` 断连协作取消：
+/// - Step 0：先生成候选；`!allow_new_tags || _ext.* == 0` 时零锁零 ONNX，经完整收口与视觉排他后返回；
+/// - Step 1：Tier 1 `AnchorCache::get` 只读刷新 LRU；
+/// - Step 2：Tier 2 按 `mediaKind` 分轨点查 `zvec` 并回填 `AnchorCache`；
+/// - Step 3：Tier 3 `apply_anchor_cosine_gate_with_context` 单批编码、零向量即刻降级截断 `_ext.*` 并回填非零锚点。
 async fn text_tag_handler(
     State(state): State<AppState>,
     Json(req): Json<TextTagRequest>,
-) -> Json<Vec<omni_core::TagChainItem>> {
-    // 非 Pro：与 perceive 的非 Pro 契约一致——返回空数组存根，严禁以其它来源顶替（§3.1）
+) -> (axum::http::HeaderMap, Json<Vec<omni_core::TagChainItem>>) {
+    // 非 Pro：与 perceive 的非 Pro 契约一致——返回空数组存根并显式标为 degraded
     if !omni_pro::is_pro_enabled() {
         tracing::warn!(
             "[OmniServer] /api/text/tag 在非 Pro 构建下无打标能力，返回空数组存根（fingerprint={}）",
             req.file_fingerprint
         );
-        return Json(Vec::new());
+        return (
+            build_text_tag_headers(true, false, Some("pro_disabled")),
+            Json(Vec::new()),
+        );
     }
 
     if req.text.trim().is_empty() {
-        return Json(Vec::new());
+        return (
+            build_text_tag_headers(false, false, None),
+            Json(Vec::new()),
+        );
     }
 
-    // 锚点同源取用：**命中即删**；每个失败分支都必须 warn 上报降级原因（§2.2.6 禁静默）。
-    // 动态感知当前激活档位（GEMMA vs BEKKO），严格杜绝跨模型空间与硬编码 384d。
     let (is_gemma, target_encoder_id, target_dim) = {
-        let cfg = state.config.lock().unwrap();
+        let cfg = state.config.lock().unwrap_or_else(|e| e.into_inner());
         let is_g = cfg.embedding_profile == "gemma_unified";
         let enc = if is_g {
             omni_core::encoder_id::GEMMA
@@ -4638,76 +4994,210 @@ async fn text_tag_handler(
         (is_g, enc, dim)
     };
 
-    let lookup = state.anchor_cache.take(
-        &req.file_fingerprint,
-        target_encoder_id,
-        target_dim,
-    );
-    let anchor = match lookup {
-        omni_core::anchor_cache::AnchorLookup::Hit(vector) => Some(vector),
-        other => {
-            tracing::warn!(
-                "[OmniServer] 返送打标缺少同源锚点，降级为纯受控打标（不产 _ext.*）：reason={} fingerprint={} language={:?} encoder={}",
-                other.degrade_reason().unwrap_or_default(),
-                req.file_fingerprint,
-                req.language,
-                target_encoder_id
-            );
-            None
-        }
-    };
-    // 降级铁律：无锚点即无法做余弦门控 ⇒ **禁止抽新标签**（§2.2.6 降级路径）
-    let allow_new_tags = req.allow_new_tags && anchor.is_some();
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_guard = TextTagCancelOnDrop(std::sync::Arc::clone(&cancel_flag));
+    let cancel_worker = std::sync::Arc::clone(&cancel_flag);
 
+    let file_fingerprint = req.file_fingerprint;
     let text = req.text;
+    let language = req.language;
+    let req_allow_new_tags = req.allow_new_tags;
     let exclude_names = req.exclude_names;
+    let media_kind = req.media_kind;
+    let anchor_context_text = req.anchor_context_text;
+
     let is_expanded = is_expanded_capacity_source(req.source_kind.as_deref(), &text);
+    let is_visual_media = matches!(media_kind.as_deref(), Some("image") | Some("video"));
     let resolved_source_kind = match req.source_kind.as_deref() {
         Some(s) if !s.trim().is_empty() => s.to_string(),
         _ => {
-            if is_expanded {
+            if is_expanded && !is_visual_media {
                 "document".to_string()
             } else {
                 "text".to_string()
             }
         }
     };
+
     let res = tokio::task::spawn_blocking(move || {
+        // 同步检查点 ①：分词与候选构建前检查客户端是否已断连
+        if cancel_worker.load(std::sync::atomic::Ordering::Relaxed) {
+            return (Vec::new(), true, false, Some("client_cancelled".to_string()));
+        }
+
+        let vt_arc = global_text_vector_table_arc();
+        // Step 0：零推理短路 + 完整出口收口（Zero ONNX, Zero AnchorCache/zvec）
+        let mut candidates = omni_pro::text::TextTagger::build_tag_candidates(
+            &text,
+            Some(&resolved_source_kind),
+            vt_arc.as_deref(),
+            req_allow_new_tags,
+            &exclude_names,
+        );
+
+        let ext_count = candidates
+            .iter()
+            .filter(|c| c.code.starts_with(omni_pro::text::EXT_CODE_PREFIX))
+            .count();
+
+        if !req_allow_new_tags || ext_count == 0 {
+            let mut tags = omni_pro::text::TextTagger::finalize_tag_candidates_with_source(
+                candidates,
+                Some(&resolved_source_kind),
+            );
+            filter_text_tag_visual_exclusivity(
+                &mut tags,
+                media_kind.as_deref(),
+                &resolved_source_kind,
+            );
+            return (tags, false, false, None);
+        }
+
+        // Step 1：Tier 1 AnchorCache::get 只读刷新 LRU（不删条目）
+        let mut degrade_reason: Option<String> = None;
+        let mut cached_anchor: Option<Vec<f32>> = if !file_fingerprint.trim().is_empty() {
+            match state
+                .anchor_cache
+                .get(&file_fingerprint, target_encoder_id, target_dim)
+            {
+                omni_core::anchor_cache::AnchorLookup::Hit(vec) => Some(vec),
+                other => {
+                    degrade_reason = other.degrade_reason();
+                    None
+                }
+            }
+        } else {
+            degrade_reason = Some("missing_fingerprint".to_string());
+            None
+        };
+
+        // Step 2：Tier 2 介质分轨 zvec 点查并回填 AnchorCache
+        if cached_anchor.is_none() && !file_fingerprint.trim().is_empty() {
+            let mk = media_kind.as_deref();
+            let has_ctx_text = anchor_context_text
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            let lookup_key: Option<String> = match mk {
+                Some("document") | Some("text") | Some("code") => {
+                    Some(format!("{file_fingerprint}:tc0"))
+                }
+                Some("image") if is_gemma && !has_ctx_text => Some(file_fingerprint.clone()),
+                _ => None,
+            };
+
+            if let Some(ref zkey) = lookup_key {
+                if let Some((vec, enc)) = state.vector.get_vector_entry(zkey, target_dim) {
+                    let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
+                    if enc == target_encoder_id
+                        && vec.len() == target_dim
+                        && norm_sq.is_finite()
+                        && norm_sq >= 1e-12
+                    {
+                        state.anchor_cache.put(
+                            &file_fingerprint,
+                            omni_core::anchor_cache::AnchorCacheEntry::new(
+                                vec.clone(),
+                                target_encoder_id,
+                                std::time::Instant::now(),
+                            ),
+                        );
+                        cached_anchor = Some(vec);
+                        degrade_reason = None;
+                    }
+                }
+            }
+        }
+
+        if cancel_worker.load(std::sync::atomic::Ordering::Relaxed) {
+            return (Vec::new(), true, false, Some("client_cancelled".to_string()));
+        }
+
+        // Step 3：Tier 3 合批编排与向量回传（零向量锚点即刻按三级全失降级剔除 _ext.*）
         let text_embedder: Box<dyn omni_pro::text::TextEmbedder> = if is_gemma {
             Box::new(GemmaTextEmbedder)
         } else {
             Box::new(omni_pro::text::BekkoEmbedder::new())
         };
-        let anchor_ref = anchor.as_deref().map(|vector| (text_embedder.as_ref(), vector));
-        let mut tags = omni_pro::text::TextTagger::tag_text_with_anchor(
-            &text,
+
+        let cached_valid = cached_anchor.as_deref().and_then(|v| {
+            let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+            if norm_sq.is_finite() && norm_sq >= 1e-12 {
+                Some((text_embedder.as_ref(), v))
+            } else {
+                None
+            }
+        });
+
+        let fresh_anchor = omni_pro::text::TextTagger::apply_anchor_cosine_gate_with_context(
+            &mut candidates,
             Some(&resolved_source_kind),
-            global_text_vector_table(),
-            allow_new_tags,
-            &exclude_names,
-            anchor_ref,
+            req_allow_new_tags,
+            &text,
+            cached_valid,
+            anchor_context_text.as_deref(),
+            Some(text_embedder.as_ref()),
+            Some(&cancel_worker),
         );
-        // 全媒体领域排他终检：非视觉介质严禁输出视觉专有维度标签（如高质量、中等质量、画质等级、打码等）
-        // 介质排他与容量解耦：只有当确属纯文档/文本而非多模态描述（multimodal_desc）时才排他
-        if resolved_source_kind == "document" {
-            tags.retain(|t| {
-                !omni_core::tag_identity::is_visual_exclusive_tag(&t.name)
-                    && !omni_core::tag_identity::is_visual_exclusive_tag(&t.code)
-                    && !omni_core::tag_identity::is_image_exclusive_tag(&t.name)
-            });
+
+        if cancel_worker.load(std::sync::atomic::Ordering::Relaxed) {
+            return (Vec::new(), true, false, Some("client_cancelled".to_string()));
         }
-        tags
+
+        let (degraded, gate_evaluated, final_reason) = if cached_valid.is_some() {
+            (false, true, None)
+        } else if let Some(new_vec) = fresh_anchor {
+            if !file_fingerprint.trim().is_empty() {
+                let norm_sq: f32 = new_vec.iter().map(|x| x * x).sum();
+                if norm_sq.is_finite() && norm_sq >= 1e-12 {
+                    state.anchor_cache.put(
+                        &file_fingerprint,
+                        omni_core::anchor_cache::AnchorCacheEntry::new(
+                            new_vec,
+                            target_encoder_id,
+                            std::time::Instant::now(),
+                        ),
+                    );
+                }
+            }
+            (false, true, None)
+        } else {
+            let reason = degrade_reason.unwrap_or_else(|| "anchor_unavailable".to_string());
+            tracing::warn!(
+                "[OmniServer] 返送打标缺少有效同源锚点，降级为纯受控打标: reason={} fingerprint={} language={:?} encoder={}",
+                reason,
+                file_fingerprint,
+                language,
+                target_encoder_id
+            );
+            (true, false, Some(reason))
+        };
+
+        let mut tags = omni_pro::text::TextTagger::finalize_tag_candidates_with_source(
+            candidates,
+            Some(&resolved_source_kind),
+        );
+        filter_text_tag_visual_exclusivity(
+            &mut tags,
+            media_kind.as_deref(),
+            &resolved_source_kind,
+        );
+        (tags, degraded, gate_evaluated, final_reason)
     })
     .await;
 
-    Json(match res {
-        Ok(tags) => tags,
+    match res {
+        Ok((tags, degraded, gate_evaluated, reason)) => (
+            build_text_tag_headers(degraded, gate_evaluated, reason.as_deref()),
+            Json(tags),
+        ),
         Err(e) => {
-            // 任务 panic 时返回空数组：调用方按「无返送标签」处理，不得误判为正常空结果
             tracing::error!("[OmniServer] 返送打标任务执行失败: {e}");
-            Vec::new()
+            (
+                build_text_tag_headers(true, false, Some("task_panic")),
+                Json(Vec::new()),
+            )
         }
-    })
+    }
 }
 
 /// 纯文本确定性特征分析请求体: POST /api/text/analyze
@@ -5055,12 +5545,28 @@ const JIT_CACHE_MAX_ENTRIES: usize = 4096;
 /// 存在意义（缺陷根因）：`OmniTextEngine::analyze` 早期恒构造 `BekkoEmbedder`，
 /// 导致「已选 gemma_unified 却仍在加载 bekko-a8m 384d」——perceive 的文本分析
 /// 正是那条日志的真实来源（检索侧已另行档位化）。
-struct GemmaTextEmbedder;
+pub(crate) struct GemmaTextEmbedder;
 
 impl omni_pro::text::TextEmbedder for GemmaTextEmbedder {
     fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         // encode_text 内部已按引擎 mrl_dimension 截断并 L2 归一化，无需二次裁剪
         omni_pro::OmniVisionEngine::encode_gemma_text(text)
+    }
+
+    fn supports_true_batch(&self) -> bool {
+        true
+    }
+
+    fn cache_identity(&self) -> Option<omni_pro::text::EmbedCacheIdentity> {
+        omni_pro::OmniVisionEngine::gemma_cache_identity()
+    }
+
+    fn embed_texts(
+        &self,
+        texts: &[&str],
+        cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        omni_pro::OmniVisionEngine::encode_gemma_texts(texts, cancel_flag)
     }
 
     /// EmbeddingGemma 文本塔单次编码成本远高于 bekko-a8m（大参数量 + 512 token），
@@ -7419,4 +7925,116 @@ Page Fault 异常处理
         assert_eq!(bad_body["error"], "MODULE_NOT_HIBERNATABLE");
     }
 
+    #[tokio::test]
+    async fn test_text_tag_handler_headers_step0_and_cancel_on_drop() {
+        use tower::ServiceExt;
+
+        let state = build_minimal_test_state();
+        state.anchor_cache.put(
+            "fp-step0-keep",
+            omni_core::anchor_cache::AnchorCacheEntry::new(
+                vec![0.1; 384],
+                omni_core::encoder_id::BEKKO,
+                std::time::Instant::now(),
+            ),
+        );
+        let app = create_app_router(state.clone());
+
+        // Step 0: allowNewTags=false 不得消耗 AnchorCache 且输出 Degraded=false, Gate-Evaluated=false
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/text/tag")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "fileFingerprint": "fp-step0-keep",
+                            "text": "风景摄影小说作品",
+                            "allowNewTags": false,
+                            "mediaKind": "document"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        if omni_pro::is_pro_enabled() {
+            assert_eq!(
+                resp.headers().get("x-omni-tag-degraded").and_then(|v| v.to_str().ok()),
+                Some("false")
+            );
+            assert_eq!(
+                resp.headers().get("x-omni-tag-gate-evaluated").and_then(|v| v.to_str().ok()),
+                Some("false")
+            );
+        }
+        assert!(matches!(
+            state.anchor_cache.get("fp-step0-keep", omni_core::encoder_id::BEKKO, 384),
+            omni_core::anchor_cache::AnchorLookup::Hit(_)
+        ));
+
+        // TextTagCancelOnDrop 在 Drop 时置位取消标志
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let _guard = super::TextTagCancelOnDrop(std::sync::Arc::clone(&flag));
+            assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_engine_warmup_handler_contract_and_spawn_blocking() {
+        use tower::ServiceExt;
+
+        let state = build_minimal_test_state();
+        let app = create_app_router(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/engine/warmup")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "textAndLexicon": true,
+                            "visionTower": false,
+                            "nsfwDetector": false,
+                            "imageOcr": false,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "POST /api/v1/engine/warmup 绝不回 404");
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        for key in [
+            "ready",
+            "textReady",
+            "trieReady",
+            "vectorTableReady",
+            "semanticGraphReady",
+            "visionReady",
+            "nsfwReady",
+            "ocrReady",
+            "warmupMs",
+            "warnings",
+        ] {
+            assert!(body.get(key).is_some(), "EngineWarmupResponse 缺字段 {key}");
+        }
+        if !omni_pro::is_pro_enabled() {
+            assert_eq!(body["ready"], false);
+        }
+    }
 }

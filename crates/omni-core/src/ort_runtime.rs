@@ -2058,7 +2058,22 @@ impl<T: Send + Sync + 'static> GenericWatchdog<T> {
 
     /// 检查当前是否已加载在内存中
     pub fn is_loaded(&self) -> bool {
-        self.state.read().unwrap().item.is_some()
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .item
+            .is_some()
+    }
+
+    /// 刷新已常驻项的最后访问时间（未加载时不触发构建，仅续期并返回是否已加载）
+    pub fn touch(&self) -> bool {
+        let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
+        if guard.item.is_some() {
+            guard.last_accessed = Instant::now();
+            true
+        } else {
+            false
+        }
     }
 
     /// 手动执行空闲驱逐检查（如超时则立即卸载并返回 true）

@@ -11,6 +11,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use omni_pro::text::TextEmbedder;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
@@ -774,23 +775,30 @@ pub async fn batch_embed_text_handler(
             return Ok((Vec::new(), target_dim));
         }
 
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         if !is_gemma {
             let embedder = omni_pro::text::BekkoEmbedder::new();
-            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            let mut vectors = embedder.batch_embed(&text_refs)?;
+            debug_assert!(
+                embedder.cache_identity().is_none() || embedder.supports_true_batch(),
+                "生产 BekkoEmbedder 必须覆写 supports_true_batch()"
+            );
+            let mut vectors = embedder.embed_texts(&text_refs, None)?;
             if vectors.len() != text_refs.len() {
                 anyhow::bail!(
-                    "ModelUnavailable: Bekko batch_embed returned {} vectors for {} inputs",
+                    "ModelUnavailable: Bekko embed_texts returned {} vectors for {} inputs",
                     vectors.len(),
                     text_refs.len()
                 );
             }
-            for v in &mut vectors {
+            for (raw_text, v) in text_refs.iter().zip(vectors.iter_mut()) {
                 if v.len() != 384 {
                     anyhow::bail!(
                         "ModelUnavailable: Bekko vector dim {} != 384",
                         v.len()
                     );
+                }
+                if raw_text.trim().is_empty() {
+                    continue;
                 }
                 let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
                 if norm <= 1e-6 {
@@ -802,9 +810,20 @@ pub async fn batch_embed_text_handler(
             }
             Ok((vectors, 384))
         } else {
-            let mut vectors = Vec::with_capacity(texts.len());
-            for text in texts {
-                let mut v = omni_pro::OmniVisionEngine::encode_gemma_text(&text)?;
+            let embedder = crate::GemmaTextEmbedder;
+            debug_assert!(
+                embedder.cache_identity().is_none() || embedder.supports_true_batch(),
+                "生产 GemmaTextEmbedder 必须覆写 supports_true_batch()"
+            );
+            let mut vectors = embedder.embed_texts(&text_refs, None)?;
+            if vectors.len() != text_refs.len() {
+                anyhow::bail!(
+                    "ModelUnavailable: Gemma embed_texts returned {} vectors for {} inputs",
+                    vectors.len(),
+                    text_refs.len()
+                );
+            }
+            for (raw_text, v) in text_refs.iter().zip(vectors.iter_mut()) {
                 if v.len() < target_dim {
                     anyhow::bail!(
                         "ModelUnavailable: Gemma vector dim {} < target_dim {}",
@@ -813,7 +832,9 @@ pub async fn batch_embed_text_handler(
                     );
                 }
                 v.truncate(target_dim);
-
+                if raw_text.trim().is_empty() {
+                    continue;
+                }
                 // 强制 L2 归一化（拒绝零向量填充假成功）
                 let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
                 if norm <= 1e-6 {
@@ -822,8 +843,6 @@ pub async fn batch_embed_text_handler(
                 for x in v.iter_mut() {
                     *x /= norm;
                 }
-
-                vectors.push(v);
             }
             Ok((vectors, target_dim))
         }
