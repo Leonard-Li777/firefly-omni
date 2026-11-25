@@ -264,6 +264,8 @@ pub mod perceive {
         pub visual_analysis_duration_sec: Option<f64>,
         pub audio_analysis_duration_sec: Option<f64>,
         pub video_truncated: Option<bool>,
+        pub degraded: Option<&'static str>,
+        pub degraded_reason: Option<&'static str>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -361,6 +363,41 @@ pub mod perceive {
         _asr_text: Option<&str>,
         _soft_token_budget: usize,
         _audio_analysis_duration_sec: Option<f64>,
+    ) -> (Vec<omni_core::OmniVideoChunk>, VideoProcessTimings, Option<image::RgbImage>) {
+        (Vec::new(), VideoProcessTimings::default(), None)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum VideoCutSensitivity {
+        Low,
+        #[default]
+        Medium,
+        High,
+    }
+
+    impl VideoCutSensitivity {
+        pub fn from_str_opt(s: Option<&str>) -> Self {
+            match s.map(|v| v.to_ascii_lowercase()).as_deref() {
+                Some("low") => Self::Low,
+                Some("high") => Self::High,
+                _ => Self::Medium,
+            }
+        }
+    }
+
+    pub fn process_video_time_chunks_with_options_and_budget(
+        _video_path: &Path,
+        _sampling_interval_seconds: f32,
+        _asr_text: Option<&str>,
+        _soft_token_budget: usize,
+        _audio_analysis_duration_sec: Option<f64>,
+        _frame_quota_max: Option<usize>,
+        _cut_sensitivity: Option<VideoCutSensitivity>,
+        _max_analyze_sec: Option<f64>,
+        _analyze_start_sec: Option<f64>,
+        _perceive_timeout_sec: Option<f64>,
+        _elapsed_before_visual_sec: f64,
+        _cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> (Vec<omni_core::OmniVideoChunk>, VideoProcessTimings, Option<image::RgbImage>) {
         (Vec::new(), VideoProcessTimings::default(), None)
     }
@@ -2317,6 +2354,12 @@ pub mod audio {
         pub fn is_asr_ready(&self) -> bool {
             false
         }
+        pub fn is_asr_installed(&self) -> bool {
+            false
+        }
+        pub fn ensure_recognizer(&self) -> bool {
+            false
+        }
         pub fn is_purification_ready(&self) -> bool {
             false
         }
@@ -2356,6 +2399,13 @@ pub mod audio {
         pub fn drop_session(&self) {}
         pub fn is_ready(&self) -> bool {
             false
+        }
+        pub fn is_installed(&self) -> bool {
+            false
+        }
+        pub fn reset_unload_guard(&self) {}
+        pub fn ensure_ready(&self) -> Result<(), String> {
+            Err("MODULE_NOT_INSTALLED".to_string())
         }
         pub fn semaphore(&self) -> Arc<tokio::sync::Semaphore> {
             Arc::new(tokio::sync::Semaphore::new(1))
@@ -2410,6 +2460,13 @@ pub mod audio {
         pub fn drop_session(&self) {}
         pub fn is_ready(&self) -> bool {
             false
+        }
+        pub fn is_installed(&self) -> bool {
+            false
+        }
+        pub fn reset_unload_guard(&self) {}
+        pub fn ensure_ready(&self) -> Result<(), String> {
+            Err("MODULE_NOT_INSTALLED".to_string())
         }
         pub fn semaphore(&self) -> Arc<tokio::sync::Semaphore> {
             Arc::new(tokio::sync::Semaphore::new(1))

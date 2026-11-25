@@ -1670,6 +1670,75 @@ impl OmniOrtRuntime {
         )
     }
 
+    /// 按需加载闭包版 Session 构建入口（对应 `.ffpc` 解密明文峰值压缩，spec §2.2.3）
+    ///
+    /// 首次 `load_bytes()` 产出的解密明文缓冲在局部块闭合时立即释放，避免在 DML warmup 窗口
+    /// 同时持有整份数百 MB 明文与 ORT Session 权重；仅当极少见 DML warmup 失败触发 CPU 回退时，
+    /// 才二次调用 `load_bytes()` 重解密构建纯 CPU Session。
+    pub fn build_session_verified_from_loader<L, B, W>(
+        load_bytes: L,
+        model_label: &Path,
+        tier: ModelTier,
+        ep_policy: EpPolicy,
+        warmup: W,
+    ) -> Result<ort::session::Session, String>
+    where
+        L: Fn() -> Result<B, String>,
+        B: AsRef<[u8]>,
+        W: Fn(&ort::session::Session) -> Result<(), ort::Error>,
+    {
+        Self::build_session_verified_from_loader_with_threads(
+            load_bytes,
+            model_label,
+            tier,
+            ep_policy,
+            Self::recommended_intra_threads(),
+            warmup,
+        )
+    }
+
+    /// 按需加载闭包版 Session 构建入口（指定 intra_threads 配额）
+    pub fn build_session_verified_from_loader_with_threads<L, B, W>(
+        load_bytes: L,
+        model_label: &Path,
+        tier: ModelTier,
+        ep_policy: EpPolicy,
+        intra_threads: usize,
+        warmup: W,
+    ) -> Result<ort::session::Session, String>
+    where
+        L: Fn() -> Result<B, String>,
+        B: AsRef<[u8]>,
+        W: Fn(&ort::session::Session) -> Result<(), ort::Error>,
+    {
+        Self::ensure_bound_for_session().map_err(|e| format!("{e}"))?;
+        // 局部块闭合时立即释放首次解密缓冲与内存构建锁，消除 warmup 期间双份内存峰值
+        let (session, used_dml) = {
+            let bytes = load_bytes()?;
+            let _guard = Self::mem_load_lock().lock().unwrap_or_else(|p| p.into_inner());
+            Self::build_with_policy_from_memory(
+                bytes.as_ref(),
+                model_label,
+                tier,
+                ep_policy,
+                intra_threads,
+            )
+            .map_err(|e| format!("{e}"))?
+        };
+        finalize_warmup_with_fallback(
+            session,
+            used_dml,
+            |s| warmup(s).map_err(|e| format!("{e}")),
+            || {
+                let bytes = load_bytes()?;
+                let _guard = Self::mem_load_lock().lock().unwrap_or_else(|p| p.into_inner());
+                Self::build_cpu_session_from_memory(bytes.as_ref(), intra_threads)
+                    .map_err(|e| format!("{e}"))
+            },
+            model_label,
+        )
+    }
+
     fn build_with_policy_from_memory(
         model_bytes: &[u8],
         model_label: &Path,

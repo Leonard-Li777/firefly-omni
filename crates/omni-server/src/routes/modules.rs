@@ -42,6 +42,15 @@ pub struct ModuleDrainResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ModuleLoadResponse {
+    pub success: bool,
+    pub status: String,
+    pub loaded: bool,
+    pub resident_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModuleErrorResponse {
     pub success: bool,
     pub error: String,
@@ -53,6 +62,161 @@ pub struct ModuleStatusResponse {
     pub loaded: bool,
     pub resident_bytes: u64,
     pub service_reachable: bool,
+}
+
+fn map_module_load_error(err: String) -> (StatusCode, Json<serde_json::Value>) {
+    let status = if err == "MODULE_NOT_INSTALLED" {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if err == "LOAD_SUPERSEDED" {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (
+        status,
+        Json(
+            serde_json::to_value(ModuleErrorResponse {
+                success: false,
+                error: err,
+            })
+            .unwrap(),
+        ),
+    )
+}
+
+/// POST /v1/modules/:module_id/session 与 POST /api/v1/modules/:module_id/session
+pub async fn post_module_session_handler(
+    State(state): State<AppState>,
+    Path(module_id): Path<String>,
+) -> impl IntoResponse {
+    if !HIBERNATABLE_MODULE_IDS.contains(&module_id.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ModuleErrorResponse {
+                    success: false,
+                    error: "MODULE_NOT_HIBERNATABLE".to_string(),
+                })
+                .unwrap(),
+            ),
+        );
+    }
+
+    match module_id.as_str() {
+        // pocket-cpu-int8-onnx 保持 handler .await，同步权重加载已在 CpuSlot 内部下沉 spawn_blocking
+        "pocket-cpu-int8-onnx" => match state.cpu_slot.preheat(false).await {
+            Ok(resp) => (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(ModuleLoadResponse {
+                        success: true,
+                        status: "loaded".to_string(),
+                        loaded: true,
+                        resident_bytes: resp.resident_bytes,
+                    })
+                    .unwrap(),
+                ),
+            ),
+            Err((code, msg)) => (
+                code,
+                Json(
+                    serde_json::to_value(ModuleErrorResponse {
+                        success: false,
+                        error: msg,
+                    })
+                    .unwrap(),
+                ),
+            ),
+        },
+        "asr-sensevoice-onnx" => {
+            let sherpa = state.sherpa.clone();
+            match tokio::task::spawn_blocking(move || {
+                if sherpa.is_asr_ready() {
+                    return Ok(ASR_SENSEVOICE_RELEASED_BYTES);
+                }
+                if !sherpa.is_asr_installed() {
+                    return Err("MODULE_NOT_INSTALLED".to_string());
+                }
+                if sherpa.ensure_recognizer() {
+                    Ok(ASR_SENSEVOICE_RELEASED_BYTES)
+                } else {
+                    Err("ASR_LOAD_FAILED".to_string())
+                }
+            })
+            .await
+            {
+                Ok(Ok(bytes)) => (
+                    StatusCode::OK,
+                    Json(
+                        serde_json::to_value(ModuleLoadResponse {
+                            success: true,
+                            status: "loaded".to_string(),
+                            loaded: true,
+                            resident_bytes: bytes,
+                        })
+                        .unwrap(),
+                    ),
+                ),
+                Ok(Err(err)) => map_module_load_error(err),
+                Err(e) => map_module_load_error(format!("TASK_PANICKED: {}", e)),
+            }
+        }
+        "tts-m5-onnx" => {
+            let m5 = state.m5.clone();
+            match tokio::task::spawn_blocking(move || {
+                if !m5.is_installed() {
+                    return Err("MODULE_NOT_INSTALLED".to_string());
+                }
+                m5.reset_unload_guard();
+                m5.ensure_ready().map(|_| TTS_M5_RELEASED_BYTES)
+            })
+            .await
+            {
+                Ok(Ok(bytes)) => (
+                    StatusCode::OK,
+                    Json(
+                        serde_json::to_value(ModuleLoadResponse {
+                            success: true,
+                            status: "loaded".to_string(),
+                            loaded: true,
+                            resident_bytes: bytes,
+                        })
+                        .unwrap(),
+                    ),
+                ),
+                Ok(Err(err)) => map_module_load_error(err),
+                Err(e) => map_module_load_error(format!("TASK_PANICKED: {}", e)),
+            }
+        }
+        "tts-moss-onnx" => {
+            let moss = state.moss.clone();
+            match tokio::task::spawn_blocking(move || {
+                if !moss.is_installed() {
+                    return Err("MODULE_NOT_INSTALLED".to_string());
+                }
+                moss.reset_unload_guard();
+                moss.ensure_ready().map(|_| TTS_MOSS_RELEASED_BYTES)
+            })
+            .await
+            {
+                Ok(Ok(bytes)) => (
+                    StatusCode::OK,
+                    Json(
+                        serde_json::to_value(ModuleLoadResponse {
+                            success: true,
+                            status: "loaded".to_string(),
+                            loaded: true,
+                            resident_bytes: bytes,
+                        })
+                        .unwrap(),
+                    ),
+                ),
+                Ok(Err(err)) => map_module_load_error(err),
+                Err(e) => map_module_load_error(format!("TASK_PANICKED: {}", e)),
+            }
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// DELETE /v1/modules/:module_id/session
@@ -119,91 +283,82 @@ pub async fn delete_module_session_handler(
             }
         }
         "asr-sensevoice-onnx" => {
-            if !state.sherpa.is_asr_ready() {
-                return (
+            let sherpa = state.sherpa.clone();
+            match tokio::task::spawn_blocking(move || {
+                if !sherpa.is_asr_ready() {
+                    return (0u64, Some("module_already_unloaded".to_string()));
+                }
+                sherpa.drop_session();
+                (ASR_SENSEVOICE_RELEASED_BYTES, None)
+            })
+            .await
+            {
+                Ok((released_bytes, message)) => (
                     StatusCode::OK,
                     Json(
                         serde_json::to_value(ModuleDrainResponse {
                             success: true,
                             status: "unloaded".to_string(),
-                            released_bytes: 0,
-                            message: Some("module_already_unloaded".to_string()),
+                            released_bytes,
+                            message,
                         })
                         .unwrap(),
                     ),
-                );
-            }
-            state.sherpa.drop_session();
-            (
-                StatusCode::OK,
-                Json(
-                    serde_json::to_value(ModuleDrainResponse {
-                        success: true,
-                        status: "unloaded".to_string(),
-                        released_bytes: ASR_SENSEVOICE_RELEASED_BYTES,
-                        message: None,
-                    })
-                    .unwrap(),
                 ),
-            )
+                Err(e) => map_module_load_error(format!("TASK_PANICKED: {}", e)),
+            }
         }
         "tts-m5-onnx" => {
-            if !state.m5.is_ready() {
-                return (
+            let m5 = state.m5.clone();
+            match tokio::task::spawn_blocking(move || {
+                if !m5.is_ready() {
+                    return (0u64, Some("module_already_unloaded".to_string()));
+                }
+                m5.drop_session();
+                (TTS_M5_RELEASED_BYTES, None)
+            })
+            .await
+            {
+                Ok((released_bytes, message)) => (
                     StatusCode::OK,
                     Json(
                         serde_json::to_value(ModuleDrainResponse {
                             success: true,
                             status: "unloaded".to_string(),
-                            released_bytes: 0,
-                            message: Some("module_already_unloaded".to_string()),
+                            released_bytes,
+                            message,
                         })
                         .unwrap(),
                     ),
-                );
-            }
-            state.m5.drop_session();
-            (
-                StatusCode::OK,
-                Json(
-                    serde_json::to_value(ModuleDrainResponse {
-                        success: true,
-                        status: "unloaded".to_string(),
-                        released_bytes: TTS_M5_RELEASED_BYTES,
-                        message: None,
-                    })
-                    .unwrap(),
                 ),
-            )
+                Err(e) => map_module_load_error(format!("TASK_PANICKED: {}", e)),
+            }
         }
         "tts-moss-onnx" => {
-            if !state.moss.is_ready() {
-                return (
+            let moss = state.moss.clone();
+            match tokio::task::spawn_blocking(move || {
+                if !moss.is_ready() {
+                    return (0u64, Some("module_already_unloaded".to_string()));
+                }
+                moss.drop_session();
+                (TTS_MOSS_RELEASED_BYTES, None)
+            })
+            .await
+            {
+                Ok((released_bytes, message)) => (
                     StatusCode::OK,
                     Json(
                         serde_json::to_value(ModuleDrainResponse {
                             success: true,
                             status: "unloaded".to_string(),
-                            released_bytes: 0,
-                            message: Some("module_already_unloaded".to_string()),
+                            released_bytes,
+                            message,
                         })
                         .unwrap(),
                     ),
-                );
-            }
-            state.moss.drop_session();
-            (
-                StatusCode::OK,
-                Json(
-                    serde_json::to_value(ModuleDrainResponse {
-                        success: true,
-                        status: "unloaded".to_string(),
-                        released_bytes: TTS_MOSS_RELEASED_BYTES,
-                        message: None,
-                    })
-                    .unwrap(),
                 ),
-            )
+                Err(e) => map_module_load_error(format!("TASK_PANICKED: {}", e)),
+            }
         }
         _ => unreachable!(),
     }

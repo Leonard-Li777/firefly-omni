@@ -264,14 +264,16 @@ pub fn create_app_router(state: AppState) -> Router {
         // 通用文本打标（spec §3.1）：**刻意注册在基础路由**——非 Pro 构建下须返回
         // 「空数组 + warn」的确定性降级，而不是 404 传输错误，故不能放进下面的 Pro 分支。
         .route("/api/text/tag", post(text_tag_handler))
-        // 统一模块休眠回收与状态对账端点 (spec §3.4.2)
+        // 统一模块会话创建 / 休眠与状态对账端点 (spec §3.4.2 & Ticket 03)
         .route(
             "/v1/modules/:module_id/session",
-            axum::routing::delete(routes::modules::delete_module_session_handler),
+            post(routes::modules::post_module_session_handler)
+                .delete(routes::modules::delete_module_session_handler),
         )
         .route(
             "/api/v1/modules/:module_id/session",
-            axum::routing::delete(routes::modules::delete_module_session_handler),
+            post(routes::modules::post_module_session_handler)
+                .delete(routes::modules::delete_module_session_handler),
         )
         .route(
             "/v1/modules/:module_id/session/status",
@@ -362,7 +364,27 @@ pub fn create_app_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .with_state(state.clone());
 
-    cpu_engine::register_cpu_engine_routes(router, Arc::clone(&state.cpu_slot))
+    let router = cpu_engine::register_cpu_engine_routes(router, Arc::clone(&state.cpu_slot));
+    router.layer(axum::middleware::from_fn_with_state(
+        state.instance_id.clone(),
+        attach_omni_instance_id_header,
+    ))
+}
+
+/// 全局响应头中间件：为所有 HTTP 响应统一附加同源 `X-Omni-Instance-Id` 身份头（spec §2.1 / §3.2）
+async fn attach_omni_instance_id_header(
+    State(instance_id): State<String>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    if let Ok(val) = axum::http::HeaderValue::from_str(&instance_id) {
+        resp.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("x-omni-instance-id"),
+            val,
+        );
+    }
+    resp
 }
 
 /// 版本信息查询: GET /api/version
@@ -387,11 +409,6 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
     } else {
         "uninitialized".to_string()
     };
-    let ram_status = if is_pro {
-        omni_pro::OmniVisionEngine::ram_vision_status()
-    } else {
-        "disabled: pro_disabled".to_string()
-    };
     let vision_resident = if is_pro {
         omni_pro::OmniVisionEngine::is_gemma_vision_resident()
     } else {
@@ -408,18 +425,36 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
         .as_ref()
         .map(|p| p.to_string_lossy().to_string())
         .or_else(|| Some(state.vector.dir().to_string_lossy().to_string()));
-    let mount_manifest = omni_core::plugin_dir::mount_manifest_status();
-    let mobile_clip_vocab = if is_pro {
-        // 仅当挂载清单实际激活了 mobile-clip 时，才在 Pro 模式下核验英文视觉词表；
-        // 未挂载 mobile-clip（如中文语言 Chinese-CLIP 模式）时直接返回 None，杜绝越界警告与自杀式双向核验阻断
-        if omni_core::plugin_dir::resolve_mounted_dir("mobile-clip").ok().flatten().is_some() {
-            Some(omni_pro::vision::verify_mobileclip_en_vocab())
+    // 消除剩余尾盘同步磁盘 stat（ram_vision_status / mount_manifest_status / verify_mobileclip_en_vocab），
+    // 统一在短 spawn_blocking 中完成，严禁在 Tokio async worker 线程执行同步文件系统调用（spec §2.2.1）
+    let (ram_status, mount_manifest, mobile_clip_vocab) = tokio::task::spawn_blocking(move || {
+        let ram_status = if is_pro {
+            omni_pro::OmniVisionEngine::ram_vision_status()
+        } else {
+            "disabled: pro_disabled".to_string()
+        };
+        let mount_manifest = omni_core::plugin_dir::mount_manifest_status();
+        let mobile_clip_vocab = if is_pro {
+            // 仅当挂载清单实际激活了 mobile-clip 时，才在 Pro 模式下核验英文视觉词表；
+            // 未挂载 mobile-clip（如中文语言 Chinese-CLIP 模式）时直接返回 None，杜绝越界警告与自杀式双向核验阻断
+            if omni_core::plugin_dir::resolve_mounted_dir("mobile-clip").ok().flatten().is_some() {
+                Some(omni_pro::vision::verify_mobileclip_en_vocab())
+            } else {
+                None
+            }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
+        (ram_status, mount_manifest, mobile_clip_vocab)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        (
+            "disabled: status_probe_join_error".to_string(),
+            omni_core::plugin_dir::mount_manifest_status(),
+            None,
+        )
+    });
     let user_data_dir = state
         .user_data_dir
         .as_ref()
@@ -1312,9 +1347,13 @@ pub async fn start_server(
         });
     }
 
-    // 启动即后台异步预热 TTS 引擎（M5 / MOSS）：在 HTTP 端口就绪后于独立阻塞线程解密加载 ONNX 权重，
-    // 避免 300MB+ 加密模型同步阻塞 TcpListener::bind 触发桌面端 80s 探活超时强杀
-    {
+    // 启动后台异步预热 TTS 引擎（M5 / MOSS）：默认关闭（0），仅 OMNI_TTS_EAGER_WARMUP=1 开启，
+    // 平时改由 Desktop 经 POST /v1/modules/:module_id/session 按需懒加载（零启动内存峰值 & 快速回滚门控）
+    let eager_tts_warmup = std::env::var("OMNI_TTS_EAGER_WARMUP")
+        .ok()
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    if eager_tts_warmup {
         let m5 = state.m5.clone();
         let moss = state.moss.clone();
         let state_bg = state.clone();
@@ -1335,6 +1374,8 @@ pub async fn start_server(
             );
             state_bg.publish_status_event("ok");
         });
+    } else {
+        info!("omni-tts eager startup pre-warm skipped (OMNI_TTS_EAGER_WARMUP != 1, using on-demand POST /session)");
     }
 
     let app = create_app_router(state.clone());
@@ -2249,22 +2290,37 @@ async fn perceive_file_handler(
     let t_start = std::time::Instant::now();
     let file_path = req.file_path.clone();
 
+    // 协作式取消令牌 Drop Guard（spec §2.4）：客户端超时断开时 Axum drop Future，自动置位终止视频帧循环
+    struct CancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_guard = CancelOnDrop(std::sync::Arc::clone(&cancel_flag));
+
     let mut benchmark = OmniPerceptionBenchmark::default();
 
     let is_pro = omni_pro::is_pro_enabled();
 
+    // 1. 前置步骤 1: 文件元数据 + Magika 文件类型精准识别（迁入 spawn_blocking，严禁在 Tokio worker 同步盘查）
+    let fp_probe = file_path.clone();
+    let (file_meta, mime_type, magika_ms) = tokio::task::spawn_blocking(move || {
+        let p = std::path::Path::new(&fp_probe);
+        let file_meta = std::fs::metadata(p).ok();
+        let t_magika = std::time::Instant::now();
+        let mime_type = omni_pro::OmniVisionEngine::detect_mime_type(p)
+            .unwrap_or_else(|_| "application/octet-stream".to_string());
+        let magika_ms = t_magika.elapsed().as_millis() as u64;
+        (file_meta, mime_type, magika_ms)
+    })
+    .await
+    .unwrap_or_else(|_| (None, "application/octet-stream".to_string(), 0));
     let p = std::path::Path::new(&file_path);
-    // 一次性读取文件元数据，file_size 与 Tier1 文本分析的 mtime 均复用该结果，避免重复 syscall
-    let file_meta = std::fs::metadata(p).ok();
     let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let is_corrupted = file_size == 0;
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-
-    // 1. 前置步骤 1: Magika 文件类型精准识别 (所有后续分析的前置)
-    let t_magika = std::time::Instant::now();
-    let mime_type = omni_pro::OmniVisionEngine::detect_mime_type(p)
-        .unwrap_or_else(|_| "application/octet-stream".to_string());
-    let magika_ms = t_magika.elapsed().as_millis() as u64;
     benchmark.record("magika_ms", magika_ms);
 
     // 2. 根据 MIME 类型与扩展名判定大类分支
@@ -2272,15 +2328,19 @@ async fn perceive_file_handler(
     let is_video = mime_type.starts_with("video/") || omni_core::is_video_ext(&ext);
     let is_audio = mime_type.starts_with("audio/") || omni_core::is_audio_ext(&ext);
 
-    // 并行任务: NTFS ADS 溯源
+    // 并行任务: NTFS ADS 溯源（迁入 spawn_blocking，防慢速磁盘/网络盘阻塞 Tokio worker）
     let f_ads = {
         let file_path = file_path.clone();
         let lang = req.language.clone();
         async move {
             if is_pro {
-                let t_ads = std::time::Instant::now();
-                let (fs, fsc, su) = omni_pro::perceive::detect_ntfs_zone_identifier_with_lang(&file_path, lang.as_deref());
-                (fs, fsc, su, Some(t_ads.elapsed().as_millis() as u64))
+                tokio::task::spawn_blocking(move || {
+                    let t_ads = std::time::Instant::now();
+                    let (fs, fsc, su) = omni_pro::perceive::detect_ntfs_zone_identifier_with_lang(&file_path, lang.as_deref());
+                    (fs, fsc, su, Some(t_ads.elapsed().as_millis() as u64))
+                })
+                .await
+                .unwrap_or((None, None, None, None))
             } else {
                 (None, None, None, None)
             }
@@ -2289,10 +2349,15 @@ async fn perceive_file_handler(
 
     let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, video_chunks, video_timings, video_cover_webp_base64)) = if is_image {
         let f_img = async {
-            // 步骤 A1: 前置 ExifTool 全量元数据提取 (画质姿态/方向依赖 exiftool 提取的元数据)
-            let t_meta = std::time::Instant::now();
-            let exiftool_map = OmniExtractor::extract_full_exiftool_metadata(p);
-            let metadata_ms = t_meta.elapsed().as_millis() as u64;
+            // 步骤 A1: 前置 ExifTool 全量元数据提取（迁入 spawn_blocking，防外部进程/磁盘 IO 阻塞 Tokio worker）
+            let p_meta = p.to_path_buf();
+            let (exiftool_map, metadata_ms) = tokio::task::spawn_blocking(move || {
+                let t_meta = std::time::Instant::now();
+                let map = OmniExtractor::extract_full_exiftool_metadata(&p_meta);
+                (map, t_meta.elapsed().as_millis() as u64)
+            })
+            .await
+            .unwrap_or_default();
 
             let exif_orient = exiftool_map
                 .get("Orientation")
@@ -2358,8 +2423,20 @@ async fn perceive_file_handler(
                 }
             }
 
-            // 步骤 A4: 计算 pHash
-            let phash = OmniExtractionResult::compute_phash(p);
+            // 步骤 A4: 计算 pHash 与缺失宽高补采（迁入 spawn_blocking，防图片解码阻塞 Tokio worker）
+            let p_phash = p.to_path_buf();
+            let need_img_dims = !(exiftool_map.contains_key("ImageWidth") && exiftool_map.contains_key("ImageHeight"));
+            let (phash, fallback_dims) = tokio::task::spawn_blocking(move || {
+                let phash = OmniExtractionResult::compute_phash(&p_phash);
+                let dims = if need_img_dims {
+                    image::image_dimensions(&p_phash).ok()
+                } else {
+                    None
+                };
+                (phash, dims)
+            })
+            .await
+            .unwrap_or((None, None));
 
             // 步骤 A5: 组装图片元数据
             let mut metadata_obj = serde_json::Map::new();
@@ -2380,7 +2457,7 @@ async fn perceive_file_handler(
                 img_meta.insert("width".into(), w.clone());
                 img_meta.insert("height".into(), h.clone());
                 img_meta.insert("resolution".into(), format!("{}x{}", w.as_str().unwrap_or(""), h.as_str().unwrap_or("")).into());
-            } else if let Ok((width, height)) = image::image_dimensions(p) {
+            } else if let Some((width, height)) = fallback_dims {
                 img_meta.insert("width".into(), width.into());
                 img_meta.insert("height".into(), height.into());
                 img_meta.insert("resolution".into(), format!("{}x{}", width, height).into());
@@ -2481,10 +2558,16 @@ async fn perceive_file_handler(
             // 绝不被 perceive.rs 内部的 `.clamp(5, 240)` 强行重开为 5 帧。ASR 分支在本块之外独立执行。
             let enable_video_visual = req.enable_video_visual_analysis.unwrap_or(true);
             if is_video && is_pro && enable_video_visual {
-                let (v_wm_lvl, v_wm_status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(&file_path));
+                let fp_wm = file_path.clone();
+                let (v_wm_lvl, v_wm_status) = tokio::task::spawn_blocking(move || {
+                    let (lvl, status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(&fp_wm));
+                    (lvl, status.to_string())
+                })
+                .await
+                .unwrap_or_else(|_| (0, "none".to_string()));
                 v.watermark_level = Some(v_wm_lvl);
                 v.has_watermark = Some(v_wm_lvl > 0);
-                v.watermark_status = Some(v_wm_status.to_string());
+                v.watermark_status = Some(v_wm_status);
 
                 let file_path_for_video = file_path.clone();
                 // 抽帧间隔已从 UI 移除，这里只是求解器的**下限**：真正取值由
@@ -2505,12 +2588,15 @@ async fn perceive_file_handler(
                         .or(req.audio_analysis_duration)
                         .unwrap_or(cfg.audio_analysis_duration) as f64
                 };
-                                let quota_opt = req.video_frame_quota_max;
+                let quota_opt = req.video_frame_quota_max;
                 let cut_sens_opt = req.video_cut_sensitivity.as_deref().map(|s| omni_pro::perceive::VideoCutSensitivity::from_str_opt(Some(s)));
                 let max_analyze_sec_opt = req.video_max_analyze_sec;
                 let analyze_start_sec_opt = req.video_analyze_start_sec;
+                let perceive_timeout_sec_opt = req.perceive_timeout_sec;
+                let elapsed_before_visual_sec = t_start.elapsed().as_secs_f64();
+                let cancel_flag_for_video = std::sync::Arc::clone(&cancel_flag);
                 let (chunks, timings, rep_frame) = tokio::task::spawn_blocking(move || {
-                    omni_pro::perceive::process_video_time_chunks_with_options(
+                    omni_pro::perceive::process_video_time_chunks_with_options_and_budget(
                         std::path::Path::new(&file_path_for_video),
                         video_interval,
                         None,
@@ -2520,6 +2606,9 @@ async fn perceive_file_handler(
                         cut_sens_opt,
                         max_analyze_sec_opt,
                         analyze_start_sec_opt,
+                        perceive_timeout_sec_opt,
+                        elapsed_before_visual_sec,
+                        Some(cancel_flag_for_video),
                     )
                 })
                 .await
@@ -2527,29 +2616,52 @@ async fn perceive_file_handler(
                 video_chunks = chunks;
                 video_timings = timings;
                 if let Some(ref rep_rgb) = rep_frame {
-                    // 1. 官方 WebP 封面直出 (Ticket 03)
-                    match omni_pro::cover::raw_to_webp(rep_rgb.as_raw(), rep_rgb.width(), rep_rgb.height(), 3) {
-                        Ok(webp_bytes) => {
-                            use base64::Engine;
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&webp_bytes);
-                            video_cover_webp_base64 = Some(b64);
-                        }
-                        Err(e) => {
-                            tracing::warn!("[OmniServer] 视频代表帧转换为 WebP 封面失败: {:?}", e);
-                        }
-                    }
+                    // 1 & 2. 代表帧 WebP 封面直出 + 纯内存视觉感知打标与特征提取（整体迁入 spawn_blocking）
+                    let rep_rgb_owned = rep_rgb.clone();
+                    let enable_vis_tags = req.enable_visual_tags.unwrap_or(true);
+                    let rep_lang = req.language.clone();
+                    let rep_profile = cfg.embedding_profile.clone();
+                    let rep_nsfw = cfg.enable_nsfw_perception;
+                    let rep_ocr_en = cfg.enable_image_ocr;
+                    let (webp_b64_opt, rep_vision_res, dyn_img) = tokio::task::spawn_blocking(move || {
+                        let webp_b64 = match omni_pro::cover::raw_to_webp(
+                            rep_rgb_owned.as_raw(),
+                            rep_rgb_owned.width(),
+                            rep_rgb_owned.height(),
+                            3,
+                        ) {
+                            Ok(webp_bytes) => {
+                                use base64::Engine;
+                                Some(base64::engine::general_purpose::STANDARD.encode(&webp_bytes))
+                            }
+                            Err(e) => {
+                                tracing::warn!("[OmniServer] 视频代表帧转换为 WebP 封面失败: {:?}", e);
+                                None
+                            }
+                        };
+                        let dyn_img = image::DynamicImage::ImageRgb8(rep_rgb_owned);
+                        let rep_res = run_vision_pipeline_on_image(
+                            &dyn_img,
+                            None,
+                            enable_vis_tags,
+                            rep_lang.as_deref(),
+                            &rep_profile,
+                            rep_nsfw,
+                            rep_ocr_en,
+                        );
+                        (webp_b64, rep_res, dyn_img)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        (
+                            None,
+                            Err(format!("视频代表帧视觉感知任务异常: {e}")),
+                            image::DynamicImage::ImageRgb8(rep_rgb.clone()),
+                        )
+                    });
+                    video_cover_webp_base64 = webp_b64_opt;
 
-                    // 2. 代表帧纯内存视觉感知打标与特征提取
-                    let dyn_img = image::DynamicImage::ImageRgb8(rep_rgb.clone());
-                    match run_vision_pipeline_on_image(
-                        &dyn_img,
-                        None,
-                        req.enable_visual_tags.unwrap_or(true),
-                        req.language.as_deref(),
-                        &cfg.embedding_profile,
-                        cfg.enable_nsfw_perception,
-                        cfg.enable_image_ocr,
-                    ) {
+                    match rep_vision_res {
                         Ok(mut rep_vision) => {
                             // 视频领域排他门禁：严格剔除截图细分、摄影照片细分等图片专有维度
                             filter_video_visual_tags(&mut rep_vision.clip_tags);
@@ -3599,103 +3711,122 @@ async fn perceive_file_handler(
         String::new()
     };
 
-    let text_embedder: Box<dyn omni_pro::text::TextEmbedder> = if is_gemma {
-        Box::new(GemmaTextEmbedder)
-    } else {
-        Box::new(omni_pro::text::BekkoEmbedder::new())
-    };
-    // 构造纯局部同源文本锚点（防御空切片与全零退化向量，绝对不触碰与清空 state.anchor_cache！）
-    let text_anchor = text_emb.as_ref().map(|v| (text_embedder.as_ref(), v.as_slice()));
-
     let extracted_text_tags = if is_pro {
-        let vt_ref = global_text_vector_table();
+        let asr_clone = asr.clone();
+        let lrc_clone = lrc.clone();
+        let ocr_clone = ocr_text.clone();
+        let enriched_clone = enriched_doc_corpus.clone();
+        let aigc_prompt_owned = metadata
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let text_emb_clone = text_emb.clone();
+        tokio::task::spawn_blocking(move || {
+            let text_embedder: Box<dyn omni_pro::text::TextEmbedder> = if is_gemma {
+                Box::new(GemmaTextEmbedder)
+            } else {
+                Box::new(omni_pro::text::BekkoEmbedder::new())
+            };
+            // 构造纯局部同源文本锚点（防御空切片与全零退化向量，绝对不触碰与清空 state.anchor_cache！）
+            let text_anchor = text_emb_clone
+                .as_ref()
+                .map(|v| (text_embedder.as_ref(), v.as_slice()));
+            let vt_ref = global_text_vector_table();
 
-        let mut tags: Vec<omni_core::TagChainItem> = Vec::new();
-        // 1. ASR / LRC 提取 (source: "asr")
-        if asr.is_some() || lrc.is_some() {
-            let asr_tags = omni_pro::text::TextTagger::tag_asr_or_lrc(asr.as_deref(), lrc.as_deref(), vt_ref);
-            tags.extend(asr_tags);
-        }
+            let mut tags: Vec<omni_core::TagChainItem> = Vec::new();
+            // 1. ASR / LRC 提取 (source: "asr")
+            if asr_clone.is_some() || lrc_clone.is_some() {
+                let asr_tags = omni_pro::text::TextTagger::tag_asr_or_lrc(
+                    asr_clone.as_deref(),
+                    lrc_clone.as_deref(),
+                    vt_ref,
+                );
+                tags.extend(asr_tags);
+            }
 
-        // 2. OCR 提取 (纯图片 OCR 或 视频代表帧 OCR，source: "ocr")
-        // 注意：复合文档的正文提取走 enriched_doc_corpus
-        if let Some(ref ocr) = ocr_text {
-            if !ocr.trim().is_empty() {
-                let ocr_tags = omni_pro::text::TextTagger::tag_text_with_anchor(
-                    ocr,
-                    Some("ocr"),
+            // 2. OCR 提取 (纯图片 OCR 或 视频代表帧 OCR，source: "ocr")
+            // 注意：复合文档的正文提取走 enriched_doc_corpus
+            if let Some(ref ocr) = ocr_clone {
+                if !ocr.trim().is_empty() {
+                    let ocr_tags = omni_pro::text::TextTagger::tag_text_with_anchor(
+                        ocr,
+                        Some("ocr"),
+                        vt_ref,
+                        true,
+                        &[],
+                        text_anchor,
+                    );
+                    for ot in ocr_tags {
+                        if let Some(existing) = tags.iter_mut().find(|t| t.code == ot.code || t.name == ot.name) {
+                            if ot.confidence > existing.confidence {
+                                *existing = ot;
+                            }
+                        } else {
+                            tags.push(ot);
+                        }
+                    }
+                }
+            }
+
+            // 3. 文档正文提取 (source: "document")
+            if !is_image && !is_video && !enriched_clone.trim().is_empty() {
+                let doc_tags = omni_pro::text::TextTagger::tag_text_with_anchor(
+                    &enriched_clone,
+                    Some("document"),
                     vt_ref,
                     true,
                     &[],
                     text_anchor,
                 );
-                for ot in ocr_tags {
-                    if let Some(existing) = tags.iter_mut().find(|t| t.code == ot.code || t.name == ot.name) {
-                        if ot.confidence > existing.confidence {
-                            *existing = ot;
+                for dt in doc_tags {
+                    if let Some(existing) = tags.iter_mut().find(|t| t.code == dt.code || t.name == dt.name) {
+                        if dt.confidence > existing.confidence {
+                            *existing = dt;
                         }
                     } else {
-                        tags.push(ot);
+                        tags.push(dt);
                     }
                 }
             }
-        }
 
-        // 3. 文档正文提取 (source: "document")
-        if !is_image && !is_video && !enriched_doc_corpus.trim().is_empty() {
-            let doc_tags = omni_pro::text::TextTagger::tag_text_with_anchor(
-                &enriched_doc_corpus,
-                Some("document"),
-                vt_ref,
-                true,
-                &[],
-                text_anchor,
-            );
-            for dt in doc_tags {
-                if let Some(existing) = tags.iter_mut().find(|t| t.code == dt.code || t.name == dt.name) {
-                    if dt.confidence > existing.confidence {
-                        *existing = dt;
+            // 3.5 AIGC Prompt 提示词提取 (source: "prompt")
+            // 当图片/视频携带正向提示词时，激活文本打标器提取受控概念作为补充标签来源
+            if (is_image || is_video) && !aigc_prompt_owned.is_empty() {
+                let prompt_tags = omni_pro::text::TextTagger::tag_text_with_anchor(
+                    &aigc_prompt_owned,
+                    Some("prompt"),
+                    vt_ref,
+                    true,
+                    &[],
+                    text_anchor,
+                );
+                for pt in prompt_tags {
+                    if let Some(existing) = tags.iter_mut().find(|t| t.code == pt.code || t.name == pt.name) {
+                        if pt.confidence > existing.confidence {
+                            *existing = pt;
+                        }
+                    } else {
+                        tags.push(pt);
                     }
-                } else {
-                    tags.push(dt);
                 }
             }
-        }
 
-        // 3.5 AIGC Prompt 提示词提取 (source: "prompt")
-        // 当图片/视频携带正向提示词时，激活文本打标器提取受控概念作为补充标签来源
-        let aigc_prompt = metadata.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim();
-        if (is_image || is_video) && !aigc_prompt.is_empty() {
-            let prompt_tags = omni_pro::text::TextTagger::tag_text_with_anchor(
-                aigc_prompt,
-                Some("prompt"),
-                vt_ref,
-                true,
-                &[],
-                text_anchor,
-            );
-            for pt in prompt_tags {
-                if let Some(existing) = tags.iter_mut().find(|t| t.code == pt.code || t.name == pt.name) {
-                    if pt.confidence > existing.confidence {
-                        *existing = pt;
-                    }
-                } else {
-                    tags.push(pt);
-                }
-            }
-        }
+            // 4. 按置信度降序排序并截断至对应容量上限（文档类放宽至 20，多媒体保留 8）
+            tags.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+            let max_text_tags = if !is_image && !is_video { 20 } else { 8 };
+            tags.truncate(max_text_tags);
 
-        // 4. 按置信度降序排序并截断至对应容量上限（文档类放宽至 20，多媒体保留 8）
-        tags.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
-        let max_text_tags = if !is_image && !is_video { 20 } else { 8 };
-        tags.truncate(max_text_tags);
-
-        tags
+            tags
+        })
+        .await
+        .unwrap_or_default()
     } else {
         Vec::new()
     };
 
-    // 9. 第三阶段: 双锚点交叉向量验证与多模态终局融合 (Task 626)
+    // 9. 第三阶段: 双锚点交叉向量验证与多模态终局融合 (Task 626，迁入 spawn_blocking 防阻塞 Tokio worker)
     // 汇聚第二阶段收集到的所有多模态异构信息为 MultimodalContext
     let current_policies = state.dimension_policies.read().unwrap_or_else(|e| e.into_inner()).clone();
     let multimodal_ctx = omni_core::MultimodalContext {
@@ -3727,17 +3858,28 @@ async fn perceive_file_handler(
     };
     let t_fusion = std::time::Instant::now();
     let fusion_outcome = if is_pro {
-        if is_gemma {
-            omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate_with_embedder(
-                &multimodal_ctx,
-                &GemmaTextEmbedder,
-            )
-        } else {
-            omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate_with_embedder(
-                &multimodal_ctx,
-                &omni_pro::text::BekkoEmbedder::new(),
-            )
-        }
+        tokio::task::spawn_blocking(move || {
+            if is_gemma {
+                omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate_with_embedder(
+                    &multimodal_ctx,
+                    &GemmaTextEmbedder,
+                )
+            } else {
+                omni_pro::text::OmniMultimodalFusionEngine::fuse_and_arbitrate_with_embedder(
+                    &multimodal_ctx,
+                    &omni_pro::text::BekkoEmbedder::new(),
+                )
+            }
+        })
+        .await
+        .unwrap_or_else(|_| omni_pro::text::FusedPerceptionOutcome {
+            smart_name: None,
+            content_description: None,
+            fused_tags: Vec::new(),
+            candidate_hypotheses: Vec::new(),
+            perf_breakdown: None,
+            anchor_vector: None,
+        })
     } else {
         // 非 Pro 构建无融合引擎：fused_tags 必须留空，严禁以 visual_tags 顶替。
         // 顶替会让视觉标签在桌面端被误判为「融合标签」组（ADR-0045 来源分组语义污染）。
@@ -3882,44 +4024,51 @@ async fn perceive_file_handler(
     }
 
     // 票 05：受控标签与扩展标签经由父 (via_parent_code) 与树状父 (parent_codes) 主链回填
-    // 终结「工单 01 已知限制」，确保受控标签行落库时 via_parent_code != ''
-    let backfill_chain_item = |mut tag: omni_core::TagChainItem| -> omni_core::TagChainItem {
-        // 1. 若已有 parent_codes 且 via_parent_code 为空，优先以首个父级作为经由父消歧锚
-        if tag.via_parent_code.is_none() && !tag.parent_codes.is_empty() {
-            tag.via_parent_code = tag.parent_codes.first().cloned();
-        }
-        // 2. 若依然缺失经由父且不是真根节点（受控标签 builtin.* / omw.* / hownet.* 或扩展标签 _ext.*），在 Pro 下通过向量底座推导补全
-        if tag.via_parent_code.is_none() && is_pro {
-            if tag.code.starts_with("_ext.") || tag.code.starts_with("builtin.") || tag.code.starts_with("omw.") || tag.code.starts_with("hownet.") {
-                let outcome = omni_pro::text::OmniMultimodalFusionEngine::resolve_ext_tag_parent(
-                    &tag.name,
-                    &tag.code,
-                );
-                if !outcome.is_empty() {
-                    tag.via_parent_code = Some(outcome.clone());
-                    if tag.parent_codes.is_empty() {
-                        tag.parent_codes = vec![outcome];
+    // 终结「工单 01 已知限制」，确保受控标签行落库时 via_parent_code != ''；
+    // 迁入 spawn_blocking 防止 resolve_ext_tag_parent 向量推导阻塞 Tokio worker（spec §2.2.1）
+    let (structured_visual_tags, fused_tags, extracted_text_tags) = tokio::task::spawn_blocking(move || {
+        let backfill_chain_item = |mut tag: omni_core::TagChainItem| -> omni_core::TagChainItem {
+            // 1. 若已有 parent_codes 且 via_parent_code 为空，优先以首个父级作为经由父消歧锚
+            if tag.via_parent_code.is_none() && !tag.parent_codes.is_empty() {
+                tag.via_parent_code = tag.parent_codes.first().cloned();
+            }
+            // 2. 若依然缺失经由父且不是真根节点（受控标签 builtin.* / omw.* / hownet.* 或扩展标签 _ext.*），在 Pro 下通过向量底座推导补全
+            if tag.via_parent_code.is_none() && is_pro {
+                if tag.code.starts_with("_ext.") || tag.code.starts_with("builtin.") || tag.code.starts_with("omw.") || tag.code.starts_with("hownet.") {
+                    let outcome = omni_pro::text::OmniMultimodalFusionEngine::resolve_ext_tag_parent(
+                        &tag.name,
+                        &tag.code,
+                    );
+                    if !outcome.is_empty() {
+                        tag.via_parent_code = Some(outcome.clone());
+                        if tag.parent_codes.is_empty() {
+                            tag.parent_codes = vec![outcome];
+                        }
                     }
                 }
             }
-        }
-        tag
-    };
+            tag
+        };
 
-    let structured_visual_tags: Vec<omni_core::TagChainItem> = structured_visual_tags
-        .into_iter()
-        .map(backfill_chain_item)
-        .collect();
+        let structured_visual_tags: Vec<omni_core::TagChainItem> = structured_visual_tags
+            .into_iter()
+            .map(backfill_chain_item)
+            .collect();
 
-    let fused_tags: Vec<omni_core::TagChainItem> = fused_tags
-        .into_iter()
-        .map(backfill_chain_item)
-        .collect();
+        let fused_tags: Vec<omni_core::TagChainItem> = fused_tags
+            .into_iter()
+            .map(backfill_chain_item)
+            .collect();
 
-    let extracted_text_tags: Vec<omni_core::TagChainItem> = extracted_text_tags
-        .into_iter()
-        .map(backfill_chain_item)
-        .collect();
+        let extracted_text_tags: Vec<omni_core::TagChainItem> = extracted_text_tags
+            .into_iter()
+            .map(backfill_chain_item)
+            .collect();
+
+        (structured_visual_tags, fused_tags, extracted_text_tags)
+    })
+    .await
+    .unwrap_or_default();
 
     // 9.1 基于维度策略执行单选互斥 argmax 与多选维度放行最终一致性仲裁
     let mut structured_visual_tags = arbitrate_tags_by_dimension_policies(structured_visual_tags, &current_policies);
@@ -4289,6 +4438,12 @@ async fn perceive_file_handler(
         vector_saved: None,
         nsfw_perception: Some(nsfw_perception),
         face_perception: Some(face_perception),
+        degraded: video_timings
+            .as_ref()
+            .and_then(|t| t.degraded.map(|s| s.to_string())),
+        degraded_reason: video_timings
+            .as_ref()
+            .and_then(|t| t.degraded_reason.map(|s| s.to_string())),
     });
 
     // 统一就地单次原子批量落盘 (Zero-Boomerang IPC)
@@ -4328,13 +4483,18 @@ async fn perceive_file_handler(
             });
         }
 
-        // 3. 内部就地单次原子批量持久化
+        // 3. 内部就地单次原子批量持久化（经 spawn_blocking 隔离磁盘写盘与量化）
         if !batch_items.is_empty() {
             let t_zvec_start = std::time::Instant::now();
-            let saved = match state.vector.batch_upsert(&batch_items) {
-                Ok(_) => true,
-                Err(e) => {
+            let vector_arc = state.vector.clone();
+            let saved = match tokio::task::spawn_blocking(move || vector_arc.batch_upsert(&batch_items)).await {
+                Ok(Ok(_)) => true,
+                Ok(Err(e)) => {
                     tracing::warn!("向量内部批量写入失败: {:?}", e);
+                    false
+                }
+                Err(join_err) => {
+                    tracing::warn!("向量内部批量写入后台任务异常: {:?}", join_err);
                     false
                 }
             };
@@ -5479,6 +5639,8 @@ pub struct AudioTtsRegisterVoiceResponse {
 #[derive(Debug, serde::Serialize)]
 pub struct AudioTtsStatusResponse {
     pub ready: bool,
+    pub installed: bool,
+    pub resident: bool,
     pub total_voices: usize,
     pub sample_rate: i32,
     pub engine: String,
@@ -5490,9 +5652,17 @@ enum ActiveTtsEngine {
     Moss,
 }
 
-fn resolve_active_tts_engine(state: &AppState) -> ActiveTtsEngine {
-    let m5_mounted = matches!(omni_core::plugin_dir::resolve_mounted_dir("m5-tts"), Ok(Some(_)));
-    if state.m5.is_ready() || (m5_mounted && !state.moss.is_ready()) {
+async fn resolve_active_tts_engine_async(state: &AppState) -> ActiveTtsEngine {
+    if state.m5.is_ready() {
+        return ActiveTtsEngine::M5;
+    }
+    let moss_ready = state.moss.is_ready();
+    let m5_mounted = tokio::task::spawn_blocking(|| {
+        matches!(omni_core::plugin_dir::resolve_mounted_dir("m5-tts"), Ok(Some(_)))
+    })
+    .await
+    .unwrap_or(false);
+    if m5_mounted && !moss_ready {
         ActiveTtsEngine::M5
     } else {
         ActiveTtsEngine::Moss
@@ -5518,19 +5688,45 @@ fn build_tts_wav_response(
 async fn audio_tts_status_handler(
     State(state): State<AppState>,
 ) -> Json<AudioTtsStatusResponse> {
-    match resolve_active_tts_engine(&state) {
-        ActiveTtsEngine::M5 => Json(AudioTtsStatusResponse {
-            ready: state.m5.is_ready(),
-            total_voices: state.m5.total_voices().await,
-            sample_rate: 24000,
-            engine: "express-voice-24k".to_string(),
-        }),
-        ActiveTtsEngine::Moss => Json(AudioTtsStatusResponse {
-            ready: state.moss.is_ready(),
-            total_voices: state.moss.total_voices().await,
-            sample_rate: 48000,
-            engine: "clone-voice-48k".to_string(),
-        }),
+    match resolve_active_tts_engine_async(&state).await {
+        ActiveTtsEngine::M5 => {
+            let ready = state.m5.is_ready();
+            let m5 = state.m5.clone();
+            let installed = if ready {
+                true
+            } else {
+                tokio::task::spawn_blocking(move || m5.is_installed())
+                    .await
+                    .unwrap_or(false)
+            };
+            Json(AudioTtsStatusResponse {
+                ready,
+                installed,
+                resident: ready,
+                total_voices: state.m5.total_voices().await,
+                sample_rate: 24000,
+                engine: "express-voice-24k".to_string(),
+            })
+        }
+        ActiveTtsEngine::Moss => {
+            let ready = state.moss.is_ready();
+            let moss = state.moss.clone();
+            let installed = if ready {
+                true
+            } else {
+                tokio::task::spawn_blocking(move || moss.is_installed())
+                    .await
+                    .unwrap_or(false)
+            };
+            Json(AudioTtsStatusResponse {
+                ready,
+                installed,
+                resident: ready,
+                total_voices: state.moss.total_voices().await,
+                sample_rate: 48000,
+                engine: "clone-voice-48k".to_string(),
+            })
+        }
     }
 }
 
@@ -5539,7 +5735,7 @@ async fn audio_tts_register_voice_handler(
     State(state): State<AppState>,
     Json(req): Json<AudioTtsRegisterVoiceRequest>,
 ) -> (StatusCode, Json<AudioTtsRegisterVoiceResponse>) {
-    if resolve_active_tts_engine(&state) == ActiveTtsEngine::M5 {
+    if resolve_active_tts_engine_async(&state).await == ActiveTtsEngine::M5 {
         return (
             StatusCode::NOT_IMPLEMENTED,
             Json(AudioTtsRegisterVoiceResponse {
@@ -5602,7 +5798,7 @@ async fn audio_tts_chunk_handler(
     }
     let _cancel_guard = CancelOnDrop(cancel_flag);
 
-    match resolve_active_tts_engine(&state) {
+    match resolve_active_tts_engine_async(&state).await {
         ActiveTtsEngine::M5 => {
             // 对齐 v1.7.2 规格书与红队裁决 V15-06: 拒绝分块并发抢占活跃流，显式告警并返回 409 JSON
             if state.m5.coordinator().is_active().await {
@@ -5857,7 +6053,15 @@ async fn audio_tts_scale_handler(
         ));
     }
 
-    let wav_bytes = moss_tts::scale_wav_speed(&body, speed)
+    let body_bytes = body.to_vec();
+    let wav_bytes = tokio::task::spawn_blocking(move || moss_tts::scale_wav_speed(&body_bytes, speed))
+        .await
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WAV scaling task failed: {}", e),
+            )
+        })?
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("WAV scaling failed: {}", e)))?;
 
     let response = axum::response::Response::builder()
@@ -5966,7 +6170,7 @@ async fn audio_analyze_voice_handler(
     State(state): State<AppState>,
     Json(req): Json<AudioAnalyzeVoiceRequest>,
 ) -> (StatusCode, Json<AudioAnalyzeVoiceResponse>) {
-    if resolve_active_tts_engine(&state) == ActiveTtsEngine::M5 {
+    if resolve_active_tts_engine_async(&state).await == ActiveTtsEngine::M5 {
         return (
             StatusCode::NOT_IMPLEMENTED,
             Json(AudioAnalyzeVoiceResponse {
@@ -5998,7 +6202,11 @@ async fn audio_analyze_voice_handler(
     }
 
     let path = std::path::PathBuf::from(&file_path);
-    if !path.exists() {
+    let check_path = path.clone();
+    let path_exists = tokio::task::spawn_blocking(move || check_path.exists())
+        .await
+        .unwrap_or(false);
+    if !path_exists {
         return (
             StatusCode::BAD_REQUEST,
             Json(AudioAnalyzeVoiceResponse {
@@ -6131,75 +6339,79 @@ async fn vision_tags_handler(
     Json(req): Json<VisionTagsRequest>,
 ) -> Result<Json<VisionTagsResponse>, (StatusCode, Json<serde_json::Value>)> {
     let cfg = state.config.lock().unwrap().clone();
-    let t_start = std::time::Instant::now();
-    let file_path = req.file_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let t_start = std::time::Instant::now();
+        let file_path = req.file_path.clone();
 
-    let mut tags = Vec::new();
-    let mut scored_tags: Option<Vec<(String, f32)>> = None;
-    if omni_pro::is_pro_enabled() {
-        if cfg.embedding_profile == "gemma_unified" {
-            // gemma_unified 档位：严格只走 EmbeddingGemma 视觉感知，禁止互通，禁止降级到 CLIP
-            match image::open(&file_path) {
-                Ok(img) => {
-                    let scored = omni_pro::OmniVisionEngine::extract_gemma_visual_tags_scored_from_image(
-                        &img,
-                        req.top_k.unwrap_or(5),
-                    );
-                    tags = scored.iter().map(|(c, _)| c.clone()).collect();
-                    scored_tags = Some(scored);
-                }
-                Err(e) => {
-                    tracing::error!("[OmniVision] gemma_unified 无法打开图片: {e}");
-                }
-            }
-        } else {
-            // classic_light 档位：严格只走 CLIP 视觉感知，禁止互通，禁止借道 Gemma
-            match image::open(&file_path) {
-                Ok(img) => {
-                    match omni_pro::OmniVisionEngine::try_extract_clip_visual_tags_scored_from_image(
-                        &img,
-                        req.language.as_deref(),
-                        req.top_k.unwrap_or(5),
-                    ) {
-                        Ok(scored) => {
-                            tags = scored.iter().map(|(c, _)| c.clone()).collect();
-                            scored_tags = Some(scored);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "[OmniVision] classic_light 视觉感知失败 (file={}): {}",
-                                file_path,
-                                e
-                            );
-                            return Err(vision_unavailable_response(&e));
-                        }
+        let mut tags = Vec::new();
+        let mut scored_tags: Option<Vec<(String, f32)>> = None;
+        if omni_pro::is_pro_enabled() {
+            if cfg.embedding_profile == "gemma_unified" {
+                // gemma_unified 档位：严格只走 EmbeddingGemma 视觉感知，禁止互通，禁止降级到 CLIP
+                match image::open(&file_path) {
+                    Ok(img) => {
+                        let scored = omni_pro::OmniVisionEngine::extract_gemma_visual_tags_scored_from_image(
+                            &img,
+                            req.top_k.unwrap_or(5),
+                        );
+                        tags = scored.iter().map(|(c, _)| c.clone()).collect();
+                        scored_tags = Some(scored);
+                    }
+                    Err(e) => {
+                        tracing::error!("[OmniVision] gemma_unified 无法打开图片: {e}");
                     }
                 }
-                Err(e) => {
-                    tracing::error!("[OmniVision] classic_light 无法打开图片: {e}");
+            } else {
+                // classic_light 档位：严格只走 CLIP 视觉感知，禁止互通，禁止借道 Gemma
+                match image::open(&file_path) {
+                    Ok(img) => {
+                        match omni_pro::OmniVisionEngine::try_extract_clip_visual_tags_scored_from_image(
+                            &img,
+                            req.language.as_deref(),
+                            req.top_k.unwrap_or(5),
+                        ) {
+                            Ok(scored) => {
+                                tags = scored.iter().map(|(c, _)| c.clone()).collect();
+                                scored_tags = Some(scored);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[OmniVision] classic_light 视觉感知失败 (file={}): {}",
+                                    file_path,
+                                    e
+                                );
+                                return Err(vision_unavailable_response(&e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("[OmniVision] classic_light 无法打开图片: {e}");
+                    }
                 }
             }
         }
-    }
 
-    if let Some(top_k) = req.top_k {
-        if tags.len() > top_k {
-            tags.truncate(top_k);
-        }
-        if let Some(ref mut st) = scored_tags {
-            if st.len() > top_k {
-                st.truncate(top_k);
+        if let Some(top_k) = req.top_k {
+            if tags.len() > top_k {
+                tags.truncate(top_k);
+            }
+            if let Some(ref mut st) = scored_tags {
+                if st.len() > top_k {
+                    st.truncate(top_k);
+                }
             }
         }
-    }
 
-    let duration_ms = t_start.elapsed().as_millis() as u64;
-    Ok(Json(VisionTagsResponse {
-        file_path,
-        tags,
-        scored_tags,
-        duration_ms,
-    }))
+        let duration_ms = t_start.elapsed().as_millis() as u64;
+        Ok(Json(VisionTagsResponse {
+            file_path,
+            tags,
+            scored_tags,
+            duration_ms,
+        }))
+    })
+    .await
+    .map_err(|e| vision_unavailable_response(&format!("视觉标签任务异常: {e}")))?
 }
 
 /// 单指标图像频域特征检测处理: POST /api/vision/inspect
@@ -6219,36 +6431,52 @@ async fn vision_inspect_handler(
         });
     }
 
-    let t_start = std::time::Instant::now();
-    let file_path = req.file_path.clone();
+    let file_path_fallback = req.file_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let t_start = std::time::Instant::now();
+        let file_path = req.file_path;
 
-    let mut has_watermark = false;
-    let mut watermark_level = 0u8;
-    let mut watermark_status = "none".to_string();
-    let mut has_mosaic = false;
-    let mut mosaic_level = 0u8;
-    let mut mosaic_status = "none".to_string();
+        let mut has_watermark = false;
+        let mut watermark_level = 0u8;
+        let mut watermark_status = "none".to_string();
+        let mut has_mosaic = false;
+        let mut mosaic_level = 0u8;
+        let mut mosaic_status = "none".to_string();
 
-    if let Ok(img) = image::open(&file_path) {
-        watermark_level = omni_pro::perceive::detect_watermark_level(&img);
-        has_watermark = watermark_level > 0;
-        watermark_status = omni_pro::perceive::detect_watermark_status(&img).to_string();
+        if let Ok(img) = image::open(&file_path) {
+            watermark_level = omni_pro::perceive::detect_watermark_level(&img);
+            has_watermark = watermark_level > 0;
+            watermark_status = omni_pro::perceive::detect_watermark_status(&img).to_string();
 
-        mosaic_level = omni_pro::perceive::detect_mosaic_level(&img);
-        has_mosaic = mosaic_level > 0;
-        mosaic_status = omni_pro::perceive::detect_mosaic_status(&img).to_string();
-    }
+            mosaic_level = omni_pro::perceive::detect_mosaic_level(&img);
+            has_mosaic = mosaic_level > 0;
+            mosaic_status = omni_pro::perceive::detect_mosaic_status(&img).to_string();
+        }
 
-    let duration_ms = t_start.elapsed().as_millis() as u64;
-    Json(VisionInspectResponse {
-        file_path,
-        has_watermark,
-        watermark_level,
-        watermark_status,
-        has_mosaic,
-        mosaic_level,
-        mosaic_status,
-        duration_ms,
+        let duration_ms = t_start.elapsed().as_millis() as u64;
+        Json(VisionInspectResponse {
+            file_path,
+            has_watermark,
+            watermark_level,
+            watermark_status,
+            has_mosaic,
+            mosaic_level,
+            mosaic_status,
+            duration_ms,
+        })
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Json(VisionInspectResponse {
+            file_path: file_path_fallback,
+            has_watermark: false,
+            watermark_level: 0,
+            watermark_status: "none".to_string(),
+            has_mosaic: false,
+            mosaic_level: 0,
+            mosaic_status: "none".to_string(),
+            duration_ms: 0,
+        })
     })
 }
 
@@ -6266,18 +6494,32 @@ async fn fs_ads_handler(
         });
     }
 
-    let t_start = std::time::Instant::now();
-    let file_path = req.file_path.clone();
+    let file_path_fallback = req.file_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let t_start = std::time::Instant::now();
+        let file_path = req.file_path;
 
-    let (file_source, file_source_code, source_url) = omni_pro::perceive::detect_ntfs_zone_identifier(&file_path);
+        let (file_source, file_source_code, source_url) =
+            omni_pro::perceive::detect_ntfs_zone_identifier(&file_path);
 
-    let duration_ms = t_start.elapsed().as_millis() as u64;
-    Json(FsAdsResponse {
-        file_path,
-        file_source,
-        file_source_code,
-        source_url,
-        duration_ms,
+        let duration_ms = t_start.elapsed().as_millis() as u64;
+        Json(FsAdsResponse {
+            file_path,
+            file_source,
+            file_source_code,
+            source_url,
+            duration_ms,
+        })
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Json(FsAdsResponse {
+            file_path: file_path_fallback,
+            file_source: None,
+            file_source_code: None,
+            source_url: None,
+            duration_ms: 0,
+        })
     })
 }
 
@@ -6935,6 +7177,246 @@ Page Fault 异常处理
         let long_prompt = "日文プロンプト".repeat(2000);
         let dual_combined = combine_inspection_text(&long_eff, Some(&long_prompt));
         assert!(dual_combined.len() <= 16385);
+    }
+
+    fn build_minimal_test_state() -> AppState {
+        AppState {
+            config: Arc::new(Mutex::new(OmniConfig::default())),
+            geo: Arc::new(omni_pro::geo::GeoService::unavailable()),
+            hownet: Arc::new(omni_pro::hownet::OmniHowNetService::unavailable()),
+            search: Arc::new(omni_pro::search::OmniSearchService::default()),
+            omw: OmwDb::unavailable(),
+            vector: Arc::new(VectorEngine::in_memory()),
+            master_db_path: Arc::new(Mutex::new(None)),
+            target_vectors_dir: None,
+            dimension_policies: Arc::new(std::sync::RwLock::new(
+                omni_core::get_default_dimension_policies(),
+            )),
+            sherpa: Arc::new(SherpaManager::new()),
+            moss: Arc::new(MossTtsManager::new_deferred()),
+            m5: Arc::new(M5TtsManager::new_deferred()),
+            anchor_cache: Arc::new(omni_core::anchor_cache::AnchorCache::default()),
+            cpu_slot: Arc::new(cpu_engine::CpuSlot::new(None, None)),
+            instance_id: service_discovery::generate_uuid_v4(),
+            revision: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            actual_port: OMNI_DEFAULT_PORT_START,
+            user_data_dir: None,
+            status_broadcast: tokio::sync::broadcast::channel(32).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_omni_instance_id_header_matches_engine_status_body() {
+        use tower::ServiceExt;
+
+        let state = build_minimal_test_state();
+        let expected_id = state.instance_id.clone();
+        let app = create_app_router(state);
+
+        // 1. /api/v1/engine/status 响应头 X-Omni-Instance-Id 必须与返回体 instanceId 100% 同源一致
+        let status_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/engine/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_resp.status(), StatusCode::OK);
+        let header_id = status_resp
+            .headers()
+            .get("x-omni-instance-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("必须返回 X-Omni-Instance-Id 全局响应头")
+            .to_string();
+        let body_bytes = axum::body::to_bytes(status_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let body_id = body_json["instanceId"]
+            .as_str()
+            .expect("status 响应体必须包含 instanceId");
+        assert_eq!(header_id, expected_id);
+        assert_eq!(body_id, expected_id);
+        assert_eq!(header_id, body_id);
+
+        // 2. /health 也必须附带同源 X-Omni-Instance-Id 头
+        let health_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health_resp.status(), StatusCode::OK);
+        assert_eq!(
+            health_resp
+                .headers()
+                .get("x-omni-instance-id")
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_id.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_status_probes_nonblocking_under_blocking_data_plane() {
+        use tower::ServiceExt;
+
+        // 注入经 spawn_blocking 隔离的 3s 同步阻塞数据面路由，在 2 个 Tokio worker 下并发压测，
+        // 同步轮询 engine/status 与 tts/status，硬断言 P99 <= 20ms（spec §4.2 AC-2）
+        let state = build_minimal_test_state();
+        let app = create_app_router(state).route(
+            "/test/blocking-data-plane",
+            axum::routing::get(|| async {
+                let _ = tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                })
+                .await;
+                StatusCode::OK
+            }),
+        );
+
+        // 预热一次消除首调静态初始化抖动
+        let _ = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/engine/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 并发打入 4 路 3s 阻塞数据面请求（远超 worker_threads = 2）
+        let mut blockers = Vec::new();
+        for _ in 0..4 {
+            let app_c = app.clone();
+            blockers.push(tokio::spawn(async move {
+                let resp = app_c
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri("/test/blocking-data-plane")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut latencies_ms: Vec<u128> = Vec::with_capacity(40);
+        for i in 0..20 {
+            for uri in ["/api/v1/engine/status", "/api/audio/tts/status"] {
+                let t0 = std::time::Instant::now();
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(uri)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let elapsed = t0.elapsed().as_millis();
+                assert_eq!(resp.status(), StatusCode::OK, "第 {i} 轮探测 {uri} 必须 200 OK");
+                latencies_ms.push(elapsed);
+            }
+        }
+        latencies_ms.sort_unstable();
+        let p99_idx = ((latencies_ms.len() as f64 * 0.99).ceil() as usize).saturating_sub(1);
+        let p99_ms = latencies_ms[p99_idx.min(latencies_ms.len() - 1)];
+        assert!(
+            p99_ms <= 20,
+            "状态探活 P99 超标: {}ms > 20ms (samples={:?})",
+            p99_ms,
+            latencies_ms
+        );
+
+        for h in blockers {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_module_session_routes_and_tts_status_fields() {
+        use tower::ServiceExt;
+
+        let state = build_minimal_test_state();
+        let app = create_app_router(state);
+
+        // 1. /api/audio/tts/status 暴露 ready/installed/resident 全字段
+        let status_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/audio/tts/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_resp.status(), StatusCode::OK);
+        let status_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(status_resp.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert!(status_json.get("ready").is_some());
+        assert!(status_json.get("installed").is_some());
+        assert!(status_json.get("resident").is_some());
+        assert!(status_json.get("total_voices").is_some());
+        assert!(status_json.get("sample_rate").is_some());
+        assert!(status_json.get("engine").is_some());
+
+        // 2. 双前缀 POST /v1/modules/:id/session & /api/v1/modules/:id/session 未安装返回 503 MODULE_NOT_INSTALLED
+        for uri in [
+            "/v1/modules/tts-m5-onnx/session",
+            "/api/v1/modules/tts-moss-onnx/session",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "POST {uri} 应返回 503");
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["error"], "MODULE_NOT_INSTALLED");
+        }
+
+        // 3. 非白名单模块返回 400 MODULE_NOT_HIBERNATABLE
+        let bad_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/modules/unknown-module/session")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+        let bad_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(bad_resp.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bad_body["error"], "MODULE_NOT_HIBERNATABLE");
     }
 
 }

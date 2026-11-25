@@ -358,6 +358,9 @@ pub struct OmniPerceptionRequest {
     /// 缺省为 false，保持既有完全向后兼容语义
     #[serde(default)]
     pub skip_5w_synthesis: Option<bool>,
+    /// 上游透传的感知请求总超时预算（秒，由 Desktop `effectiveCpuCapMs / 1000.0` 透传，供视频三态看门狗单源闭合）
+    #[serde(default)]
+    pub perceive_timeout_sec: Option<f64>,
 }
 
 /// 逐请求覆盖值的统一载体。`omni-server` 三类请求体各自映射为此结构后套用同一套校验，
@@ -793,6 +796,12 @@ pub struct OmniPerceptionResult {
     /// 感知插槽: 人脸特征分析 (perception_face，Ticket 03)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub face_perception: Option<PerceptionSlotResult>,
+    /// 显式降级标记（例如视频预算不足跳过视觉抽帧时写入 "visual_skipped_budget"）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
+    /// 显式降级细分原因（例如 "pre_elapsed" | "budget_structural"）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
 }
 
 /// 视频时序切片实体（30 秒窗口切片）

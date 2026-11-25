@@ -266,16 +266,27 @@ impl CpuSlot {
         // 写入 .inflight 崩溃标记
         let _ = self.circuit_breaker.write_inflight(pid, &boot_id, epoch);
 
-        // 加载模型与分词器 (受控 1~4 线程)
+        // 加载模型与分词器 (受控 1~4 线程)，阻塞权重加载下沉 spawn_blocking 避免阻塞 Tokio worker
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let num_threads = std::cmp::min(std::cmp::max(cpus.saturating_sub(1), 1), 4);
         let gen: Arc<dyn CpuGenerator> = if let Some(ref dir) = self.model_dir {
-            match PocketCpuGenerator::load_from_dir(dir, num_threads) {
-                Ok(g) => Arc::new(g),
-                Err(e) => {
+            let dir_owned = dir.clone();
+            match tokio::task::spawn_blocking(move || {
+                PocketCpuGenerator::load_from_dir(&dir_owned, num_threads)
+            })
+            .await
+            {
+                Ok(Ok(g)) => Arc::new(g),
+                Ok(Err(e)) => {
                     self.circuit_breaker.remove_inflight();
                     *self.lifecycle.write().unwrap() = SessionLifecycle::Failed(e.clone());
                     return Err(e);
+                }
+                Err(join_err) => {
+                    let msg = format!("Pocket CPU 加载任务异常: {}", join_err);
+                    self.circuit_breaker.remove_inflight();
+                    *self.lifecycle.write().unwrap() = SessionLifecycle::Failed(msg.clone());
+                    return Err(msg);
                 }
             }
         } else {
