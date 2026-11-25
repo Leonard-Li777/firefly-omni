@@ -1,89 +1,22 @@
 /**
- * omni 依赖资源初始化与解压脚本 (setup-extra-resources.js)
- * 检查 extraResources/bin 目录中是否存在已解压文件，
- * 如果不存在，从 presetResources/ 找到匹配当前平台 (exiftool-bin-[platform]-[arch].[ext]) 的压缩包并解压。
- * 同时负责 omni-geo 地理数据集的两级装配：本地 presetResources 优先，缺失时经
- * consume-preset-resources.js 从 firefly-resources 统一资源管线拉取（两步认证下载 + sha256 校验）。
+ * omni 依赖资源初始化脚本 (setup-extra-resources.js)
+ *
+ * 职责已收敛为「地理数据集装配」一件事：omni-geo 本地 presetResources 优先，
+ * 缺失时经 consume-preset-resources.js 从 firefly-resources 统一资源管线拉取
+ * （两步认证下载 + sha256 校验）。
+ *
+ * ffmpeg / ffprobe / exiftool 三个共享 tool 资产自 2026-11-25 起不再由本脚本维护，
+ * 唯一装配入口是 desktop 的 `pro/scripts/setup-extra-resources.js`（见 setupOmniExtraResources 注释）。
  */
 
 const fs = require('fs')
 const path = require('path')
-const { spawnSync, execSync } = require('child_process')
+const { spawnSync } = require('child_process')
 
 function ensureDir(dirPath) {
   if (!fs.existsSync(dirPath)) {
     fs.mkdirSync(dirPath, { recursive: true })
     console.log(`✅ [omni-setup] 创建目录: ${dirPath}`)
-  }
-}
-
-function getCurrentPlatform() {
-  const platform = process.platform
-  const arch = process.arch === 'x64' ? 'x64' : 'arm64'
-  return { platform, arch }
-}
-
-function matchPlatformArchive(filename, toolName, platform, arch) {
-  const lower = filename.toLowerCase()
-  if (!lower.startsWith(`${toolName}-bin-`) && !lower.startsWith(`${toolName}-`)) return false
-  const nameWithoutExt = lower.replace(/\.(zip|tar\.gz)$/, '')
-  const parts = nameWithoutExt.split('-')
-  if (parts.length < 4) return false
-
-  const filePlatform = parts[2]
-  const fileArch = parts[3]
-
-  // 严格平台前缀匹配，防止 'darwin' 误匹配 'win'
-  let platformMatched = false
-  if (platform === 'win32') {
-    platformMatched = filePlatform === 'win' || filePlatform === 'win32' || filePlatform === 'windows'
-  } else if (platform === 'darwin') {
-    platformMatched = filePlatform === 'darwin' || filePlatform === 'mac' || filePlatform === 'macos' || filePlatform === 'osx'
-  } else if (platform === 'linux') {
-    platformMatched = filePlatform === 'linux' || filePlatform === 'ubuntu'
-  }
-
-  if (!platformMatched) return false
-
-  // 严格架构匹配
-  const isTargetArm64 = arch === 'arm64' || arch === 'aarch64'
-  const isFileArm64 = fileArch.includes('arm64') || fileArch.includes('aarch64')
-  const isTargetX64 = arch === 'x64' || arch === 'x86_64' || arch === 'amd64'
-  const isFileX64 = fileArch.includes('x64') || fileArch.includes('x86_64') || fileArch.includes('amd64')
-
-  if (isTargetArm64 && isFileArm64) return true
-  if (isTargetX64 && isFileX64) return true
-  return false
-}
-
-async function extractZip(zipPath, destDir) {
-  ensureDir(destDir)
-  if (process.platform === 'win32') {
-    try {
-      execSync(`tar -xf "${zipPath}" -C "${destDir}"`, { windowsHide: true })
-      console.log(`   - [系统 tar] 成功解压: ${path.basename(zipPath)}`)
-      return
-    } catch (tarErr) {
-      try {
-        execSync(
-          `powershell -NoProfile -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${destDir}' -Force"`,
-          { windowsHide: true }
-        )
-        console.log(`   - [PowerShell] 成功解压: ${path.basename(zipPath)}`)
-        return
-      } catch (psErr) {
-        console.warn(`   ⚠️ 解压失败:`, psErr.message)
-        throw psErr
-      }
-    }
-  } else {
-    try {
-      const res = spawnSync('unzip', ['-q', '-o', zipPath, '-d', destDir])
-      if (res.status === 0) {
-        console.log(`   - [系统 unzip] 成功解压: ${path.basename(zipPath)}`)
-        return
-      }
-    } catch (e) {}
   }
 }
 
@@ -229,56 +162,17 @@ async function setupOmniExtraResources() {
 
   ensureDir(extraResourcesBin)
 
-  if (!fs.existsSync(presetDir)) {
-    console.log(`ℹ️ [omni-setup] 预设资源目录不存在，跳过解压: ${presetDir}`)
-    return
-  }
-
-  const { platform, arch } = getCurrentPlatform()
-
-  console.log(`📦 [omni-setup] 检查并解压预设二进制工具包 (平台: ${platform}-${arch})...`)
-
-  const tools = [
-    { name: 'exiftool', exeName: platform === 'win32' ? 'exiftool.exe' : 'exiftool', displayName: 'ExifTool' },
-    { name: 'ffmpeg', exeName: platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg', displayName: 'FFmpeg' },
-    { name: 'ffprobe', exeName: platform === 'win32' ? 'ffprobe.exe' : 'ffprobe', displayName: 'FFprobe' },
-  ]
-
-  for (const tool of tools) {
-    const toolPresetDir = path.join(presetDir, tool.name)
-    if (!fs.existsSync(toolPresetDir)) {
-      continue
-    }
-
-    const files = fs.readdirSync(toolPresetDir)
-    const matchedFile = files.find(f => matchPlatformArchive(f, tool.name, platform, arch))
-
-    if (matchedFile) {
-      const srcPath = path.join(toolPresetDir, matchedFile)
-      const ext = matchedFile.endsWith('.tar.gz') ? '.tar.gz' : path.extname(matchedFile)
-      const zipName = path.basename(matchedFile, ext)
-
-      const destDir = path.join(extraResourcesBin, tool.name)
-      const readyFlag = path.join(destDir, `.ready-${zipName}`)
-      const targetExe = path.join(destDir, tool.exeName)
-
-      if (!fs.existsSync(targetExe) || !fs.existsSync(readyFlag)) {
-        console.log(`📦 [omni-setup] 解压 [${matchedFile}] -> [${destDir}]...`)
-        ensureDir(destDir)
-        if (matchedFile.endsWith('.zip')) {
-          await extractZip(srcPath, destDir)
-        } else if (matchedFile.endsWith('.tar.gz')) {
-          await extractTarGz(srcPath, destDir)
-        }
-        fs.writeFileSync(readyFlag, 'completed')
-        console.log(`✅ [omni-setup] ${tool.displayName} 解压部署完成！`)
-      } else {
-        console.log(`ℹ️ [omni-setup] [跳过已解压]: ${matchedFile}`)
-      }
-    } else {
-      console.warn(`⚠️ [omni-setup] 未发现匹配平台 (${platform}-${arch}) 的 ${tool.displayName} 预设包`)
-    }
-  }
+  // 已退役（2026-11-25）：omni 不再自行解压/维护 ffmpeg / ffprobe / exiftool。
+  //
+  // 这三个是 firefly-resources 的共享 tool 资产，唯一装配入口是 desktop 的
+  // `pro/scripts/setup-extra-resources.js`（落到 `build/extraResources/bin/<tool>/<exe>`）。
+  // omni 侧的旧实现解压的是已退役 npm 包产物（2018 年 ffmpeg/ffprobe 构建），
+  // 且 `scripts/omni-build-to-desktop.js` 会把它覆盖回 desktop，形成 ADR-0029 禁止的越界冗余。
+  // 运行态定位已由 `czkawka_bridge::ensure_media_tools_in_path` 改为按资源相对路径探测
+  // （`resources/bin/<tool>/<exe>` / `build/extraResources/bin/<tool>/<exe>`），无需本脚本落盘。
+  console.log(
+    'ℹ️ [omni-setup] ffmpeg / ffprobe / exiftool 由 desktop 统一装配，omni 侧不再解压维护'
+  )
 }
 
 if (require.main === module) {

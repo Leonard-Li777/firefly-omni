@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -29,6 +29,31 @@ static INIT_CZKAWKA: std::sync::Once = std::sync::Once::new();
 
 pub struct CzkawkaBridge;
 
+/// 生成某个媒体工具（ffmpeg / ffprobe）的探测候选路径。
+///
+/// 落点真相（2026-11-25 校正）：这两个二进制属 firefly-resources 共享资产，
+/// 由 desktop 装配进 `extraResources/bin/<tool>/<exe>`；electron-builder 打包时
+/// `extraResources` 被**平铺到 `resources/` 根**，因此发布形态是
+/// `resources/bin/<tool>/<exe>`，而不是 `resources/bin/<exe>`。
+/// 旧实现在打包环境下两条正常形态都缺（只有 `resources/bin/win32/<exe>` 与根平铺），
+/// 导致视频查重/视频优化只能靠 PATH 碰运气、静默退化为 0 结果。
+/// 严禁再挂 `node_modules/@ffmpeg-installer/*` 这类已删除的 npm 副本路径，
+/// 也严禁回锚某个开发者本机绝对路径（D:\workspace\...）。
+fn media_tool_candidates(cur: &Path, tool: &str, exe: &str, platform_dir: &str) -> Vec<PathBuf> {
+    vec![
+        // 开发态：桌面装配目录（仓库根 / desktop 目录两跳内均可命中）
+        cur.join(format!("apps/desktop/build/extraResources/bin/{}/{}", tool, exe)),
+        cur.join(format!("build/extraResources/bin/{}/{}", tool, exe)),
+        cur.join(format!("extraResources/bin/{}/{}", tool, exe)),
+        // 发布态：extraResources 平铺到 resources/ 根
+        cur.join(format!("resources/bin/{}/{}", tool, exe)),
+        cur.join(format!("bin/{}/{}", tool, exe)),
+        // 历史平铺形态（保留兜底，不再作为唯一依赖）
+        cur.join(format!("resources/bin/{}/{}", platform_dir, exe)),
+        cur.join(format!("resources/bin/{}", exe)),
+    ]
+}
+
 fn ensure_media_tools_in_path() {
     let is_win = cfg!(target_os = "windows");
     let ffmpeg_exe = if is_win { "ffmpeg.exe" } else { "ffmpeg" };
@@ -42,58 +67,26 @@ fn ensure_media_tools_in_path() {
 
     let search_roots = [
         std::env::current_dir().unwrap_or_default(),
-        std::env::current_exe().map(|p| p.parent().unwrap_or(&p).to_path_buf()).unwrap_or_default(),
-        PathBuf::from(r"D:\workspace\firefly-ai-folder"),
+        std::env::current_exe()
+            .map(|p| p.parent().unwrap_or(&p).to_path_buf())
+            .unwrap_or_default(),
     ];
 
     let mut added_paths = Vec::new();
 
     for root in &search_roots {
         let mut cur = root.clone();
-        for _ in 0..6 {
-            // 1. 优先从 extraResources/bin/ffmpeg 探测
-            let ffmpeg_candidates = [
-                cur.join(format!("apps/omni/build/extraResources/bin/ffmpeg/{}", ffmpeg_exe)),
-                cur.join(format!("build/extraResources/bin/ffmpeg/{}", ffmpeg_exe)),
-                cur.join(format!("apps/omni/extraResources/bin/ffmpeg/{}", ffmpeg_exe)),
-                cur.join(format!("extraResources/bin/ffmpeg/{}", ffmpeg_exe)),
-                cur.join(format!("resources/bin/{}/{}", platform_dir, ffmpeg_exe)),
-                cur.join(format!("resources/bin/{}", ffmpeg_exe)),
-                cur.join(format!("node_modules/@ffmpeg-installer/win32-x64/{}", ffmpeg_exe)),
-                cur.join(format!(r"node_modules\.pnpm\@ffmpeg-installer+win32-x64@4.1.0\node_modules\@ffmpeg-installer\win32-x64\{}", ffmpeg_exe)),
-            ];
-            for c in &ffmpeg_candidates {
-                if c.exists() {
-                    if let Some(parent) = c.parent() {
-                        let parent_buf = parent.to_path_buf();
-                        if !added_paths.contains(&parent_buf) {
-                            added_paths.push(parent_buf);
-                        }
+        for _ in 0..8 {
+            for (tool, exe) in [("ffmpeg", ffmpeg_exe), ("ffprobe", ffprobe_exe)] {
+                if let Some(parent) = media_tool_candidates(&cur, tool, exe, platform_dir)
+                    .iter()
+                    .find(|c| c.exists())
+                    .and_then(|c| c.parent())
+                    .map(|p| p.to_path_buf())
+                {
+                    if !added_paths.contains(&parent) {
+                        added_paths.push(parent);
                     }
-                    break;
-                }
-            }
-
-            // 2. 优先从 extraResources/bin/ffprobe 探测
-            let ffprobe_candidates = [
-                cur.join(format!("apps/omni/build/extraResources/bin/ffprobe/{}", ffprobe_exe)),
-                cur.join(format!("build/extraResources/bin/ffprobe/{}", ffprobe_exe)),
-                cur.join(format!("apps/omni/extraResources/bin/ffprobe/{}", ffprobe_exe)),
-                cur.join(format!("extraResources/bin/ffprobe/{}", ffprobe_exe)),
-                cur.join(format!("resources/bin/{}/{}", platform_dir, ffprobe_exe)),
-                cur.join(format!("resources/bin/{}", ffprobe_exe)),
-                cur.join(format!("node_modules/@ffprobe-installer/win32-x64/{}", ffprobe_exe)),
-                cur.join(format!(r"node_modules\.pnpm\@ffprobe-installer+win32-x64@5.1.0\node_modules\@ffprobe-installer\win32-x64\{}", ffprobe_exe)),
-            ];
-            for c in &ffprobe_candidates {
-                if c.exists() {
-                    if let Some(parent) = c.parent() {
-                        let parent_buf = parent.to_path_buf();
-                        if !added_paths.contains(&parent_buf) {
-                            added_paths.push(parent_buf);
-                        }
-                    }
-                    break;
                 }
             }
 

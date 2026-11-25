@@ -108,7 +108,22 @@ function createZipFromFile(filePath, destZip) {
   }
 }
 
-async function buildFfmpegAndFfprobe() {
+/**
+ * ⚠️ 已退役（2026-11-25）：ffmpeg / ffprobe 不再由 npm 包 `@ffmpeg-installer/*` 生成。
+ *
+ * 病根：本函数产出 `ffmpeg-bin-<platform>.zip`（内含 2018 年的 61MB 老二进制），
+ * 与 firefly-resources 已发布的 `ffmpeg-master-<ver>-<platform>-<arch>.zip`
+ * （BtbN GPL static 构建，含 libdav1d / x264 / x265 / svtav1 / nvdec / nvenc / amf / vpl）并存；
+ * 一旦哪个消费方按文件名/目录顺序取到本函数的产物，装配出来的就是 8 年前的解码能力，
+ * 且 sha256 与 BOM 声明完全对不上（ADR-0029 明令禁止的「跨子模块资源冗余」）。
+ *
+ * 现行唯一来源：`apps/firefly-resources/sources/ffmpeg.json` + `sources/ffprobe.json`
+ * （upstream 指向 BtbN master-latest），由 firefly-resources 发布流水线上传到恒定 tag `resources`，
+ * 各子模块只做缓存消费（desktop 侧由 `setup-extra-resources.js` 按 lock/BOM 装配）。
+ *
+ * 仅当需要复现历史产物（例如比对旧版本行为）时，显式传 `--legacy-npm-media` 才会重新生成。
+ */
+async function buildFfmpegAndFfprobeLegacy() {
   const platforms = [
     { target: 'win-x64', ffmpegPkg: '@ffmpeg-installer/win32-x64', ffprobePkg: '@ffprobe-installer/win32-x64', exeSuffix: '.exe' },
     { target: 'darwin-arm64', ffmpegPkg: '@ffmpeg-installer/darwin-arm64', ffprobePkg: '@ffprobe-installer/darwin-arm64', exeSuffix: '' },
@@ -227,7 +242,19 @@ async function main() {
   ensureDir(OMNI_PRESET_DIR)
   ensureDir(TEMP_DIR)
 
-  await buildFfmpegAndFfprobe()
+  // ffmpeg / ffprobe 已切换到 firefly-resources 公共资源发布链（见函数注释），默认不再生成
+  if (process.argv.includes('--legacy-npm-media')) {
+    console.warn(
+      '⚠️ 已显式启用 --legacy-npm-media：将用 @ffmpeg-installer npm 包生成 2018 年老二进制，' +
+        '仅用于历史比对，严禁用于发布或打进安装包'
+    )
+    await buildFfmpegAndFfprobeLegacy()
+  } else {
+    console.log(
+      '⏭️ 跳过 ffmpeg/ffprobe：唯一来源为 firefly-resources（ffmpeg-master-<ver> 资产），' +
+        '需要历史产物请传 --legacy-npm-media'
+    )
+  }
   await buildExifTool()
 
   console.log('\n🎉 omni 所有平台的 presetResources 压缩包已准备完毕！')
