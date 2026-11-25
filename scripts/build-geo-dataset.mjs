@@ -25,6 +25,7 @@ import { pipeline } from 'node:stream/promises'
 import readline from 'node:readline'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import downloadLock from '../../../scripts/lib/resource-download-lock.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const OMNI_ROOT = path.resolve(__dirname, '..')
@@ -41,9 +42,7 @@ const LANGS = new Set(['en', 'zh', 'ja', 'ko', 'fr', 'de', 'es', 'ru', 'pt', 'ar
 const EN = 'en'
 /** 数据集版本号：构建日期（本地时区 YYYYMMDD） */
 const VERSION = Number(
-  new Date()
-    .toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' })
-    .replaceAll('-', '')
+  new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' }).replaceAll('-', '')
 )
 
 function log(msg) {
@@ -61,7 +60,9 @@ function ensureDir(dir) {
  * 例如 "zh-Hans" -> "zh"，"pt-BR" -> "pt"，"lv" -> null
  */
 function normalizeLang(iso) {
-  const lower = String(iso || '').trim().toLowerCase()
+  const lower = String(iso || '')
+    .trim()
+    .toLowerCase()
   if (!lower) return null
   const base = lower.split(/[-_]/)[0]
   return LANGS.has(lower) ? lower : LANGS.has(base) ? base : null
@@ -72,7 +73,20 @@ async function downloadFile(url, dest) {
   // 优先使用系统 curl：自带重试与断点续传，对代理链路中断更鲁棒
   const curl = spawnSync(
     'curl',
-    ['-L', '--fail', '--retry', '5', '--retry-delay', '2', '--retry-all-errors', '-C', '-', '-o', dest, url],
+    [
+      '-L',
+      '--fail',
+      '--retry',
+      '5',
+      '--retry-delay',
+      '2',
+      '--retry-all-errors',
+      '-C',
+      '-',
+      '-o',
+      dest,
+      url
+    ],
     { stdio: ['ignore', 'ignore', 'pipe'] }
   )
   if (curl.status !== 0) {
@@ -84,7 +98,9 @@ async function downloadFile(url, dest) {
       }
       await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(dest))
     } catch (err) {
-      throw new Error(`下载失败 (${url}): ${err.message}（curl 输出: ${curl.stderr?.toString().trim()}）`)
+      throw new Error(
+        `下载失败 (${url}): ${err.message}（curl 输出: ${curl.stderr?.toString().trim()}）`
+      )
     }
   }
   const sizeMB = (fs.statSync(dest).size / 1024 / 1024).toFixed(1)
@@ -244,7 +260,7 @@ async function main() {
       ad2: p[11] || null,
       pop: Number(p[14]) || 0,
       bag: new NameBag(),
-      asciiName: p[2] || p[1] || '',
+      asciiName: p[2] || p[1] || ''
     }
     points.push(point)
     pointsById.set(id, point)
@@ -342,12 +358,12 @@ async function main() {
         ad1: p.ad1,
         ad2: p.ad2,
         pop: p.pop,
-        ...(n ? { n } : {}),
+        ...(n ? { n } : {})
       }
     }),
     admin1: serializeBags(admin1),
     admin2: serializeBags(admin2),
-    countries: serializeBags(countries),
+    countries: serializeBags(countries)
   }
 
   const jsonStr = JSON.stringify(dataset)
@@ -357,21 +373,34 @@ async function main() {
   fs.writeFileSync(path.join(GEO_OUT_DIR, 'VERSION'), String(VERSION))
 
   const jsonMB = (fs.statSync(jsonPath).size / 1024 / 1024).toFixed(1)
-  log(`✅ 数据集已生成: ${jsonPath} (${jsonMB} MB, ${dataset.points.length} 个居民点, 地名匹配 ${matched} 条)`)
+  log(
+    `✅ 数据集已生成: ${jsonPath} (${jsonMB} MB, ${dataset.points.length} 个居民点, 地名匹配 ${matched} 条)`
+  )
 
   // ========== 8. 打包分发包（tar.gz，跨平台系统 tar 创建）==========
   ensureDir(PRESET_GEO_DIR)
   const tarPath = path.join(PRESET_GEO_DIR, 'geonames-resources.tar.gz')
-  const tarRes = spawnSync('tar', ['-czf', tarPath, '-C', GEO_OUT_DIR, 'geonames-compact.json', 'VERSION'])
+  const tarRes = spawnSync('tar', [
+    '-czf',
+    tarPath,
+    '-C',
+    GEO_OUT_DIR,
+    'geonames-compact.json',
+    'VERSION'
+  ])
   if (tarRes.status !== 0) {
     throw new Error('tar 打包失败，请确认系统存在 tar 命令')
   }
   const tarMB = (fs.statSync(tarPath).size / 1024 / 1024).toFixed(1)
   log(`📦 分发包已生成: ${tarPath} (${tarMB} MB)`)
-  log('🎉 构建完成！可执行 node scripts/upload-ci-static-resources.js 上传至 firefly-omni Release (geo-data)。')
+  log(
+    '🎉 构建完成！可执行 node scripts/upload-ci-static-resources.js 上传至 firefly-omni Release (geo-data)。'
+  )
 }
 
-main().catch(err => {
+// build/geo-cache 与 build/extraResources/geo 都是 Worktree 共享/半共享目录，
+// 多个 Worktree 同时构建会并发写同一批 zip 与解包目录，必须持跨 Worktree 锁执行。
+downloadLock.withResourceLock('omni-geo-dataset', main).catch(err => {
   console.error('❌ 构建失败:', err)
   process.exit(1)
 })
