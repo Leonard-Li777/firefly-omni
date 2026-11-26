@@ -14,6 +14,37 @@ fn has_mupdf_headers(dir: &Path) -> bool {
         || dir.join("fitz.h").is_file()
 }
 
+/// 候选目录是否**真的**含 libclang 动态库文件。
+///
+/// 仅判目录存在（`dir.exists()`）会把「空壳目录」当成可用路径：历史事故中
+/// `presetResources/libclang/bin` 目录在、`libclang.dll` 已被清掉，于是 preset 路径
+/// 覆盖掉系统 LLVM 的 `LIBCLANG_PATH`，bindgen 一加载就失败，表现为「资源被删了」。
+/// 因此必须以动态库文件（含 Linux 版本化命名 `libclang.so.N`）为唯一判据，
+/// 空壳目录一律跳过、优雅回退系统 LLVM。
+fn has_libclang_library(dir: &Path, target_os: &str) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let exact = match target_os {
+        "windows" => "libclang.dll",
+        "macos" => "libclang.dylib",
+        _ => "libclang.so",
+    };
+    if dir.join(exact).is_file() {
+        return true;
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Linux 常见版本化命名：libclang.so.1 / libclang.so.14.0.6
+            if name.starts_with("libclang.") && entry.path().is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
@@ -23,13 +54,13 @@ fn main() {
     let mut clang_cur = env::current_dir().unwrap_or_default();
     for _ in 0..6 {
         let preset_libclang = clang_cur.join("apps/omni/build/presetResources/libclang/bin");
-        if preset_libclang.exists() {
+        if has_libclang_library(&preset_libclang, &target_os) {
             env::set_var("LIBCLANG_PATH", &preset_libclang);
             println!("cargo:rustc-env=LIBCLANG_PATH={}", preset_libclang.display());
             break;
         }
         let preset_rel = clang_cur.join("build/presetResources/libclang/bin");
-        if preset_rel.exists() {
+        if has_libclang_library(&preset_rel, &target_os) {
             env::set_var("LIBCLANG_PATH", &preset_rel);
             println!("cargo:rustc-env=LIBCLANG_PATH={}", preset_rel.display());
             break;
