@@ -55,43 +55,48 @@ fn media_tool_candidates(cur: &Path, tool: &str, exe: &str, platform_dir: &str) 
 }
 
 fn ensure_media_tools_in_path() {
-    let is_win = cfg!(target_os = "windows");
-    let ffmpeg_exe = if is_win { "ffmpeg.exe" } else { "ffmpeg" };
-    let ffprobe_exe = if is_win { "ffprobe.exe" } else { "ffprobe" };
-    let platform_dir = match std::env::consts::OS {
-        "windows" => "win32",
-        "macos" => "darwin",
-        "linux" => "linux",
-        other => other,
-    };
-
-    let search_roots = [
-        std::env::current_dir().unwrap_or_default(),
-        std::env::current_exe()
-            .map(|p| p.parent().unwrap_or(&p).to_path_buf())
-            .unwrap_or_default(),
-    ];
-
     let mut added_paths = Vec::new();
-
-    for root in &search_roots {
-        let mut cur = root.clone();
-        for _ in 0..8 {
-            for (tool, exe) in [("ffmpeg", ffmpeg_exe), ("ffprobe", ffprobe_exe)] {
-                if let Some(parent) = media_tool_candidates(&cur, tool, exe, platform_dir)
-                    .iter()
-                    .find(|c| c.exists())
-                    .and_then(|c| c.parent())
-                    .map(|p| p.to_path_buf())
-                {
-                    if !added_paths.contains(&parent) {
-                        added_paths.push(parent);
-                    }
+    let global_layout = crate::global_resource_layout();
+    for tool in ["ffmpeg", "ffprobe"] {
+        if let Some(bin) = crate::resolve_media_tool_with_layout(tool, global_layout.as_ref()) {
+            if let Some(parent) = bin.parent().map(|p| p.to_path_buf()) {
+                if !added_paths.contains(&parent) {
+                    added_paths.push(parent);
                 }
             }
+        }
+    }
 
-            if !cur.pop() {
-                break;
+    if added_paths.is_empty() {
+        let is_win = cfg!(target_os = "windows");
+        let ffmpeg_exe = if is_win { "ffmpeg.exe" } else { "ffmpeg" };
+        let ffprobe_exe = if is_win { "ffprobe.exe" } else { "ffprobe" };
+        let platform_dir = match std::env::consts::OS {
+            "windows" => "win32",
+            "macos" => "darwin",
+            "linux" => "linux",
+            other => other,
+        };
+        if let Ok(exe_dir) = std::env::current_exe()
+            .map(|p| p.parent().unwrap_or(&p).to_path_buf())
+        {
+            let mut cur = exe_dir;
+            for _ in 0..4 {
+                for (tool, exe) in [("ffmpeg", ffmpeg_exe), ("ffprobe", ffprobe_exe)] {
+                    if let Some(parent) = media_tool_candidates(&cur, tool, exe, platform_dir)
+                        .iter()
+                        .find(|c| c.is_file())
+                        .and_then(|c| c.parent())
+                        .map(|p| p.to_path_buf())
+                    {
+                        if !added_paths.contains(&parent) {
+                            added_paths.push(parent);
+                        }
+                    }
+                }
+                if !cur.pop() {
+                    break;
+                }
             }
         }
     }

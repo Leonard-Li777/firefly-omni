@@ -596,12 +596,49 @@ pub fn load_manifest_from_path(
     }
 }
 
+/// 宿主/引擎 --bootstrap 信封注入的单轨挂载清单路径与严格门禁开关（优先于环境变量）
+static BOOTSTRAP_MOUNTS_FILE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static BOOTSTRAP_STRICT_PLUGINS: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
+
+/// 由 `start_server_inner` 按 `OmniBootstrapConfig` 注入，即使挂载清单写盘失败 (`None`) 仍保持 Fail-Closed
+pub fn set_bootstrap_mounts_state(path: Option<PathBuf>, strict: bool) {
+    let slot = BOOTSTRAP_MOUNTS_FILE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = path.map(|p| p.to_string_lossy().to_string());
+    }
+    let strict_slot = BOOTSTRAP_STRICT_PLUGINS.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = strict_slot.lock() {
+        *guard = Some(strict);
+    }
+    invalidate_mount_cache();
+}
+
+/// 兼容旧签名封装
+pub fn set_bootstrap_mounts_file(path: Option<PathBuf>) {
+    let strict = path.is_some();
+    set_bootstrap_mounts_state(path, strict);
+}
+
 fn current_cache_key() -> CacheKey {
-    let manifest_path = env::var(ENV_ACTIVE_MODEL_MOUNTS_FILE)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let strict_env = env::var(ENV_STRICT_ACTIVE_PLUGINS).ok();
+    let bootstrap_manifest = BOOTSTRAP_MOUNTS_FILE
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|g| g.clone());
+    let bootstrap_strict = BOOTSTRAP_STRICT_PLUGINS
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|g| *g);
+    let manifest_path = bootstrap_manifest.or_else(|| {
+        env::var(ENV_ACTIVE_MODEL_MOUNTS_FILE)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+    let strict_env = match bootstrap_strict {
+        Some(true) => Some("1".to_string()),
+        Some(false) => env::var(ENV_STRICT_ACTIVE_PLUGINS).ok(),
+        None => env::var(ENV_STRICT_ACTIVE_PLUGINS).ok(),
+    };
     let shared_dir_env = env::var(ENV_SHARED_DIR)
         .ok()
         .map(|s| s.trim().to_string())

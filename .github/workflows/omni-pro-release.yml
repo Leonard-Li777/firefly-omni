@@ -275,11 +275,18 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 配置 MuPDF 编译环境变量
+      - name: 配置 MuPDF 编译环境变量（单源解析）
         shell: bash
         run: |
-          LIB_DIR="build/libmupdf/${{ matrix.artifact_suffix }}"
-          if [ -d "$LIB_DIR" ]; then
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            ASSET_NAME="libmupdf-macos-universal.tar.gz"
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            ASSET_NAME="libmupdf-windows-x86_64.zip"
+          else
+            ASSET_NAME="libmupdf-${{ matrix.artifact_suffix }}.tar.gz"
+          fi
+          LIB_DIR=$(node scripts/download-libmupdf.js --resolve-dir "${ASSET_NAME}" --arch-suffix "${{ matrix.artifact_suffix }}")
+          if [ -f "$LIB_DIR/include/mupdf/fitz.h" ] || [ -f "$LIB_DIR/mupdf/fitz.h" ]; then
             if [ "${{ runner.os }}" = "Windows" ]; then
               ABS_LIB="$(cd "$LIB_DIR" && pwd -W 2>/dev/null || pwd -P)"
             else
@@ -290,9 +297,10 @@ jobs:
             echo "MUPDF_LIB_DIR=$ABS_LIB" >> $GITHUB_ENV
             echo "MUPDF_INCLUDE_DIR=$ABS_LIB/include" >> $GITHUB_ENV
             echo "MUPDF_STATIC=1" >> $GITHUB_ENV
-            echo "✅ 已配置 MuPDF 编译环境变量: $ABS_LIB"
+            echo "✅ 已配置 MuPDF 编译环境变量（单源）: $ABS_LIB"
           else
-            echo "⚠️ 未找到预编译 libmupdf: $LIB_DIR，将使用 vendored 编译路径"
+            echo "::error::未找到规范单源预编译 libmupdf（缺少 fitz.h）: $LIB_DIR"
+            exit 1
           fi
 
       - name: 构建 firefly-omni 二进制 (Pro)
@@ -329,7 +337,10 @@ jobs:
             ls -lh "$BIN_PATH"
           fi
 
-      - name: 打包产物
+      # 构件边界契约（ADR-0073 / multi-product-resource-placement-and-assembly-spec）：
+      # omni-pro-release 仅产出 Pro 裸二进制构件并推送至 firefly-resources['firefly-omni'] 供 Desktop 内嵌，
+      # 严禁在此混入 semantic / taxonomy / geo / models 重资源目录树，防止 Desktop 解压二次嵌套膨胀。
+      - name: 打包产物（Pro 裸二进制构件）
         shell: bash
         run: |
           BIN_NAME="firefly-omni"
