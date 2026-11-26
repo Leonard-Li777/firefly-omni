@@ -14,25 +14,45 @@ fn main() {
     }
 
     if target_dir.is_none() {
-        let search_roots = [
-            std::env::current_dir().unwrap_or_default(),
-            PathBuf::from(r"D:\workspace\firefly-ai-folder"),
-        ];
+        // 构建期缓存唯一落点（多产品资源放置方案 §4.4）：
+        //   apps/omni/build/presetResources/libmupdf/<platform-arch>/
+        // 摊平根目录与 build/libmupdf 旧布局均已废止，此处不保留兼容候选：
+        // 多留一个候选只会让「缓存放错位置」静默通过，把失败推迟到链接阶段。
+        let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        let platform_dir = match (target_os.as_str(), target_arch.as_str()) {
+            ("linux", "x86_64") => Some("linux-x86_64"),
+            ("linux", "aarch64") => Some("linux-aarch64"),
+            ("windows", "x86_64") => Some("windows-x86_64"),
+            ("windows", "aarch64") => Some("windows-aarch64"),
+            ("macos", "x86_64") => Some("macos-x86_64"),
+            ("macos", "aarch64") => Some("macos-aarch64"),
+            _ => None,
+        };
 
-        for root in &search_roots {
-            let mut cur = root.clone();
-            for _ in 0..6 {
-                let candidate = cur.join("apps/omni/build/presetResources/libmupdf");
-                if candidate.exists() {
-                    target_dir = Some(candidate);
-                    break;
+        if let Some(pd) = platform_dir {
+            let roots = [
+                std::env::current_dir().unwrap_or_default(),
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            ];
+            'outer: for root in roots {
+                let mut cur = root;
+                for _ in 0..8 {
+                    for candidate in [
+                        cur.join("apps/omni/build/presetResources/libmupdf").join(pd),
+                        cur.join("build/presetResources/libmupdf").join(pd),
+                    ] {
+                        if candidate.join("include/mupdf/fitz.h").exists()
+                            || candidate.join("mupdf/fitz.h").exists()
+                        {
+                            target_dir = Some(candidate);
+                            break 'outer;
+                        }
+                    }
+                    if !cur.pop() {
+                        break;
+                    }
                 }
-                if !cur.pop() {
-                    break;
-                }
-            }
-            if target_dir.is_some() {
-                break;
             }
         }
     }

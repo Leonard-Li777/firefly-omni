@@ -1,9 +1,14 @@
 /**
  * 下载预编译 MuPDF 静态库脚本 (download-libmupdf.js)
  * 目的：从 firefly-omni 仓库的 ci-resources Release 下载预编译好的
- * libmupdf 静态库（libmupdf-out/：*.a / *.lib + include/），解压并摊平
- * 到 omni 的 build/libmupdf/<suffix>/ 目录，供 Rust build script 以
- * MUPDF_LIB 环境变量引用（见 omni-pro-release.yml / omni-ce-release.yml）。
+ * libmupdf 静态库（libmupdf-out/：*.a / *.lib + include/），解压到
+ * omni 的构建期缓存 apps/omni/build/presetResources/libmupdf/<suffix>/，
+ * 供 Rust build script 以 MUPDF_LIB 环境变量引用（见 omni-pro-release.yml / omni-ce-release.yml）。
+ *
+ * 落点契约：docs/developer/architecture/multi-product-resource-placement-plan.md §4.4
+ * —— presetResources 只有 libmupdf/<platform-arch> 与 libclang 两个合法子目录，
+ * 旧的摊平布局（libmupdf 根部直接放 include 与 *.lib）与 build/libmupdf/<suffix>
+ * 已废止，本脚本不再向那两处写入。
  *
  * 用法:
  *   node scripts/download-libmupdf.js --asset <asset> [--force]
@@ -23,9 +28,9 @@
  *   libmupdf-linux-x86_64.tar.gz   → linux-x86_64
  *   libmupdf-linux-aarch64.tar.gz  → linux-aarch64
  *
- * 下载失败时兜底：若本地存在 vendored 静态库目录
- * （build/presetResources/libmupdf/），则复制其内容到部署目标并告警，
- * 保证 omni-build 在纯离线环境仍可用 vendored 编译路径。
+ * 下载失败时兜底：若单源缓存目录下已有任一平台后缀可用（例如
+ * libmupdf/windows-x86_64），则复用它部署本次目标后缀，保证纯离线环境
+ * 仍可完成同平台构建，不再依赖已废止的摊平 vendored 目录。
  */
 
 const fs = require('fs')
@@ -38,6 +43,8 @@ const { Readable } = require('stream')
 const OMNI_ROOT = path.resolve(__dirname, '..')
 const DEFAULT_REPO = 'Leonard-Li777/firefly-omni'
 const DEFAULT_TAG = 'ci-resources'
+/** 构建期缓存根：presetResources/libmupdf（其下按平台后缀分目录） */
+const MUPDF_CACHE_ROOT = path.join(OMNI_ROOT, 'build', 'presetResources', 'libmupdf')
 
 // 资产名 → 目标部署后缀映射（宿主 omni-build matrix 的 artifact_suffix）
 const SUFFIX_MAP = {
@@ -71,6 +78,21 @@ function hasStaticLib(dir) {
   } catch (e) {
     return false
   }
+}
+
+/**
+ * 缓存目录是否**可用于构建**：静态库与规范嵌套头文件缺一不可。
+ * 只判 `include/` 目录存在会让「头文件被摊平到根部」的残骸通过，随后
+ * wrapper.c 的 `#include <mupdf/fitz.h>` 照样失败。
+ * @param {string} dir 目录
+ * @returns {boolean}
+ */
+function hasReadyMupdf(dir) {
+  if (!hasStaticLib(dir)) return false
+  return (
+    fs.existsSync(path.join(dir, 'include', 'mupdf', 'fitz.h')) ||
+    fs.existsSync(path.join(dir, 'mupdf', 'fitz.h'))
+  )
 }
 
 /**
@@ -231,7 +253,7 @@ function flattenLibRoot(extractRoot) {
  * @returns {string[]} 部署的库文件列表
  */
 function deployTo(libRoot, suffix) {
-  const target = path.join(OMNI_ROOT, 'build', 'libmupdf', suffix)
+  const target = path.join(MUPDF_CACHE_ROOT, suffix)
   copyDirSync(libRoot, target)
   const libs = fs.readdirSync(target).filter(f => /\.(a|lib)$/.test(f))
   log(`✅ 已部署 ${suffix}/（${libs.join(', ') || '仅头文件'}）`)
@@ -239,18 +261,27 @@ function deployTo(libRoot, suffix) {
 }
 
 /**
- * 本地 vendored 兜底：从 build/presetResources/libmupdf 复制静态库
+ * 本地兜底：若单源缓存下已有任一平台后缀可用，则复用它部署本次目标后缀。
+ * 这是「离线可用」而非「兼容旧布局」——只读单源目录，不再接受摊平残留。
  * @param {string[]} suffixes 目标后缀列表
  * @returns {boolean} 是否兜底成功
  */
 function deployLocalFallback(suffixes) {
-  const vendored = path.join(OMNI_ROOT, 'build', 'presetResources', 'libmupdf')
-  if (!hasStaticLib(vendored)) {
+  if (!fs.existsSync(MUPDF_CACHE_ROOT)) {
     return false
   }
-  log(`⚠️ 使用本地 vendored 静态库（${vendored}）作为兜底部署源`)
+  const readyDirs = fs
+    .readdirSync(MUPDF_CACHE_ROOT, { withFileTypes: true })
+    .filter(e => e.isDirectory() && hasReadyMupdf(path.join(MUPDF_CACHE_ROOT, e.name)))
+    .map(e => e.name)
+  if (readyDirs.length === 0) {
+    return false
+  }
+  const source = path.join(MUPDF_CACHE_ROOT, readyDirs[0])
+  log(`⚠️ 下载不可用，复用单源缓存 ${readyDirs[0]}/ 作为兜底部署源`)
   for (const suffix of suffixes) {
-    deployTo(vendored, suffix)
+    if (readyDirs.includes(suffix)) continue
+    deployTo(source, suffix)
   }
   return true
 }
@@ -329,7 +360,7 @@ async function main() {
 
   // 幂等：目标 suffix 均已就位且未强制 → 跳过
   if (!force) {
-    const ready = suffixes.filter(s => hasStaticLib(path.join(OMNI_ROOT, 'build', 'libmupdf', s)))
+    const ready = suffixes.filter(s => hasReadyMupdf(path.join(MUPDF_CACHE_ROOT, s)))
     if (ready.length === suffixes.length) {
       log(`ℹ️ 目标已就位，跳过下载（${ready.join(', ')}）；使用 --force 可重新部署`)
       return
@@ -350,11 +381,18 @@ async function main() {
     const libRoot = flattenLibRoot(extractRoot)
     for (const suffix of suffixes) {
       deployTo(libRoot, suffix)
+      // 落位后立即校验：只判「有 .lib」会放过缺头文件的半成品，
+      // 那种目录在下一轮 cargo check 才炸，且会被误判为「已就位」跳过重下。
+      if (!hasReadyMupdf(path.join(MUPDF_CACHE_ROOT, suffix))) {
+        throw new Error(
+          `部署后校验失败：${suffix}/ 缺少静态库或 include/mupdf/fitz.h（目标 ${path.join(MUPDF_CACHE_ROOT, suffix)}）`
+        )
+      }
     }
   } catch (err) {
     log(`❌ 下载/部署失败: ${err.message}`)
     if (deployLocalFallback(suffixes)) {
-      log('⚠️ 已使用本地 vendored 静态库 ⊥ 构建将走 vendored 编译路径')
+      log('⚠️ 已复用单源缓存完成兜底部署（离线构建路径）')
       return
     }
     process.exit(1)

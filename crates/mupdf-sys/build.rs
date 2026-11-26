@@ -3,15 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// 判断候选目录是否含 MuPDF 头文件（bindgen/cc 编译 wrapper 的硬前提）。
-/// 摊平布局 fitz.h 位于 include/mupdf/fitz.h 或 include/fitz.h；按平台布局同理。
+/// 只认 `include/mupdf/fitz.h` 与 `mupdf/fitz.h` 两种规范嵌套：根部裸 `fitz.h`
+/// 是已废止的摊平残留特征，不能再被当成可用缓存（否则 wrapper.c 里的
+/// `#include <mupdf/fitz.h>` 仍会失败，只是把错误推迟到编译阶段）。
 fn has_mupdf_headers(dir: &Path) -> bool {
     if !dir.is_dir() {
         return false;
     }
-    dir.join("include/mupdf/fitz.h").is_file()
-        || dir.join("mupdf/fitz.h").is_file()
-        || dir.join("include/fitz.h").is_file()
-        || dir.join("fitz.h").is_file()
+    dir.join("include/mupdf/fitz.h").is_file() || dir.join("mupdf/fitz.h").is_file()
 }
 
 /// 候选目录是否**真的**含 libclang 动态库文件。
@@ -43,6 +42,19 @@ fn has_libclang_library(dir: &Path, target_os: &str) -> bool {
         }
     }
     false
+}
+
+/// 当前目标平台对应的缓存子目录名（与 scripts/utils/mupdf-lib-utils.js 的 SUFFIX_MAP 对齐）
+fn platform_dir_name(target_os: &str, target_arch: &str) -> Option<&'static str> {
+    match (target_os, target_arch) {
+        ("linux", "x86_64") => Some("linux-x86_64"),
+        ("linux", "aarch64") => Some("linux-aarch64"),
+        ("windows", "x86_64") => Some("windows-x86_64"),
+        ("windows", "aarch64") => Some("windows-aarch64"),
+        ("macos", "x86_64") => Some("macos-x86_64"),
+        ("macos", "aarch64") => Some("macos-aarch64"),
+        _ => None,
+    }
 }
 
 fn main() {
@@ -80,53 +92,37 @@ fn main() {
     }
 
     if target_dir.is_none() {
-        // 本地 WSL/Linux 开发布局：download-libmupdf.js 按平台产出 build/libmupdf/<os>-<arch>/，
-        // 头文件在 include/mupdf/ 下、静态库为 *.a；发布/CI 则摊平到 presetResources/libmupdf。
-        // 旧逻辑只认 presetResources，导致本地直接 cargo 构建报 mupdf/fitz.h: No such file。
-        let platform_dir = match (target_os.as_str(), target_arch.as_str()) {
-            ("linux", "x86_64") => Some("linux-x86_64"),
-            ("linux", "aarch64") => Some("linux-aarch64"),
-            ("windows", "x86_64") => Some("windows-x86_64"),
-            ("windows", "aarch64") => Some("windows-aarch64"),
-            ("macos", "x86_64") => Some("macos-x86_64"),
-            ("macos", "aarch64") => Some("macos-aarch64"),
-            _ => None,
-        };
-        let mut cur = env::current_dir().unwrap_or_default();
-        for _ in 0..6 {
-            let preset = cur.join("apps/omni/build/presetResources/libmupdf");
-            if has_mupdf_headers(&preset) {
-                target_dir = Some(preset);
-                break;
-            }
-            let preset_rel = cur.join("build/presetResources/libmupdf");
-            if has_mupdf_headers(&preset_rel) {
-                target_dir = Some(preset_rel);
-                break;
-            }
-            if let Some(pd) = platform_dir {
-                for lib_root in [
-                    cur.join("apps/omni/build/libmupdf"),
-                    cur.join("build/libmupdf"),
+        // 构建期缓存唯一落点（资源放置方案 §4.4 收敛规则 2）：
+        //   apps/omni/build/presetResources/libmupdf/<platform-arch>/
+        // 摊平根目录（presetResources/libmupdf 直接放 include 与 *.lib）与
+        // apps/omni/build/libmupdf 旧按平台布局均已废止，此处不再保留任何兼容候选：
+        // 多留一个候选只会让「缓存放错位置」静默通过，把缺头文件的问题推迟到下一次清洁检出。
+        if let Some(pd) = platform_dir_name(target_os.as_str(), target_arch.as_str()) {
+            let mut cur = env::current_dir().unwrap_or_default();
+            for _ in 0..6 {
+                for root in [
+                    cur.join("apps/omni/build/presetResources/libmupdf"),
+                    cur.join("build/presetResources/libmupdf"),
                 ] {
-                    let candidate = lib_root.join(pd);
+                    let candidate = root.join(pd);
                     if has_mupdf_headers(&candidate) {
                         target_dir = Some(candidate);
                         break;
                     }
                 }
-            }
-            if target_dir.is_some() {
-                break;
-            }
-            if !cur.pop() {
-                break;
+                if target_dir.is_some() || !cur.pop() {
+                    break;
+                }
             }
         }
     }
 
     let lib_dir = target_dir.unwrap_or_else(|| {
-        PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../build/presetResources/libmupdf")
+        // 未命中时仍指向规范位（而非某个历史布局），让链接/编译失败的日志直接给出应放路径。
+        let pd = platform_dir_name(target_os.as_str(), target_arch.as_str()).unwrap_or("unsupported");
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../../build/presetResources/libmupdf")
+            .join(pd)
     });
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
