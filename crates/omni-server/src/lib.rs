@@ -822,6 +822,18 @@ async fn health_handler(
         .unwrap_or(false);
     let omw_source_label = omw_source(&state.omw);
     let graph_ready = state.omw.semantic_graph().is_some();
+    // 规则资产健康块（规格书 `omni-failure-path-fail-closed-spec.md` §3.3）：
+    // `status ∈ ok|missing|corrupt|not_provisioned`，`source` 恒为 `asset`（内置来源已删除）。
+    // 只读快照：不触发加载、不做磁盘探测以外的工作，供诊断面板与支持包取证。
+    let (nsfw_config_health, nsfw_rules_health) =
+        omni_pro::text::FastTextNsfwClassifier::asset_health();
+    let assets = serde_json::json!({
+        "tagAdmissibility": omni_core::tag_admissibility::asset_health(),
+        "nsfwConfig": nsfw_config_health,
+        "nsfwRules": nsfw_rules_health,
+        "vocabLayers": omni_pro::vision::vocab_layers_health(),
+        "domainMatrix": omni_pro::vision::domain_matrix_health(),
+    });
     Json(serde_json::json!({
         "status": "ok",
         "server": "firefly-omni",
@@ -835,7 +847,9 @@ async fn health_handler(
         "omwSource": omw_source_label,
         "graphReady": graph_ready,
         // 工单 10：CLIP 文本塔探活五字段（只读探测，不加载模型）
-        "clipText": clip_text_health(query.lang.as_deref())
+        "clipText": clip_text_health(query.lang.as_deref()),
+        // 规则资产装配状态（fail-closed 可观测出口）
+        "assets": assets
     }))
 }
 

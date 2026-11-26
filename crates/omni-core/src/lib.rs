@@ -48,6 +48,10 @@ pub mod tag_thresholds;
 /// 标签准入闸门 · G1 词形层（取码前，零本体依赖；单一数据源 `taxonomy/tag-admissibility.json`）
 pub mod tag_admissibility;
 
+/// 运行期规则资产统一加载（fail-closed）：四类失败语义 + 严格解码 + 只缓存成功值的有界负缓存。
+/// 规格见 `docs/specs/omni-failure-path-fail-closed-spec.md` §2.3 / §3.1。
+pub mod runtime_asset;
+
 /// 批 B 锚点缓存：最近分析文件的**全局语义锚点**进程内中转（spec §2.2.6 / §3.3）
 ///
 /// 住在 omni-core 而非 omni-text：该类型被 `omni-server` 的 `AppState` 持有，

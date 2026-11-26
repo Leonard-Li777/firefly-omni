@@ -4,9 +4,10 @@
 //! ADR:  `docs/adr/0052-tag-admissibility-gate-and-controlled-pos-enum.md`
 //!
 //! 设计要点：
-//! - **单一数据源**：`taxonomy/tag-admissibility.json`（与 `vocab_layers.json`、`domain_tag_matrix.json` 同构），
-//!   资产缺失时回退**内置同源默认**；两侧一致性由单测 `builtin_default_matches_asset` 守护，
-//!   **严禁在别处再写一份硬编码副本**。
+//! - **单一数据源 + fail-closed**：唯一数据源 `taxonomy/tag-admissibility.json`（与
+//!   `vocab_layers.json`、`domain_tag_matrix.json` 同构）；资产缺失/损坏/半字段一律 `AssetError`
+//!   （启动装配失败或运行期 500），**不再保留内置副本**，负向矩阵见单测
+//!   `asset_strict_load_and_negative_matrix`。
 //! - **裁决空间封闭三值**：`Allow` / `Reject { rule, reason }` / `Exempt`，**不引入「降权」**。
 //! - **拒绝可追溯**：拒绝原因落 `tracing` + 按规则**聚合计数**（不建审计表，spec §7 D8）。
 //! - **零本体依赖**：不查语义包、不取码，故可放在铸造入口最省算力的位置。
@@ -26,9 +27,14 @@
 //! R-G1-04…R-G1-09（超长、hex 形态、停用词、句型框架、CJK 单字、括号截断、保留字）及
 //! R-G1-03 的其余范畴承担者（hex/流水号等形态判定由各自既有实现负责）**不在本模块范围**。
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::Arc;
+
+use crate::runtime_asset::{
+    read_json, require_bilingual_str_array, require_object, require_str_array, require_version,
+    resolve_taxonomy_dir, AssetError, AssetHealth, AssetKind, AssetSlot, LoadedAsset,
+};
 
 /// R-G1-01 非白名单文种
 pub const R_G1_01: &str = "R-G1-01";
@@ -247,16 +253,9 @@ pub struct TagAdmissibility {
     banned_lexfiles: Vec<String>,
     /// 抽象空洞壳名词（R-G2-11: 习惯/情况/问题等，禁止单独成标）
     shell_nouns: Vec<String>,
-    /// 配置来源是否为内置默认（false = 命中外部资产）。供诊断/单测使用。
-    builtin_default: bool,
 }
 
 impl TagAdmissibility {
-    /// 是否正在使用内置默认配置（外部资产缺失）
-    pub fn is_builtin_default(&self) -> bool {
-        self.builtin_default
-    }
-
     /// 白名单文种（只读）
     pub fn allowed_scripts(&self) -> &[Script] {
         &self.allowed_scripts
@@ -316,256 +315,185 @@ impl TagAdmissibility {
         self.closed_pos.iter().any(|x| x == &p) || self.cleaned_pos.iter().any(|x| x == &p)
     }
 
-    fn default_config() -> TagAdmissibility {
-        use Script::*;
-        TagAdmissibility {
-            allowed_scripts: vec![Han, Hiragana, Katakana, Hangul, Latin, Cyrillic, Arabic],
-            neutral_chars: vec!['-', '_', '·'],
-            // 刻意**不**含 Latin↔Cyrillic / Latin↔Arabic：品牌与外来词常合法混写（如 `МВидео`），
-            // 误杀代价高于收益。互斥对只取现实中不会合法共现的组合。
-            exclusive_pairs: vec![
-                (Cyrillic, Arabic),
-                (Han, Cyrillic),
-                (Han, Arabic),
-                (Hiragana, Cyrillic),
-                (Hiragana, Arabic),
-                (Katakana, Cyrillic),
-                (Katakana, Arabic),
-                (Hangul, Cyrillic),
-                (Hangul, Arabic),
-            ],
-            // 词表类数据（GH #708 S2）**严禁内置副本**——单源 = taxonomy/tag-admissibility.json
-            // （与 TS 桌面闸 S3 共用）。资源缺失时对应判据跳过（降级不降契约：文种类 4 条仍生效）。
-            stopwords: Vec::new(),
-            sentence_framework_patterns: Vec::new(),
-            reserved_words: Vec::new(),
-            // G2 词性受控封闭枚举（ADR-0052 / tag-admissibility.json 单一数据源对齐）
-            closed_pos: vec![
-                "m".into(), "q".into(), "p".into(), "c".into(),
-                "u".into(), "y".into(), "o".into(), "h".into(),
-            ],
-            cleaned_pos: vec!["w".into(), "g".into(), "b".into()],
-            allowed_pos: vec!["n".into(), "a".into(), "s".into()],
-            verb_adv_pos: vec!["v".into(), "r".into()],
-            banned_lemmas: Vec::new(),
-            banned_lexfiles: vec!["adv.all".into(), "adj.pert".into()],
-            shell_nouns: vec![
-                "习惯".into(), "情况".into(), "问题".into(), "方式".into(), "方法".into(),
-                "原因".into(), "结果".into(), "过程".into(), "状态".into(), "内容".into(),
-                "意义".into(), "目的".into(), "现象".into(), "东西".into(), "事情".into(),
-                "部分".into(), "中央".into(), "画面".into(), "整体".into(),
-                "habit".into(), "situation".into(), "problem".into(), "method".into(), "process".into(), "result".into(),
-            ],
-            builtin_default: true,
-        }
-    }
+}
 
-    fn from_json(v: &serde_json::Value, fallback: &TagAdmissibility) -> TagAdmissibility {
-        let g1 = v.get("g1");
-        let g2 = v.get("g2");
-        let pick_scripts = |key: &str, dflt: &[Script]| -> Vec<Script> {
-            let parsed: Vec<Script> = g1
-                .and_then(|g| g.get(key))
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|s| s.as_str())
-                        .filter_map(Script::from_name)
-                        .collect()
-                })
-                .unwrap_or_default();
-            if parsed.is_empty() {
-                dflt.to_vec()
-            } else {
-                parsed
+/// 严格解析标签准入规则资产（规格书 `omni-failure-path-fail-closed-spec.md` §2.3）。
+///
+/// 硬约束：必需字段一个不少、必需集合不得为空、未识别文种名即失败。
+/// **严禁** 逐字段 `unwrap_or_else(|_| 内置默认)` —— 那会产出"资产字段 + 内置字段"的混血配置，
+/// 让"规则文件没装进来"这个装配错误伪装成正常运行态。
+fn parse_tag_admissibility(
+    v: &serde_json::Value,
+    path: &Path,
+) -> Result<(TagAdmissibility, String), AssetError> {
+    let kind = AssetKind::TagAdmissibility;
+    let version = require_version(v, kind, path)?;
+    let g1 = require_object(v, kind, path, "g1")?;
+    let g2 = require_object(v, kind, path, "g2")?;
+
+    let allowed_scripts: Vec<Script> = require_str_array(g1, kind, path, "allowed_scripts", false)?
+        .iter()
+        .map(|s| Script::from_name(s))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| AssetError::AssetCorrupt {
+            kind,
+            path: Some(path.to_path_buf()),
+            reason: "字段 `allowed_scripts` 含未识别文种名".to_string(),
+        })?;
+
+    let neutral_chars: Vec<char> = require_str_array(g1, kind, path, "neutral_chars", false)?
+        .iter()
+        .map(|s| {
+            let mut it = s.chars();
+            match (it.next(), it.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
             }
-        };
-        let allowed_scripts = pick_scripts("allowed_scripts", &fallback.allowed_scripts);
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| AssetError::AssetCorrupt {
+            kind,
+            path: Some(path.to_path_buf()),
+            reason: "字段 `neutral_chars` 每项必须是单个字符".to_string(),
+        })?;
 
-        let neutral_chars: Vec<char> = g1
-            .and_then(|g| g.get("neutral_chars"))
-            .and_then(|x| x.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|s| s.as_str())
-                    .filter_map(|s| s.chars().next())
-                    .collect()
-            })
-            .filter(|v: &Vec<char>| !v.is_empty())
-            .unwrap_or_else(|| fallback.neutral_chars.clone());
+    let pairs_val = g1
+        .get("exclusive_script_pairs")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| AssetError::AssetCorrupt {
+            kind,
+            path: Some(path.to_path_buf()),
+            reason: "字段 `exclusive_script_pairs` 缺失或不是数组".to_string(),
+        })?;
+    if pairs_val.is_empty() {
+        return Err(AssetError::AssetCorrupt {
+            kind,
+            path: Some(path.to_path_buf()),
+            reason: "字段 `exclusive_script_pairs` 为空数组（空判据集合不得视为合法资源）"
+                .to_string(),
+        });
+    }
+    let exclusive_pairs: Vec<(Script, Script)> = pairs_val
+        .iter()
+        .map(|pair| {
+            let arr = pair.as_array()?;
+            if arr.len() < 2 {
+                return None;
+            }
+            let a = Script::from_name(arr[0].as_str()?)?;
+            let b = Script::from_name(arr[1].as_str()?)?;
+            Some((a, b))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| AssetError::AssetCorrupt {
+            kind,
+            path: Some(path.to_path_buf()),
+            reason: "字段 `exclusive_script_pairs` 含非法元素（须为 [文种, 文种]）".to_string(),
+        })?;
 
-        let exclusive_pairs: Vec<(Script, Script)> = g1
-            .and_then(|g| g.get("exclusive_script_pairs"))
-            .and_then(|x| x.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|pair| pair.as_array())
-                    .filter(|p| p.len() >= 2)
-                    .filter_map(|p| {
-                        let a = p[0].as_str().and_then(Script::from_name)?;
-                        let b = p[1].as_str().and_then(Script::from_name)?;
-                        Some((a, b))
-                    })
-                    .collect()
-            })
-            .unwrap_or_else(|| fallback.exclusive_pairs.clone());
+    let stopwords = require_bilingual_str_array(g1, kind, path, "stopwords")?;
+    let sentence_framework_patterns =
+        require_str_array(g1, kind, path, "sentence_framework_patterns", false)?;
+    let reserved_words = require_str_array(g1, kind, path, "reserved_words", false)?;
 
+    let allowed_pos = require_str_array(g2, kind, path, "allowed_pos", true)?;
+    let verb_adv_pos = require_str_array(g2, kind, path, "verb_adv_pos", true)?;
+    let closed_pos = require_str_array(g2, kind, path, "closed_pos", true)?;
+    let cleaned_pos = require_str_array(g2, kind, path, "cleaned_pos", true)?;
+    let banned_lemmas = require_bilingual_str_array(g2, kind, path, "banned_lemmas")?;
+    let banned_lexfiles = require_str_array(g2, kind, path, "banned_lexfiles", true)?;
+    let shell_nouns = require_bilingual_str_array(g2, kind, path, "shell_nouns")?;
+
+    Ok((
         TagAdmissibility {
             allowed_scripts,
             neutral_chars,
             exclusive_pairs,
-            // 词表类数据（GH #708 S2）：资源缺失/字段缺失 → 空表（对应判据跳过）
-            stopwords: g1
-                .and_then(|g| g.get("stopwords"))
-                .map(|s| {
-                    let mut all: Vec<String> = Vec::new();
-                    for key in ["zh", "en"] {
-                        if let Some(arr) = s.get(key).and_then(|x| x.as_array()) {
-                            all.extend(
-                                arr.iter()
-                                    .filter_map(|w| w.as_str())
-                                    .map(|w| w.trim().to_lowercase())
-                                    .filter(|w| !w.is_empty()),
-                            );
-                        }
-                    }
-                    all
-                })
-                .unwrap_or_default(),
-            sentence_framework_patterns: g1
-                .and_then(|g| g.get("sentence_framework_patterns"))
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|p| p.as_str())
-                        .filter(|p| !p.is_empty())
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            reserved_words: g1
-                .and_then(|g| g.get("reserved_words"))
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|w| w.as_str())
-                        .map(|w| w.trim().to_lowercase())
-                        .filter(|w| !w.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default(),
-            closed_pos: g2
-                .and_then(|g| g.get("closed_pos"))
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|w| w.as_str())
-                        .map(|w| w.trim().to_lowercase())
-                        .filter(|w| !w.is_empty())
-                        .collect()
-                })
-                .unwrap_or_else(|| fallback.closed_pos.clone()),
-            cleaned_pos: g2
-                .and_then(|g| g.get("cleaned_pos"))
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|w| w.as_str())
-                        .map(|w| w.trim().to_lowercase())
-                        .filter(|w| !w.is_empty())
-                        .collect()
-                })
-                .unwrap_or_else(|| fallback.cleaned_pos.clone()),
-            allowed_pos: g2
-                .and_then(|g| g.get("allowed_pos"))
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|w| w.as_str())
-                        .map(|w| w.trim().to_lowercase())
-                        .filter(|w| !w.is_empty())
-                        .collect()
-                })
-                .unwrap_or_else(|| fallback.allowed_pos.clone()),
-            verb_adv_pos: g2
-                .and_then(|g| g.get("verb_adv_pos"))
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|w| w.as_str())
-                        .map(|w| w.trim().to_lowercase())
-                        .filter(|w| !w.is_empty())
-                        .collect()
-                })
-                .unwrap_or_else(|| fallback.verb_adv_pos.clone()),
-            banned_lemmas: g2
-                .and_then(|g| g.get("banned_lemmas"))
-                .map(|s| {
-                    let mut all: Vec<String> = Vec::new();
-                    if let Some(arr) = s.as_array() {
-                        all.extend(
-                            arr.iter()
-                                .filter_map(|w| w.as_str())
-                                .map(|w| w.trim().to_lowercase())
-                                .filter(|w| !w.is_empty()),
-                        );
-                    } else {
-                        for key in ["zh", "en"] {
-                            if let Some(arr) = s.get(key).and_then(|x| x.as_array()) {
-                                all.extend(
-                                    arr.iter()
-                                        .filter_map(|w| w.as_str())
-                                        .map(|w| w.trim().to_lowercase())
-                                        .filter(|w| !w.is_empty()),
-                                );
-                            }
-                        }
-                    }
-                    all
-                })
-                .unwrap_or_default(),
-            banned_lexfiles: g2
-                .and_then(|g| g.get("banned_lexfiles"))
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|w| w.as_str())
-                        .map(|w| w.trim().to_lowercase())
-                        .filter(|w| !w.is_empty())
-                        .collect()
-                })
-                .unwrap_or_else(|| fallback.banned_lexfiles.clone()),
-            shell_nouns: g2
-                .and_then(|g| g.get("shell_nouns"))
-                .map(|s| {
-                    let mut all: Vec<String> = Vec::new();
-                    if let Some(arr) = s.as_array() {
-                        all.extend(
-                            arr.iter()
-                                .filter_map(|w| w.as_str())
-                                .map(|w| w.trim().to_lowercase())
-                                .filter(|w| !w.is_empty()),
-                        );
-                    } else {
-                        for key in ["zh", "en"] {
-                            if let Some(arr) = s.get(key).and_then(|x| x.as_array()) {
-                                all.extend(
-                                    arr.iter()
-                                        .filter_map(|w| w.as_str())
-                                        .map(|w| w.trim().to_lowercase())
-                                        .filter(|w| !w.is_empty()),
-                                );
-                            }
-                        }
-                    }
-                    all
-                })
-                .unwrap_or_default(),
-            builtin_default: false,
-        }
-    }
+            stopwords,
+            sentence_framework_patterns,
+            reserved_words,
+            closed_pos,
+            cleaned_pos,
+            allowed_pos,
+            verb_adv_pos,
+            banned_lemmas,
+            banned_lexfiles,
+            shell_nouns,
+        },
+        version,
+    ))
 }
 
+/// 标签准入规则资产文件名（**唯一**数据源；仓库内不再保留任何内置副本）
+const TAG_ADMISSIBILITY_FILE: &str = "tag-admissibility.json";
+
+/// 进程级资产槽：只缓存成功值，失败走 30s 有界负缓存（规格书 §4.7）
+static TAG_ADMISSIBILITY_SLOT: AssetSlot<TagAdmissibility> = AssetSlot::new();
+
+fn load_tag_admissibility_at(path: &Path) -> Result<LoadedAsset<TagAdmissibility>, AssetError> {
+    let kind = AssetKind::TagAdmissibility;
+    let value = read_json(kind, path)?;
+    let (cfg, version) = parse_tag_admissibility(&value, path)?;
+    Ok(LoadedAsset {
+        value: Arc::new(cfg),
+        path: Some(path.to_path_buf()),
+        version: Some(version),
+    })
+}
+
+fn load_tag_admissibility() -> Result<LoadedAsset<TagAdmissibility>, AssetError> {
+    let kind = AssetKind::TagAdmissibility;
+    let dir = resolve_taxonomy_dir(TAG_ADMISSIBILITY_FILE).ok_or(AssetError::AssetMissing {
+        kind,
+        path: None,
+    })?;
+    load_tag_admissibility_at(&dir.join(TAG_ADMISSIBILITY_FILE))
+}
+
+/// 启动装配：从显式目录加载（单测 / 诊断注入用）
+pub fn init_from_root(root: &Path) -> Result<(), AssetError> {
+    TAG_ADMISSIBILITY_SLOT
+        .load_or_get(true, AssetKind::TagAdmissibility, || {
+            load_tag_admissibility_at(&root.join(TAG_ADMISSIBILITY_FILE))
+        })
+        .map(|_| ())
+}
+
+/// 启动装配：自动定位规则资产目录。失败即装配错误（引擎侧应在服务前退出，不得带病启动）。
+pub fn init() -> Result<(), AssetError> {
+    TAG_ADMISSIBILITY_SLOT
+        .load_or_get(false, AssetKind::TagAdmissibility, load_tag_admissibility)
+        .map(|_| ())
+}
+
+/// 显式热重载：资产修好后无需重启；失败时保留旧快照并记录 health（调用方应回 500）。
+pub fn reload() -> Result<Arc<TagAdmissibility>, AssetError> {
+    TAG_ADMISSIBILITY_SLOT.load_or_get(
+        true,
+        AssetKind::TagAdmissibility,
+        load_tag_admissibility,
+    )
+}
+
+/// 可失败取快照（启动装配、健康端点、诊断入口使用）
+pub fn try_config() -> Result<Arc<TagAdmissibility>, AssetError> {
+    if let Some(v) = TAG_ADMISSIBILITY_SLOT.snapshot() {
+        return Ok(v);
+    }
+    init()?;
+    Ok(TAG_ADMISSIBILITY_SLOT.require(AssetKind::TagAdmissibility))
+}
+
+/// 取当前生效规则快照（热路径；未装配即 panic —— 装配错误必须炸出来，禁止回退内置值）
+pub fn config() -> Arc<TagAdmissibility> {
+    try_config()
+        .unwrap_or_else(|e| panic!("标签准入规则资产不可用（禁止内置兜底回退）: {e}"))
+}
+
+/// 资产健康快照（供 `/health.assets` 与诊断面板）
+pub fn asset_health() -> AssetHealth {
+    TAG_ADMISSIBILITY_SLOT.health()
+}
 /// 判定给定的受控词性 (POS) 是否为闭类虚词或清洗词性（禁止作为文件标签标注，R-G2-04/R-G2-05）
 pub fn is_tag_pos_rejected(pos: &str) -> bool {
     config().is_closed_or_cleaned_pos(pos)
@@ -782,76 +710,6 @@ pub fn is_admissible_compound_candidate(
     }
     // Step 4: 修饰语自身不得命中壳名词或违禁词（阻断“部分人员 [shell+n]”、“画面中央 [shell+head]”）
     !is_shell_noun(modifier) && !is_banned_lemma(modifier)
-}
-
-/// 规则资源所在目录候选。
-///
-/// **镜像自 `omni-vision::OmniVisionEngine::resolve_taxonomy_dir`，但已登记 3 处差异**
-/// （S1 #705 第 1 轮审查 P2-3；完整收敛——下沉为 omni-core 单一函数、omni-vision 改为调用——
-/// 属超纲建议，另行开票）：
-/// ① 后者另有 `%APPDATA%/firefly-ai-folder/taxonomy` 与 `%USERPROFILE%/.firefly/taxonomy` 两个
-///    宿主侧候选，本函数**有意不收**（引擎不应读宿主用户数据，见
-///    `docs/features/ai/engine-resource-lookup-scope.md`，尽管该文档只管辖引擎二进制）；
-/// ② 命中判据不同：本函数要求目录含 `tag-admissibility.json`，后者要求含 `entity_ontology.json`——
-///    若某目录只有其一，两者可能选中**不同目录**（规则与词表漂移的现实风险）；
-/// ③ CWD 向上 walk 已补齐 `build/extraResources/taxonomy`（原镜像源漏了该项）。
-/// 重复的是**路径查找**而非**规则数据**——规则数据仍只有 `tag-admissibility.json` 一份。
-fn taxonomy_dir_candidates() -> Vec<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from("apps/desktop/build/extraResources/taxonomy"),
-        PathBuf::from("apps/desktop/pro/build/extraResources/taxonomy"),
-        PathBuf::from("build/extraResources/taxonomy"),
-        PathBuf::from("../desktop/build/extraResources/taxonomy"),
-        PathBuf::from("../../desktop/build/extraResources/taxonomy"),
-        PathBuf::from("../../../desktop/build/extraResources/taxonomy"),
-        PathBuf::from("../../../apps/desktop/build/extraResources/taxonomy"),
-        PathBuf::from("taxonomy"),
-    ];
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(mut current) = exe_path.parent() {
-            for _ in 0..8 {
-                candidates.push(current.join("taxonomy"));
-                candidates.push(current.join("build/extraResources/taxonomy"));
-                candidates.push(current.join("apps/desktop/build/extraResources/taxonomy"));
-                match current.parent() {
-                    Some(p) => current = p,
-                    None => break,
-                }
-            }
-        }
-    }
-    if let Ok(mut current) = std::env::current_dir() {
-        for _ in 0..8 {
-            candidates.push(current.join("taxonomy"));
-            candidates.push(current.join("build/extraResources/taxonomy"));
-            candidates.push(current.join("apps/desktop/build/extraResources/taxonomy"));
-            match current.parent() {
-                Some(p) => current = p.to_path_buf(),
-                None => break,
-            }
-        }
-    }
-    candidates
-}
-
-/// 加载 G1 规则配置：优先 `taxonomy/tag-admissibility.json`，缺失/损坏时回退内置同源默认。
-pub fn config() -> &'static TagAdmissibility {
-    static CFG: OnceLock<TagAdmissibility> = OnceLock::new();
-    CFG.get_or_init(|| {
-        let fallback = TagAdmissibility::default_config();
-        for dir in taxonomy_dir_candidates() {
-            let path = dir.join("tag-admissibility.json");
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-                tracing::warn!(path = %path.display(), "tag-admissibility.json 解析失败，回退内置默认");
-                continue;
-            };
-            return TagAdmissibility::from_json(&value, &fallback);
-        }
-        fallback
-    })
 }
 
 // ============ 聚合计数（spec §7 D8：拒绝原因落日志 + 聚合计数，不建审计表） ============
@@ -1282,24 +1140,32 @@ mod tests {
     }
 
     #[test]
-    fn from_json_partial_corruption_falls_back_per_field() {
-        // 部分字段损坏 → 该字段回退内置默认；合法字段照常采纳（逐字段降级，不整体失败）
-        let dflt = TagAdmissibility::default_config();
+    fn partial_corruption_fails_whole_asset() {
+        // 规格书 G2：半 JSON / 坏字段 → **整体失败**，严禁"资产字段 + 内置字段"混血配置。
+        // （旧实现逐字段 `unwrap_or_else(内置默认)`，此处为回归锁：任何部分采纳都算回归。）
         let cfg = serde_json::json!({
+            "version": 1,
             "g1": {
                 "allowed_scripts": "not-an-array",
                 "neutral_chars": ["-", "_"],
                 "exclusive_script_pairs": [["Han", "Cyrillic"]]
+            },
+            "g2": {
+                "allowed_pos": ["n"], "verb_adv_pos": ["v"],
+                "closed_pos": ["u"], "cleaned_pos": ["w"],
+                "banned_lexfiles": ["adv.all"]
             }
         });
-        let parsed = TagAdmissibility::from_json(&cfg, &dflt);
-        // 损坏字段 → 回退默认（7 个白名单文种）
-        assert_eq!(parsed.allowed_scripts(), dflt.allowed_scripts());
-        // 合法字段 → 采纳（不含 `·`，与默认不同）
-        assert_eq!(parsed.neutral_chars, vec!['-', '_']);
-        // 合法字段 → 采纳
-        use Script::*;
-        assert_eq!(parsed.exclusive_pairs(), &[(Han, Cyrillic)]);
+        let err = parse_tag_admissibility(&cfg, Path::new("__inline__.json")).unwrap_err();
+        assert_eq!(err.code(), "ASSET_CORRUPT");
+        // 缺 g1.stopwords / g2.banned_lemmas / g2.shell_nouns 等必需字段同样整体失败
+        let half = serde_json::json!({ "version": 1, "g1": {}, "g2": {} });
+        assert_eq!(
+            parse_tag_admissibility(&half, Path::new("__inline__.json"))
+                .unwrap_err()
+                .code(),
+            "ASSET_CORRUPT"
+        );
     }
 
     #[test]
@@ -1536,47 +1402,61 @@ mod tests {
     }
 
     #[test]
-    fn builtin_default_matches_asset() {
-        // 单一数据源守护：内置默认必须与 taxonomy/tag-admissibility.json 同源。
-        // 若资产不存在（omni 子模块被单独检出）则跳过，不制造假失败。
-        let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    fn asset_strict_load_and_negative_matrix() {
+        // 规格书 §4.2 负向矩阵：资产缺失/损坏/半字段/空判据集合必须**失败**，
+        // 且不得回退内置默认（内置副本已在运行期删除）。
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let asset = manifest
             .join("../../../../apps/desktop/build/extraResources/taxonomy/tag-admissibility.json");
         if !asset.exists() {
             eprintln!("skip: 资产不存在 {}", asset.display());
             return;
         }
-        let text = std::fs::read_to_string(&asset).expect("读取 tag-admissibility.json");
-        let value: serde_json::Value = serde_json::from_str(&text).expect("解析 JSON");
-        let builtin = TagAdmissibility::default_config();
-        let parsed = TagAdmissibility::from_json(&value, &builtin);
-        assert_eq!(
-            parsed.allowed_scripts, builtin.allowed_scripts,
-            "allowed_scripts 与内置默认漂移"
-        );
-        assert_eq!(
-            parsed.exclusive_pairs, builtin.exclusive_pairs,
-            "exclusive_script_pairs 与内置默认漂移"
-        );
-        assert_eq!(
-            parsed.neutral_chars, builtin.neutral_chars,
-            "neutral_chars 与内置默认漂移"
-        );
-        assert_eq!(
-            parsed.closed_pos, builtin.closed_pos,
-            "closed_pos 与内置默认漂移"
-        );
-        assert_eq!(
-            parsed.cleaned_pos, builtin.cleaned_pos,
-            "cleaned_pos 与内置默认漂移"
-        );
-        assert_eq!(
-            parsed.allowed_pos, builtin.allowed_pos,
-            "allowed_pos 与内置默认漂移"
-        );
-        assert_eq!(
-            parsed.verb_adv_pos, builtin.verb_adv_pos,
-            "verb_adv_pos 与内置默认漂移"
-        );
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&asset).expect("读取资产"))
+                .expect("资产 JSON 必须合法");
+        let (cfg, version) =
+            parse_tag_admissibility(&value, &asset).expect("真实资产必须严格解析通过");
+        assert_eq!(version, "1", "资产 version 必须可读");
+        assert!(!cfg.allowed_scripts.is_empty());
+        assert!(!cfg.stopwords.is_empty(), "停用词表不得为空（空集 = 判据 fail-open）");
+        assert!(!cfg.banned_lemmas.is_empty());
+        assert!(!cfg.shell_nouns.is_empty());
+
+        // ① 文件缺失 → ASSET_MISSING
+        let missing = manifest.join("__omni_no_such_tag_admissibility__.json");
+        let err = read_json(AssetKind::TagAdmissibility, &missing).unwrap_err();
+        assert_eq!(err.code(), "ASSET_MISSING");
+
+        // ② 半 JSON（删 g2）→ 整体失败，不得产出"资产字段 + 内置字段"混血配置
+        let mut half = value.clone();
+        half.as_object_mut().unwrap().remove("g2");
+        let err = parse_tag_admissibility(&half, &asset).unwrap_err();
+        assert_eq!(err.code(), "ASSET_CORRUPT");
+
+        // ③ 缺 g2.closed_pos → 失败
+        let mut no_pos = value.clone();
+        no_pos["g2"].as_object_mut().unwrap().remove("closed_pos");
+        assert!(parse_tag_admissibility(&no_pos, &asset).is_err());
+
+        // ④ 停用词表为空数组 → 失败（空判据集合 = 非法资源）
+        let mut empty_stop = value.clone();
+        empty_stop["g1"]["stopwords"]["zh"] = serde_json::json!([]);
+        assert!(parse_tag_admissibility(&empty_stop, &asset).is_err());
+
+        // ⑤ 文种名未识别 → 失败（不得静默丢弃该文种）
+        let mut bad_script = value.clone();
+        bad_script["g1"]["allowed_scripts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("Klingon"));
+        assert!(parse_tag_admissibility(&bad_script, &asset).is_err());
+
+        // ⑥ 缺 version → 失败（严禁"无版本视为兼容"）
+        let mut no_version = value.clone();
+        no_version.as_object_mut().unwrap().remove("version");
+        assert!(parse_tag_admissibility(&no_version, &asset).is_err());
     }
 
     #[test]
