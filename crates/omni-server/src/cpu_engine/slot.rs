@@ -1,7 +1,7 @@
 use super::active_guard::ActiveTaskGuard;
 use super::circuit_breaker::{get_default_run_dir, get_os_boot_id, CircuitBreakerManager};
 use super::generator::{CpuGenerator, CpuGeneratorConfig, GenerationOutput, PocketCpuGenerator};
-use super::memory::{preflight_cold_load, preflight_hot_infer};
+use super::memory::{preflight_cold_load, preflight_hot_infer, MemoryGateError};
 use super::types::{
     AdmissionState, CpuSessionSnapshot, SessionDrainResponse,
     SessionLifecycle, SessionPreheatResponse, TokenizeResponse,
@@ -9,7 +9,9 @@ use super::types::{
 use axum::http::StatusCode;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, Notify};
@@ -40,12 +42,15 @@ pub struct CpuSlot {
     notify_drain: Arc<Notify>,
     circuit_breaker: Arc<CircuitBreakerManager>,
     generator: Arc<RwLock<Option<Arc<dyn CpuGenerator>>>>,
-    // 独立常驻分词器（保证 POST /v1/tokenize 绝不触发模型加载，P99 <= 5ms）
-    standalone_tokenizer: Arc<RwLock<Arc<dyn CpuGenerator>>>,
+    // 独立常驻分词器（保证 POST /v1/tokenize 绝不触发模型加载）；
+    // None 表示分词资产尚未装载：此时分词端点必须显式报未就绪，严禁回退假词表。
+    standalone_tokenizer: Arc<RwLock<Option<Arc<dyn CpuGenerator>>>>,
     // 单飞加载信道与并发排队计数
     load_tx: Arc<Mutex<Option<broadcast::Sender<Result<(), String>>>>>,
     wait_queue_count: Arc<AtomicUsize>,
     model_dir: Option<PathBuf>,
+    // 注入 Panic 触发器（仅测试构建可用；生产构建不得存在可触发的 panic 注入点）
+    #[cfg(test)]
     pub inject_panic: AtomicBool,
 }
 
@@ -61,6 +66,9 @@ impl CpuSlot {
         let initial_lifecycle = if crash_count >= 2 {
             warn!("启动检查：检测到底层连续崩溃 2 次，CPU 会话直接锁定为 Failed(CRASH_LOOP)");
             SessionLifecycle::Failed("CRASH_LOOP".to_string())
+        } else if model_dir.is_none() {
+            // 依赖前置化：模型未配置/未挂载属确定性失败，严禁进入假 Ready
+            SessionLifecycle::Failed("MODEL_UNMOUNTED".to_string())
         } else {
             SessionLifecycle::Unloaded
         };
@@ -80,10 +88,11 @@ impl CpuSlot {
             notify_drain: Arc::new(Notify::new()),
             circuit_breaker,
             generator: Arc::new(RwLock::new(None)),
-            standalone_tokenizer: Arc::new(RwLock::new(Arc::new(PocketCpuGenerator::new_test_stub()))),
+            standalone_tokenizer: Arc::new(RwLock::new(None)),
             load_tx: Arc::new(Mutex::new(None)),
             wait_queue_count: Arc::new(AtomicUsize::new(0)),
             model_dir,
+            #[cfg(test)]
             inject_panic: AtomicBool::new(false),
         }
     }
@@ -217,7 +226,7 @@ impl CpuSlot {
                         model_id: "pocket-cpu-int8".to_string(),
                     });
                 }
-                Ok(Err(err)) => return Err((StatusCode::SERVICE_UNAVAILABLE, err)),
+                Ok(Err(err)) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err)),
                 Err(_) => {
                     return Err((
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -246,16 +255,29 @@ impl CpuSlot {
                 resident_bytes: ESTIMATED_RESIDENT_BYTES,
                 model_id: "pocket-cpu-int8".to_string(),
             }),
-            Err(e) => Err((StatusCode::SERVICE_UNAVAILABLE, e)),
+            Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     }
 
     async fn perform_actual_load(&self) -> Result<(), String> {
-        // 冷启动内存门限核验
-        if let Err((avail, floor)) = preflight_cold_load(ESTIMATED_PEAK_RSS_BYTES, ESTIMATED_RESIDENT_BYTES) {
-            let msg = format!("可用物理内存不足 (当前: {}MB, 门限: {}MB)", avail / 1024 / 1024, floor / 1024 / 1024);
-            *self.lifecycle.write().unwrap() = SessionLifecycle::Failed("LOW_MEMORY".to_string());
-            return Err(msg);
+        // 冷启动内存门限核验：探测失败必须显式失败，严禁按假 4GB 放行
+        match preflight_cold_load(ESTIMATED_PEAK_RSS_BYTES, ESTIMATED_RESIDENT_BYTES) {
+            Ok(_) => {}
+            Err(MemoryGateError::Insufficient { available, floor }) => {
+                let msg = format!(
+                    "可用物理内存不足 (当前: {}MB, 门限: {}MB)",
+                    available / 1024 / 1024,
+                    floor / 1024 / 1024
+                );
+                *self.lifecycle.write().unwrap() =
+                    SessionLifecycle::Failed("LOW_MEMORY".to_string());
+                return Err(msg);
+            }
+            Err(MemoryGateError::ProbeFailed(reason)) => {
+                *self.lifecycle.write().unwrap() =
+                    SessionLifecycle::Failed("MEMORY_PROBE_FAILED".to_string());
+                return Err(format!("MEMORY_PROBE_FAILED: {reason}"));
+            }
         }
 
         *self.lifecycle.write().unwrap() = SessionLifecycle::Loading;
@@ -269,33 +291,39 @@ impl CpuSlot {
         // 加载模型与分词器 (受控 1~4 线程)，阻塞权重加载下沉 spawn_blocking 避免阻塞 Tokio worker
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let num_threads = std::cmp::min(std::cmp::max(cpus.saturating_sub(1), 1), 4);
-        let gen: Arc<dyn CpuGenerator> = if let Some(ref dir) = self.model_dir {
-            let dir_owned = dir.clone();
-            match tokio::task::spawn_blocking(move || {
-                PocketCpuGenerator::load_from_dir(&dir_owned, num_threads)
-            })
-            .await
-            {
-                Ok(Ok(g)) => Arc::new(g),
-                Ok(Err(e)) => {
-                    self.circuit_breaker.remove_inflight();
-                    *self.lifecycle.write().unwrap() = SessionLifecycle::Failed(e.clone());
-                    return Err(e);
-                }
-                Err(join_err) => {
-                    let msg = format!("Pocket CPU 加载任务异常: {}", join_err);
-                    self.circuit_breaker.remove_inflight();
-                    *self.lifecycle.write().unwrap() = SessionLifecycle::Failed(msg.clone());
-                    return Err(msg);
+        let gen: Arc<dyn CpuGenerator> = match self.model_dir.as_ref() {
+            Some(dir) => {
+                let dir_owned = dir.clone();
+                match tokio::task::spawn_blocking(move || {
+                    PocketCpuGenerator::load_from_dir(&dir_owned, num_threads)
+                })
+                .await
+                {
+                    Ok(Ok(g)) => Arc::new(g),
+                    Ok(Err(e)) => {
+                        self.circuit_breaker.remove_inflight();
+                        *self.lifecycle.write().unwrap() = SessionLifecycle::Failed(e.clone());
+                        return Err(e);
+                    }
+                    Err(join_err) => {
+                        let msg = format!("Pocket CPU 加载任务异常: {}", join_err);
+                        self.circuit_breaker.remove_inflight();
+                        *self.lifecycle.write().unwrap() = SessionLifecycle::Failed(msg.clone());
+                        return Err(msg);
+                    }
                 }
             }
-        } else {
-            // 测试模式桩代码
-            Arc::new(PocketCpuGenerator::new_test_stub())
+            None => {
+                // 模型未配置/未挂载：确定性失败，严禁以测试桩冒充就绪
+                self.circuit_breaker.remove_inflight();
+                *self.lifecycle.write().unwrap() =
+                    SessionLifecycle::Failed("MODEL_UNMOUNTED".to_string());
+                return Err("MODEL_UNMOUNTED: CPU 模型目录未挂载".to_string());
+            }
         };
 
         *self.generator.write().unwrap() = Some(Arc::clone(&gen));
-        *self.standalone_tokenizer.write().unwrap() = Arc::clone(&gen);
+        *self.standalone_tokenizer.write().unwrap() = Some(Arc::clone(&gen));
         *self.lifecycle.write().unwrap() = SessionLifecycle::Ready;
         *self.admission.write().unwrap() = AdmissionState::Accepting;
         self.touch_active();
@@ -384,22 +412,33 @@ impl CpuSlot {
         let mut counts = Vec::with_capacity(texts.len());
         let mut total_tokens = 0;
 
-        let tok_gen = if let Some(gen) = self.generator.read().unwrap().as_ref() {
-            Arc::clone(gen)
-        } else {
-            // 惰性加载：若未加载过且有 model_dir，尝试只加载分词器
-            if let Some(ref dir) = self.model_dir {
+        let tok_gen: Arc<dyn CpuGenerator> =
+            if let Some(gen) = self.generator.read().unwrap().as_ref() {
+                Arc::clone(gen)
+            } else if let Some(dir) = self.model_dir.as_ref() {
+                // 惰性装载：只加载分词器，绝不隐式加载模型；装载失败必须显式报未就绪
                 let mut guard = self.standalone_tokenizer.write().unwrap();
-                if guard.tokenize("你好").map(|t| t.is_empty()).unwrap_or(true) {
+                if guard.is_none() {
                     if let Some(tok) = PocketCpuGenerator::load_tokenizer_only(dir) {
-                        *guard = Arc::new(PocketCpuGenerator::new_with_tokenizer(tok));
+                        *guard = Some(Arc::new(PocketCpuGenerator::new_with_tokenizer(tok)));
                     }
                 }
-                Arc::clone(&*guard)
+                match guard.as_ref() {
+                    Some(g) => Arc::clone(g),
+                    None => {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            "ENGINE_NOT_READY: 分词器资产缺失或解析失败，禁止回退假词表"
+                                .to_string(),
+                        ))
+                    }
+                }
             } else {
-                Arc::clone(&*self.standalone_tokenizer.read().unwrap())
-            }
-        };
+                return Err((
+                    StatusCode::CONFLICT,
+                    "ENGINE_NOT_READY: CPU 模型目录未挂载，分词器不可用".to_string(),
+                ));
+            };
 
         for text in texts {
             let tokens = tok_gen
@@ -436,6 +475,7 @@ impl CpuSlot {
 
         // G-06: 强制使用 std::panic::catch_unwind 进行 Panic 隔离
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
             if self.inject_panic.load(Ordering::SeqCst) {
                 panic!("Simulated critical Rust panic inside execute_generate");
             }
@@ -462,8 +502,22 @@ impl CpuSlot {
         }
     }
 
-    /// 注入 Panic 触发（测试专用）
+    /// 注入 Panic 触发（仅测试构建可用）
+    #[cfg(test)]
     pub fn set_inject_panic_for_test(&self, inject: bool) {
         self.inject_panic.store(inject, Ordering::SeqCst);
+    }
+
+    /// 仅测试构建：直接注入桩生成器并置 Ready，用于验证 Drain/TTL/Panic 等会话语义。
+    /// 生产构建不存在此入口，也不存在任何桩生成器。
+    #[cfg(test)]
+    pub fn new_test_ready(run_dir: Option<PathBuf>) -> Self {
+        let slot = Self::new(run_dir, None);
+        let stub: Arc<dyn CpuGenerator> = Arc::new(PocketCpuGenerator::new_test_stub());
+        *slot.generator.write().unwrap() = Some(Arc::clone(&stub));
+        *slot.standalone_tokenizer.write().unwrap() = Some(stub);
+        *slot.lifecycle.write().unwrap() = SessionLifecycle::Ready;
+        *slot.admission.write().unwrap() = AdmissionState::Accepting;
+        slot
     }
 }

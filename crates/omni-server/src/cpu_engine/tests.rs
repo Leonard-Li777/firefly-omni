@@ -7,7 +7,7 @@ use super::memory::{
 use super::slot::{
     is_generation_active, CpuSlot, ESTIMATED_PEAK_RSS_BYTES, ESTIMATED_RESIDENT_BYTES,
 };
-use super::types::{AdmissionState, FinishReason, SessionLifecycle};
+use super::types::{AdmissionState, SessionLifecycle};
 use axum::http::StatusCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,26 +21,36 @@ static SERIAL_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[tokio::test]
 async fn test_single_flight_load() {
     let tmp = tempdir().unwrap();
-    let slot = Arc::new(CpuSlot::new(Some(tmp.path().to_path_buf()), None));
+    // 指向不存在的模型目录：单飞加载必须把同一个确定性失败广播给全部等待者
+    let missing_model_dir = tmp.path().join("no-such-model");
+    let slot = Arc::new(CpuSlot::new(
+        Some(tmp.path().to_path_buf()),
+        Some(missing_model_dir),
+    ));
 
-    // 1. 模拟 8 个并发请求同时触发预热加载
     let mut handles = Vec::new();
     for _ in 0..8 {
         let s = Arc::clone(&slot);
-        handles.push(tokio::spawn(async move {
-            s.preheat(false).await
-        }));
+        handles.push(tokio::spawn(async move { s.preheat(false).await }));
     }
 
     for h in handles {
         let res = h.await.unwrap();
-        assert!(res.is_ok(), "并发预热等待应成功: {:?}", res);
+        assert!(res.is_err(), "模型缺失时严禁预热成功（禁止假 Ready）: {:?}", res);
+        assert_eq!(
+            res.err().unwrap().0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "确定性加载失败必须映射 500，不得混入 503 被客户端判为瞬态"
+        );
     }
 
-    // 验证最终状态为 Ready，且活跃任务数为 0
+    // 验证最终状态为 Failed，且未因并发而互相覆盖成 Ready
     let snapshot = slot.get_snapshot();
-    assert_eq!(snapshot.lifecycle, SessionLifecycle::Ready);
-    assert_eq!(snapshot.admission, AdmissionState::Accepting);
+    assert!(
+        matches!(snapshot.lifecycle, SessionLifecycle::Failed(_)),
+        "模型缺失时生命周期必须为 Failed，实际: {:?}",
+        snapshot.lifecycle
+    );
 }
 
 // ============================================================================
@@ -50,7 +60,7 @@ async fn test_single_flight_load() {
 async fn test_task_guard_atomic() {
     let _serial_lock = SERIAL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempdir().unwrap();
-    let slot = Arc::new(CpuSlot::new(Some(tmp.path().to_path_buf()), None));
+    let slot = Arc::new(CpuSlot::new_test_ready(Some(tmp.path().to_path_buf())));
 
     // 预热进入 Ready 态
     slot.preheat(false).await.unwrap();
@@ -84,7 +94,7 @@ async fn test_task_guard_atomic() {
 async fn test_ttl_atomic() {
     let _serial_lock = SERIAL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempdir().unwrap();
-    let slot = Arc::new(CpuSlot::new(Some(tmp.path().to_path_buf()), None));
+    let slot = Arc::new(CpuSlot::new_test_ready(Some(tmp.path().to_path_buf())));
     slot.preheat(false).await.unwrap();
 
     // 1. 当有活跃任务时，TTL 回收无条件挂起，不予卸载
@@ -109,7 +119,7 @@ async fn test_ttl_atomic() {
 async fn test_drain_barrier() {
     let _serial_lock = SERIAL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempdir().unwrap();
-    let slot = Arc::new(CpuSlot::new(Some(tmp.path().to_path_buf()), None));
+    let slot = Arc::new(CpuSlot::new_test_ready(Some(tmp.path().to_path_buf())));
     slot.preheat(false).await.unwrap();
 
     let guard = slot.try_begin_task().unwrap();
@@ -147,11 +157,13 @@ async fn test_cancel_atomic() {
     let mut config = CpuGeneratorConfig::default();
     config.max_new_tokens = 50;
 
-    // 模拟在第 1 步前即触发取消
+    // 无真实 ORT Session：必须显式未就绪，严禁桩回退吐 token
     cancel.store(true, Ordering::Relaxed);
-    let out = generator.generate(&[1, 2, 3], &config, &cancel).unwrap();
-
-    assert_eq!(out.finish_reason, FinishReason::Cancelled, "取消信号置位后应返回 Cancelled 终止原因");
+    let err = generator.generate(&[1, 2, 3], &config, &cancel).unwrap_err();
+    assert!(
+        err.contains("ENGINE_NOT_READY"),
+        "无 Session 时必须返回 ENGINE_NOT_READY，实际: {err}"
+    );
 }
 
 // ============================================================================
@@ -160,7 +172,7 @@ async fn test_cancel_atomic() {
 #[tokio::test]
 async fn test_panic_isolation() {
     let tmp = tempdir().unwrap();
-    let slot = Arc::new(CpuSlot::new(Some(tmp.path().to_path_buf()), None));
+    let slot = Arc::new(CpuSlot::new_test_ready(Some(tmp.path().to_path_buf())));
     slot.preheat(false).await.unwrap();
 
     // 注入 Panic 触发
@@ -227,7 +239,7 @@ fn test_crash_loop() {
 async fn test_resource_coexistence() {
     let _serial_lock = SERIAL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempdir().unwrap();
-    let slot = Arc::new(CpuSlot::new(Some(tmp.path().to_path_buf()), None));
+    let slot = Arc::new(CpuSlot::new_test_ready(Some(tmp.path().to_path_buf())));
     slot.preheat(false).await.unwrap();
 
     assert!(!is_generation_active());
@@ -247,14 +259,28 @@ async fn test_resource_coexistence() {
 #[test]
 fn test_tokenize_contract() {
     let tmp = tempdir().unwrap();
-    let slot = CpuSlot::new(Some(tmp.path().to_path_buf()), None);
 
-    // 在模型未加载 (Unloaded) 状态下直接调用分词
-    assert_eq!(slot.get_snapshot().lifecycle, SessionLifecycle::Unloaded);
+    // 1. 模型未挂载 → 分词端点必须显式报未就绪（409），严禁回退假词表
+    let unloaded = CpuSlot::new(Some(tmp.path().to_path_buf()), None);
+    assert!(
+        matches!(
+            unloaded.get_snapshot().lifecycle,
+            SessionLifecycle::Failed(ref r) if r == "MODEL_UNMOUNTED"
+        ),
+        "未挂载模型必须直接进入 Failed(MODEL_UNMOUNTED)"
+    );
+    let res = unloaded.tokenize(&["你好，世界！".to_string()]);
+    assert_eq!(
+        res.err().unwrap().0,
+        StatusCode::CONFLICT,
+        "分词器不可用必须返回 409 ENGINE_NOT_READY"
+    );
 
-    let res = slot.tokenize(&["你好，世界！".to_string(), "财务报表".to_string()]);
-    assert!(res.is_ok(), "未加载模型时分词器应常驻可用");
-    let tokens = res.unwrap();
+    // 2. 测试构建的 Ready 槽位仍可命中请求体门限
+    let slot = CpuSlot::new_test_ready(Some(tmp.path().to_path_buf()));
+    let tokens = slot
+        .tokenize(&["你好，世界！".to_string(), "财务报表".to_string()])
+        .expect("测试桩词表应可分词");
     assert_eq!(tokens.tokens.len(), 2);
     assert_eq!(tokens.counts.len(), 2);
 
@@ -277,17 +303,22 @@ fn test_kv_cache_binding() {
     let generator = PocketCpuGenerator::new_test_stub();
     let cancel = AtomicBool::new(false);
 
-    // 1. short-name 任务首 Token 前缀强制
+    // 无真实 ORT Session 时，任何任务（含 short-name / quality-score）都不得伪造产出
     let mut config_name = CpuGeneratorConfig::default();
     config_name.task_id = Some("short-name".to_string());
-    let out_name = generator.generate(&[1, 2], &config_name, &cancel).unwrap();
-    assert!(out_name.completion_tokens.first().copied() == Some(3), "short-name 首 Token 必须为 3");
+    let err_name = generator.generate(&[1, 2], &config_name, &cancel).unwrap_err();
+    assert!(
+        err_name.contains("ENGINE_NOT_READY"),
+        "short-name 在无 Session 时必须显式失败，实际: {err_name}"
+    );
 
-    // 2. quality-score 任务 logits 约束在 1..5
     let mut config_score = CpuGeneratorConfig::default();
     config_score.task_id = Some("quality-score".to_string());
-    let out_score = generator.generate(&[1, 2], &config_score, &cancel).unwrap();
-    assert_eq!(out_score.completion_tokens.first().copied(), Some(15), "quality-score 约束固定产出评分 Token");
+    let err_score = generator.generate(&[1, 2], &config_score, &cancel).unwrap_err();
+    assert!(
+        err_score.contains("ENGINE_NOT_READY"),
+        "quality-score 严禁固定产出评分 Token，实际: {err_score}"
+    );
 }
 
 // ============================================================================
@@ -356,11 +387,12 @@ fn test_zero_mock_generation() {
     let mut config = CpuGeneratorConfig::default();
     config.max_new_tokens = 5;
 
-    let out = generator.generate(&[1, 2], &config, &cancel).unwrap();
-    // 文本必须为真实解码产生，严禁返回死字面量
-    assert_ne!(out.text, "财务报表_2026Q3_审计初稿");
-    assert_ne!(out.text, "{\"tags\": [\"财务\", \"审计\", \"报表\"]}");
-    assert_eq!(out.completion_tokens.len(), out.completion_tokens_count);
+    let err = generator.generate(&[1, 2], &config, &cancel).unwrap_err();
+    // 无 Session 时任何文本产出（含死字面量）都属欺诈性 Mock，必须失败
+    assert!(
+        err.contains("ENGINE_NOT_READY"),
+        "无 Session 严禁产出任何伪造文本，实际: {err}"
+    );
 }
 
 #[test]

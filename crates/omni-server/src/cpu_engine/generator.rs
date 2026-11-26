@@ -59,8 +59,6 @@ pub struct PocketCpuGenerator {
     model_id: &'static str,
     tokenizer: Arc<Tokenizer>,
     session: Arc<Mutex<Option<ort::session::Session>>>,
-    // 注入 Panic 触发器（专用于 G-06 panic 隔离测试）
-    pub inject_panic_on_generate: AtomicBool,
     pub _payload_guard: Option<omni_core::ffp_crypto::DecryptedPayload>,
 }
 
@@ -162,12 +160,16 @@ impl PocketCpuGenerator {
                                                 loaded_ffpc = Some((payload, sess, tok));
                                             }
                                             Err(e) => {
-                                                tracing::warn!("PocketCpuGenerator: 内存构建 Session 失败: {:?}，尝试回退", e);
+                                                return Err(format!(
+                                                    "CPU 模型（.ffpc）Session 构建失败，拒绝静默回退明文模型: {e}"
+                                                ));
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!("PocketCpuGenerator: 解密 .ffpc 失败: {:?}，尝试回退", e);
+                                        return Err(format!(
+                                            "CPU 模型（.ffpc）解密失败，拒绝静默回退明文模型: {e:?}"
+                                        ));
                                     }
                                 }
                             }
@@ -185,7 +187,10 @@ impl PocketCpuGenerator {
                 if tokenizer_path.exists() {
                     Tokenizer::from_file(&tokenizer_path).map_err(|e| format!("加载分词器失败: {e}"))?
                 } else {
-                    Self::create_fallback_tokenizer()
+                    return Err(format!(
+                        "TOKENIZER_MISSING: 加密容器未内嵌分词器且缺少 {:?}，拒绝使用假词表",
+                        tokenizer_path
+                    ));
                 }
             };
 
@@ -193,7 +198,6 @@ impl PocketCpuGenerator {
                 model_id: "pocket-cpu-int8",
                 tokenizer: Arc::new(tokenizer),
                 session: Arc::new(Mutex::new(Some(sess))),
-                inject_panic_on_generate: AtomicBool::new(false),
                 _payload_guard: Some(payload),
             });
         }
@@ -203,8 +207,10 @@ impl PocketCpuGenerator {
         let tokenizer = if tokenizer_path.exists() {
             Tokenizer::from_file(&tokenizer_path).map_err(|e| format!("加载分词器失败: {e}"))?
         } else {
-            // 兜底极简分词器（防未下载时崩溃）
-            Self::create_fallback_tokenizer()
+            return Err(format!(
+                "TOKENIZER_MISSING: 缺少分词器资产 {:?}，拒绝使用假词表",
+                tokenizer_path
+            ));
         };
 
         let model_path = if dir.join("model_quantized.onnx").exists() {
@@ -226,26 +232,28 @@ impl PocketCpuGenerator {
             Self::validate_io_signature(&sess)?;
             Some(sess)
         } else {
-            None
+            return Err(format!(
+                "MODEL_MISSING: 模型目录 {:?} 下既无 model_quantized.onnx 也无 model.onnx，拒绝构造 session=None 的假就绪对象",
+                dir
+            ));
         };
 
         Ok(Self {
             model_id: "pocket-cpu-int8",
             tokenizer: Arc::new(tokenizer),
             session: Arc::new(Mutex::new(session)),
-            inject_panic_on_generate: AtomicBool::new(false),
             _payload_guard: None,
         })
     }
 
-    /// 构造内存测试桩生成器（无磁盘文件时亦可运行单测）
+    /// 构造内存测试桩生成器（仅测试构建可用；生产构建不得存在空跑桩）
+    #[cfg(test)]
     pub fn new_test_stub() -> Self {
         let tokenizer = Self::create_fallback_tokenizer();
         Self {
             model_id: "pocket-cpu-int8",
             tokenizer: Arc::new(tokenizer),
             session: Arc::new(Mutex::new(None)),
-            inject_panic_on_generate: AtomicBool::new(false),
             _payload_guard: None,
         }
     }
@@ -256,7 +264,6 @@ impl PocketCpuGenerator {
             model_id: "pocket-cpu-int8",
             tokenizer: Arc::new(tokenizer),
             session: Arc::new(Mutex::new(None)),
-            inject_panic_on_generate: AtomicBool::new(false),
             _payload_guard: None,
         }
     }
@@ -298,6 +305,7 @@ impl PocketCpuGenerator {
         }
     }
 
+    #[cfg(test)]
     fn create_fallback_tokenizer() -> Tokenizer {
         // 创建极简字符级/字节级分词器（固定元组数组直接实现 Into<AHashMap<String, u32>>）
         let vocab = [
@@ -466,11 +474,6 @@ impl CpuGenerator for PocketCpuGenerator {
         config: &CpuGeneratorConfig,
         cancel: &AtomicBool,
     ) -> Result<GenerationOutput, String> {
-        // G-06: Panic 注入点（测试 catch_unwind 隔离）
-        if self.inject_panic_on_generate.load(Ordering::SeqCst) {
-            panic!("Simulated critical Rust panic inside PocketCpuGenerator::generate");
-        }
-
         let prompt_len = prompt_tokens.len();
         if prompt_len + config.max_new_tokens > config.context_length {
             return Err(format!(
@@ -631,39 +634,9 @@ impl CpuGenerator for PocketCpuGenerator {
                 }
             }
         } else {
-            // 无真实 Session 时的测试桩回退自回归生成
-            for step in 0..config.max_new_tokens {
-                if cancel.load(Ordering::Relaxed) {
-                    finish_reason = FinishReason::Cancelled;
-                    break;
-                }
-
-                if let Some(task_id) = &config.task_id {
-                    if task_id == "quality-score" && step == 0 {
-                        generated_tokens.push(15); // '5'
-                        finish_reason = FinishReason::Stop;
-                        break;
-                    }
-                }
-
-                if Self::check_repetition_degradation(&generated_tokens) {
-                    warn!("检测到自回归生成重复退化，执行截断保护");
-                    finish_reason = FinishReason::Length;
-                    break;
-                }
-
-                if step > 0 && generated_tokens.len() >= 6 {
-                    finish_reason = FinishReason::Stop;
-                    break;
-                }
-
-                let next_token = 20 + (step as u32);
-                if config.stop_token_ids.contains(&next_token) {
-                    finish_reason = FinishReason::Stop;
-                    break;
-                }
-                generated_tokens.push(next_token);
-            }
+            // 无真实 ORT Session 时**严禁**用桩吐 token 伪造生成结果（B2 空跑桩清零）：
+            // 上层本应在加载阶段就进入 Failed，此处再兜一层显式错误，杜绝伪输出。
+            return Err("ENGINE_NOT_READY: CPU 模型会话未加载，禁止桩回退生成".to_string());
         }
 
         // 真实通过分词器解码文本，严禁针对 task_id 硬编码假响应！

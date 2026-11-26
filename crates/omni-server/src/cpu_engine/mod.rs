@@ -14,8 +14,10 @@ pub use circuit_breaker::{get_default_run_dir, get_os_boot_id, is_pid_alive, Cir
 pub use generator::{CpuGenerator, CpuGeneratorConfig, GenerationOutput, PocketCpuGenerator};
 pub use memory::{
     compute_cold_load_floor, get_available_physical_memory_bytes, preflight_cold_load,
-    preflight_hot_infer, set_mock_available_memory_bytes, HOT_INFER_FLOOR,
+    preflight_hot_infer, MemoryGateError, HOT_INFER_FLOOR,
 };
+#[cfg(test)]
+pub use memory::set_mock_available_memory_bytes;
 pub use slot::{is_generation_active, CpuSlot, GLOBAL_GENERATION_ACTIVE};
 pub use types::*;
 
