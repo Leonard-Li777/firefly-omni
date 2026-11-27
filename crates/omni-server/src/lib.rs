@@ -360,9 +360,7 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/v1/text/tokenize", post(text_tokenize_handler))
             .route("/api/text/tokenize", post(text_tokenize_handler))
             // 多模态视觉塔显存驱逐 API (spec §4.3)
-            .route("/api/v1/engine/vision/evict", post(engine_vision_evict_handler))
-            // 资产与挂载清单原子热重载 API（Ticket 06 / Spec §3.1.5）
-            .route("/api/v1/assets/reload", post(assets_reload_handler));
+            .route("/api/v1/engine/vision/evict", post(engine_vision_evict_handler));
     }
 
     let router = router
