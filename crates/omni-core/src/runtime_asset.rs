@@ -12,7 +12,9 @@
 //! 3. 路径解析收敛在此处：显式环境变量 > 固定候选 > 可执行文件向上 8 层；
 //!    **删除**工作目录（CWD）逐级向上 walk —— 同一资产在不同工作目录命中不同文件本身就是漂移源。
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -664,5 +666,147 @@ mod tests {
         assert_eq!(stale_health["assets"]["status"], "stale");
         assert_eq!(stale_health["assets"]["reason"], "visual_vocab_stale");
     }
+}
+
+static E2E_VISUAL_VOCAB_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+static E2E_ASSETS_RELOAD_COUNT: AtomicU64 = AtomicU64::new(0);
+static E2E_LAST_RELOAD_AT_MS: AtomicU64 = AtomicU64::new(0);
+static E2E_SNAPSHOT_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// 记录一次真实的视觉词表磁盘读取（仅用于 E2E 诊断验证无逐请求读盘）
+#[inline]
+pub fn record_visual_vocab_disk_read() {
+    E2E_VISUAL_VOCAB_READ_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+/// 读取累计视觉词表磁盘读取次数
+#[inline]
+pub fn visual_vocab_disk_read_count() -> u64 {
+    E2E_VISUAL_VOCAB_READ_COUNT.load(Ordering::SeqCst)
+}
+
+/// 记录一次 `/api/v1/assets/reload` 完成事件
+#[inline]
+pub fn record_assets_reload(at_ms: u64) {
+    E2E_ASSETS_RELOAD_COUNT.fetch_add(1, Ordering::SeqCst);
+    E2E_LAST_RELOAD_AT_MS.store(at_ms, Ordering::SeqCst);
+}
+
+/// 返回 `(assets_reload_count, last_reload_at_ms)`
+#[inline]
+pub fn assets_reload_stats() -> (u64, Option<u64>) {
+    let count = E2E_ASSETS_RELOAD_COUNT.load(Ordering::SeqCst);
+    let last = E2E_LAST_RELOAD_AT_MS.load(Ordering::SeqCst);
+    (count, if last == 0 { None } else { Some(last) })
+}
+
+/// 单调递增 `VisualRuntimeSnapshot` 修订号
+#[inline]
+pub fn bump_visual_snapshot_revision() -> u64 {
+    E2E_SNAPSHOT_REVISION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// 读取当前 `VisualRuntimeSnapshot` 修订号
+#[inline]
+pub fn current_visual_snapshot_revision() -> u64 {
+    E2E_SNAPSHOT_REVISION.load(Ordering::SeqCst)
+}
+
+/// 单请求视觉前向真实执行计数器（挂载于请求工作线程局部作用域）
+#[derive(Debug, Default)]
+pub struct RequestVisionCounters {
+    pub image_vision_encoding_calls: AtomicU32,
+    pub vision_session_calls: AtomicU32,
+    pub multimodal_projection_calls: AtomicU32,
+    pub tagging_prompt_text_encoding_calls: AtomicU32,
+    pub synthetic_hypothesis_text_encoding_calls: AtomicU32,
+}
+
+impl RequestVisionCounters {
+    pub fn snapshot_diagnostics(&self) -> crate::VisualPipelineDiagnostics {
+        crate::VisualPipelineDiagnostics {
+            image_vision_encoding_calls: self.image_vision_encoding_calls.load(Ordering::SeqCst),
+            vision_session_calls: self.vision_session_calls.load(Ordering::SeqCst),
+            multimodal_projection_calls: self.multimodal_projection_calls.load(Ordering::SeqCst),
+            tagging_prompt_text_encoding_calls: self
+                .tagging_prompt_text_encoding_calls
+                .load(Ordering::SeqCst),
+            synthetic_hypothesis_text_encoding_calls: self
+                .synthetic_hypothesis_text_encoding_calls
+                .load(Ordering::SeqCst),
+            visual_vocab_read_count: visual_vocab_disk_read_count(),
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_REQUEST_VISION_COUNTERS: RefCell<Option<Arc<RequestVisionCounters>>> = const { RefCell::new(None) };
+}
+
+pub struct RequestVisionCountersGuard {
+    prev: Option<Arc<RequestVisionCounters>>,
+}
+
+impl Drop for RequestVisionCountersGuard {
+    fn drop(&mut self) {
+        ACTIVE_REQUEST_VISION_COUNTERS.with(|cell| {
+            *cell.borrow_mut() = self.prev.take();
+        });
+    }
+}
+
+/// 在当前同步执行线程作用域内挂载请求级视觉计数器（RAII 自动还原）
+pub fn attach_request_vision_counters(
+    counters: Arc<RequestVisionCounters>,
+) -> RequestVisionCountersGuard {
+    let prev = ACTIVE_REQUEST_VISION_COUNTERS.with(|cell| cell.borrow_mut().replace(counters));
+    RequestVisionCountersGuard { prev }
+}
+
+#[inline]
+pub fn record_image_vision_encoding_call() {
+    ACTIVE_REQUEST_VISION_COUNTERS.with(|cell| {
+        if let Some(c) = cell.borrow().as_ref() {
+            c.image_vision_encoding_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+}
+
+#[inline]
+pub fn record_vision_session_call() {
+    ACTIVE_REQUEST_VISION_COUNTERS.with(|cell| {
+        if let Some(c) = cell.borrow().as_ref() {
+            c.vision_session_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+}
+
+#[inline]
+pub fn record_multimodal_projection_call() {
+    ACTIVE_REQUEST_VISION_COUNTERS.with(|cell| {
+        if let Some(c) = cell.borrow().as_ref() {
+            c.multimodal_projection_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+}
+
+#[inline]
+pub fn record_tagging_prompt_text_encoding_call() {
+    ACTIVE_REQUEST_VISION_COUNTERS.with(|cell| {
+        if let Some(c) = cell.borrow().as_ref() {
+            c.tagging_prompt_text_encoding_calls
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    });
+}
+
+#[inline]
+pub fn record_synthetic_hypothesis_text_encoding_call() {
+    ACTIVE_REQUEST_VISION_COUNTERS.with(|cell| {
+        if let Some(c) = cell.borrow().as_ref() {
+            c.synthetic_hypothesis_text_encoding_calls
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    });
 }
 

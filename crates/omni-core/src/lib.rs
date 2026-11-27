@@ -825,6 +825,12 @@ pub struct OmniPerceptionResult {
     /// 显式降级细分原因（例如 "pre_elapsed" | "budget_structural"）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
+    /// E2E 单请求视觉前向计数器（仅 FF_E2E_MODE=1 且鉴权通过时序列化，生产响应不输出）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<VisualPipelineDiagnostics>,
+    /// E2E 快照修订号（仅 FF_E2E_MODE=1 且鉴权通过时序列化）
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "snapshotRevision")]
+    pub snapshot_revision: Option<u64>,
 }
 
 /// 视频时序切片实体（30 秒窗口切片）
@@ -1032,6 +1038,18 @@ pub struct VisionTagsRequest {
     pub top_k: Option<usize>,
 }
 
+/// E2E 单请求视觉前向编码诊断计数器（仅 `FF_E2E_MODE=1` 且携带有效 `x-ff-e2e-token` 时输出）
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualPipelineDiagnostics {
+    pub image_vision_encoding_calls: u32,
+    pub vision_session_calls: u32,
+    pub multimodal_projection_calls: u32,
+    pub tagging_prompt_text_encoding_calls: u32,
+    pub synthetic_hypothesis_text_encoding_calls: u32,
+    pub visual_vocab_read_count: u64,
+}
+
 /// 单指标视觉标签响应
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -1043,6 +1061,10 @@ pub struct VisionTagsResponse {
     pub scored_tags: Option<Vec<(String, f32)>>,
     #[serde(alias = "duration_ms")]
     pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<VisualPipelineDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_revision: Option<u64>,
 }
 
 /// 单指标图像频域特征检测请求: POST /api/vision/inspect

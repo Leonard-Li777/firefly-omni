@@ -403,8 +403,23 @@ async fn version_handler() -> Json<serde_json::Value> {
     }))
 }
 
+/// 判定当前请求是否获准暴露 E2E 诊断计数器（必须同时满足 `FF_E2E_MODE=1` 且 `FF_E2E_TOKEN` 非空且与请求头 `x-ff-e2e-token` 精确匹配）
+fn is_e2e_diagnostics_authorized(headers: &axum::http::HeaderMap) -> bool {
+    if std::env::var("FF_E2E_MODE").ok().as_deref() != Some("1") {
+        return false;
+    }
+    match std::env::var("FF_E2E_TOKEN") {
+        Ok(expected) if !expected.is_empty() => headers
+            .get("x-ff-e2e-token")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|actual| actual == expected),
+        _ => false,
+    }
+}
+
 /// 引擎与多模态塔运行时状态查询: GET /api/v1/engine/status
 async fn engine_status_handler(
+    headers: axum::http::HeaderMap,
     Query(query): Query<HealthQuery>,
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
@@ -458,7 +473,7 @@ async fn engine_status_handler(
         .user_data_dir
         .as_ref()
         .map(|p| p.to_string_lossy().to_string());
-    Json(serde_json::json!({
+    let mut payload = serde_json::json!({
         "status": "ok",
         "pid": std::process::id(),
         "instanceId": state.instance_id,
@@ -484,7 +499,27 @@ async fn engine_status_handler(
         "version": env!("CARGO_PKG_VERSION"),
         "masterDbPath": master_db_path,
         "targetVectorsDir": target_vectors_dir,
-    }))
+    });
+    if is_e2e_diagnostics_authorized(&headers) {
+        let (assets_reload_count, last_reload_at) = omni_core::runtime_asset::assets_reload_stats();
+        let snap_rev = omni_core::runtime_asset::current_visual_snapshot_revision();
+        let code_masks = omni_pro::vision::export_active_code_masks();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "e2eDiagnostics".to_string(),
+                serde_json::json!({
+                    "assetsReloadCount": assets_reload_count,
+                    "visualVocabReadCount": omni_core::runtime_asset::visual_vocab_disk_read_count(),
+                    "lastReloadAt": last_reload_at,
+                }),
+            );
+            obj.insert("snapshotRevision".to_string(), serde_json::json!(snap_rev));
+            if let Some(masks) = code_masks {
+                obj.insert("codeMasks".to_string(), serde_json::json!(masks));
+            }
+        }
+    }
+    Json(payload)
 }
 
 /// 供 `firefly-omni verify-visual-vocab <dir>` CLI 调用的暂存视觉词表静态校验（纯本地无网络）
@@ -536,6 +571,7 @@ async fn assets_reload_handler(
         })?;
         let snap = omni_pro::vision::reload_runtime_snapshot(&closure, true)
             .map_err(|e| omni_pro::PipelineError::from_asset_error(&e))?;
+        omni_core::runtime_asset::record_assets_reload(snap.compiled_at_ms);
         let slot_health = omni_pro::vision::tagger_slots_health();
         let (vocab_status, tagger_source) =
             omni_pro::vision::build_visual_vocab_status(&profile, lang_opt.as_deref());
@@ -2776,9 +2812,12 @@ fn build_enriched_document_corpus(
 /// 处理全量原生多模态感知请求: POST /api/perceive
 /// 单次 I/O 汇聚元数据提取、NTFS ADS 来源直查、频域水印/打码检测、离线逆地理编码与物理事实
 async fn perceive_file_handler(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     Json(req): Json<OmniPerceptionRequest>,
 ) -> Result<Json<OmniPerceptionResult>, (StatusCode, Json<serde_json::Value>)> {
+    let e2e_diag_enabled = is_e2e_diagnostics_authorized(&headers);
+    let req_vision_counters = std::sync::Arc::new(omni_core::runtime_asset::RequestVisionCounters::default());
     let global_cfg = state.config.lock().unwrap().clone();
     // 单向遮蔽全局 cfg：后续全链路（DBNet / 纯图 OCR / 代表帧 OCR / NSFW / 人脸 / 视频视觉 / ASR）
     // 统一只读本请求局部 cfg，彻底切断多工作区并发串扰；双 OnceLock OCR 槽位保持常驻零卸载。
@@ -2868,9 +2907,11 @@ async fn perceive_file_handler(
             let profile = cfg.embedding_profile.clone();
             let ocr_size_opt = cfg.ocr_model_size.clone();
             let omw_for_img = state.omw.clone();
+            let counters_for_img = std::sync::Arc::clone(&req_vision_counters);
             let mut vision_err: Option<omni_pro::PipelineError> = None;
             let vision_res = if is_pro {
                 match tokio::task::spawn_blocking(move || {
+                    let _vc_guard = omni_core::runtime_asset::attach_request_vision_counters(counters_for_img);
                     let closure_opt = if enable_visual_tags
                         && omni_pro::vision::current_runtime_snapshot().is_none()
                         && omw_for_img.is_available()
@@ -3111,7 +3152,9 @@ async fn perceive_file_handler(
                 let perceive_timeout_sec_opt = req.perceive_timeout_sec;
                 let elapsed_before_visual_sec = t_start.elapsed().as_secs_f64();
                 let cancel_flag_for_video = std::sync::Arc::clone(&cancel_flag);
+                let counters_for_video = std::sync::Arc::clone(&req_vision_counters);
                 let chunk_res = tokio::task::spawn_blocking(move || {
+                    let _vc_guard = omni_core::runtime_asset::attach_request_vision_counters(counters_for_video);
                     omni_pro::perceive::process_video_time_chunks_with_options_and_budget(
                         std::path::Path::new(&file_path_for_video),
                         video_interval,
@@ -4925,6 +4968,16 @@ async fn perceive_file_handler(
         degraded_reason: video_timings
             .as_ref()
             .and_then(|t| t.degraded_reason.map(|s| s.to_string())),
+        diagnostics: if e2e_diag_enabled && is_pro && (is_image || is_video) {
+            Some(req_vision_counters.snapshot_diagnostics())
+        } else {
+            None
+        },
+        snapshot_revision: if e2e_diag_enabled {
+            Some(omni_core::runtime_asset::current_visual_snapshot_revision())
+        } else {
+            None
+        },
     });
 
     // 统一就地单次原子批量落盘 (Zero-Boomerang IPC)
@@ -7073,12 +7126,19 @@ async fn audio_analyze_voice_handler(
 
 /// 单指标视觉标签处理: POST /api/vision/tags
 async fn vision_tags_handler(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     Json(req): Json<VisionTagsRequest>,
 ) -> Result<Json<VisionTagsResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let e2e_diag_enabled = is_e2e_diagnostics_authorized(&headers);
     let cfg = state.config.lock().unwrap().clone();
     let omw = state.omw.clone();
     tokio::task::spawn_blocking(move || {
+        let req_vision_counters =
+            std::sync::Arc::new(omni_core::runtime_asset::RequestVisionCounters::default());
+        let _vc_guard = omni_core::runtime_asset::attach_request_vision_counters(
+            std::sync::Arc::clone(&req_vision_counters),
+        );
         let t_start = std::time::Instant::now();
         let file_path = req.file_path.clone();
 
@@ -7167,11 +7227,22 @@ async fn vision_tags_handler(
         }
 
         let duration_ms = t_start.elapsed().as_millis() as u64;
+        let is_pro = omni_pro::is_pro_enabled();
         Ok(Json(VisionTagsResponse {
             file_path,
             tags,
             scored_tags,
             duration_ms,
+            diagnostics: if e2e_diag_enabled && is_pro {
+                Some(req_vision_counters.snapshot_diagnostics())
+            } else {
+                None
+            },
+            snapshot_revision: if e2e_diag_enabled {
+                Some(omni_core::runtime_asset::current_visual_snapshot_revision())
+            } else {
+                None
+            },
         }))
     })
     .await
@@ -8298,5 +8369,53 @@ Page Fault 异常处理
         if !omni_pro::is_pro_enabled() {
             assert_eq!(body["ready"], false);
         }
+    }
+
+    #[test]
+    fn e2e_diagnostics_gate_blocks_non_e2e_and_validates_token() {
+        let mut headers = axum::http::HeaderMap::new();
+        std::env::remove_var("FF_E2E_MODE");
+        std::env::remove_var("FF_E2E_TOKEN");
+        assert!(!is_e2e_diagnostics_authorized(&headers));
+
+        let plain_resp = omni_core::VisionTagsResponse {
+            file_path: "a.jpg".to_string(),
+            tags: vec!["builtin.landscape_photos".to_string()],
+            scored_tags: None,
+            duration_ms: 1,
+            diagnostics: None,
+            snapshot_revision: None,
+        };
+        let plain_json = serde_json::to_value(&plain_resp).unwrap();
+        assert!(plain_json.get("diagnostics").is_none());
+        assert!(plain_json.get("snapshotRevision").is_none());
+
+        std::env::set_var("FF_E2E_MODE", "1");
+        // 未配置 FF_E2E_TOKEN 时必须 Fail-Closed 拒绝
+        std::env::remove_var("FF_E2E_TOKEN");
+        assert!(!is_e2e_diagnostics_authorized(&headers));
+
+        std::env::set_var("FF_E2E_TOKEN", "secret-e2e");
+        assert!(!is_e2e_diagnostics_authorized(&headers));
+        headers.insert("x-ff-e2e-token", "wrong".parse().unwrap());
+        assert!(!is_e2e_diagnostics_authorized(&headers));
+        headers.insert("x-ff-e2e-token", "secret-e2e".parse().unwrap());
+        assert!(is_e2e_diagnostics_authorized(&headers));
+
+        let counters = std::sync::Arc::new(omni_core::runtime_asset::RequestVisionCounters::default());
+        {
+            let _guard = omni_core::runtime_asset::attach_request_vision_counters(
+                std::sync::Arc::clone(&counters),
+            );
+            omni_core::runtime_asset::record_image_vision_encoding_call();
+            omni_core::runtime_asset::record_vision_session_call();
+        }
+        let snap = counters.snapshot_diagnostics();
+        assert_eq!(snap.image_vision_encoding_calls, 1);
+        assert_eq!(snap.vision_session_calls, 1);
+        assert_eq!(snap.multimodal_projection_calls, 0);
+
+        std::env::remove_var("FF_E2E_MODE");
+        std::env::remove_var("FF_E2E_TOKEN");
     }
 }

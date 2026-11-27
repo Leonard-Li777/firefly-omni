@@ -702,9 +702,14 @@ pub mod vision {
     #[derive(Debug, Clone, Default)]
     pub struct VisualRuntimeSnapshot {
         pub compiled_at_ms: u64,
+        pub snapshot_revision: u64,
     }
 
     pub fn current_runtime_snapshot() -> Option<std::sync::Arc<VisualRuntimeSnapshot>> {
+        None
+    }
+
+    pub fn export_active_code_masks() -> Option<std::collections::BTreeMap<String, u16>> {
         None
     }
 
