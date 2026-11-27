@@ -360,7 +360,9 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/v1/text/tokenize", post(text_tokenize_handler))
             .route("/api/text/tokenize", post(text_tokenize_handler))
             // 多模态视觉塔显存驱逐 API (spec §4.3)
-            .route("/api/v1/engine/vision/evict", post(engine_vision_evict_handler));
+            .route("/api/v1/engine/vision/evict", post(engine_vision_evict_handler))
+            // 资产与挂载清单原子热重载 API（Ticket 06 / Spec §3.1.5）
+            .route("/api/v1/assets/reload", post(assets_reload_handler));
     }
 
     let router = router
@@ -398,6 +400,16 @@ async fn version_handler() -> Json<serde_json::Value> {
         "server": "firefly-omni",
         "version": env!("CARGO_PKG_VERSION"),
         "isPro": is_pro
+    }))
+}
+
+/// 资产与单轨挂载清单原子热重载: POST /api/v1/assets/reload
+async fn assets_reload_handler() -> Json<serde_json::Value> {
+    omni_core::plugin_dir::invalidate_mount_cache();
+    let mount_state = omni_core::plugin_dir::current_mount_state();
+    Json(serde_json::json!({
+        "reloaded": true,
+        "mountManifest": mount_state.status
     }))
 }
 
@@ -1388,6 +1400,32 @@ fn refresh_classifier_map(omw: &OmwDb) {
     }
 }
 
+pub fn is_pro_enabled() -> bool {
+    omni_pro::is_pro_enabled()
+}
+
+pub async fn start_server_with_bootstrap(
+    cfg: omni_core::OmniBootstrapConfig,
+) -> anyhow::Result<()> {
+    cfg.validate()?;
+    let addr: SocketAddr = cfg
+        .listen_addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bootstrap.listenAddr 非法 ({}): {e}", cfg.listen_addr))?;
+    let layout = cfg.resource_layout();
+    start_server_inner(
+        addr,
+        cfg.storage.db_path.clone(),
+        Some(layout.semantic_pack_file()).filter(|p| p.is_file()),
+        Some(cfg.runtime.embedding_profile.clone()),
+        Some(cfg.runtime.mrl_dimension),
+        cfg.storage.vectors_dir.clone(),
+        cfg.storage.user_data_dir.clone(),
+        Some(cfg),
+    )
+    .await
+}
+
 pub async fn start_server(
     addr: SocketAddr,
     db_path: Option<PathBuf>,
@@ -1397,13 +1435,45 @@ pub async fn start_server(
     vectors_path: Option<PathBuf>,
     discovery_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    // 桌面端在检测到 DirectML 原生崩溃（进程 abort，Windows 退出码 0xC0000409 等）后，
-    // 会携带该环境变量重启本进程，强制改用纯 CPU 执行视觉塔。DirectML 的原生异常
-    // （如并发 Run / 驱动 AV）无法被 Rust 捕获，进程会直接 abort，导致视频切片永久丢失；
-    // 该闸门是崩溃后的确定性 CPU 兜底，保证同一视频在重试时能真正产出切片。
-    if std::env::var("OMNI_DISABLE_DML").ok().as_deref() == Some("1") {
+    start_server_inner(
+        addr,
+        db_path,
+        pack_path,
+        embedding_profile,
+        mrl_dimension,
+        vectors_path,
+        discovery_dir,
+        None,
+    )
+    .await
+}
+
+async fn start_server_inner(
+    addr: SocketAddr,
+    db_path: Option<PathBuf>,
+    pack_path: Option<PathBuf>,
+    embedding_profile: Option<String>,
+    mrl_dimension: Option<usize>,
+    vectors_path: Option<PathBuf>,
+    discovery_dir: Option<PathBuf>,
+    bootstrap: Option<omni_core::OmniBootstrapConfig>,
+) -> anyhow::Result<()> {
+    if let Some(ref cfg) = bootstrap {
+        // 一旦通过 --bootstrap 启动，即便 plugin_mounts_file 为 None（如宿主写盘失败），
+        // 仍锁定 strict=true 以强制进入 strict_missing_manifest (Fail-Closed)，严禁退化至 legacy_env_fallback
+        omni_core::plugin_dir::set_bootstrap_mounts_state(cfg.plugin_mounts_file.clone(), true);
+    } else {
+        omni_core::plugin_dir::set_bootstrap_mounts_state(None, false);
+    }
+    let layout = bootstrap.as_ref().map(|b| b.resource_layout());
+    omni_core::set_global_resource_layout(layout.clone());
+    let disable_dml = bootstrap
+        .as_ref()
+        .map(|b| b.runtime.disable_direct_ml)
+        .unwrap_or_else(|| std::env::var("OMNI_DISABLE_DML").ok().as_deref() == Some("1"));
+    if disable_dml {
         omni_core::ort_runtime::disable_directml(
-            "OMNI_DISABLE_DML=1（桌面端检测到 DirectML 原生崩溃后强制 CPU 兜底）",
+            "DirectML 禁用标志已置位（桌面端检测到 DirectML 原生崩溃后强制 CPU 兜底）",
         );
     }
     let mut initial_config = load_config_from_disk();
@@ -1416,8 +1486,14 @@ pub async fn start_server(
     if omni_pro::is_pro_enabled() {
         omni_pro::OmniVisionEngine::set_gemma_mrl_dimension(initial_config.mrl_dimension);
     }
-    // 地理数据集发现链：环境变量 → exe 相对目录 → cwd 候选；落空或开源存根时软不可用
-    let geo = match omni_pro::geo::discover_dataset_path() {
+    // 地理数据集：--bootstrap 模式下严禁回退散落环境变量与目录猜谜，仅信任 ResourceLayout
+    let geo_resolved = if let Some(ref l) = layout {
+        let p = l.geo_data_file();
+        if p.is_file() { Some(p) } else { None }
+    } else {
+        omni_pro::geo::discover_dataset_path()
+    };
+    let geo = match geo_resolved {
         Some(path) => {
             info!("omni-geo dataset found at {}", path.display());
             Arc::new(omni_pro::geo::GeoService::from_path(path))
@@ -1459,7 +1535,12 @@ pub async fn start_server(
     let omw = OmwDb::unavailable();
     let mut omw_connected = false;
     let is_pro_build = omni_pro::is_pro_enabled();
-    let pack_to_load = pack_path.or_else(SemanticPackLoader::discover_pack_path);
+    // --bootstrap 模式下仅信任 layout.semantic_pack_file()，严禁向上爬目录偷探外部 semantic.pack（保障 AC-7 负向阻断）
+    let pack_to_load = if layout.is_some() {
+        pack_path
+    } else {
+        pack_path.or_else(SemanticPackLoader::discover_pack_path)
+    };
     match pack_to_load {
         Some(target_pack_path) => match omw.connect_pack(&target_pack_path) {
             Ok(()) => {
@@ -1550,15 +1631,14 @@ pub async fn start_server(
     });
 
     let initial_policies = routes::taxonomy::load_dimension_policies_from_db(db_path.as_deref());
-    // 注意顺序：sherpa 必须在任何 OmniOrtRuntime 绑定之前完成运行时 A 的加载
-    // （`SetDllDirectoryW` 是进程级单槽替换，见 sherpa_manager.rs 的跨 crate 时序契约），
-    // 因此下面的运行时 B 绑定显式排在 SherpaManager::new() 之后。
-    let sherpa = Arc::new(SherpaManager::new());
-    // 【工单 04 / SPEC §3.8】启动期显式绑定运行时 B（先探后绑 + 全进程唯一一次 init_from）：
-    // 保证启动日志可观测到「运行时 B 路径 + FileVersion + 内存中 DirectML.dll 实际路径
-    // + EP 探测 + DML 闸状态」。绑定失败不阻断服务启动（推理请求会在 build_session 处
-    // 显式返回 Err），但必须 error 可见，严禁静默。
-    if let Err(err) = omni_core::OmniOrtRuntime::init() {
+    // 使用 NativeRuntimeBinder 固化：先 Sherpa 运行时 A（SetDllDirectoryW），后 OmniOrtRuntime 运行时 B
+    let explicit_onnx_dir = layout.as_ref().map(|l| l.native_onnx_lib_dir());
+    let (sherpa_raw, ort_init_res) = omni_core::ort_runtime::NativeRuntimeBinder::bind_all_with(
+        explicit_onnx_dir.as_deref(),
+        |dir| SherpaManager::new_with_onnx_dir(dir),
+    );
+    let sherpa = Arc::new(sherpa_raw);
+    if let Err(err) = ort_init_res {
         tracing::error!(
             "[OmniServer] ONNX Runtime 运行时 B 绑定失败，全部 ONNX 推理将不可用: {err}"
         );
@@ -1603,12 +1683,14 @@ pub async fn start_server(
                     }
                 };
 
-                let mut run_dir = None;
-                if let Ok(env_run) = std::env::var("FIREFLY_RUN_DIR") {
-                    run_dir = Some(PathBuf::from(env_run));
-                } else if let Some(ref dp) = db_path {
-                    if let Some(parent) = dp.parent() {
-                        run_dir = Some(parent.join("run"));
+                let mut run_dir = bootstrap.as_ref().and_then(|b| b.storage.run_dir.clone());
+                if run_dir.is_none() {
+                    if let Ok(env_run) = std::env::var("FIREFLY_RUN_DIR") {
+                        run_dir = Some(PathBuf::from(env_run));
+                    } else if let Some(ref dp) = db_path {
+                        if let Some(parent) = dp.parent() {
+                            run_dir = Some(parent.join("run"));
+                        }
                     }
                 }
                 (run_dir, model_dir)
@@ -1643,10 +1725,15 @@ pub async fn start_server(
 
     // 启动后台异步预热 TTS 引擎（M5 / MOSS）：默认关闭（0），仅 OMNI_TTS_EAGER_WARMUP=1 开启，
     // 平时改由 Desktop 经 POST /v1/modules/:module_id/session 按需懒加载（零启动内存峰值 & 快速回滚门控）
-    let eager_tts_warmup = std::env::var("OMNI_TTS_EAGER_WARMUP")
-        .ok()
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false);
+    let eager_tts_warmup = bootstrap
+        .as_ref()
+        .map(|b| b.runtime.eager_tts_warmup)
+        .unwrap_or_else(|| {
+            std::env::var("OMNI_TTS_EAGER_WARMUP")
+                .ok()
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false)
+        });
     if eager_tts_warmup {
         let m5 = state.m5.clone();
         let moss = state.moss.clone();
@@ -1705,11 +1792,12 @@ pub async fn start_server(
     );
 
     let shutdown_state = state.clone();
+    let watch_stdin = bootstrap
+        .as_ref()
+        .map(|b| b.runtime.watch_stdin)
+        .unwrap_or_else(|| std::env::var("OMNI_WATCH_STDIN").map(|v| v == "1").unwrap_or(false));
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            // 当由 Electron / Node.js 宿主显式配置 OMNI_WATCH_STDIN=1 拉起时，监听 stdin EOF
-            // 默认情况下（独立运行、后台守护、CLI）仅响应 Ctrl+C 信号，杜绝无终端环境下直接读到 EOF 导致的误退出
-            let watch_stdin = std::env::var("OMNI_WATCH_STDIN").map(|v| v == "1").unwrap_or(false);
             tokio::select! {
                 _ = async {
                     if !watch_stdin {

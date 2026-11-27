@@ -343,6 +343,19 @@ function parseArgs(argv) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2))
+  const resolveAsset = args.resolvedir
+  if (resolveAsset) {
+    if (!SUFFIX_MAP[resolveAsset]) {
+      console.error(`❌ 未知资产名: ${resolveAsset}`)
+      process.exit(1)
+    }
+    const candidates = SUFFIX_MAP[resolveAsset]
+    const requestedSuffix = args.archsuffix
+    const chosen =
+      requestedSuffix && candidates.includes(requestedSuffix) ? requestedSuffix : candidates[0]
+    console.log(path.join(MUPDF_CACHE_ROOT, chosen))
+    return
+  }
   const asset = args.asset
   if (!asset) {
     log('用法: node scripts/download-libmupdf.js --asset <asset> [--force]')

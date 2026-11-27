@@ -888,28 +888,13 @@ pub mod vision {
     pub struct OmniVisionEngine;
 
     impl OmniVisionEngine {
+        /// CE 版确定性文件类型探测（魔数头 + 扩展名策略，`source = "magic_header"`，严禁伪造神经网络高分）
+        pub fn detect_file_type<P: AsRef<Path>>(path: P) -> omni_core::FileTypeDetection {
+            omni_core::detect_file_type_deterministic(path.as_ref())
+        }
+
         pub fn detect_mime_type<P: AsRef<Path>>(path: P) -> anyhow::Result<String> {
-            let p = path.as_ref();
-            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                let mime = match ext.to_lowercase().as_str() {
-                    "png" => "image/png",
-                    "jpg" | "jpeg" => "image/jpeg",
-                    "gif" => "image/gif",
-                    "webp" => "image/webp",
-                    "bmp" => "image/bmp",
-                    "pdf" => "application/pdf",
-                    "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                    "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    "mp3" => "audio/mpeg",
-                    "mp4" => "video/mp4",
-                    "json" => "application/json",
-                    "txt" | "md" => "text/plain",
-                    _ => "application/octet-stream",
-                };
-                return Ok(mime.to_string());
-            }
-            Ok("application/octet-stream".to_string())
+            Ok(Self::detect_file_type(path).mime_type)
         }
 
         pub fn group_boxes_into_lines(_boxes: Vec<OCRBoxResult>) -> String {
@@ -2763,6 +2748,9 @@ pub mod audio {
     pub struct SherpaManager;
     impl SherpaManager {
         pub fn new() -> Self {
+            Self
+        }
+        pub fn new_with_onnx_dir(_onnx_dir: Option<&std::path::Path>) -> Self {
             Self
         }
         pub fn denoise(&self, _samples: &[f32], _sample_rate: i32) -> Vec<f32> {

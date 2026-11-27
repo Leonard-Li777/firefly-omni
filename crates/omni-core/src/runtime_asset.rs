@@ -568,14 +568,30 @@ pub fn require_version(
     Ok(ver)
 }
 
+/// 基于显式 `&ResourceLayout` 定位 taxonomy 规则资产目录
+pub fn resolve_taxonomy_dir_with_layout(
+    layout: &crate::ResourceLayout,
+    required_file: &str,
+) -> Option<PathBuf> {
+    let dir = layout.taxonomy_dir();
+    if dir.is_dir() && dir.join(required_file).is_file() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
 /// 定位 taxonomy 规则资产目录（**与工作目录完全无关**）。
 ///
-/// 优先级：显式环境变量 `FFP_TAXONOMY_DIR` > 可执行文件向上 8 层（仓库开发布局 / 安装包布局）。
-/// **禁止**任何 CWD 相对候选：同一资产在不同工作目录命中不同文件，本身就是资产漂移源。
+/// 优先级：已注入的 `ResourceLayout` > 可执行文件相对布局（独立测试兜底）。
 /// `required_file` 用于避免"目录存在但装的是别的资产集"导致的跨资产漂移。
 pub fn resolve_taxonomy_dir(required_file: &str) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(layout) = crate::global_resource_layout() {
+        // 已由 --bootstrap 注入全局 ResourceLayout 时严格收口，不再回退环境变量或 8 层目录猜谜
+        return resolve_taxonomy_dir_with_layout(&layout, required_file);
+    }
 
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(raw) = std::env::var("FFP_TAXONOMY_DIR") {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {

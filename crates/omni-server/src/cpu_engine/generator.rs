@@ -690,22 +690,19 @@ mod tests {
 
     #[test]
     fn test_pocket_cpu_real_model_generation() {
-        let candidates = [
-            PathBuf::from(r"C:\Users\lilun\AppData\Roaming\firefly-ai-folder_v4_cn_development\modules\_shared\cpu-485c04b7"),
-            PathBuf::from(r"D:\workspace\firefly-ai-folder\apps\desktop\build\extraResources\models\pocket-cpu"),
-            PathBuf::from(r"D:\plugin\_shared\cpu-485c04b7"),
-        ];
-
-        let model_dir = candidates.iter().find(|p| p.exists());
-        let model_dir = match model_dir {
+        let model_dir = match std::env::var("FIREFLY_TEST_POCKET_CPU_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+        {
             Some(d) => d,
             None => {
-                eprintln!("跳过测试：未检测到本地 pocket-cpu 模型目录");
+                eprintln!("跳过测试：未设置 FIREFLY_TEST_POCKET_CPU_DIR 本地模型夹具");
                 return;
             }
         };
 
-        let gen = match PocketCpuGenerator::load_from_dir(model_dir, 2) {
+        let gen = match PocketCpuGenerator::load_from_dir(&model_dir, 2) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("加载模型失败（可能缺少解密密钥或损坏）: {e}");

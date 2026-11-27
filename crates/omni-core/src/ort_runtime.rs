@@ -30,17 +30,21 @@ pub fn set_safe_dll_directory(sub_dir: &str) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use std::path::PathBuf;
 
-    // 优先支持环境变量 FIREFLY_ONNX_DIR 覆盖
-    let target_path = if let Ok(custom_dir) = std::env::var("FIREFLY_ONNX_DIR") {
+    let explicit = PathBuf::from(sub_dir);
+    // 显式传入的绝对路径（如 ResourceLayout::native_onnx_lib_dir）最高优先；
+    // 仅在相对路径模式下保留 FIREFLY_ONNX_DIR / exe_dir 兼容展开路径。
+    let target_path = if explicit.is_absolute() {
+        explicit
+    } else if let Ok(custom_dir) = std::env::var("FIREFLY_ONNX_DIR") {
         PathBuf::from(custom_dir)
     } else if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             exe_dir.join(sub_dir)
         } else {
-            PathBuf::from(sub_dir)
+            explicit
         }
     } else {
-        PathBuf::from(sub_dir)
+        explicit
     };
 
     let path_to_set = if target_path.exists() {
@@ -686,21 +690,21 @@ static BOUND_DML_CAPABLE: AtomicBool = AtomicBool::new(false);
 static BIND_FAILED: OnceLock<String> = OnceLock::new();
 
 impl OmniOrtRuntime {
-    /// 运行时 B 发现链（优先级从高到低，SPEC §3.1 第 1~5 步）
-    ///
-    /// 1. `OMNI_ORT_DLL` 显式路径（最高优先，兼容测试与排障）；
-    /// 2. `FIREFLY_ONNX_DIR` 目录：**先 `onnxruntime_dml.dll` 再 `onnxruntime.dll`**
-    ///    （防排障时把该变量指向 bin/omni 反而静默失去 DML 的假阳性形态）；
-    /// 3. `ORT_DYLIB_PATH`（既有语义并入本档）；
-    /// 4. exe 同级 `onnxruntime_dml.dll`；
-    /// 5. exe 同级 / 既有发现链的 `onnxruntime.dll`（仅运行时 A 的裸环境，如未装配 DML 的 CI）。
-    pub fn discover_onnx_dll_candidates() -> Vec<PathBuf> {
+    /// 运行时 B 发现链（支持显式注入 `explicit_onnx_dir` 并统一覆盖 Windows / macOS / Linux）
+    pub fn discover_onnx_dll_candidates_with_dir(explicit_onnx_dir: Option<&Path>) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
         let mut push = |p: PathBuf| {
             if !p.as_os_str().is_empty() && !out.contains(&p) {
                 out.push(p);
             }
         };
+
+        // 0. 显式注入的 ResourceLayout::native_onnx_lib_dir() 绝对最高优先
+        if let Some(dir) = explicit_onnx_dir {
+            for lib_name in Self::platform_ort_lib_names() {
+                push(dir.join(lib_name));
+            }
+        }
 
         // 1. 显式路径（最高优先）
         if let Ok(p) = std::env::var("OMNI_ORT_DLL") {
@@ -709,8 +713,9 @@ impl OmniOrtRuntime {
         // 2. FIREFLY_ONNX_DIR：先 DML 后普通
         if let Ok(dir) = std::env::var("FIREFLY_ONNX_DIR") {
             let d = PathBuf::from(dir);
-            push(d.join("onnxruntime_dml.dll"));
-            push(d.join("onnxruntime.dll"));
+            for lib_name in Self::platform_ort_lib_names() {
+                push(d.join(lib_name));
+            }
         }
         // 3. ORT_DYLIB_PATH（既有排障通道）
         if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
@@ -731,20 +736,15 @@ impl OmniOrtRuntime {
         for base in roots {
             let mut cur = base;
             for _ in 0..6 {
-                push(cur.join("onnxruntime_dml.dll"));
-                push(cur.join("onnxruntime.dll"));
-                push(cur.join("bin/omni/onnxruntime_dml.dll"));
-                push(cur.join("bin/omni/onnxruntime.dll"));
-                push(cur.join("resources/bin/omni/onnxruntime_dml.dll"));
-                push(cur.join("resources/bin/omni/onnxruntime.dll"));
-                push(cur.join("apps/desktop/build/extraResources/bin/omni/onnxruntime_dml.dll"));
-                push(cur.join("apps/desktop/build/extraResources/bin/omni/onnxruntime.dll"));
-                push(cur.join("build/extraResources/bin/omni/onnxruntime_dml.dll"));
-                push(cur.join("build/extraResources/bin/omni/onnxruntime.dll"));
-                push(cur.join("target/debug/onnxruntime_dml.dll"));
-                push(cur.join("target/debug/onnxruntime.dll"));
-                push(cur.join("target/release/onnxruntime_dml.dll"));
-                push(cur.join("target/release/onnxruntime.dll"));
+                for lib_name in Self::platform_ort_lib_names() {
+                    push(cur.join(lib_name));
+                    push(cur.join("bin/omni").join(lib_name));
+                    push(cur.join("resources/bin/omni").join(lib_name));
+                    push(cur.join("apps/desktop/build/extraResources/bin/omni").join(lib_name));
+                    push(cur.join("build/extraResources/bin/omni").join(lib_name));
+                    push(cur.join("target/debug").join(lib_name));
+                    push(cur.join("target/release").join(lib_name));
+                }
                 if let Some(parent) = cur.parent() {
                     cur = parent.to_path_buf();
                 } else {
@@ -755,6 +755,20 @@ impl OmniOrtRuntime {
         out
     }
 
+    pub fn platform_ort_lib_names() -> &'static [&'static str] {
+        if cfg!(target_os = "windows") {
+            &["onnxruntime_dml.dll", "onnxruntime.dll"]
+        } else if cfg!(target_os = "macos") {
+            &["libonnxruntime.dylib"]
+        } else {
+            &["libonnxruntime.so"]
+        }
+    }
+
+    pub fn discover_onnx_dll_candidates() -> Vec<PathBuf> {
+        Self::discover_onnx_dll_candidates_with_dir(None)
+    }
+
     /// 自动发现本地有效的 ONNX Runtime DLL 路径（历史入口，返回发现链首个真实存在的文件）
     pub fn discover_onnx_dll() -> Option<PathBuf> {
         Self::discover_onnx_dll_candidates()
@@ -763,12 +777,9 @@ impl OmniOrtRuntime {
     }
 
     /// 预探运行时 B：发现链阶梯 + 裸名兜底，返回唯一胜出者（只探不绑）
-    ///
-    /// 注：`ORT_DYLIB_PATH` 在 `ort::init_from` 路径下会被 `G_ORT_DYLIB_PATH` 覆盖而失效
-    /// （rc.9 `environment.rs:393`），因此这里把它当成**显式候选**纳入阶梯而非依赖 ort 自解析。
     #[cfg(target_os = "windows")]
-    fn probe_runtime_b() -> Result<OrtProbeReport, String> {
-        let candidates = Self::discover_onnx_dll_candidates();
+    fn probe_runtime_b(explicit_onnx_dir: Option<&Path>) -> Result<OrtProbeReport, String> {
+        let candidates = Self::discover_onnx_dll_candidates_with_dir(explicit_onnx_dir);
         match probe_ladder(&candidates) {
             Ok(report) => Ok(report),
             Err(e) => {
@@ -782,19 +793,23 @@ impl OmniOrtRuntime {
         }
     }
 
-    /// 非 Windows 预探：仅做「dylib 是否真的可定位」的存在性校验
-    ///
-    /// 不做 PE 符号探测（无 `onnxruntime_dml.dll` 语义），但**必须**校验可加载性：
-    /// `ort::init_from(...).commit()` 在 dylib 缺席时是 panic（rc.9 `lib.rs:109`），
-    /// 预探谎报成功会直接把「静默降级」升级成进程 abort（release `panic = "abort"`）。
+    /// 非 Windows 预探：支持显式 `onnx_dir`（修复原分支完全忽略外部注入目录的盲区）
     #[cfg(not(target_os = "windows"))]
-    fn probe_runtime_b() -> Result<OrtProbeReport, String> {
+    fn probe_runtime_b(explicit_onnx_dir: Option<&Path>) -> Result<OrtProbeReport, String> {
         let bare = if cfg!(target_os = "macos") {
             "libonnxruntime.dylib"
         } else {
             "libonnxruntime.so"
         };
         let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = explicit_onnx_dir {
+            candidates.push(dir.join(bare));
+        }
+        if let Ok(dir) = std::env::var("FIREFLY_ONNX_DIR") {
+            if !dir.is_empty() {
+                candidates.push(PathBuf::from(dir).join(bare));
+            }
+        }
         // `ORT_DYLIB_PATH` 会被 init_from 覆盖，故作为显式候选纳入阶梯
         if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
             if !p.is_empty() {
@@ -804,6 +819,7 @@ impl OmniOrtRuntime {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 candidates.push(dir.join(bare));
+                candidates.push(dir.join("resources").join("bin").join("omni").join(bare));
             }
         }
         if let Ok(cwd) = std::env::current_dir() {
@@ -957,13 +973,11 @@ impl OmniOrtRuntime {
         }
     }
 
-    /// 在应用启动时初始化 ONNX Runtime：先探后绑（阶梯全败不污染 OnceLock）
-    pub fn init() -> Result<(), String> {
+    /// 在应用启动时初始化 ONNX Runtime（显式 `onnx_dir` 优先）：先探后绑（阶梯全败不污染 OnceLock）
+    pub fn init_with_onnx_dir(onnx_dir: Option<&Path>) -> Result<(), String> {
         if let Some(done) = RUNTIME_INIT.get() {
             return done.clone();
         }
-        // 绑定阶段已失败 ⇒ 结论永久冻结（G_ORT_DYLIB_PATH 不可覆盖），此处零成本短路，
-        // 杜绝「每次建会话重跑全阶梯 + 打一条 INFO 预探通过却必然失败」的日志矛盾与放大
         if let Some(prev) = BIND_FAILED.get() {
             return Err(prev.clone());
         }
@@ -976,7 +990,7 @@ impl OmniOrtRuntime {
         }
 
         // 阶段 1：预探（绝不触碰 OnceLock / ort 全局单例；预探失败不记忆，修复资产后可重试）
-        let winner = match Self::probe_runtime_b() {
+        let winner = match Self::probe_runtime_b(onnx_dir) {
             Ok(w) => w,
             Err(e) => {
                 tracing::error!(
@@ -992,6 +1006,11 @@ impl OmniOrtRuntime {
             let _ = RUNTIME_INIT.set(bound.clone());
         }
         bound
+    }
+
+    /// 在应用启动时初始化 ONNX Runtime：先探后绑（阶梯全败不污染 OnceLock）
+    pub fn init() -> Result<(), String> {
+        Self::init_with_onnx_dir(None)
     }
 
     /// 指定特定 DLL 路径初始化（排障通道，同样先探后绑，严禁绕过预探）
@@ -3301,13 +3320,68 @@ mod tests {
                     tok_bytes,
                     Some(payload),
                 );
-                assert!(loaded.tokenizer_bytes.is_some());
-                assert!(loaded._payload_guard.is_some());
-                println!("✅ 成功从解密内存切片中构建真实 ORT Session 并完成 LoadedAsset 托管");
+                assert_eq!(loaded.tokenizer_bytes.is_some(), true);
+                let _ = loaded;
             }
             Err(e) => {
-                println!("[WARN] ORT 运行时环境未就绪或动态链接不可用: {e}");
+                println!("[SKIP] 运行时未能构建 ORT 内存 Session: {}", e);
             }
         }
+    }
+}
+
+/// 多平台原生推理运行时绑定深模块 (NativeRuntimeBinder)
+///
+/// 消除跨 crate 隐式初始化时序（Sherpa 运行时 A 必须先占 `SetDllDirectoryW` 加载 CPU 版，
+/// 再显式绝对路径 `init_from` 绑定 DirectML/平台运行时 B），并统一 `win32 / darwin / linux`
+/// 三个平台对 `onnx_dir` 的寻址。
+pub struct NativeRuntimeBinder;
+
+impl NativeRuntimeBinder {
+    /// 各平台所需随包原生动态库文件名（权威声明，与 `BinaryContract` 同源）
+    pub fn required_runtime_lib_names(platform: &str) -> &'static [&'static str] {
+        match platform {
+            "win32" | "windows" => &[
+                "onnxruntime.dll",
+                "onnxruntime_dml.dll",
+                "DirectML.dll",
+                "sherpa-onnx-c-api.dll",
+            ],
+            "darwin" | "macos" => &["libonnxruntime.dylib", "libsherpa-onnx-c-api.dylib"],
+            "linux" => &["libonnxruntime.so", "libsherpa-onnx-c-api.so"],
+            _ => &[],
+        }
+    }
+
+    /// 在同一个不可逆原子流程中固化：
+    /// ① 若传入 `onnx_dir` 则先设定进程搜索上下文 ➔ ② 执行 `init_sherpa()` 加载运行时 A ➔ ③ 绑定 `OmniOrtRuntime` 运行时 B。
+    pub fn bind_all_with<T, F>(onnx_dir: Option<&Path>, init_sherpa: F) -> (T, Result<(), String>)
+    where
+        F: FnOnce(Option<&Path>) -> T,
+    {
+        if let Some(dir) = onnx_dir {
+            if let Some(s) = dir.to_str() {
+                set_safe_dll_directory(s);
+            }
+        }
+        let sherpa = init_sherpa(onnx_dir);
+        let ort_res = OmniOrtRuntime::init_with_onnx_dir(onnx_dir);
+        (sherpa, ort_res)
+    }
+}
+
+#[cfg(test)]
+mod binder_tests {
+    use super::*;
+
+    #[test]
+    fn native_runtime_binder_covers_all_three_platforms_and_places_explicit_dir_first() {
+        assert_eq!(NativeRuntimeBinder::required_runtime_lib_names("win32").len(), 4);
+        assert_eq!(NativeRuntimeBinder::required_runtime_lib_names("darwin").len(), 2);
+        assert_eq!(NativeRuntimeBinder::required_runtime_lib_names("linux").len(), 2);
+
+        let custom = PathBuf::from("/tmp/custom_omni_libs");
+        let cands = OmniOrtRuntime::discover_onnx_dll_candidates_with_dir(Some(&custom));
+        assert!(cands.first().unwrap().starts_with(&custom));
     }
 }

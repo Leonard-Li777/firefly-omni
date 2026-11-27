@@ -28,9 +28,10 @@ impl OmniExtractor {
         let metadata = std::fs::metadata(p)?;
         let file_size = metadata.len();
 
-        // 识别真实 MIME 类型与扩展名 (Magika 类型识别阶段计时)
+        // 识别真实 MIME 类型与扩展名（Pro: Magika ONNX / 魔数快判；CE: 确定性魔数头，严禁伪造 固定高置信度）
         let t_magika_start = std::time::Instant::now();
-        let mime_type = OmniVisionEngine::detect_mime_type(p).unwrap_or_else(|_| "application/octet-stream".to_string());
+        let detected = OmniVisionEngine::detect_file_type(p);
+        let mime_type = detected.mime_type.clone();
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
         let magika_duration_ms = t_magika_start.elapsed().as_millis() as u64;
 
@@ -41,13 +42,18 @@ impl OmniExtractor {
             markdown_content: String::new(),
             metadata: serde_json::json!({
                 "magika": {
-                    "label": if ext.is_empty() { "bin" } else { &ext },
-                    "mime_type": mime_type,
-                    "group": determine_file_group(&ext, &mime_type),
-                    "name": format!("Magika Identified Format ({})", mime_type),
-                    "score": 0.995,
-                    "description": format!("Magika Neural Network Classification for {}", mime_type),
-                    "extensions": if ext.is_empty() { vec![] } else { vec![ext.clone()] }
+                    "label": detected.label,
+                    "mime_type": detected.mime_type,
+                    "group": if detected.group == "unknown" {
+                        determine_file_group(&ext, &mime_type).to_string()
+                    } else {
+                        detected.group
+                    },
+                    "name": detected.description,
+                    "score": detected.score,
+                    "description": detected.description,
+                    "extensions": detected.extensions,
+                    "source": detected.source
                 }
             }),
             phash: None,
@@ -509,11 +515,23 @@ impl OmniExtractor {
 /// exiftool 可执行文件路径缓存（仅查找一次，避免每次提取都重复启动 Perl 进程探测）
 static EXIFTOOL_EXE_CACHE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
 
-fn find_exiftool_executable() -> Option<std::path::PathBuf> {
-    EXIFTOOL_EXE_CACHE.get_or_init(|| find_exiftool_executable_inner()).clone()
-}
+/// 基于显式 `&ResourceLayout` 定位 ExifTool（随包优先于系统 PATH，阻断系统旧版劫持漏洞）
+pub fn resolve_exiftool_with_layout(
+    layout: Option<&omni_core::ResourceLayout>,
+) -> Option<std::path::PathBuf> {
+    if let Some(l) = layout {
+        let bundled = l.exiftool_bin();
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
+    if let Some(global) = omni_core::global_resource_layout() {
+        let bundled = global.exiftool_bin();
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
 
-fn find_exiftool_executable_inner() -> Option<std::path::PathBuf> {
     let is_win = cfg!(target_os = "windows");
     let exe_name = if is_win { "exiftool.exe" } else { "exiftool" };
     let platform_dir = match std::env::consts::OS {
@@ -523,110 +541,55 @@ fn find_exiftool_executable_inner() -> Option<std::path::PathBuf> {
         other => other,
     };
 
-    // 1. 优先查找系统 PATH 中的 exiftool / exiftool.exe
-    // 注意：不再用 -ver 进程探测（每次启动 Perl 约需 1-2s），改为直接检查 PATH 上的文件是否存在
+    // 1. 优先随包 exe 相对目录（严禁系统 PATH 劫持随包版本）
+    if let Ok(exe_dir) = std::env::current_exe().map(|p| p.parent().unwrap_or(std::path::Path::new("")).to_path_buf()) {
+        let mut curr: Option<&std::path::Path> = Some(exe_dir.as_path());
+        for _ in 0..4 {
+            let Some(dir) = curr else { break };
+            let candidates = [
+                dir.join(format!("resources/bin/exiftool/{}", exe_name)),
+                dir.join(format!("bin/exiftool/{}", exe_name)),
+                dir.join(format!("build/extraResources/bin/exiftool/{}", exe_name)),
+                dir.join(format!("extraResources/bin/exiftool/{}", exe_name)),
+                dir.join(format!("resources/bin/{}/{}", platform_dir, exe_name)),
+                dir.join(format!("resources/bin/{}", exe_name)),
+            ];
+            for cand in candidates {
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+            curr = dir.parent();
+        }
+    }
+
+    // 2. 末位兜底：系统 PATH（仅当随包缺失时回退）
     if let Ok(path_env) = std::env::var("PATH") {
         let sep = if is_win { ';' } else { ':' };
         for dir in path_env.split(sep) {
+            if dir.trim().is_empty() {
+                continue;
+            }
             let candidate = std::path::Path::new(dir).join(exe_name);
-            if candidate.exists() {
+            if candidate.is_file() {
                 return Some(candidate);
             }
-            // Windows 上同时尝试无 .exe 后缀的 exiftool
             if is_win {
                 let candidate2 = std::path::Path::new(dir).join("exiftool");
-                if candidate2.exists() {
+                if candidate2.is_file() {
                     return Some(candidate2);
                 }
             }
         }
     }
 
-    // 2. 查找 APPDATA / HOME 本地缓存目录中的 bin/{platform}/
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let candidates = [
-            std::path::Path::new(&appdata).join(format!("firefly-ai-folder/bin/{}/{}", platform_dir, exe_name)),
-            std::path::Path::new(&appdata).join(format!("firefly-ai-folder/bin/{}", exe_name)),
-        ];
-        for cand in candidates {
-            if cand.exists() {
-                return Some(cand);
-            }
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let candidates = [
-            std::path::Path::new(&home).join(format!(".config/firefly-ai-folder/bin/{}/{}", platform_dir, exe_name)),
-            std::path::Path::new(&home).join(format!(".config/firefly-ai-folder/bin/{}", exe_name)),
-        ];
-        for cand in candidates {
-            if cand.exists() {
-                return Some(cand);
-            }
-        }
-    }
-
-    // 3. 向上递归搜索可执行文件所在目录 (exe_dir)
-    if let Ok(exe_dir) = std::env::current_exe().map(|p| p.parent().unwrap_or(std::path::Path::new("")).to_path_buf()) {
-        let mut curr: Option<&std::path::Path> = Some(exe_dir.as_path());
-        while let Some(dir) = curr {
-            let candidates = [
-                dir.join(format!("build/extraResources/bin/exiftool/{}", exe_name)),
-                dir.join(format!("build/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("apps/omni/build/extraResources/bin/exiftool/{}", exe_name)),
-                dir.join(format!("apps/omni/build/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("extraResources/bin/exiftool/{}", exe_name)),
-                dir.join(format!("extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("apps/omni/extraResources/bin/exiftool/{}", exe_name)),
-                dir.join(format!("apps/omni/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("resources/bin/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("resources/bin/{}", exe_name)),
-                dir.join(format!("apps/omni/resources/bin/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("apps/omni/resources/bin/{}", exe_name)),
-                dir.join(exe_name),
-            ];
-            for cand in candidates {
-                if cand.exists() {
-                    return Some(cand);
-                }
-            }
-            curr = dir.parent();
-        }
-    }
-
-    // 4. 向上递归搜索 CWD / Monorepo build/extraResources/bin
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut curr: Option<&std::path::Path> = Some(cwd.as_path());
-        while let Some(dir) = curr {
-            let candidates = [
-                dir.join(format!("build/extraResources/bin/exiftool/{}", exe_name)),
-                dir.join(format!("build/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("apps/omni/build/extraResources/bin/exiftool/{}", exe_name)),
-                dir.join(format!("apps/omni/build/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("extraResources/bin/exiftool/{}", exe_name)),
-                dir.join(format!("extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("apps/omni/extraResources/bin/exiftool/{}", exe_name)),
-                dir.join(format!("apps/omni/extraResources/bin/exiftool/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("resources/bin/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("resources/bin/{}", exe_name)),
-                dir.join(format!("apps/omni/resources/bin/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("apps/omni/resources/bin/{}", exe_name)),
-                dir.join(format!("crates/omni-extract/bin/{}/{}", platform_dir, exe_name)),
-                dir.join(format!("crates/omni-extract/bin/{}", exe_name)),
-                dir.join(format!("bin/{}", exe_name)),
-                dir.join("apps/desktop/node_modules/exiftool-vendored.exe/bin/exiftool.exe"),
-                dir.join("node_modules/exiftool-vendored.exe/bin/exiftool.exe"),
-            ];
-            for cand in candidates {
-                if cand.exists() {
-                    return Some(cand);
-                }
-            }
-            curr = dir.parent();
-        }
-    }
-
     None
+}
+
+fn find_exiftool_executable() -> Option<std::path::PathBuf> {
+    EXIFTOOL_EXE_CACHE
+        .get_or_init(|| resolve_exiftool_with_layout(None))
+        .clone()
 }
 
 
@@ -2422,5 +2385,32 @@ mod tests {
         assert!(slice_pdf_first_n_pages(&src, 10).is_none());
 
         let _ = std::fs::remove_file(&src);
+    }
+}
+
+
+#[cfg(test)]
+mod resource_layout_extract_tests {
+    use super::*;
+
+    #[test]
+    fn exiftool_layout_takes_precedence_over_system_path() {
+        let base = std::env::temp_dir().join(format!("ff-exiftool-layout-{}", std::process::id()));
+        let bundled_dir = base.join("resources").join("bin").join("exiftool");
+        let fake_path_dir = base.join("fake_path");
+        std::fs::create_dir_all(&bundled_dir).unwrap();
+        std::fs::create_dir_all(&fake_path_dir).unwrap();
+
+        let exe_name = if cfg!(target_os = "windows") { "exiftool.exe" } else { "exiftool" };
+        let bundled_bin = bundled_dir.join(exe_name);
+        let fake_path_bin = fake_path_dir.join(exe_name);
+        std::fs::write(&bundled_bin, b"bundled").unwrap();
+        std::fs::write(&fake_path_bin, b"fake-old-system").unwrap();
+
+        let layout = omni_core::ResourceLayout::from_root(base.join("resources"));
+        let resolved = resolve_exiftool_with_layout(Some(&layout)).expect("应命中随包 exiftool");
+        assert_eq!(resolved, bundled_bin);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

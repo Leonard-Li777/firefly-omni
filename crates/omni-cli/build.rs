@@ -1,9 +1,32 @@
 /// omni-cli build.rs
-/// 确保在最终生成 firefly-omni.exe 可执行文件时，将预置目录下的全量静态库传给链接器
+/// 确保在最终生成 firefly-omni.exe 可执行文件时，将预置目录下的全量静态库传给链接器，
+/// 同时注入编译期 `FIREFLY_GIT_SHA` 供 `firefly-omni contract --json` 自描述契约使用。
 
 use std::path::PathBuf;
+use std::process::Command;
+
+fn emit_git_sha() {
+    let sha = std::env::var("FIREFLY_GIT_SHA")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=FIREFLY_GIT_SHA={sha}");
+    println!("cargo:rerun-if-env-changed=FIREFLY_GIT_SHA");
+}
 
 fn main() {
+    emit_git_sha();
+
     let mut target_dir: Option<PathBuf> = None;
 
     if let Ok(lib_dir) = std::env::var("MUPDF_LIB") {
@@ -66,10 +89,10 @@ fn main() {
                 if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
                     if ext == "lib" {
-                    let lower = stem.to_lowercase();
-                    if lower.contains("_all") || lower.contains("_combined") {
-                        continue;
-                    }
+                        let lower = stem.to_lowercase();
+                        if lower.contains("_all") || lower.contains("_combined") {
+                            continue;
+                        }
                         println!("cargo:rustc-link-lib=static={}", stem);
                     } else if ext == "a" {
                         let name = stem.strip_prefix("lib").unwrap_or(stem);

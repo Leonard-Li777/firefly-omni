@@ -76,6 +76,25 @@ pub use ffp_crypto;
 /// 全系统模型目录解析与激活挂载清单单轨门禁 (SSOT Mount Guard)
 pub mod plugin_dir;
 
+/// 跨版本确定性文件类型探测与魔数头快判 (Ticket 08)
+pub mod file_type;
+pub use file_type::{
+    detect_file_type_deterministic, detect_magic_header, probe_file_magic_header,
+    FileTypeDetection, MagicMatch,
+};
+
+/// 静态资源只读布局、引导配置信封与二进制自描述契约 (Ticket 01)
+pub mod resource_layout;
+pub use resource_layout::{
+    global_resource_layout, resolve_ffmpeg_with_layout, resolve_ffprobe_with_layout,
+    resolve_media_tool_with_layout, set_global_resource_layout, BinaryContract,
+    BootstrapRuntimeConfig, BootstrapStorageConfig, OmniBootstrapConfig, ResourceLayout,
+    BOOTSTRAP_SCHEMA_VERSION, CONTRACT_SCHEMA_VERSION,
+};
+
+/// 盲化同源视觉矩阵资产只读校验器（零 mmap，供 CLI 与运行期共用）
+pub mod visual_vocab_verifier;
+
 /// 本地二进制智能分析与分类引擎 (BinaryLens)
 pub mod binarylens;
 pub use binarylens::{analyze_binary, BinaryAnalysisInfo, BinaryLensError};

@@ -34,38 +34,19 @@ try {
 
 /**
  * Omni 静态资源统一上传脚本 (upload-ci-static-resources.js)
- * 目的：将 omni 稳定预设资源打包并按目标分组上传至 GitHub Release
- * (Leonard-Li777/firefly-omni)，作为 CI/CD 与运行时资源回退的稳定发布源。
- *
- * Release 标签分组：
- *   - ci-resources : exiftool / ffmpeg / ffprobe 二进制工具包 (zip)
- *   - geo-data     : omni-geo 地理数据集分发包 (滚动更新 tar.gz)
+ * 说明：exiftool / ffmpeg / ffprobe 已按 ADR-0029 统一交由 `apps/firefly-resources` 发布与装配，
+ * 本脚本仅保留 omni-geo 地理数据集 (`geo-data`) 上传通道。
  */
 
 const REPO_OWNER = process.env.OMNI_REPO_OWNER || 'Leonard-Li777'
 const REPO_NAME = process.env.OMNI_REPO_NAME || 'firefly-omni'
-const DEFAULT_TAG = 'ci-resources'
+const DEFAULT_TAG = 'geo-data'
 
 const OMNI_ROOT = path.resolve(__dirname, '..')
 const ASSETS_DIR = path.join(OMNI_ROOT, 'build', 'presetResources')
 
-// 待上传的资源清单（tag 缺省为 DEFAULT_TAG；contentType 缺省为 application/zip）
+// 待上传的资源清单（媒体工具已退役，仅保留 geo-data）
 const TARGETS = [
-  {
-    name: 'exiftool-resources.zip',
-    source: path.join(ASSETS_DIR, 'exiftool'),
-    type: 'directory'
-  },
-  {
-    name: 'ffmpeg-resources.zip',
-    source: path.join(ASSETS_DIR, 'ffmpeg'),
-    type: 'directory'
-  },
-  {
-    name: 'ffprobe-resources.zip',
-    source: path.join(ASSETS_DIR, 'ffprobe'),
-    type: 'directory'
-  },
   {
     name: 'geonames-resources.tar.gz',
     source: path.join(ASSETS_DIR, 'geo', 'geonames-resources.tar.gz'),

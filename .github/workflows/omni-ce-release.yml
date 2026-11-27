@@ -174,24 +174,44 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 配置 MuPDF 编译环境变量
+      - name: 配置 MuPDF 编译环境变量（单源解析）
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "macOS" ]; then
-            SUFFIX="macos-universal"
+            ASSET_NAME="libmupdf-macos-universal.tar.gz"
+            if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
+              SUFFIX="macos-aarch64"
+            else
+              SUFFIX="macos-x86_64"
+            fi
           elif [ "${{ runner.os }}" = "Windows" ]; then
+            ASSET_NAME="libmupdf-windows-x86_64.zip"
             SUFFIX="windows-x86_64"
           else
             if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+              ASSET_NAME="libmupdf-linux-aarch64.tar.gz"
               SUFFIX="linux-aarch64"
             else
+              ASSET_NAME="libmupdf-linux-x86_64.tar.gz"
               SUFFIX="linux-x86_64"
             fi
           fi
-          MUPDF_DIR="${GITHUB_WORKSPACE}/build/libmupdf/${SUFFIX}"
-          if [ -d "$MUPDF_DIR" ]; then
-            echo "MUPDF_LIB=$MUPDF_DIR" >> $GITHUB_ENV
-            echo "🔍 MUPDF_LIB 已配置: $MUPDF_DIR"
+          MUPDF_DIR=$(node scripts/download-libmupdf.js --resolve-dir "${ASSET_NAME}" --arch-suffix "${SUFFIX}")
+          if [ -f "$MUPDF_DIR/include/mupdf/fitz.h" ] || [ -f "$MUPDF_DIR/mupdf/fitz.h" ]; then
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              ABS_LIB="$(cd "$MUPDF_DIR" && pwd -W 2>/dev/null || pwd -P)"
+            else
+              ABS_LIB="$(cd "$MUPDF_DIR" && pwd -P)"
+            fi
+            echo "MUPDF_LIB=$ABS_LIB" >> $GITHUB_ENV
+            echo "MUPDF_DIR=$ABS_LIB" >> $GITHUB_ENV
+            echo "MUPDF_LIB_DIR=$ABS_LIB" >> $GITHUB_ENV
+            echo "MUPDF_INCLUDE_DIR=$ABS_LIB/include" >> $GITHUB_ENV
+            echo "MUPDF_STATIC=1" >> $GITHUB_ENV
+            echo "🔍 MUPDF_LIB 已配置（单源）: $ABS_LIB"
+          else
+            echo "::error::未找到规范单源 MuPDF 头文件与静态库: $MUPDF_DIR"
+            exit 1
           fi
 
       - name: 构建开源二进制
@@ -221,8 +241,10 @@ jobs:
             ls -lh "$BIN_PATH"
           fi
 
-      - name: 打包产物
+      - name: 打包产物（ProductResourceAssembler 声明式装配 + 契约/体量门禁）
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             BIN_NAME="firefly-omni.exe"
@@ -230,22 +252,85 @@ jobs:
             BIN_NAME="firefly-omni"
           fi
           TARGET_DIR="target/${{ matrix.target }}/release"
-          mkdir -p dist
-          cp "${TARGET_DIR}/${BIN_NAME}" "dist/${BIN_NAME}"
-          chmod +x "dist/${BIN_NAME}"
-          cd dist
-          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            if [ "${{ runner.os }}" = "Windows" ]; then
-              7z a "${{ matrix.artifact_name }}" "${BIN_NAME}"
-            else
-              zip -qr "${{ matrix.artifact_name }}" "${BIN_NAME}"
-            fi
-          else
-            tar czf "${{ matrix.artifact_name }}" "${BIN_NAME}"
+          rm -rf dist && mkdir -p dist/bundle
+          cp "${TARGET_DIR}/${BIN_NAME}" "dist/bundle/${BIN_NAME}"
+          chmod +x "dist/bundle/${BIN_NAME}"
+
+          # 定位 ProductResourceAssembler（monorepo 内直用 ../firefly-resources；独立仓 CI 浅克隆临时副本）
+          ASSEMBLER_DIR="../firefly-resources"
+          if [ ! -f "${ASSEMBLER_DIR}/assemble-product.js" ]; then
+            git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/Leonard-Li777/firefly-resources.git" _firefly_resources
+            ASSEMBLER_DIR="_firefly_resources"
           fi
-          rm -f "${BIN_NAME}"
+          case "${{ matrix.target }}" in
+            x86_64-pc-windows-msvc)   ASM_PLAT="win32"; ASM_ARCH="x64" ;;
+            aarch64-pc-windows-msvc)  ASM_PLAT="win32"; ASM_ARCH="arm64" ;;
+            x86_64-apple-darwin)      ASM_PLAT="darwin"; ASM_ARCH="x64" ;;
+            aarch64-apple-darwin)     ASM_PLAT="darwin"; ASM_ARCH="arm64" ;;
+            x86_64-unknown-linux-gnu) ASM_PLAT="linux"; ASM_ARCH="x64" ;;
+            aarch64-unknown-linux-gnu) ASM_PLAT="linux"; ASM_ARCH="arm64" ;;
+          esac
+
+          node "${ASSEMBLER_DIR}/assemble-product.js" \
+            --product omni-ce \
+            --mode release-locked \
+            --target-root "dist/bundle/resources" \
+            --preset-dir "build/presetResources" \
+            --platform "${ASM_PLAT}" \
+            --arch "${ASM_ARCH}"
+
+          # 契约与体量硬门禁：必须是 CE 版本、<= 100 MB、且 0 Pro 资产残留
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const { execFileSync } = require("child_process");
+            const bundleRoot = path.resolve("dist/bundle");
+            const bin = path.join(bundleRoot, process.argv[1]);
+            const contract = JSON.parse(execFileSync(bin, ["contract", "--json"], { encoding: "utf8" }));
+            if (contract.edition !== "ce") {
+              throw new Error("Omni CE 发行包契约违规: edition=" + contract.edition);
+            }
+            const resRoot = path.join(bundleRoot, "resources");
+            for (const reqRel of contract.requiredStaticPaths || []) {
+              if (!fs.existsSync(path.join(resRoot, reqRel))) {
+                throw new Error("Omni CE 缺失契约静态资源: " + reqRel);
+              }
+            }
+            const forbidden = ["semantic", "taxonomy", "geo", "models", "libmupdf", "libclang", "onnxruntime", "DirectML", "sherpa"];
+            let totalBytes = 0;
+            const walk = (d) => {
+              for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
+                const full = path.join(d, ent.name);
+                if (forbidden.some(f => ent.name.toLowerCase().includes(f.toLowerCase()))) {
+                  throw new Error("Omni CE 禁止混入 Pro/禁止项资产: " + full);
+                }
+                if (ent.isDirectory()) walk(full);
+                else totalBytes += fs.statSync(full).size;
+              }
+            };
+            walk(bundleRoot);
+            const totalMb = totalBytes / (1024 * 1024);
+            console.log(`✔ Omni CE contract OK: edition=${contract.edition}, size=${totalMb.toFixed(2)} MB`);
+            if (totalMb > 100) {
+              throw new Error(`Omni CE 体积超限 (${totalMb.toFixed(2)} MB > 100 MB)`);
+            }
+          ' "${BIN_NAME}"
+
+          (
+            cd dist/bundle
+            if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+              if [ "${{ runner.os }}" = "Windows" ]; then
+                7z a "../${{ matrix.artifact_name }}" .
+              else
+                zip -qr "../${{ matrix.artifact_name }}" .
+              fi
+            else
+              tar czf "../${{ matrix.artifact_name }}" .
+            fi
+          )
+          rm -rf dist/bundle _firefly_resources
           echo "ARTIFACT_PATH=dist/${{ matrix.artifact_name }}" >> $GITHUB_ENV
-          ls -lh
+          ls -lh dist
 
       - name: 解析发布版本号（从 Cargo.toml 或 inputs，禁止使用 github.ref_name）
         id: resolve_tag

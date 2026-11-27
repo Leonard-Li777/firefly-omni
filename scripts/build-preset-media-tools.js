@@ -238,27 +238,19 @@ async function buildExifTool() {
 }
 
 async function main() {
-  console.log('🚀 开始构建 omni presetResources 预设压缩包...')
+  console.log('⚠️ build-preset-media-tools.js 已退役：exiftool / ffmpeg / ffprobe 唯一权威发布与装配入口已收敛至 apps/firefly-resources（ADR-0029）。')
+  console.log('ℹ️ 请改用 apps/firefly-resources/assemble-product.js --product <desktop|omni-ce|engine>。')
+  if (!process.argv.includes('--legacy-npm-media')) {
+    return
+  }
   ensureDir(OMNI_PRESET_DIR)
   ensureDir(TEMP_DIR)
-
-  // ffmpeg / ffprobe 已切换到 firefly-resources 公共资源发布链（见函数注释），默认不再生成
-  if (process.argv.includes('--legacy-npm-media')) {
-    console.warn(
-      '⚠️ 已显式启用 --legacy-npm-media：将用 @ffmpeg-installer npm 包生成 2018 年老二进制，' +
-        '仅用于历史比对，严禁用于发布或打进安装包'
-    )
-    await buildFfmpegAndFfprobeLegacy()
-  } else {
-    console.log(
-      '⏭️ 跳过 ffmpeg/ffprobe：唯一来源为 firefly-resources（ffmpeg-master-<ver> 资产），' +
-        '需要历史产物请传 --legacy-npm-media'
-    )
-  }
+  console.warn(
+    '⚠️ 已显式启用 --legacy-npm-media：将用 @ffmpeg-installer npm 包生成 2018 年老二进制，' +
+      '仅用于历史比对，严禁用于发布或打进安装包'
+  )
+  await buildFfmpegAndFfprobeLegacy()
   await buildExifTool()
-
-  console.log('\n🎉 omni 所有平台的 presetResources 压缩包已准备完毕！')
-  console.log(`📁 目录: ${OMNI_PRESET_DIR}`)
 }
 
 if (require.main === module) {
