@@ -398,8 +398,8 @@ pub mod perceive {
         _perceive_timeout_sec: Option<f64>,
         _elapsed_before_visual_sec: f64,
         _cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    ) -> (Vec<omni_core::OmniVideoChunk>, VideoProcessTimings, Option<image::RgbImage>) {
-        (Vec::new(), VideoProcessTimings::default(), None)
+    ) -> Result<(Vec<omni_core::OmniVideoChunk>, VideoProcessTimings, Option<image::RgbImage>), super::PipelineError> {
+        Ok((Vec::new(), VideoProcessTimings::default(), None))
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,50 +493,361 @@ pub mod vision {
         pub confidence: f32,
     }
 
-    pub const CLIP_TEXT_DIM: usize = 512;
-    pub const CLIP_TEXT_OUTPUT_UNSUPPORTED: &str = "unsupported_text_output";
-
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-    #[serde(rename_all = "camelCase")]
-    pub struct MobileClipVocabStatus {
-        pub status: String,
-        pub valid: bool,
-        pub branch: String,
-        pub reject_reason: Option<String>,
-        pub detail: Option<String>,
-        pub vocab_version: Option<String>,
-        pub vocab_sha256: Option<String>,
-        pub vocab_text_sha256: Option<String>,
-        pub vocab_entry_count: Option<usize>,
-        pub expected_vocab_version: String,
-        pub expected_vocab_sha256: String,
-        pub expected_vocab_text_sha256: String,
-        pub expected_vocab_entry_count: usize,
-        #[serde(skip_serializing)]
-        pub bin_path: Option<std::path::PathBuf>,
-        #[serde(skip_serializing)]
-        pub txt_path: Option<std::path::PathBuf>,
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum PipelineError {
+        MissingAsset(String),
+        CorruptAsset(String),
+        StaleVocab(String),
+        CorruptInput(String),
+        InferenceFailed(String),
     }
 
-    pub fn verify_mobileclip_en_vocab() -> MobileClipVocabStatus {
-        MobileClipVocabStatus {
-            status: "vocab_missing".to_string(),
-            valid: false,
-            branch: "none".to_string(),
-            reject_reason: Some("vocab_missing".to_string()),
-            detail: Some("MobileCLIP vocab not available in Community Edition".to_string()),
-            vocab_version: None,
-            vocab_sha256: None,
-            vocab_text_sha256: None,
-            vocab_entry_count: None,
-            expected_vocab_version: "20261111-v1".to_string(),
-            expected_vocab_sha256: String::new(),
-            expected_vocab_text_sha256: String::new(),
-            expected_vocab_entry_count: 246,
-            bin_path: None,
-            txt_path: None,
+    impl PipelineError {
+        pub fn http_status_u16(&self) -> u16 {
+            match self {
+                Self::MissingAsset(_) | Self::CorruptAsset(_) | Self::InferenceFailed(_) => 500,
+                Self::StaleVocab(_) => 409,
+                Self::CorruptInput(_) => 422,
+            }
+        }
+
+        pub fn from_asset_error(err: &omni_core::runtime_asset::AssetError) -> Self {
+            use omni_core::runtime_asset::AssetError;
+            match err {
+                AssetError::AssetMissing { .. } => Self::MissingAsset(err.to_string()),
+                AssetError::AssetCorrupt { reason, .. } => Self::CorruptAsset(reason.clone()),
+                AssetError::Incompatible { reason, .. } => Self::StaleVocab(reason.clone()),
+                AssetError::NotProvisioned { .. } => Self::StaleVocab(err.to_string()),
+            }
         }
     }
+
+    impl std::fmt::Display for PipelineError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::MissingAsset(m) => write!(f, "ASSET_MISSING: {m}"),
+                Self::CorruptAsset(m) => write!(f, "ASSET_CORRUPT: {m}"),
+                Self::StaleVocab(m) => write!(f, "VISUAL_VOCAB_STALE: {m}"),
+                Self::CorruptInput(m) => write!(f, "CORRUPT_INPUT: {m}"),
+                Self::InferenceFailed(m) => write!(f, "INFERENCE_FAILED: {m}"),
+            }
+        }
+    }
+
+    impl std::error::Error for PipelineError {}
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub enum MediaDomain {
+        Image,
+        Video,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum TaggerSource {
+        ChineseClip,
+        MobileClip,
+        Gemma,
+    }
+
+    impl TaggerSource {
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::ChineseClip => "chinese_clip",
+                Self::MobileClip => "mobile_clip",
+                Self::Gemma => "gemma",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum VisualTagSourceKind {
+        SystemDimension,
+        MutualGroup,
+        FineGrainedEntity,
+        PhysicalOperator,
+        OcrText,
+        Nsfw,
+        Quality,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum VisualMutualGroup {
+        ContentForm,
+        TextPresence,
+        ColorMode,
+        PhotoGenre,
+        ComicLayout,
+        ComicAudience,
+        BillType,
+        CertType,
+        ScreenshotScene,
+        GenerateVector,
+        ShotScale,
+        Lighting,
+        Perspective,
+        Layout,
+        SystemEcology,
+        NumberOfSubjects,
+        TimeSeason,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum OcrEvidenceState {
+        #[default]
+        NoText,
+        Detected,
+        Unavailable,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct OcrEvidence {
+        pub raw_text: String,
+        pub char_count: usize,
+        pub has_large_title: bool,
+        pub state: OcrEvidenceState,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct VisionRequestContext {
+        pub media_domain: MediaDomain,
+        pub lang: Option<String>,
+        pub path_hint: Option<String>,
+        pub file_name: String,
+        pub photo_type_override: Option<String>,
+        pub ocr: OcrEvidence,
+        pub width: u32,
+        pub height: u32,
+        pub top_k: usize,
+    }
+
+    impl VisionRequestContext {
+        pub fn for_image(
+            file_name: impl Into<String>,
+            width: u32,
+            height: u32,
+            lang: Option<String>,
+            ocr: OcrEvidence,
+        ) -> Self {
+            Self {
+                media_domain: MediaDomain::Image,
+                lang,
+                path_hint: None,
+                file_name: file_name.into(),
+                photo_type_override: None,
+                ocr,
+                width,
+                height,
+                top_k: 10,
+            }
+        }
+
+        pub fn for_video(
+            file_name: impl Into<String>,
+            width: u32,
+            height: u32,
+            lang: Option<String>,
+        ) -> Self {
+            Self {
+                media_domain: MediaDomain::Video,
+                lang,
+                path_hint: None,
+                file_name: file_name.into(),
+                photo_type_override: None,
+                ocr: OcrEvidence {
+                    state: OcrEvidenceState::Unavailable,
+                    ..Default::default()
+                },
+                width,
+                height,
+                top_k: 10,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VisualTagOutput {
+        pub code: String,
+        pub name: String,
+        pub confidence: f32,
+        pub raw_dot: f32,
+        pub source_kind: VisualTagSourceKind,
+        pub mutual_group: Option<VisualMutualGroup>,
+        pub engine: &'static str,
+        pub origin: TaggerSource,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct SingleForwardVectors {
+        pub retrieval_vec: Vec<f32>,
+        pub tagging_vec_512: Vec<f32>,
+        pub encoder_id: u8,
+        pub encoder_digest: String,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct VisualPerceptionOutput {
+        pub vectors: SingleForwardVectors,
+        pub modal_type: String,
+        pub domain_id: u16,
+        pub tags: Vec<VisualTagOutput>,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct SemanticClosureSnapshot;
+
+    #[derive(Debug, Clone, Default)]
+    pub struct VisualRuntimeSnapshot {
+        pub compiled_at_ms: u64,
+    }
+
+    pub fn current_runtime_snapshot() -> Option<std::sync::Arc<VisualRuntimeSnapshot>> {
+        None
+    }
+
+    pub fn vocab_layers_health() -> omni_core::runtime_asset::AssetHealth {
+        omni_core::runtime_asset::AssetHealth {
+            status: omni_core::runtime_asset::AssetStatus::NotProvisioned,
+            source: "asset",
+            path: None,
+            version: None,
+            reason: Some("Community Edition".to_string()),
+            last_failure_at_ms: None,
+            retry_after_ms: None,
+        }
+    }
+
+    pub fn domain_matrix_health() -> omni_core::runtime_asset::AssetHealth {
+        vocab_layers_health()
+    }
+
+    pub fn detect_physical_operators_for_domain(
+        _img: Option<&image::DynamicImage>,
+        _width: u32,
+        _height: u32,
+        _ocr_char_count: usize,
+        _has_large_title: bool,
+        _domain: MediaDomain,
+    ) -> Vec<(omni_core::concepts::Concept, &'static str)> {
+        Vec::new()
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VisualTaggerEncoderSlotHealth {
+        pub encoder_id: u8,
+        pub status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub code: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VisualTaggerSlotsHealth {
+        pub chinese_clip: omni_core::runtime_asset::AssetHealth,
+        pub mobile_clip: omni_core::runtime_asset::AssetHealth,
+        pub gemma: omni_core::runtime_asset::AssetHealth,
+        pub snapshot_ready: bool,
+        pub status: String,
+        pub by_encoder: std::collections::HashMap<String, VisualTaggerEncoderSlotHealth>,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VisualVocabEngineStatus {
+        pub active_status: String,
+        pub active_encoder_id: u8,
+        pub by_encoder: std::collections::HashMap<String, VisualTaggerEncoderSlotHealth>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct LoadedVisualCodeTable {
+        pub encoder_id: u8,
+        pub encoder_digest: String,
+        pub embedding_space_id: String,
+        pub bake_revision: u32,
+        pub version: String,
+        pub entries: Vec<()>,
+    }
+
+    fn disabled_encoder_slot_health(encoder_id: u8) -> VisualTaggerEncoderSlotHealth {
+        VisualTaggerEncoderSlotHealth {
+            encoder_id,
+            status: "not_provisioned".to_string(),
+            code: Some("COMMUNITY_EDITION".to_string()),
+            error: Some("Community Edition".to_string()),
+        }
+    }
+
+    pub fn tagger_slots_health() -> VisualTaggerSlotsHealth {
+        let disabled = omni_core::runtime_asset::AssetHealth {
+            status: omni_core::runtime_asset::AssetStatus::NotProvisioned,
+            source: "asset",
+            path: None,
+            version: None,
+            reason: Some("Community Edition".to_string()),
+            last_failure_at_ms: None,
+            retry_after_ms: None,
+        };
+        let mut by_encoder = std::collections::HashMap::with_capacity(3);
+        by_encoder.insert("2".to_string(), disabled_encoder_slot_health(2));
+        by_encoder.insert("3".to_string(), disabled_encoder_slot_health(3));
+        by_encoder.insert("4".to_string(), disabled_encoder_slot_health(4));
+        VisualTaggerSlotsHealth {
+            chinese_clip: disabled.clone(),
+            mobile_clip: disabled.clone(),
+            gemma: disabled,
+            snapshot_ready: false,
+            status: "not_provisioned".to_string(),
+            by_encoder,
+        }
+    }
+
+    pub fn build_visual_vocab_status(
+        embedding_profile: &str,
+        _lang_opt: Option<&str>,
+    ) -> (VisualVocabEngineStatus, &'static str) {
+        let h = tagger_slots_health();
+        let active_encoder_id = if embedding_profile == "gemma_unified" {
+            4
+        } else {
+            2
+        };
+        (
+            VisualVocabEngineStatus {
+                active_status: "not_provisioned".to_string(),
+                active_encoder_id,
+                by_encoder: h.by_encoder,
+            },
+            "unavailable",
+        )
+    }
+
+    pub fn verify_visual_vocab_staging_dir(
+        _dir: &Path,
+        _expected_encoder_id: Option<u8>,
+    ) -> Result<LoadedVisualCodeTable, omni_core::runtime_asset::AssetError> {
+        Err(omni_core::runtime_asset::AssetError::NotProvisioned {
+            kind: omni_core::runtime_asset::AssetKind::Tagger,
+        })
+    }
+
+    pub fn reload_runtime_snapshot(
+        _closure: &SemanticClosureSnapshot,
+        _force_slots: bool,
+    ) -> Result<std::sync::Arc<VisualRuntimeSnapshot>, omni_core::runtime_asset::AssetError> {
+        Err(omni_core::runtime_asset::AssetError::NotProvisioned {
+            kind: omni_core::runtime_asset::AssetKind::Tagger,
+        })
+    }
+
+    pub const CLIP_TEXT_DIM: usize = 512;
+    pub const CLIP_TEXT_OUTPUT_UNSUPPORTED: &str = "unsupported_text_output";
 
     pub fn clip_text_model_ready(_clip_dir: &Path) -> bool {
         false
@@ -641,10 +952,6 @@ pub mod vision {
             false
         }
 
-        pub fn warmup_ram() -> bool {
-            false
-        }
-
         pub fn warmup_clip_vision(_lang: Option<&str>) -> bool {
             false
         }
@@ -665,28 +972,27 @@ pub mod vision {
             Ok(String::new())
         }
 
-        pub fn extract_clip_visual_tags_from_image(
-            _img: &image::DynamicImage,
-            _lang: Option<&str>,
-            _top_k: usize,
-        ) -> Vec<String> {
-            Vec::new()
-        }
-
-        pub fn extract_ram_tags(
-            _img: &image::DynamicImage,
-            _lang: Option<&str>,
-            _top_k: usize,
-        ) -> Vec<omni_core::TagChainItem> {
-            Vec::new()
-        }
-
         pub fn resolve_tag_to_chain_item(tag: &str, confidence: f32) -> omni_core::TagChainItem {
-            // G1 词形闸（拒绝先于铸造）：开源兜底同样不得为不合格词产出 code。
-            // 闸与铸造**必须同源取自修剪后串**（S1 #705 第 1 轮 P2-5）：若闸判 trim 串、
-            // 铸造用原串，`"\u{85}abc"` 会产出 `builtin.\u{85}abc`——C1 控制字符直入 code/name。
-            // 与 `omni_core::tag_identity::normalize_tag_to_code` 的「trim 一次、两处同用」保持一致。
+            Self::resolve_tag_to_chain_item_with_lang(tag, confidence, None)
+        }
+
+        pub fn resolve_tag_to_chain_item_with_lang(
+            tag: &str,
+            confidence: f32,
+            current_lang: Option<&str>,
+        ) -> omni_core::TagChainItem {
+            // G1 词形闸（拒绝先于铸造）：与 omni_core::tag_identity 保持一致，严禁 format!("builtin.{}") 伪受控码。
             let tag_clean = tag.trim();
+            if let Some((code, canonical)) =
+                omni_core::tag_identity::resolve_controlled_tag_two_stage(tag_clean, current_lang)
+            {
+                return omni_core::TagChainItem {
+                    code: code.to_string(),
+                    name: canonical.unwrap_or_else(|| tag_clean.to_string()),
+                    confidence,
+                    ..Default::default()
+                };
+            }
             if omni_core::tag_admissibility::is_g1_rejected(tag_clean) {
                 return omni_core::TagChainItem {
                     code: String::new(),
@@ -696,19 +1002,11 @@ pub mod vision {
                 };
             }
             omni_core::TagChainItem {
-                code: format!("builtin.{}", tag_clean),
+                code: omni_core::tag_identity::derive_ext_tag_code(tag_clean),
                 name: tag_clean.to_string(),
                 confidence,
                 ..Default::default()
             }
-        }
-
-        pub fn resolve_tag_to_chain_item_with_lang(
-            tag: &str,
-            confidence: f32,
-            _current_lang: Option<&str>,
-        ) -> omni_core::TagChainItem {
-            Self::resolve_tag_to_chain_item(tag, confidence)
         }
 
         pub fn calibrate_clip_score(sim: f32) -> f32 {
@@ -721,22 +1019,6 @@ pub mod vision {
             _photo_type: Option<&str>,
             _engine_lookup: &std::collections::HashMap<String, String>,
         ) {}
-
-        pub fn try_extract_clip_visual_tags_scored_from_image(
-            _img: &image::DynamicImage,
-            _lang: Option<&str>,
-            _top_k: usize,
-        ) -> Result<Vec<(String, f32)>, String> {
-            Ok(Vec::new())
-        }
-
-        pub fn extract_clip_visual_tags_scored_from_image(
-            _img: &image::DynamicImage,
-            _lang: Option<&str>,
-            _top_k: usize,
-        ) -> Vec<(String, f32)> {
-            Vec::new()
-        }
 
         pub fn resolve_chinese_clip_model_dir() -> Option<std::path::PathBuf> {
             None
@@ -812,39 +1094,10 @@ pub mod vision {
             "uninitialized".to_string()
         }
 
-        pub fn ram_vision_status() -> String {
-            "disabled: pro_stub".to_string()
-        }
-
         pub fn evict_gemma_vision() {}
 
         pub fn is_gemma_vision_resident() -> bool {
             false
-        }
-
-        pub fn extract_clip_visual_tags_from_image_with_hint(
-            _img: &image::DynamicImage,
-            _path_hint: Option<&str>,
-            _lang: Option<&str>,
-            _top_k: usize,
-        ) -> Vec<String> {
-            Vec::new()
-        }
-
-        pub fn extract_clip_visual_tags<P: AsRef<Path>>(
-            _image_path: P,
-            _lang: Option<&str>,
-            _top_k: usize,
-        ) -> Vec<String> {
-            Vec::new()
-        }
-
-        pub fn extract_clip_high_confidence_tags(
-            _img: &image::DynamicImage,
-            _path_hint: Option<&str>,
-            _lang: Option<&str>,
-        ) -> Vec<String> {
-            Vec::new()
         }
 
         pub fn extract_morphology_tags(
@@ -956,7 +1209,7 @@ pub mod vision {
         pub fn synthesize_cascade_hypotheses_and_arbitrate(
             _file_path: &str,
             _system_dimension_tags: &[String],
-            _ram_tags: &[omni_core::TagChainItem],
+            _subject_tags: &[omni_core::TagChainItem],
             _morphology_tags: &[String],
             _nsfw_tags: &[String],
             _image_embedding: Option<&[f32]>,
@@ -975,7 +1228,7 @@ pub mod vision {
         pub fn synthesize_cascade_hypotheses_and_arbitrate_with_encoder(
             _file_path: &str,
             _system_dimension_tags: &[String],
-            _ram_tags: &[omni_core::TagChainItem],
+            _subject_tags: &[omni_core::TagChainItem],
             _morphology_tags: &[String],
             _nsfw_tags: &[String],
             _image_embedding: Option<&[f32]>,
@@ -998,12 +1251,61 @@ pub mod vision {
         ) -> Vec<String> {
             Vec::new()
         }
+
+        pub fn detect_physical_operators_for_domain(
+            _img: Option<&image::DynamicImage>,
+            _width: u32,
+            _height: u32,
+            _ocr_char_count: usize,
+            _has_large_title: bool,
+            _domain: MediaDomain,
+        ) -> Vec<(omni_core::concepts::Concept, &'static str)> {
+            Vec::new()
+        }
+
+        pub fn encode_single_forward_for_profile(
+            _img: &image::DynamicImage,
+            _embedding_profile: &str,
+            _lang: Option<&str>,
+            _target_retrieval_dim: usize,
+        ) -> Result<(SingleForwardVectors, TaggerSource), PipelineError> {
+            Err(PipelineError::MissingAsset("Open-core mode: visual perception requires omni-pro".to_string()))
+        }
+
+        pub fn encode_for_visual_pipeline(
+            _img: &image::DynamicImage,
+            _embedding_profile: &str,
+            _lang: Option<&str>,
+            _target_retrieval_dim: usize,
+            _closure_opt: Option<&SemanticClosureSnapshot>,
+        ) -> Result<(std::sync::Arc<VisualRuntimeSnapshot>, SingleForwardVectors, TaggerSource), PipelineError> {
+            Err(PipelineError::MissingAsset("Open-core mode: visual perception requires omni-pro".to_string()))
+        }
+
+        pub fn finish_visual_pipeline(
+            _snapshot: &VisualRuntimeSnapshot,
+            _vectors: SingleForwardVectors,
+            _origin: TaggerSource,
+            _ctx: &VisionRequestContext,
+            _img_opt: Option<&image::DynamicImage>,
+        ) -> Result<VisualPerceptionOutput, PipelineError> {
+            Err(PipelineError::MissingAsset("Open-core mode: visual perception requires omni-pro".to_string()))
+        }
+
+        pub fn perceive_visual_single_forward(
+            _img: &image::DynamicImage,
+            _embedding_profile: &str,
+            _target_retrieval_dim: usize,
+            _ctx: &VisionRequestContext,
+            _closure_opt: Option<&SemanticClosureSnapshot>,
+        ) -> Result<VisualPerceptionOutput, PipelineError> {
+            Err(PipelineError::MissingAsset("Open-core mode: visual perception requires omni-pro".to_string()))
+        }
     }
 }
 
 pub use vision::{
-    is_nsfw_or_restricted_tag, is_vocab_layer_blocked, MobileClipVocabStatus, OCRBoxResult,
-    OmniVisionEngine,
+    is_nsfw_or_restricted_tag, is_vocab_layer_blocked, OCRBoxResult, OmniVisionEngine, PipelineError,
 };
 
 pub mod hownet {
@@ -2091,6 +2393,9 @@ pub mod omw_db {
         pub fn validate(&self) -> bool {
             false
         }
+        pub fn build_visual_semantic_closure(&self) -> anyhow::Result<crate::vision::SemanticClosureSnapshot> {
+            anyhow::bail!("Open-core mode: omw requires omni-pro");
+        }
         pub fn with_conn<F, T>(&self, _f: F) -> anyhow::Result<T>
         where
             F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T>,
@@ -2367,16 +2672,28 @@ mod tests {
         OmniVisionEngine::apply_domain_matrix_gating(&mut tags, &[], None, &engine_lookup);
         assert_eq!(tags.len(), 1);
 
-        let scored = OmniVisionEngine::extract_clip_visual_tags_scored_from_image(
-            &image::DynamicImage::new_rgb8(1, 1),
+        let ctx = vision::VisionRequestContext::for_image(
+            "ce.png",
+            1,
+            1,
             None,
-            5,
+            vision::OcrEvidence::default(),
         );
-        assert!(scored.is_empty());
+        let pipe_res = OmniVisionEngine::perceive_visual_single_forward(
+            &image::DynamicImage::new_rgb8(1, 1),
+            "classic_light",
+            512,
+            &ctx,
+            None,
+        );
+        assert!(matches!(pipe_res, Err(PipelineError::MissingAsset(_))));
+
+        let (v_status, t_src) = vision::build_visual_vocab_status("classic_light", None);
+        assert_eq!(v_status.active_status, "not_provisioned");
+        assert_eq!(t_src, "unavailable");
 
         let chain = OmniVisionEngine::resolve_tag_to_chain_item_with_lang("测试", 0.9, Some("zh"));
-        assert_eq!(chain.name, "测试");
-        assert_eq!(chain.code, "builtin.测试");
+        assert_ne!(chain.code, "builtin.测试");
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub enum AssetKind {
     VocabLayers,
     DomainMatrix,
     SemanticPack,
+    Tagger,
 }
 
 impl AssetKind {
@@ -38,11 +39,12 @@ impl AssetKind {
             AssetKind::VocabLayers => "vocab_layers",
             AssetKind::DomainMatrix => "domain_matrix",
             AssetKind::SemanticPack => "semantic_pack",
+            AssetKind::Tagger => "tagger",
         }
     }
 }
 
-/// 四类失败语义（见规格书 §2.2）
+/// 资产加载失败语义（Spec §2.2 & Visual Tagger v2.12 §3.3）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssetError {
     /// 应随包分发但找不到
@@ -56,6 +58,12 @@ pub enum AssetError {
         path: Option<PathBuf>,
         reason: String,
     },
+    /// 挂载陈旧、模型/schema 版本不兼容或摘要失配（HTTP 409 ENGINE_NOT_READY）
+    Incompatible {
+        kind: AssetKind,
+        path: Option<PathBuf>,
+        reason: String,
+    },
     /// 该能力/资产本就未安装（可选插件资产）
     NotProvisioned { kind: AssetKind },
 }
@@ -65,6 +73,7 @@ impl AssetError {
         match self {
             AssetError::AssetMissing { kind, .. } => *kind,
             AssetError::AssetCorrupt { kind, .. } => *kind,
+            AssetError::Incompatible { kind, .. } => *kind,
             AssetError::NotProvisioned { kind } => *kind,
         }
     }
@@ -74,6 +83,7 @@ impl AssetError {
         match self {
             AssetError::AssetMissing { .. } => "ASSET_MISSING",
             AssetError::AssetCorrupt { .. } => "ASSET_CORRUPT",
+            AssetError::Incompatible { .. } => "ENGINE_NOT_READY",
             AssetError::NotProvisioned { .. } => "NOT_PROVISIONED",
         }
     }
@@ -82,6 +92,7 @@ impl AssetError {
         match self {
             AssetError::AssetMissing { .. } => AssetStatus::Missing,
             AssetError::AssetCorrupt { .. } => AssetStatus::Corrupt,
+            AssetError::Incompatible { .. } => AssetStatus::Stale,
             AssetError::NotProvisioned { .. } => AssetStatus::NotProvisioned,
         }
     }
@@ -90,13 +101,23 @@ impl AssetError {
         match self {
             AssetError::AssetMissing { path, .. } => path.as_deref(),
             AssetError::AssetCorrupt { path, .. } => path.as_deref(),
+            AssetError::Incompatible { path, .. } => path.as_deref(),
             AssetError::NotProvisioned { .. } => None,
+        }
+    }
+
+    pub fn reason_str(&self) -> Option<&str> {
+        match self {
+            AssetError::AssetCorrupt { reason, .. } => Some(reason.as_str()),
+            AssetError::Incompatible { reason, .. } => Some(reason.as_str()),
+            _ => None,
         }
     }
 
     fn reason_text(&self) -> Option<String> {
         match self {
             AssetError::AssetCorrupt { reason, .. } => Some(reason.clone()),
+            AssetError::Incompatible { reason, .. } => Some(reason.clone()),
             AssetError::AssetMissing { .. } => Some("资产文件缺失".to_string()),
             AssetError::NotProvisioned { .. } => None,
         }
@@ -111,6 +132,17 @@ impl std::fmt::Display for AssetError {
                 None => write!(f, "{}: {}（未找到资产）", self.code(), kind.as_str()),
             },
             AssetError::AssetCorrupt { kind, path, reason } => match path {
+                Some(p) => write!(
+                    f,
+                    "{}: {}（{}）: {}",
+                    self.code(),
+                    kind.as_str(),
+                    p.display(),
+                    reason
+                ),
+                None => write!(f, "{}: {}: {}", self.code(), kind.as_str(), reason),
+            },
+            AssetError::Incompatible { kind, path, reason } => match path {
                 Some(p) => write!(
                     f,
                     "{}: {}（{}）: {}",
@@ -137,6 +169,7 @@ pub enum AssetStatus {
     Ok,
     Missing,
     Corrupt,
+    Stale,
     NotProvisioned,
 }
 
@@ -146,6 +179,7 @@ impl AssetStatus {
             AssetStatus::Ok => "ok",
             AssetStatus::Missing => "missing",
             AssetStatus::Corrupt => "corrupt",
+            AssetStatus::Stale => "stale",
             AssetStatus::NotProvisioned => "not_provisioned",
         }
     }
@@ -336,17 +370,23 @@ impl<T: 'static> AssetSlot<T> {
                 Ok(arc)
             }
             Err(err) => {
-                *self.health.write().unwrap_or_else(|e| e.into_inner()) = AssetHealth::failed(
-                    &err,
-                    Some(NEGATIVE_CACHE_TTL.as_millis() as u64),
-                );
-                *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.clone());
-                *self.retry_at.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(Instant::now() + NEGATIVE_CACHE_TTL);
+                self.record_failure(&err);
                 tracing::error!(kind = kind.as_str(), error = %err, "规则资产加载失败（fail-closed）");
                 Err(err)
             }
         }
+    }
+
+    /// 显式写入槽位失败状态与有界负缓存，并清空旧快照（用于加载后编译失败的 Fail-Closed 隔离）
+    pub fn record_failure(&self, err: &AssetError) {
+        *self.value.write().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.health.write().unwrap_or_else(|e| e.into_inner()) = AssetHealth::failed(
+            err,
+            Some(NEGATIVE_CACHE_TTL.as_millis() as u64),
+        );
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.clone());
+        *self.retry_at.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Instant::now() + NEGATIVE_CACHE_TTL);
     }
 }
 
@@ -595,6 +635,18 @@ mod tests {
             bad["assets"].get("version").is_none(),
             "失败态不得伪造 version"
         );
+
+        let stale = AssetError::Incompatible {
+            kind: AssetKind::Tagger,
+            path: None,
+            reason: "visual_vocab_stale".to_string(),
+        };
+        assert_eq!(stale.code(), "ENGINE_NOT_READY");
+        assert_eq!(stale.status(), AssetStatus::Stale);
+        assert_eq!(stale.kind().as_str(), "tagger");
+        let stale_health = serde_json::json!({ "assets": AssetHealth::from_error(&stale) });
+        assert_eq!(stale_health["assets"]["status"], "stale");
+        assert_eq!(stale_health["assets"]["reason"], "visual_vocab_stale");
     }
 }
 

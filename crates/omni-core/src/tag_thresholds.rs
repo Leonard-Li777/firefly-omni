@@ -55,17 +55,6 @@ pub const GEMMA_CALIBRATE_SLOPE: f32 = 1.2;
 /// Gemma 标定 conf 上限（饱和值，详见事故规格 §4.4：全库 visual 组该通道恒等于此值）
 pub const GEMMA_CALIBRATE_CAP: f32 = 0.95;
 
-// ============ RAM（omni-vision extract_ram_tags*） ============
-
-/// RAM ONNX 主路径概率阈值
-pub const RAM_ONNX_THRESHOLD: f32 = 0.5;
-
-/// RAM 降级路径（embeddings 点积）绝对阈值
-pub const RAM_FALLBACK_THRESHOLD: f32 = 0.22;
-
-/// RAM 降级路径 Top-1 侧向抑制 margin
-pub const RAM_FALLBACK_MARGIN: f32 = 0.05;
-
 // ============ 互斥组（classify_mutual_exclusive_groups） ============
 
 /// 互斥组宽松最低置信阈值（多数内容域组）
@@ -230,7 +219,6 @@ mod tests {
     fn threshold_constants_are_consistent() {
         assert!(CLIP_ABS_THRESHOLD > 0.0);
         assert!(CLIP_TOP_MARGIN > 0.0);
-        assert!(RAM_ONNX_THRESHOLD > RAM_FALLBACK_THRESHOLD);
         assert!(MUTUAL_GROUP_MARGIN > 0.0);
         assert!(EXIT_CONFIDENCE_THRESHOLD > LAYER_FALLBACK_CLIP);
         assert!(LAYER_FALLBACK_OCR > LAYER_FALLBACK_PHYSICAL);

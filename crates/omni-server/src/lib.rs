@@ -336,6 +336,8 @@ pub fn create_app_router(state: AppState) -> Router {
             .route("/api/v1/taxonomy/fast-recognize", post(routes::taxonomy::fast_recognize_handler))
             .route("/api/taxonomy/reload-policies", post(routes::taxonomy::reload_policies_handler))
             .route("/api/v1/taxonomy/reload-policies", post(routes::taxonomy::reload_policies_handler))
+            // 视觉词表与目录事务隔离重载入口（Strict Single-Flight，独立于 /api/v1/taxonomy/reload-policies）
+            .route("/api/v1/assets/reload", post(assets_reload_handler))
             .route("/api/v1/vector/upsert", post(routes::vector::vector_upsert_handler))
             .route("/api/v1/vector/search", post(routes::vector::vector_search_handler))
             .route("/api/v1/vector/get", post(routes::vector::vector_get_handler))
@@ -400,7 +402,11 @@ async fn version_handler() -> Json<serde_json::Value> {
 }
 
 /// 引擎与多模态塔运行时状态查询: GET /api/v1/engine/status
-async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn engine_status_handler(
+    Query(query): Query<HealthQuery>,
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let lang_opt = query.lang.clone();
     let cfg = state.config.lock().unwrap().clone();
     let profile = cfg.embedding_profile;
     let mrl_dim = cfg.mrl_dimension;
@@ -426,36 +432,26 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
         .as_ref()
         .map(|p| p.to_string_lossy().to_string())
         .or_else(|| Some(state.vector.dir().to_string_lossy().to_string()));
-    // 消除剩余尾盘同步磁盘 stat（ram_vision_status / mount_manifest_status / verify_mobileclip_en_vocab），
+    // 消除剩余尾盘同步磁盘 stat（mount_manifest_status / tagger_slots_health / build_visual_vocab_status），
     // 统一在短 spawn_blocking 中完成，严禁在 Tokio async worker 线程执行同步文件系统调用（spec §2.2.1）
-    let (ram_status, mount_manifest, mobile_clip_vocab) = tokio::task::spawn_blocking(move || {
-        let ram_status = if is_pro {
-            omni_pro::OmniVisionEngine::ram_vision_status()
-        } else {
-            "disabled: pro_disabled".to_string()
-        };
-        let mount_manifest = omni_core::plugin_dir::mount_manifest_status();
-        let mobile_clip_vocab = if is_pro {
-            // 仅当挂载清单实际激活了 mobile-clip 时，才在 Pro 模式下核验英文视觉词表；
-            // 未挂载 mobile-clip（如中文语言 Chinese-CLIP 模式）时直接返回 None，杜绝越界警告与自杀式双向核验阻断
-            if omni_core::plugin_dir::resolve_mounted_dir("mobile-clip").ok().flatten().is_some() {
-                Some(omni_pro::vision::verify_mobileclip_en_vocab())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        (ram_status, mount_manifest, mobile_clip_vocab)
-    })
-    .await
-    .unwrap_or_else(|_| {
-        (
-            "disabled: status_probe_join_error".to_string(),
-            omni_core::plugin_dir::mount_manifest_status(),
-            None,
-        )
-    });
+    let profile_for_status = profile.clone();
+    let lang_for_blocking = lang_opt.clone();
+    let (mount_manifest, visual_tagger_health, (visual_vocab_status, tagger_source_label)) =
+        tokio::task::spawn_blocking(move || {
+            let mount_manifest = omni_core::plugin_dir::mount_manifest_status();
+            let tagger = omni_pro::vision::tagger_slots_health();
+            let vocab_status =
+                omni_pro::vision::build_visual_vocab_status(&profile_for_status, lang_for_blocking.as_deref());
+            (mount_manifest, tagger, vocab_status)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            (
+                omni_core::plugin_dir::mount_manifest_status(),
+                omni_pro::vision::tagger_slots_health(),
+                omni_pro::vision::build_visual_vocab_status(&profile, lang_opt.as_deref()),
+            )
+        });
     let user_data_dir = state
         .user_data_dir
         .as_ref()
@@ -473,20 +469,104 @@ async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json
         "visionSessionResident": vision_resident,
         "vision_engines_available": {
             "gemma": vision_status.clone(),
-            "ram": ram_status.clone(),
         },
         "visionEnginesAvailable": {
             "gemma": vision_status.clone(),
-            "ram": ram_status.clone(),
         },
+        "visualTagger": visual_tagger_health,
+        "visualVocab": visual_vocab_status,
+        "taggerSource": tagger_source_label,
         "mountManifest": mount_manifest,
-        "mobileClipVocab": mobile_clip_vocab,
         "idleTimeoutSeconds": 300,
         "isPro": is_pro,
         "version": env!("CARGO_PKG_VERSION"),
         "masterDbPath": master_db_path,
         "targetVectorsDir": target_vectors_dir,
     }))
+}
+
+/// 供 `firefly-omni verify-visual-vocab <dir>` CLI 调用的暂存视觉词表静态校验（纯本地无网络）
+pub fn verify_visual_vocab_staging_json(
+    dir: &std::path::Path,
+    expected_encoder_id: Option<u8>,
+) -> Result<serde_json::Value, serde_json::Value> {
+    match omni_pro::vision::verify_visual_vocab_staging_dir(dir, expected_encoder_id) {
+        Ok(table) => Ok(serde_json::json!({
+            "ok": true,
+            "dir": dir.to_string_lossy(),
+            "encoderId": table.encoder_id,
+            "encoderDigest": table.encoder_digest,
+            "embeddingSpaceId": table.embedding_space_id,
+            "bakeRevision": table.bake_revision,
+            "version": table.version,
+            "entryCount": table.entries.len(),
+        })),
+        Err(err) => Ok(serde_json::json!({
+            "ok": false,
+            "dir": dir.to_string_lossy(),
+            "status": err.status().as_str(),
+            "code": err.code(),
+            "error": err.to_string(),
+        }))
+        .and_then(Err),
+    }
+}
+
+/// 全局单飞互斥锁：保证 `POST /api/v1/assets/reload` 在并发安装/对账下严格串行执行，不与 taxonomy/reload-policies 耦合
+static ASSETS_RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// 视觉资产与运行期快照重载端点：POST /api/v1/assets/reload
+///
+/// 与 `/api/v1/taxonomy/reload-policies` 物理隔离：仅刷新挂载清单缓存 + 三槽视觉词表 + `VisualRuntimeSnapshot`
+/// （含 [OOS-02] `allowed_domains_mask` 现场编译），绝不触碰策略表或反向联动。
+async fn assets_reload_handler(
+    Query(query): Query<HealthQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _single_flight = ASSETS_RELOAD_LOCK.lock().await;
+    let omw = state.omw.clone();
+    let profile = state.config.lock().unwrap().embedding_profile.clone();
+    let lang_opt = query.lang.clone();
+    let res = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, omni_pro::PipelineError> {
+        omni_core::plugin_dir::invalidate_mount_cache();
+        let closure = omw.build_visual_semantic_closure().map_err(|e| {
+            omni_pro::PipelineError::MissingAsset(format!("语义库闭包构建失败: {e}"))
+        })?;
+        let snap = omni_pro::vision::reload_runtime_snapshot(&closure, true)
+            .map_err(|e| omni_pro::PipelineError::from_asset_error(&e))?;
+        let slot_health = omni_pro::vision::tagger_slots_health();
+        let (vocab_status, tagger_source) =
+            omni_pro::vision::build_visual_vocab_status(&profile, lang_opt.as_deref());
+        let mut tagger_json = serde_json::to_value(&slot_health).unwrap_or_default();
+        if let Some(obj) = tagger_json.as_object_mut() {
+            obj.insert("activeStatus".to_string(), serde_json::json!(vocab_status.active_status));
+            obj.insert("activeEncoderId".to_string(), serde_json::json!(vocab_status.active_encoder_id));
+            obj.insert("taggerSource".to_string(), serde_json::json!(tagger_source));
+        }
+        Ok(serde_json::json!({
+            "success": true,
+            "compiledAtMs": snap.compiled_at_ms,
+            "assets": {
+                "tagger": tagger_json,
+                "vocabLayers": omni_pro::vision::vocab_layers_health(),
+                "domainMatrix": omni_pro::vision::domain_matrix_health(),
+            }
+        }))
+    })
+    .await
+    .map_err(|e| {
+        pipeline_error_response(omni_pro::PipelineError::InferenceFailed(format!(
+            "assets_reload 任务异常: {e}"
+        )))
+    })?;
+
+    match res {
+        Ok(val) => {
+            state.publish_status_event("ok");
+            Ok(Json(val))
+        }
+        Err(err) => Err(pipeline_error_response(err)),
+    }
 }
 
 /// Omni 状态推送 SSE 端点：GET /api/v1/omni/events & GET /api/omni/events
@@ -638,7 +718,6 @@ async fn engine_warmup_handler(
                 }
             } else {
                 let clip_ok = omni_pro::OmniVisionEngine::warmup_clip_vision(None);
-                let _ram_ok = omni_pro::OmniVisionEngine::warmup_ram();
                 vision_ready = clip_ok;
                 if !clip_ok {
                     warnings.push("clip_vision_warmup_unavailable".to_string());
@@ -736,21 +815,14 @@ fn clip_text_health(lang: Option<&str>) -> serde_json::Value {
         ),
         None => (false, false),
     };
-    let en_vocab_status = omni_pro::vision::verify_mobileclip_en_vocab();
-    let mobile_vocab_ready = mobile_tokenizer_ready && en_vocab_status.valid;
     let zh_verified = omni_pro::vision::clip_text_output_verified();
     let mobile_verified = omni_pro::vision::mobileclip_text_output_verified();
 
     let image_encoder = omni_pro::vision::active_clip_image_encoder_label(lang).to_string();
-    let (text_model_ready, vocab_ready, text_output_verified, vocab_reject_reason) = if is_zh {
-        (zh_model_ready, zh_vocab_ready, zh_verified, None)
+    let (text_model_ready, vocab_ready, text_output_verified) = if is_zh {
+        (zh_model_ready, zh_vocab_ready, zh_verified)
     } else {
-        (
-            mobile_model_ready,
-            mobile_vocab_ready,
-            mobile_verified,
-            en_vocab_status.reject_reason.clone(),
-        )
+        (mobile_model_ready, mobile_tokenizer_ready, mobile_verified)
     };
     let available = text_model_ready && vocab_ready && text_output_verified != Some(false);
 
@@ -760,7 +832,6 @@ fn clip_text_health(lang: Option<&str>) -> serde_json::Value {
         "textModelReady": text_model_ready,
         "vocabReady": vocab_ready,
         "textOutputVerified": text_output_verified,
-        "vocabRejectReason": vocab_reject_reason,
         "chineseClip": {
             "available": zh_model_ready && zh_vocab_ready && zh_verified != Some(false),
             "imageEncoder": "chinese_clip",
@@ -769,13 +840,11 @@ fn clip_text_health(lang: Option<&str>) -> serde_json::Value {
             "textOutputVerified": zh_verified,
         },
         "mobileClip": {
-            "available": mobile_model_ready && mobile_vocab_ready && mobile_verified != Some(false),
+            "available": mobile_model_ready && mobile_tokenizer_ready && mobile_verified != Some(false),
             "imageEncoder": "mobileclip",
             "textModelReady": mobile_model_ready,
-            "vocabReady": mobile_vocab_ready,
+            "vocabReady": mobile_tokenizer_ready,
             "textOutputVerified": mobile_verified,
-            "rejectReason": &en_vocab_status.reject_reason,
-            "vocabStatus": &en_vocab_status,
         }
     })
 }
@@ -833,6 +902,7 @@ async fn health_handler(
         "nsfwRules": nsfw_rules_health,
         "vocabLayers": omni_pro::vision::vocab_layers_health(),
         "domainMatrix": omni_pro::vision::domain_matrix_health(),
+        "tagger": omni_pro::vision::tagger_slots_health(),
     });
     Json(serde_json::json!({
         "status": "ok",
@@ -1435,13 +1505,29 @@ pub async fn start_server(
         );
     }
 
-    // 量词接线（GH #710 S9）：词库就绪后刷新量词进程缓存
-    // （spawn_blocking：41k 行全表 SQL 不阻塞 async runtime worker；await 保证首个请求前完成）
+    // 量词接线（GH #710 S9）：词库就绪后刷新量词进程缓存，并后台异步装配视觉词表运行期快照
+    // （spawn_blocking：全表 SQL 不阻塞 async runtime worker；视觉快照异步加载绝不阻断纯文本接口）
     if omw_connected {
         let omw_bg = omw.clone();
         tokio::task::spawn_blocking(move || refresh_classifier_map(&omw_bg))
             .await
             .unwrap_or_else(|err| tracing::warn!("classifier map refresh join failed: {err}"));
+        if is_pro_build {
+            let omw_vis = omw.clone();
+            tokio::spawn(async move {
+                let res = tokio::task::spawn_blocking(move || {
+                    let closure = omw_vis.build_visual_semantic_closure()?;
+                    omni_pro::vision::reload_runtime_snapshot(&closure, false)
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                })
+                .await;
+                if let Err(err) = res {
+                    tracing::warn!("[OmniServer] 启动视觉词表快照预热 join 异常: {err}");
+                } else if let Ok(Err(err)) = res {
+                    tracing::warn!("[OmniServer] 启动视觉词表快照装配未就绪（后续视觉请求 Fail-Closed）: {err}");
+                }
+            });
+        }
     }
 
     // 阿里巴巴 zvec 嵌入式向量引擎 (RaBitQ + INT8 量化，适配 384d bekko-a8m 与 512d EmbeddingGemma)
@@ -1782,7 +1868,7 @@ pub struct VisionComputed {
     pub quality_score: Option<f32>,
     pub quality_issues: Vec<String>,
     pub photo_type: Option<String>,
-    pub ram_tags: Vec<omni_core::RamTagItem>,
+    pub visual_pipeline_tags: Vec<omni_pro::vision::VisualTagOutput>,
     pub inspect_img: Option<image::DynamicImage>,
     /// CLIP 图像嵌入向量（512 维归一化），用于级联假设仲裁
     pub image_embedding: Option<Vec<f32>>,
@@ -1802,7 +1888,6 @@ pub struct VisionComputed {
     pub aesthetic_ms: u64,
     pub bw_ms: u64,
     pub tag_ms: u64,
-    pub ram_ms: u64,
     pub subtasks: std::collections::BTreeMap<String, u64>,
 }
 
@@ -1836,7 +1921,7 @@ pub fn run_vision_pipeline_on_image(
     embedding_profile: &str,
     enable_nsfw: bool,
     enable_image_ocr: bool,
-) -> Result<VisionComputed, String> {
+) -> Result<VisionComputed, omni_pro::PipelineError> {
     run_vision_pipeline_on_image_with_ocr_size(
         inspect_img,
         exif_orient,
@@ -1849,6 +1934,29 @@ pub fn run_vision_pipeline_on_image(
     )
 }
 
+fn mutual_group_zh(g: omni_pro::vision::VisualMutualGroup) -> &'static str {
+    use omni_pro::vision::VisualMutualGroup;
+    match g {
+        VisualMutualGroup::ContentForm => "内容形态",
+        VisualMutualGroup::TextPresence => "文字存在性",
+        VisualMutualGroup::ColorMode => "色彩模式",
+        VisualMutualGroup::PhotoGenre => "摄影题材细分",
+        VisualMutualGroup::ComicLayout => "漫画版式排版",
+        VisualMutualGroup::ComicAudience => "漫画受众分级",
+        VisualMutualGroup::BillType => "票据凭据类型",
+        VisualMutualGroup::CertType => "证件证照类型",
+        VisualMutualGroup::ScreenshotScene => "截图场景细分",
+        VisualMutualGroup::GenerateVector => "生成载体",
+        VisualMutualGroup::ShotScale => "景别",
+        VisualMutualGroup::Lighting => "光照",
+        VisualMutualGroup::Perspective => "视角",
+        VisualMutualGroup::Layout => "版面",
+        VisualMutualGroup::SystemEcology => "系统生态",
+        VisualMutualGroup::NumberOfSubjects => "主体数量",
+        VisualMutualGroup::TimeSeason => "时间季节",
+    }
+}
+
 /// 带同会话 `ocr_model_size` 透传的多核零拷贝并行视觉感知流水线（消除探活固定 tiny 造成的切档抖动）
 pub fn run_vision_pipeline_on_image_with_ocr_size(
     inspect_img: &image::DynamicImage,
@@ -1859,7 +1967,35 @@ pub fn run_vision_pipeline_on_image_with_ocr_size(
     enable_nsfw: bool,
     enable_image_ocr: bool,
     ocr_model_size: Option<&str>,
-) -> Result<VisionComputed, String> {
+) -> Result<VisionComputed, omni_pro::PipelineError> {
+    run_vision_pipeline_on_image_with_context(
+        inspect_img,
+        exif_orient,
+        enable_visual_tags,
+        lang,
+        embedding_profile,
+        enable_nsfw,
+        enable_image_ocr,
+        ocr_model_size,
+        omni_pro::vision::MediaDomain::Image,
+        "",
+        None,
+    )
+}
+
+pub fn run_vision_pipeline_on_image_with_context(
+    inspect_img: &image::DynamicImage,
+    exif_orient: Option<&str>,
+    enable_visual_tags: bool,
+    lang: Option<&str>,
+    embedding_profile: &str,
+    enable_nsfw: bool,
+    enable_image_ocr: bool,
+    ocr_model_size: Option<&str>,
+    media_domain: omni_pro::vision::MediaDomain,
+    file_name: &str,
+    closure_opt: Option<&omni_pro::vision::SemanticClosureSnapshot>,
+) -> Result<VisionComputed, omni_pro::PipelineError> {
     let t_vision = std::time::Instant::now();
     let mut out = VisionComputed::default();
 
@@ -1867,7 +2003,9 @@ pub fn run_vision_pipeline_on_image_with_ocr_size(
     if embedding_profile == "gemma_unified" {
         let gemma = omni_pro::OmniVisionEngine::gemma_engine();
         if gemma.circuit_breaker().is_disabled() {
-            return Err("高精度全能语义搜索 视觉塔已熔断或禁用，gemma_unified 档位禁止降级到 CLIP".to_string());
+            return Err(omni_pro::PipelineError::InferenceFailed(
+                "高精度全能语义搜索 视觉塔已熔断或禁用，gemma_unified 档位禁止降级到 CLIP".to_string(),
+            ));
         }
     }
 
@@ -1881,11 +2019,11 @@ pub fn run_vision_pipeline_on_image_with_ocr_size(
         inspect_img
     };
 
-    // 多核并行：7 大视觉算子零拷贝只读引用借用 &img_ref，独立计时
-    let scope_res = std::thread::scope(|s| -> Result<(), String> {
+    // 多核并行：视觉物理算子与单次前向统一流水线（严禁重复图像前向，严禁触发已退役 RAM++）
+    let ret_dim = omni_pro::OmniVisionEngine::gemma_mrl_dimension();
+    let scope_res = std::thread::scope(|s| -> Result<(), omni_pro::PipelineError> {
         let ocr_size_ref = ocr_model_size.unwrap_or("tiny");
         // 1. 文本探活 (DBNet / MobileNet 骨干)
-        // [V11-03] 关闭图片 OCR 时必须在任何模型初始化前短路，零 DBNet 调用、零 Session 加载。
         let h_text = omni_core::timed_spawn!(s, {
             if enable_image_ocr {
                 omni_pro::OmniVisionEngine::fast_detect_has_text_with_size(img_ref, ocr_size_ref)
@@ -1894,29 +2032,7 @@ pub fn run_vision_pipeline_on_image_with_ocr_size(
             }
         });
 
-        // 2. 视觉语义标签 (Chinese-CLIP / Mobile-CLIP / EmbeddingGemma)
-        // 档位绝对隔离：gemma_unified 严格只走 Gemma，classic_light 严格只走 CLIP，严禁降级
-        let h_clip = omni_core::timed_spawn!(s, {
-            if enable_visual_tags {
-                if embedding_profile == "gemma_unified" {
-                    let tags = omni_pro::OmniVisionEngine::extract_gemma_visual_tags_scored_from_image(
-                        img_ref,
-                        10,
-                    );
-                    Ok(tags)
-                } else {
-                    omni_pro::OmniVisionEngine::try_extract_clip_visual_tags_scored_from_image(
-                        img_ref,
-                        lang,
-                        10,
-                    )
-                }
-            } else {
-                Ok(Vec::new())
-            }
-        });
-
-        // 3. NSFW 模型 5 分类概率推理 (Ticket 03: 仅在插槽激活且就绪时执行推理)
+        // 2. NSFW 模型 5 分类概率推理 (Ticket 03: 仅在插槽激活且就绪时执行推理)
         let h_nsfw = omni_core::timed_spawn!(s, {
             if enable_nsfw {
                 omni_pro::OmniVisionEngine::run_nsfw_model(img_ref)
@@ -1925,51 +2041,61 @@ pub fn run_vision_pipeline_on_image_with_ocr_size(
             }
         });
 
-        // 4. 频域水印检测
+        // 3. 频域水印检测
         let h_wm = omni_core::timed_spawn!(s, {
             omni_pro::perceive::detect_watermark_level(img_ref)
         });
 
-        // 5. 宏块打码检测
+        // 4. 宏块打码检测
         let h_mc = omni_core::timed_spawn!(s, {
             omni_pro::perceive::detect_mosaic_level(img_ref)
         });
 
-        // 6. 物理美学与画质评估 (直接消费前置 ExifTool 提取的 exif_orient！)
+        // 5. 物理美学与画质评估 (直接消费前置 ExifTool 提取的 exif_orient！)
         let h_aes = omni_core::timed_spawn!(s, {
             omni_pro::perceive::evaluate_image_aesthetic_and_quality(img_ref, exif_orient)
         });
 
-        // 7. 黑白全彩检测
+        // 6. 黑白全彩检测
         let h_bw = omni_core::timed_spawn!(s, {
             omni_pro::OmniVisionEngine::detect_is_black_and_white(img_ref)
         });
 
-        // 8. RAM++ 细粒度实体与泛维度/泛标签投影提取
-        let h_ram = omni_core::timed_spawn!(s, {
+        // 7. 单次视觉前向 Stage 1（并发执行 ONNX 编码，待真实 text_detect join 后再运行 Stage 2 域裁决）/ 纯嵌入提取
+        let h_visual = omni_core::timed_spawn!(s, {
             if enable_visual_tags {
-                omni_pro::OmniVisionEngine::extract_ram_tags(img_ref, lang, 10)
+                omni_pro::OmniVisionEngine::encode_for_visual_pipeline(
+                    img_ref,
+                    embedding_profile,
+                    lang,
+                    ret_dim,
+                    closure_opt,
+                )
+                .map(Some)
             } else {
-                Vec::new()
+                Ok(None)
             }
         });
 
-        // 9. 图像嵌入向量提取 (用于级联假设仲裁与多模态稠密检索)，统一走 timed_spawn! 计时宏
-        // 编码器出处由产出层回传：Gemma 视觉塔 → 4；CLIP 图像塔 → 由 omni-vision 判定 2/3。
-        let h_embed = omni_core::timed_spawn!(s, {
-            if embedding_profile == "gemma_unified" {
-                match omni_pro::OmniVisionEngine::encode_gemma_image(img_ref) {
-                    Ok(v) => Ok(Some((v, omni_pro::vector_engine::encoder_id::GEMMA))),
-                    Err(e) => {
-                        Err(format!("高精度全能语义搜索 图像向量编码失败: {:?}，禁止降级到 CLIP", e))
-                    }
+        // 当关闭视觉打标时，仅按档位可选抽取检索嵌入向量（classic_light 无模型时静默回退 None）
+        let h_embed_only = omni_core::timed_spawn!(s, {
+            if !enable_visual_tags {
+                if embedding_profile == "gemma_unified" {
+                    omni_pro::OmniVisionEngine::encode_single_forward_for_profile(
+                        img_ref,
+                        embedding_profile,
+                        lang,
+                        ret_dim,
+                    )
+                    .map(|(v, _)| Some((v.retrieval_vec, v.encoder_id)))
+                } else {
+                    Ok(omni_pro::OmniVisionEngine::extract_clip_image_embedding(img_ref, lang))
                 }
             } else {
-                Ok(omni_pro::OmniVisionEngine::extract_clip_image_embedding(img_ref, lang))
+                Ok(None)
             }
         });
 
-        // 汇聚并行子任务: panic 时回退默认值并记录日志，避免零耗时误导瓶颈判定
         macro_rules! join_or_log {
             ($handle:expr, $name:literal, $default:expr) => {
                 match $handle.join() {
@@ -1981,39 +2107,24 @@ pub fn run_vision_pipeline_on_image_with_ocr_size(
                 }
             };
         }
-        let (td, td_ms) = join_or_log!(h_text, "text_detect", (false, 0));
-        let (ct_res, ct_ms) = join_or_log!(h_clip, "clip", (Ok(Vec::new()), 0));
-        let ct_scored = match ct_res {
-            Ok(v) => v,
-            Err(e) => return Err(e),
+        let (td, td_ms, text_panicked) = match h_text.join() {
+            Ok((v, ms)) => (v, ms, false),
+            Err(err) => {
+                tracing::warn!("视觉流水线子任务 text_detect panic，标记 OCR 证据为 Unavailable: {:?}", err);
+                (false, 0, true)
+            }
         };
         let (np, np_ms) = join_or_log!(h_nsfw, "nsfw", (None, 0));
         let (wl, wl_ms) = join_or_log!(h_wm, "watermark", (0, 0));
         let (ml, ml_ms) = join_or_log!(h_mc, "mosaic", (0, 0));
         let (ar, ar_ms) = join_or_log!(h_aes, "aesthetic", ((7.5, Vec::new()), 0));
         let (bw, bw_ms) = join_or_log!(h_bw, "bw", (false, 0));
-        let (ram_res, ram_ms) = join_or_log!(h_ram, "ram", (Vec::new(), 0));
-        let (embed_res, embed_ms) = join_or_log!(h_embed, "clip_embed", (Ok(None), 0));
-        let img_embed = match embed_res {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
+        let (enc_res, vis_ms) = join_or_log!(h_visual, "visual_pipeline", (Ok(None), 0));
+        let (embed_only_res, embed_only_ms) = join_or_log!(h_embed_only, "clip_embed", (Ok(None), 0));
 
-        out.has_text = Some(td);
+        let ocr_unavailable = !enable_image_ocr || text_panicked;
+        out.has_text = if ocr_unavailable { None } else { Some(td) };
         out.text_detect_ms = td_ms;
-        // (WP2b) 分数快照与标签名拆分：clip_tags 保持 Vec<String> 兼容既有门禁/消歧流程
-        out.clip_tag_confs = ct_scored.iter().cloned().collect();
-        out.clip_tags = ct_scored.into_iter().map(|(t, _)| t).collect();
-        // gemma_unified 档位：补齐组内单选互斥（2026-10-30 风景照误标事故修复）。
-        // 该档位此前被整体旁路（图像嵌入来自 Gemma 塔，无法与 CLIP 文本锚空间做余弦竞争），
-        // 导致同维度多标签并存（风景照+宠物照）流出。改为对按生点积降序的标签序列
-        // 做纯序数 Top-1 过滤，不需要任何嵌入向量，与档位天然解耦。
-        if embedding_profile == "gemma_unified" && enable_visual_tags {
-            out.clip_tags = omni_pro::OmniVisionEngine::filter_mutual_groups_top1(
-                std::mem::take(&mut out.clip_tags),
-            );
-        }
-        out.clip_ms = ct_ms;
         out.nsfw_probs = np;
         out.nsfw_ms = np_ms;
         out.watermark_level = Some(wl);
@@ -2025,44 +2136,128 @@ pub fn run_vision_pipeline_on_image_with_ocr_size(
         out.quality_issues = ar.1;
         out.aesthetic_ms = ar_ms;
         out.bw_ms = bw_ms;
-        out.ram_tags = ram_res;
-        out.ram_ms = ram_ms;
-        // 解包 (向量, 编码器出处)：出处与向量同源同生，不在此层推断
-        let (img_vec, img_enc) = match img_embed {
-            Some((v, enc)) => (Some(v), Some(enc)),
-            None => (None, None),
-        };
-        out.image_embedding = img_vec;
-        out.image_encoder_id = img_enc;
-        // CLIP 互斥分类：利用图像嵌入向量对内容形态/色彩/文字等互斥组分类（仅 Classic Light 模式使用）
-        let mut mutual_ms = 0u64;
-        if let Some(ref emb) = out.image_embedding {
-            if embedding_profile != "gemma_unified" {
-                let t_mutual = std::time::Instant::now();
-                out.clip_mutual_tags = omni_pro::OmniVisionEngine::classify_mutual_exclusive_groups_with_encoder(
-                    emb.as_slice(),
-                    out.image_encoder_id,
-                    lang,
-                );
-                mutual_ms = t_mutual.elapsed().as_millis() as u64;
-            }
-        }
-        // 标签分支挂钟 = 并行段长尾 (CLIP/NSFW/RAM/Embed 取 Max) + 串行尾巴 (互斥分类)
-        let tag_wall_ms = ct_ms.max(np_ms).max(ram_ms).max(embed_ms) + mutual_ms;
-        out.tag_ms = tag_wall_ms;
 
-        // 统一汇总至子任务度量字典
+        let aspect = img_ref.width() as f32 / img_ref.height().max(1) as f32;
+        let (mut morphology_tags, mut morphology_high_confidence_tags) =
+            omni_pro::OmniVisionEngine::derive_morphology_tags(aspect, td, bw);
+        if ocr_unavailable {
+            morphology_tags.retain(|t| {
+                !tag_matches_concept(t, Concept::有字图.zh_name())
+                    && !tag_matches_concept(t, Concept::无字图.zh_name())
+            });
+            morphology_high_confidence_tags.retain(|t| {
+                !tag_matches_concept(t, Concept::有字图.zh_name())
+                    && !tag_matches_concept(t, Concept::无字图.zh_name())
+            });
+        }
+
+        if let Some((snapshot, vectors, origin)) = enc_res? {
+            let t_stage2 = std::time::Instant::now();
+            let ocr_state = if ocr_unavailable {
+                omni_pro::vision::OcrEvidenceState::Unavailable
+            } else if td {
+                omni_pro::vision::OcrEvidenceState::Detected
+            } else {
+                omni_pro::vision::OcrEvidenceState::NoText
+            };
+            let ocr_evidence = omni_pro::vision::OcrEvidence {
+                raw_text: String::new(),
+                char_count: 0,
+                has_large_title: false,
+                state: ocr_state,
+            };
+            let mut ctx = match media_domain {
+                omni_pro::vision::MediaDomain::Image => omni_pro::vision::VisionRequestContext::for_image(
+                    file_name,
+                    raw_w,
+                    raw_h,
+                    lang.map(|l| l.to_string()),
+                    ocr_evidence,
+                ),
+                omni_pro::vision::MediaDomain::Video => omni_pro::vision::VisionRequestContext::for_video(
+                    file_name,
+                    raw_w,
+                    raw_h,
+                    lang.map(|l| l.to_string()),
+                ),
+            };
+            ctx.top_k = 12;
+            let vis = omni_pro::OmniVisionEngine::finish_visual_pipeline(
+                &snapshot,
+                vectors,
+                origin,
+                &ctx,
+                Some(img_ref),
+            )?;
+            let total_vis_ms = vis_ms + t_stage2.elapsed().as_millis() as u64;
+            out.image_embedding = Some(vis.vectors.retrieval_vec);
+            out.image_encoder_id = Some(vis.vectors.encoder_id);
+            out.photo_type = Some(vis.modal_type);
+            out.visual_pipeline_tags = vis.tags.clone();
+            for t in vis.tags {
+                if t.engine == "physical" {
+                    if !morphology_tags.contains(&t.name) {
+                        morphology_tags.push(t.name.clone());
+                        morphology_high_confidence_tags.push(t.name);
+                    }
+                } else {
+                    if let Some(mg) = t.mutual_group {
+                        out.clip_mutual_tags.push((
+                            t.name.clone(),
+                            t.raw_dot,
+                            mutual_group_zh(mg),
+                        ));
+                    }
+                    out.clip_tag_confs.insert(t.name.clone(), t.confidence);
+                    if !out.clip_tags.contains(&t.name) {
+                        out.clip_tags.push(t.name);
+                    }
+                }
+            }
+            out.clip_ms = total_vis_ms;
+            out.tag_ms = total_vis_ms.max(np_ms);
+        } else {
+            let (img_vec, img_enc) = match embed_only_res? {
+                Some((v, enc)) => (Some(v), Some(enc)),
+                None => (None, None),
+            };
+            out.image_embedding = img_vec;
+            out.image_encoder_id = img_enc;
+            out.clip_ms = embed_only_ms;
+            out.tag_ms = np_ms.max(embed_only_ms);
+            // 物理事实轻量算子注入 (DEC-05)
+            for (concept, _) in omni_pro::vision::detect_physical_operators_for_domain(
+                Some(img_ref),
+                raw_w,
+                raw_h,
+                0,
+                false,
+                media_domain,
+            ) {
+                let name = concept.zh_name().to_string();
+                if !morphology_tags.contains(&name) {
+                    morphology_tags.push(name.clone());
+                    morphology_high_confidence_tags.push(name);
+                }
+            }
+            out.photo_type = Some(omni_pro::perceive::infer_image_modal_type(
+                img_ref,
+                &morphology_tags,
+                &out.clip_tags,
+                &[],
+                td,
+                file_name,
+            ));
+        }
+
         out.subtasks.insert("text_detect_ms".to_string(), td_ms);
-        out.subtasks.insert("clip_ms".to_string(), ct_ms);
-        out.subtasks.insert("clip_embed_ms".to_string(), embed_ms);
-        out.subtasks.insert("clip_mutual_ms".to_string(), mutual_ms);
+        out.subtasks.insert("clip_ms".to_string(), out.clip_ms);
         out.subtasks.insert("nsfw_ms".to_string(), np_ms);
         out.subtasks.insert("watermark_ms".to_string(), wl_ms);
         out.subtasks.insert("mosaic_ms".to_string(), ml_ms);
         out.subtasks.insert("aesthetic_ms".to_string(), ar_ms);
         out.subtasks.insert("bw_ms".to_string(), bw_ms);
-        out.subtasks.insert("ram_ms".to_string(), ram_ms);
-        out.subtasks.insert("tag_ms".to_string(), tag_wall_ms);
+        out.subtasks.insert("tag_ms".to_string(), out.tag_ms);
 
         // 零耗时内存推导
         out.has_watermark = Some(wl > 0);
@@ -2079,55 +2274,8 @@ pub fn run_vision_pipeline_on_image_with_ocr_size(
             _ => "none",
         }.to_string());
 
-        let aspect = img_ref.width() as f32 / img_ref.height().max(1) as f32;
-        let (mut morphology_tags, mut morphology_high_confidence_tags) =
-            omni_pro::OmniVisionEngine::derive_morphology_tags(aspect, td, bw);
-
-        // 物理事实轻量算子注入 (DEC-05)
-        // 1. 画幅算子 (ID 143)
-        let aspect_concept = omni_pro::OmniVisionEngine::detect_aspect_ratio_type(raw_w, raw_h);
-        let aspect_name = aspect_concept.zh_name().to_string();
-        if !morphology_tags.contains(&aspect_name) {
-            morphology_tags.push(aspect_name.clone());
-            morphology_high_confidence_tags.push(aspect_name);
-        }
-
-        // 2. 背景算子 (ID 139)
-        let bg_concept = omni_pro::OmniVisionEngine::detect_background_type(img_ref);
-        let bg_name = bg_concept.zh_name().to_string();
-        if !morphology_tags.contains(&bg_name) {
-            morphology_tags.push(bg_name.clone());
-            morphology_high_confidence_tags.push(bg_name);
-        }
-
-        // 3. 主色调与色系算子 (ID 149)
-        let (main_color_opt, color_series_opt) = omni_pro::OmniVisionEngine::detect_main_color_and_series(img_ref);
-        if let Some(mc) = main_color_opt {
-            let mc_name = mc.zh_name().to_string();
-            if !morphology_tags.contains(&mc_name) {
-                morphology_tags.push(mc_name.clone());
-                morphology_high_confidence_tags.push(mc_name);
-            }
-        }
-        if let Some(series_concept) = color_series_opt {
-            let cs_name = series_concept.zh_name().to_string();
-            if !morphology_tags.contains(&cs_name) {
-                morphology_tags.push(cs_name.clone());
-                morphology_high_confidence_tags.push(cs_name);
-            }
-        }
-
-        // 4. 画质等级算子 (ID 122)
-        if let Some(rq) = omni_pro::OmniVisionEngine::detect_resolution_quality(raw_w, raw_h) {
-            let rq_name = rq.zh_name().to_string();
-            if !morphology_tags.contains(&rq_name) {
-                morphology_tags.push(rq_name.clone());
-                morphology_high_confidence_tags.push(rq_name);
-            }
-        }
-
-        // 无字图排版门禁：若未探活出文本内容，严禁打上依赖排版文字的海报宣发或截图标签
-        if !td {
+        // 无字图排版门禁（仅在 OCR 真实完成且确认无字时生效，Unavailable 不误删）
+        if !ocr_unavailable && !td {
             out.clip_tags.retain(|t| {
                 !tag_matches_concept(t, "海报宣发") && !tag_matches_concept(t, "截图")
             });
@@ -2174,7 +2322,6 @@ pub fn run_vision_pipeline_on_image_with_ocr_size(
         }
         out.clip_high_confidence_tags = high_conf;
 
-        // 漫画细分标签形态门禁
         let is_anime_art = out.clip_tags.iter().any(|t| {
             tag_matches_concept(t, "二次元")
                 || tag_matches_concept(t, "动漫")
@@ -2196,18 +2343,6 @@ pub fn run_vision_pipeline_on_image_with_ocr_size(
 
         out.morphology_tags = morphology_tags;
         out.morphology_high_confidence_tags = morphology_high_confidence_tags;
-
-        // 图像细分形态分类
-        let p_type = omni_pro::perceive::infer_image_modal_type(
-            img_ref,
-            &out.morphology_tags,
-            &out.clip_tags,
-            &[],
-            td,
-            "",
-        );
-        out.photo_type = Some(p_type);
-
         Ok(())
     });
 
@@ -2220,32 +2355,73 @@ pub fn run_vision_pipeline_on_image_with_ocr_size(
     Ok(out)
 }
 
-fn extract_vocab_error_reason(err: &str) -> Option<&'static str> {
-    if err.contains("vocab_hash_mismatch") {
-        Some("vocab_hash_mismatch")
-    } else if err.contains("vocab_version_mismatch") {
-        Some("vocab_version_mismatch")
-    } else if err.contains("vocab_missing") {
-        Some("vocab_missing")
-    } else if err.contains("model_missing") || err.contains("ModelMissing") {
-        Some("model_missing")
-    } else {
-        None
+fn extract_encoder_id_from_msg(msg: &str) -> Option<u8> {
+    for prefix in ["encoder_id=", "encoderId="] {
+        if let Some(pos) = msg.find(prefix) {
+            let rest = &msg[pos + prefix.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(id) = digits.parse::<u8>() {
+                return Some(id);
+            }
+        }
     }
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("chinese_clip") || lower.contains("chinese-clip") {
+        return Some(omni_core::encoder_id::CHINESE_CLIP);
+    }
+    if lower.contains("mobile_clip") || lower.contains("mobile-clip") {
+        return Some(omni_core::encoder_id::MOBILE_CLIP);
+    }
+    if lower.contains("embeddinggemma") || lower.contains("gemma") {
+        return Some(omni_core::encoder_id::GEMMA);
+    }
+    None
 }
 
-fn vision_unavailable_response(err: &str) -> (StatusCode, Json<serde_json::Value>) {
-    let reason = extract_vocab_error_reason(err).unwrap_or("vision_model_unavailable");
+fn pipeline_error_response(err: omni_pro::PipelineError) -> (StatusCode, Json<serde_json::Value>) {
+    use omni_pro::PipelineError;
+    let msg = err.to_string();
+    let encoder_id = extract_encoder_id_from_msg(&msg);
+    let (status, code, reason) = match &err {
+        PipelineError::MissingAsset(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "ASSET_MISSING", "ASSET_MISSING")
+        }
+        PipelineError::CorruptAsset(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "ASSET_CORRUPT", "ASSET_CORRUPT")
+        }
+        PipelineError::InferenceFailed(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "INFERENCE_FAILED", "INFERENCE_FAILED")
+        }
+        PipelineError::StaleVocab(raw_msg) => (
+            StatusCode::CONFLICT,
+            "ENGINE_NOT_READY",
+            if raw_msg.contains("app_update_needed") {
+                "app_update_needed"
+            } else {
+                "VISUAL_VOCAB_STALE"
+            },
+        ),
+        PipelineError::CorruptInput(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "INPUT_REJECTED", "CORRUPT_INPUT")
+        }
+    };
     (
-        StatusCode::SERVICE_UNAVAILABLE,
+        status,
         Json(serde_json::json!({
-            "error": err,
+            "error": {
+                "code": code,
+                "reason": reason,
+                "message": msg,
+                "encoder_id": encoder_id,
+            },
+            "code": code,
             "reason": reason,
+            "message": msg,
         })),
     )
 }
 
-/// 兼容既有磁盘路径调用的薄包装层
+/// 兼容既有磁盘路径调用的包装层（坏图解码失败返回 422 PipelineError::CorruptInput）
 fn run_vision_pipeline(
     file_path: &str,
     exif_orient: Option<&str>,
@@ -2255,7 +2431,8 @@ fn run_vision_pipeline(
     enable_nsfw: bool,
     enable_image_ocr: bool,
     ocr_model_size: Option<&str>,
-) -> Result<VisionComputed, String> {
+    closure_opt: Option<&omni_pro::vision::SemanticClosureSnapshot>,
+) -> Result<VisionComputed, omni_pro::PipelineError> {
     let t_vision = std::time::Instant::now();
     let ext = std::path::Path::new(file_path)
         .extension()
@@ -2267,37 +2444,28 @@ fn run_vision_pipeline(
     let is_video = omni_core::is_video_ext(&ext);
 
     if is_image {
-        match image::open(file_path) {
-            Ok(img) => {
-                match run_vision_pipeline_on_image_with_ocr_size(
-                    &img,
-                    exif_orient,
-                    enable_visual_tags,
-                    lang,
-                    embedding_profile,
-                    enable_nsfw,
-                    enable_image_ocr,
-                    ocr_model_size,
-                ) {
-                    Ok(mut computed) => {
-                        computed.duration_ms = t_vision.elapsed().as_millis() as u64;
-                        tracing::debug!(
-                            "[OmniServer] 图片文本前置检测: file={}, has_text={}",
-                            file_path,
-                            computed.has_text.unwrap_or(false)
-                        );
-                        return Ok(computed);
-                    }
-                    Err(e) => {
-                        tracing::error!("[OmniServer] 图像视觉感知流水线失败: file={}, err={}", file_path, e);
-                        return Err(e);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("[OmniServer] 无法打开图像文件: file={}, err={}", file_path, e);
-            }
-        }
+        let img = image::open(file_path).map_err(|e| {
+            omni_pro::PipelineError::CorruptInput(format!("无法解码图像文件 ({file_path}): {e}"))
+        })?;
+        let file_name = std::path::Path::new(file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let mut computed = run_vision_pipeline_on_image_with_context(
+            &img,
+            exif_orient,
+            enable_visual_tags,
+            lang,
+            embedding_profile,
+            enable_nsfw,
+            enable_image_ocr,
+            ocr_model_size,
+            omni_pro::vision::MediaDomain::Image,
+            file_name,
+            closure_opt,
+        )?;
+        computed.duration_ms = t_vision.elapsed().as_millis() as u64;
+        return Ok(computed);
     } else if is_video {
         let (v_wm_lvl, v_wm_status) = omni_pro::perceive::detect_video_dynamic_watermark(std::path::Path::new(file_path));
         let mut out = VisionComputed::default();
@@ -2621,9 +2789,18 @@ async fn perceive_file_handler(
             let eo = exif_orient.clone();
             let profile = cfg.embedding_profile.clone();
             let ocr_size_opt = cfg.ocr_model_size.clone();
-            let mut vision_err: Option<String> = None;
+            let omw_for_img = state.omw.clone();
+            let mut vision_err: Option<omni_pro::PipelineError> = None;
             let vision_res = if is_pro {
                 match tokio::task::spawn_blocking(move || {
+                    let closure_opt = if enable_visual_tags
+                        && omni_pro::vision::current_runtime_snapshot().is_none()
+                        && omw_for_img.is_available()
+                    {
+                        omw_for_img.build_visual_semantic_closure().ok()
+                    } else {
+                        None
+                    };
                     run_vision_pipeline(
                         &fp,
                         eo.as_deref(),
@@ -2633,6 +2810,7 @@ async fn perceive_file_handler(
                         cfg.enable_nsfw_perception,
                         cfg.enable_image_ocr,
                         Some(ocr_size_opt.as_str()),
+                        closure_opt.as_ref(),
                     )
                 })
                 .await
@@ -2643,7 +2821,7 @@ async fn perceive_file_handler(
                         VisionComputed::default()
                     }
                     Err(e) => {
-                        vision_err = Some(format!("视觉感知任务 panic: {e}"));
+                        vision_err = Some(omni_pro::PipelineError::InferenceFailed(format!("视觉感知任务 panic: {e}")));
                         VisionComputed::default()
                     }
                 }
@@ -2775,7 +2953,7 @@ async fn perceive_file_handler(
         let (ads_res, (metadata_ms, vision_res, vision_err, markdown_content, ocr_ms, text_ms, phash, metadata, ocr_text)) =
             tokio::join!(f_ads, f_img);
         if let Some(err) = vision_err {
-            return Err(vision_unavailable_response(&err));
+            return Err(pipeline_error_response(err));
         }
 
         benchmark.record_opt("metadata_ms", if metadata_ms > 0 { Some(metadata_ms) } else { None });
@@ -2808,7 +2986,7 @@ async fn perceive_file_handler(
             let extract_ms = t_extract.elapsed().as_millis() as u64;
 
             let mut v = VisionComputed::default();
-            let mut vision_err: Option<String> = None;
+            let mut vision_err: Option<omni_pro::PipelineError> = None;
             let mut video_chunks: Vec<omni_core::OmniVideoChunk> = Vec::new();
             let mut video_timings = omni_pro::perceive::VideoProcessTimings::default();
             let mut video_cover_webp_base64: Option<String> = None;
@@ -2855,7 +3033,7 @@ async fn perceive_file_handler(
                 let perceive_timeout_sec_opt = req.perceive_timeout_sec;
                 let elapsed_before_visual_sec = t_start.elapsed().as_secs_f64();
                 let cancel_flag_for_video = std::sync::Arc::clone(&cancel_flag);
-                let (chunks, timings, rep_frame) = tokio::task::spawn_blocking(move || {
+                let chunk_res = tokio::task::spawn_blocking(move || {
                     omni_pro::perceive::process_video_time_chunks_with_options_and_budget(
                         std::path::Path::new(&file_path_for_video),
                         video_interval,
@@ -2871,8 +3049,18 @@ async fn perceive_file_handler(
                         Some(cancel_flag_for_video),
                     )
                 })
-                .await
-                .unwrap_or_default();
+                .await;
+                let (chunks, timings, rep_frame) = match chunk_res {
+                    Ok(Ok(res)) => res,
+                    Ok(Err(e)) => {
+                        vision_err = Some(e);
+                        (Vec::new(), Default::default(), None)
+                    }
+                    Err(e) => {
+                        vision_err = Some(omni_pro::PipelineError::InferenceFailed(format!("视频切片任务异常: {e}")));
+                        (Vec::new(), Default::default(), None)
+                    }
+                };
                 video_chunks = chunks;
                 video_timings = timings;
                 if let Some(ref rep_rgb) = rep_frame {
@@ -2884,6 +3072,8 @@ async fn perceive_file_handler(
                     let rep_nsfw = cfg.enable_nsfw_perception;
                     let rep_ocr_en = cfg.enable_image_ocr;
                     let rep_ocr_size = cfg.ocr_model_size.clone();
+                    let omw_for_vid = state.omw.clone();
+                    let vid_fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
                     let (webp_b64_opt, rep_vision_res, dyn_img) = tokio::task::spawn_blocking(move || {
                         let webp_b64 = match omni_pro::cover::raw_to_webp(
                             rep_rgb_owned.as_raw(),
@@ -2901,7 +3091,15 @@ async fn perceive_file_handler(
                             }
                         };
                         let dyn_img = image::DynamicImage::ImageRgb8(rep_rgb_owned);
-                        let rep_res = run_vision_pipeline_on_image_with_ocr_size(
+                        let closure_opt = if enable_vis_tags
+                            && omni_pro::vision::current_runtime_snapshot().is_none()
+                            && omw_for_vid.is_available()
+                        {
+                            omw_for_vid.build_visual_semantic_closure().ok()
+                        } else {
+                            None
+                        };
+                        let rep_res = run_vision_pipeline_on_image_with_context(
                             &dyn_img,
                             None,
                             enable_vis_tags,
@@ -2910,6 +3108,9 @@ async fn perceive_file_handler(
                             rep_nsfw,
                             rep_ocr_en,
                             Some(rep_ocr_size.as_str()),
+                            omni_pro::vision::MediaDomain::Video,
+                            &vid_fname,
+                            closure_opt.as_ref(),
                         );
                         (webp_b64, rep_res, dyn_img)
                     })
@@ -2917,7 +3118,7 @@ async fn perceive_file_handler(
                     .unwrap_or_else(|e| {
                         (
                             None,
-                            Err(format!("视频代表帧视觉感知任务异常: {e}")),
+                            Err(omni_pro::PipelineError::InferenceFailed(format!("视频代表帧视觉感知任务异常: {e}"))),
                             image::DynamicImage::ImageRgb8(rep_rgb.clone()),
                         )
                     });
@@ -2943,16 +3144,20 @@ async fn perceive_file_handler(
                             });
 
                             rep_vision.photo_type = None;
+                            rep_vision.visual_pipeline_tags.retain(|t| {
+                                !omni_core::is_image_exclusive_tag(&t.code)
+                                    && !omni_core::is_image_exclusive_tag(&t.name)
+                            });
 
                             v.clip_tags = rep_vision.clip_tags;
                             v.clip_tag_confs = rep_vision.clip_tag_confs;
                             v.clip_high_confidence_tags = rep_vision.clip_high_confidence_tags;
                             v.clip_mutual_tags = rep_vision.clip_mutual_tags;
+                            v.visual_pipeline_tags = rep_vision.visual_pipeline_tags;
                             v.aesthetic_score = rep_vision.aesthetic_score;
                             v.quality_score = rep_vision.quality_score;
                             v.quality_issues = rep_vision.quality_issues;
                             v.has_text = rep_vision.has_text;
-                            v.ram_tags = rep_vision.ram_tags;
                             v.nsfw_probs = rep_vision.nsfw_probs;
                             v.morphology_tags = rep_vision.morphology_tags;
                             v.morphology_high_confidence_tags = rep_vision.morphology_high_confidence_tags;
@@ -3093,7 +3298,7 @@ async fn perceive_file_handler(
         };
         let (ads_res, (extract_ms, ext_res, v, vision_err, audio_ms, video_chunks, video_timings, video_cover_webp_base64, video_rep_ocr, video_ocr_ms)) = tokio::join!(f_ads, f_non_img);
         if let Some(err) = vision_err {
-            return Err(vision_unavailable_response(&err));
+            return Err(pipeline_error_response(err));
         }
 
         benchmark.extract_ms = Some(extract_ms);
@@ -3324,7 +3529,7 @@ async fn perceive_file_handler(
     let mut morphology_high_confidence_tags = vision_res.morphology_high_confidence_tags;
     let mut clip_high_confidence_tags = vision_res.clip_high_confidence_tags;
 
-    let ram_tags = vision_res.ram_tags;
+    let visual_pipeline_tags = vision_res.visual_pipeline_tags;
     let image_embedding = vision_res.image_embedding;
     // 图像向量的编码器出处由视觉层随向量一并返回，后续原样透传
     let image_encoder_id = vision_res.image_encoder_id;
@@ -3353,8 +3558,13 @@ async fn perceive_file_handler(
         {
             merged.retain(|t| !tag_matches_concept(t, Concept::全彩.zh_name()));
         }
-        // 2. 文字存在性：客观检测与 OCR 事实优先于语义猜测（仅图片路径，避免文本正文误标有字图）
-        if is_image && (has_text == Some(true) || !effective_text.trim().is_empty()) {
+        // 2. 文字存在性：客观检测与 OCR 事实优先于语义猜测（含图片与视频代表帧，避免 OCR 不可用时泄漏「无字图」）
+        if has_text.is_none() && effective_text.trim().is_empty() {
+            merged.retain(|t| {
+                !tag_matches_concept(t, Concept::无字图.zh_name())
+                    && !tag_matches_concept(t, Concept::有字图.zh_name())
+            });
+        } else if is_image && (has_text == Some(true) || !effective_text.trim().is_empty()) {
             merged.retain(|t| !tag_matches_concept(t, Concept::无字图.zh_name()));
             if !merged.iter().any(|t| tag_matches_concept(t, Concept::有字图.zh_name())) {
                 merged.push(Concept::有字图.zh_name().to_string());
@@ -3372,7 +3582,12 @@ async fn perceive_file_handler(
         }
         merged
     } else {
-        if is_image && (has_text == Some(true) || !effective_text.trim().is_empty()) {
+        if has_text.is_none() && effective_text.trim().is_empty() {
+            morphology_tags.retain(|t| {
+                !tag_matches_concept(t, Concept::无字图.zh_name())
+                    && !tag_matches_concept(t, Concept::有字图.zh_name())
+            });
+        } else if is_image && (has_text == Some(true) || !effective_text.trim().is_empty()) {
             morphology_tags.retain(|t| !tag_matches_concept(t, Concept::无字图.zh_name()));
             if !morphology_tags.iter().any(|t| tag_matches_concept(t, Concept::有字图.zh_name())) {
                 morphology_tags.push(Concept::有字图.zh_name().to_string());
@@ -3426,22 +3641,19 @@ async fn perceive_file_handler(
         .chain(morphology_tags.iter())
         .chain(nsfw_tags.iter())
         .chain(quality_issues.iter())
-        // (#718 汇聚侧同源化) ram 贡献改推 r.code（proj.code = 受控反查 zh 规范名，权威）：
-        // 此前推 r.name（展示名）→ normalize 后未受控条目 code = 展示名 hash，与过滤侧
-        // r.code（zh 规范名 hash）派生输入不同必然分叉；同源化后两侧消费同一 code，
-        // 非 zh 会话未受控条目不再依赖 OR 兜底存活。r.code 为空的条目回落展示名（旧行为）。
-        .chain(ram_tags.iter().map(|r| if r.code.is_empty() { &r.name } else { &r.code }))
     {
         if !detected_visual_tags.contains(tag) {
             detected_visual_tags.push(tag.clone());
         }
     }
 
-    // (WP2a) 来源标记 + (WP2b) 置信度贯通：登记 name → (engine, 优先级, 真实分数 Option) 映射，
-    // 优先级 物理事实(ocr) > 互斥组 > 物理规则 > ram > clip > nsfw/quality；
-    // 同名多来源时高优先级覆盖（分数随覆盖项携带），6.2 构建 TagChainItem 时按 original_name 反查
+    // (WP2a) 来源标记 + (WP2b) 置信度贯通：
+    // 优先直接保留 VisualPerceptionPipeline 产出的 engine ("visual" | "physical") 与基于 margin_c 标定的置信度，
+    // 绝不覆写为 "gemma"/"clip"/"mutual_group"，也不重复执行 calibrate_clip_score。
     let mut tag_engine_map: std::collections::HashMap<String, (&'static str, u8, Option<f32>)> =
         std::collections::HashMap::new();
+    let mut pipeline_locked_names: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(visual_pipeline_tags.len() * 2);
     {
         let mut register = |name: &str, engine: &'static str, prio: u8, conf: Option<f32>| {
             match tag_engine_map.get(name) {
@@ -3451,14 +3663,23 @@ async fn perceive_file_handler(
                 }
             }
         };
+        for vt in &visual_pipeline_tags {
+            let prio = if vt.engine == "physical" { 6 } else { 5 };
+            register(&vt.name, vt.engine, prio, Some(vt.confidence));
+            register(&vt.code, vt.engine, prio, Some(vt.confidence));
+            pipeline_locked_names.insert(vt.name.clone());
+            pipeline_locked_names.insert(vt.code.clone());
+        }
         for t in &clip_tags {
-            // CLIP/Gemma：提取层标定分 (calibrate_clip_score / gemma 线性标定)，无分回退 0.55 起步值。
-            // 引擎名按档位如实登记：gemma_unified 档位的标签物理上由 EmbeddingGemma 产出，
-            // 此前恒登记为 "clip"（历史坏账），误导日志归因与桌面端溯源映射。
-            let engine: &'static str = if cfg.embedding_profile == "gemma_unified" { "gemma" } else { "clip" };
-            register(t, engine, 2, clip_tag_confs.get(t).copied());
+            if pipeline_locked_names.contains(t) {
+                continue;
+            }
+            register(t, "visual", 2, clip_tag_confs.get(t).copied());
         }
         for t in &morphology_tags {
+            if pipeline_locked_names.contains(t) {
+                continue;
+            }
             // 物理规则推导：无模型分数，分层回退 0.90
             register(t, "physical", 4, None);
         }
@@ -3468,34 +3689,13 @@ async fn perceive_file_handler(
         for t in &quality_issues {
             register(t, "quality", 1, None);
         }
-        for r in &ram_tags {
-            // RAM++：真实模型置信度直接贯通
-            register(&r.name, "ram", 3, Some(r.confidence));
-            // (#718) 汇聚侧同源化后 detected_visual_tags 内 ram 条目为 r.code 形态，
-            // engine_lookup（域压制②按集合条目精确取来源）必须同时覆盖 code 键，
-            // 否则「截图域压制 ram 来源」静默失效。
-            if !r.code.is_empty() && r.code != r.name {
-                register(&r.code, "ram", 3, Some(r.confidence));
-            }
-        }
         for (tag, conf, _group) in &clip_mutual_tags {
-            // ★ ADR-0045「物理事实绝对覆盖律」（2026-10-16 定性修复）：
-            //   已登记为 physical 的**规则推导物理事实**（见上方 physical_fact_tags 基线注释：
-            //   客观文字检测 has_text → 有字图/无字图、DEC-05 算子 → 画幅/背景/主色调/画质等级）
-            //   不得被 CLIP 互斥组的语义投票覆盖来源标签。互斥组（如「文字存在性」组命中无字图）
-            //   即便与客观检测同向，也只是对确定性事实的冗余确认——一旦覆盖为 mutual_group，
-            //   桌面端 `resolveProvenanceGroup(engine, 'visual')` 会把「无字图」这类客观物理事实
-            //   误归 visual 组而非 fact 组（真实事故：has_text=false 时无字图同时命中规则推导与
-            //   CLIP 文字存在性互斥组，prio 5 > 4 被覆盖，属性面板把物理事实显示在视觉标签分组）。
-            //   仅拦截基线集合内的物理事实；互斥组独有胜出项（摄影题材细分等语义标签）
-            //   保持 mutual_group 语义不变（模型推理不得伪装成物理事实）。
-            if physical_fact_tags.contains(tag) {
+            if pipeline_locked_names.contains(tag) || physical_fact_tags.contains(tag) {
                 continue;
             }
-            // 互斥组胜出项：组内点积经同一标定函数换算
             register(
                 tag,
-                "mutual_group",
+                "visual",
                 5,
                 Some(omni_pro::OmniVisionEngine::calibrate_clip_score(*conf)),
             );
@@ -3538,24 +3738,12 @@ async fn perceive_file_handler(
         }
     }
 
-    // Spec D12：统一归一为稳定 code 后再做集合同步，保证 zh/en 输入幂等
-    // 修复(问题2)：normalize 前先保留「原始名 → code」映射，供 6.2 步骤反查真实展示名
-    let mut detected_visual_tag_name_to_code: std::collections::HashMap<String, String> = detected_visual_tags
+    let detected_visual_tag_name_to_code: std::collections::HashMap<String, String> = detected_visual_tags
         .iter()
         .map(|name| (name.clone(), normalize_tag_to_code(name)))
         .collect();
-    // (#718) 同源化后 ram 条目在集合内是 code 形态，6.2 反查展示名需补「展示名 → code」
-    // 条目；同 code 多键时反查侧优先非 code 形态键（见下方 original_name 查找）。
-    for r in &ram_tags {
-        if !r.code.is_empty() && r.code != r.name {
-            detected_visual_tag_name_to_code.insert(r.name.clone(), r.code.clone());
-        }
-    }
     let detected_visual_tags = normalize_tag_set_to_codes(&detected_visual_tags);
 
-    // 修复(问题4)：clip/morphology 只用 code 集合做内部比对，保留原始名供输出
-    // 同步清洗 morphology_tags 与 clip_tags，确保互斥清洗结果一致贯通（防止被清洗的子标签混入下游主体池）
-    // 输出保留原始中文/英文名（debug 字段，与 ram_tags 保持一致）
     let morphology_tags: Vec<String> = morphology_tags
         .into_iter()
         .filter(|name| {
@@ -3569,24 +3757,6 @@ async fn perceive_file_handler(
             let code = normalize_tag_to_code(name);
             detected_visual_tags.contains(&code)
         })
-        .collect();
-    // RAM 对称治理 (P3 来源对称)：与 clip/morphology 一致，按 gated 后 code 集回写过滤，
-    // 杜绝原始 ram_tags 经「6.1 直注 / ram_tags_flat / 级联主体池」三条通道绕过互斥门禁
-    let gated_ram_tags: Vec<omni_core::RamTagItem> = ram_tags
-        .iter()
-        .filter(|r| {
-            // spec §6.9.6 待裁定项 2 —— #718 同源化后 OR 兜底退役为单判据：
-            // 汇聚侧 ram 贡献已改推 r.code（权威 proj.code），过滤判据与派生源合一：
-            // r.code 非空 → contains(r.code)（自身贡献在集合 = 未被门控剔除）；
-            // r.code 为空（投影缺格）→ 回落名字归一（旧行为保底）。
-            // 旧 OR 的名字归一分支曾依赖「展示名 hash」偶然命中，已随同源化失去存在意义。
-            if r.code.is_empty() {
-                detected_visual_tags.contains(&normalize_tag_to_code(&r.name))
-            } else {
-                detected_visual_tags.contains(&r.code)
-            }
-        })
-        .cloned()
         .collect();
     let sem_graph = if is_pro { state.omw.semantic_graph() } else { None };
     let current_file_group = if is_video {
@@ -3612,10 +3782,6 @@ async fn perceive_file_handler(
             g.enrich_tag_chain_item_with_context(tag, current_file_group);
         }
     };
-    let mut gated_ram_tags = gated_ram_tags;
-    for r in &mut gated_ram_tags {
-        enrich_tag(r);
-    }
 
     // 4. 离线逆地理编码 (若元数据中含 GPS 坐标且开启了地理反查，Pro 专享)
     // 维度 16「地理位置」的 trigger 文件类型分支为「图片 / 视频」⇒ 仅 image / video 参与逆地理编码，
@@ -3713,18 +3879,7 @@ async fn perceive_file_handler(
     // 6. 统一汇聚各大引擎标签并解析为标签链 (TagChainItem) 结构
     let mut structured_visual_tags: Vec<omni_core::TagChainItem> = Vec::new();
 
-    // 6.1 首先将已具备完整维度与逻辑泛维度的 RAM++ 标签加入
-    // (P3 来源对称：只注入互斥门禁后存活的 gated_ram_tags，原始 ram_tags 不得绕过门禁直注)
-    for r in &gated_ram_tags {
-        if !structured_visual_tags.iter().any(|t| t.name.eq_ignore_ascii_case(&r.name)) {
-            let mut item = r.clone();
-            // (WP2a) 标记打标引擎来源
-            item.engine = Some("ram".to_string());
-            structured_visual_tags.push(item);
-        }
-    }
-
-    // 6.2 将其他各大引擎的有效视觉标签 (经过互斥门禁过滤的 detected_visual_tags) 统一映射为 TagChainItem
+    // 将有效视觉标签 (经过互斥门禁过滤的 detected_visual_tags) 统一映射为 TagChainItem
     // 修复(问题2)：detected_visual_tags 此时为 code 字符串（normalize 后），
     // 需先从 name→code 映射反查原始展示名，再构建 TagChainItem，防止 name 被写成 code 串
     for raw_code in &detected_visual_tags {
@@ -3806,14 +3961,12 @@ async fn perceive_file_handler(
         }
     }
 
-    // 7. 级联提示词合成 + CLIP 向量仲裁终局裁决 (Pro 专享，仅图片路径生效)
-    // 注意：此处在 ram_tags 降级为 flat 前调用，以获取完整 TagChainItem 结构
-    // (P3 来源对称：级联主体池同样只消费门禁后存活的 gated_ram_tags)
+    // 7. 级联提示词合成 + 向量仲裁终局裁决 (Pro 专享，仅图片路径生效，消费阶段 2 富化后标签，零额外 ONNX 推理)
     let (cascade_candidates, winning_hypothesis, activated_dimension_tags, _smart_name, _content_description, pruned_ambiguous_words) = if is_pro && is_image {
         omni_pro::OmniVisionEngine::synthesize_cascade_hypotheses_and_arbitrate_with_encoder(
             &file_path,
             &detected_visual_tags,
-            &gated_ram_tags,
+            &structured_visual_tags,
             &morphology_tags,
             &nsfw_tags,
             image_embedding.as_deref(),
@@ -3822,26 +3975,6 @@ async fn perceive_file_handler(
         )
     } else {
         (Vec::new(), None, Vec::new(), None, None, Vec::new())
-    };
-
-    // 6.3 ram_tags 平铺字符串数组：忠实透出 RAM++ 模型端原始识别结果 (全年龄/安全内容下过滤违禁敏感词)
-    let is_all_ages_content = is_pro && sensitive_types.is_empty() && (
-        content_rating.as_deref() == Some("safe")
-            || content_rating.as_deref() == Some("all_ages")
-            || content_rating.as_deref().map_or(false, |r| tag_matches_concept(r, Concept::全年龄.code()))
-            || nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::全年龄.code()))
-            // Gate F3: 严禁裸字符串比较受控码，统一走 tag_matches_concept 路由
-            || (!nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || tag_matches_concept(t, "R-18") || tag_matches_concept(t, "R-18G"))
-                && !nsfw_text_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || tag_matches_concept(t, "R-18") || tag_matches_concept(t, "R-18G")))
-    );
-    let ram_tags_flat: Vec<String> = if is_all_ages_content {
-        ram_tags
-            .iter()
-            .filter(|r| !omni_pro::is_nsfw_or_restricted_tag(&r.name))
-            .map(|r| r.name.clone())
-            .collect()
-    } else {
-        ram_tags.iter().map(|r| r.name.clone()).collect()
     };
 
     let lrc = metadata
@@ -4578,6 +4711,14 @@ async fn perceive_file_handler(
     // 核心安全合规契约：无论什么类型的文件（图片/视频/音频/文本/文档），
     // 若通过 nsfw_tags 或 nsfw_text_tags 专职判定为非 NSFW 的内容 (is_all_ages_content)，全面过滤所有通道的敏感标签！
     // 若为真正违规/NSFW 的内容，则不过滤，忠实透出全部检测结果供审计与标记。
+    let is_all_ages_content = is_pro && sensitive_types.is_empty() && (
+        content_rating.as_deref() == Some("safe")
+            || content_rating.as_deref() == Some("all_ages")
+            || content_rating.as_deref().map_or(false, |r| tag_matches_concept(r, Concept::全年龄.code()))
+            || nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::全年龄.code()))
+            || (!nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || tag_matches_concept(t, "R-18") || tag_matches_concept(t, "R-18G"))
+                && !nsfw_text_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || tag_matches_concept(t, "R-18") || tag_matches_concept(t, "R-18G")))
+    );
     if is_all_ages_content {
         clip_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(t));
         clip_high_confidence_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(t));
@@ -4590,7 +4731,7 @@ async fn perceive_file_handler(
     benchmark.total_ms = t_start.elapsed().as_millis() as u64;
 
     tracing::debug!(
-        "[OmniServer] 原生多模态感知完成: file={}, 耗时={}ms, watermark_level={:?}, mosaic_level={:?}, has_text={:?}, visual_tags_count={}, fused_tags_count={}, ram_tags={:?}, geo={:?}",
+        "[OmniServer] 原生多模态感知完成: file={}, 耗时={}ms, watermark_level={:?}, mosaic_level={:?}, has_text={:?}, visual_tags_count={}, fused_tags_count={}, geo={:?}",
         file_path,
         benchmark.total_ms,
         watermark_level,
@@ -4598,7 +4739,6 @@ async fn perceive_file_handler(
         has_text,
         structured_visual_tags.len(),
         fused_tags.len(),
-        ram_tags_flat,
         geo_address
     );
 
@@ -4640,7 +4780,7 @@ async fn perceive_file_handler(
         clip_tags,
         nsfw_tags,
         nsfw_text_tags,
-        ram_tags: ram_tags_flat,
+        ram_tags: Vec::new(),
         morphology_high_confidence_tags,
         clip_high_confidence_tags,
         nsfw_high_confidence_tags,
@@ -6859,6 +6999,7 @@ async fn vision_tags_handler(
     Json(req): Json<VisionTagsRequest>,
 ) -> Result<Json<VisionTagsResponse>, (StatusCode, Json<serde_json::Value>)> {
     let cfg = state.config.lock().unwrap().clone();
+    let omw = state.omw.clone();
     tokio::task::spawn_blocking(move || {
         let t_start = std::time::Instant::now();
         let file_path = req.file_path.clone();
@@ -6866,49 +7007,74 @@ async fn vision_tags_handler(
         let mut tags = Vec::new();
         let mut scored_tags: Option<Vec<(String, f32)>> = None;
         if omni_pro::is_pro_enabled() {
-            if cfg.embedding_profile == "gemma_unified" {
-                // gemma_unified 档位：严格只走 EmbeddingGemma 视觉感知，禁止互通，禁止降级到 CLIP
-                match image::open(&file_path) {
-                    Ok(img) => {
-                        let scored = omni_pro::OmniVisionEngine::extract_gemma_visual_tags_scored_from_image(
-                            &img,
-                            req.top_k.unwrap_or(5),
-                        );
-                        tags = scored.iter().map(|(c, _)| c.clone()).collect();
-                        scored_tags = Some(scored);
-                    }
-                    Err(e) => {
-                        tracing::error!("[OmniVision] gemma_unified 无法打开图片: {e}");
+            let img = image::open(&file_path).map_err(|e| {
+                pipeline_error_response(omni_pro::PipelineError::CorruptInput(format!(
+                    "无法解码图像文件 ({file_path}): {e}"
+                )))
+            })?;
+            let (w, h) = (img.width(), img.height());
+            let fname = std::path::Path::new(&file_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let ocr_evidence = if cfg.enable_image_ocr {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    omni_pro::OmniVisionEngine::fast_detect_has_text_with_size(
+                        &img,
+                        &cfg.ocr_model_size,
+                    )
+                })) {
+                    Ok(true) => omni_pro::vision::OcrEvidence {
+                        state: omni_pro::vision::OcrEvidenceState::Detected,
+                        ..Default::default()
+                    },
+                    Ok(false) => omni_pro::vision::OcrEvidence {
+                        state: omni_pro::vision::OcrEvidenceState::NoText,
+                        ..Default::default()
+                    },
+                    Err(err) => {
+                        tracing::warn!("/api/vision/tags DBNet text_detect panic，回退 OcrEvidenceState::Unavailable: {:?}", err);
+                        omni_pro::vision::OcrEvidence {
+                            state: omni_pro::vision::OcrEvidenceState::Unavailable,
+                            ..Default::default()
+                        }
                     }
                 }
             } else {
-                // classic_light 档位：严格只走 CLIP 视觉感知，禁止互通，禁止借道 Gemma
-                match image::open(&file_path) {
-                    Ok(img) => {
-                        match omni_pro::OmniVisionEngine::try_extract_clip_visual_tags_scored_from_image(
-                            &img,
-                            req.language.as_deref(),
-                            req.top_k.unwrap_or(5),
-                        ) {
-                            Ok(scored) => {
-                                tags = scored.iter().map(|(c, _)| c.clone()).collect();
-                                scored_tags = Some(scored);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "[OmniVision] classic_light 视觉感知失败 (file={}): {}",
-                                    file_path,
-                                    e
-                                );
-                                return Err(vision_unavailable_response(&e));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("[OmniVision] classic_light 无法打开图片: {e}");
-                    }
+                omni_pro::vision::OcrEvidence {
+                    state: omni_pro::vision::OcrEvidenceState::Unavailable,
+                    ..Default::default()
                 }
-            }
+            };
+            let mut ctx = omni_pro::vision::VisionRequestContext::for_image(
+                fname,
+                w,
+                h,
+                req.language.clone(),
+                ocr_evidence,
+            );
+            ctx.top_k = req.top_k.unwrap_or(5);
+            let closure_opt = if omni_pro::vision::current_runtime_snapshot().is_none() && omw.is_available() {
+                omw.build_visual_semantic_closure().ok()
+            } else {
+                None
+            };
+            let ret_dim = omni_pro::OmniVisionEngine::gemma_mrl_dimension();
+            let vis = omni_pro::OmniVisionEngine::perceive_visual_single_forward(
+                &img,
+                &cfg.embedding_profile,
+                ret_dim,
+                &ctx,
+                closure_opt.as_ref(),
+            )
+            .map_err(pipeline_error_response)?;
+            let scored: Vec<(String, f32)> = vis
+                .tags
+                .into_iter()
+                .map(|t| (t.code, t.confidence))
+                .collect();
+            tags = scored.iter().map(|(c, _)| c.clone()).collect();
+            scored_tags = Some(scored);
         }
 
         if let Some(top_k) = req.top_k {
@@ -6931,7 +7097,11 @@ async fn vision_tags_handler(
         }))
     })
     .await
-    .map_err(|e| vision_unavailable_response(&format!("视觉标签任务异常: {e}")))?
+    .map_err(|e| {
+        pipeline_error_response(omni_pro::PipelineError::InferenceFailed(format!(
+            "视觉标签任务异常: {e}"
+        )))
+    })?
 }
 
 /// 单指标图像频域特征检测处理: POST /api/vision/inspect

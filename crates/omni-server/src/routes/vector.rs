@@ -1045,26 +1045,12 @@ pub async fn embed_clip_text_handler(
                 Err(reason) => Err((reason, encoder_id::CHINESE_CLIP, 0u128, 0u128)),
             }
         } else {
-            let vocab_status = omni_pro::vision::verify_mobileclip_en_vocab();
             let clip_dir = match omni_pro::OmniVisionEngine::resolve_mobile_clip_model_dir() {
                 Some(d) => d,
                 None => {
-                    let reason = match vocab_status.reject_reason.as_deref() {
-                        Some("vocab_hash_mismatch") => "vocab_hash_mismatch",
-                        Some("vocab_version_mismatch") => "vocab_version_mismatch",
-                        _ => "model_missing",
-                    };
-                    return Err((reason, encoder_id::MOBILE_CLIP, 0u128, 0u128));
+                    return Err(("model_missing", encoder_id::MOBILE_CLIP, 0u128, 0u128));
                 }
             };
-            if !vocab_status.valid {
-                let reason = match vocab_status.reject_reason.as_deref() {
-                    Some("vocab_hash_mismatch") => "vocab_hash_mismatch",
-                    Some("vocab_version_mismatch") => "vocab_version_mismatch",
-                    _ => "vocab_missing",
-                };
-                return Err((reason, encoder_id::MOBILE_CLIP, 0u128, 0u128));
-            }
             if !omni_pro::vision::mobileclip_text_model_ready(&clip_dir) {
                 return Err(("model_missing", encoder_id::MOBILE_CLIP, 0u128, 0u128));
             }

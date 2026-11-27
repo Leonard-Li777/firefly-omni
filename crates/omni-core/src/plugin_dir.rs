@@ -21,7 +21,7 @@ pub const ENV_STRICT_ACTIVE_PLUGINS: &str = "FIREFLY_STRICT_ACTIVE_PLUGINS";
 /// 全局受控 `_shared` 共享根目录环境变量名
 pub const ENV_SHARED_DIR: &str = "FIREFLY_SHARED_DIR";
 
-/// MobileCLIP 英文视觉词表运行期校验预期元数据（随挂载清单由主进程单一权威下发）
+/// 旧版视觉词表运行期校验预期元数据（Expand 兼容保留，Contract 在 Ticket 10 收口）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MountVocabMeta {
@@ -31,6 +31,23 @@ pub struct MountVocabMeta {
     pub vocab_sha256: String,
     pub vocab_text_sha256: String,
     pub vocab_entry_count: usize,
+    pub embed_dim: usize,
+}
+
+/// 新版同源受控视觉矩阵权威元数据（三视觉适配器通用，Spec v2.12 §2.4 & §3.1）
+/// 注：已采纳 [OOS-02]，不含 domain_order_version / domain_matrix_sha256。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualMountVocabMeta {
+    pub matrix_file_name: String,
+    pub meta_file_name: String,
+    pub version: String,
+    pub schema_version: u32,
+    pub bake_revision: u32,
+    pub encoder_digest_prefix: String,
+    pub matrix_sha256: String,
+    pub meta_sha256: String,
+    pub entry_count: usize,
     pub embed_dim: usize,
 }
 
@@ -60,6 +77,8 @@ pub struct ActiveMountEntry {
     pub encoder_id: Option<u32>,
     #[serde(default)]
     pub vocab_meta: Option<MountVocabMeta>,
+    #[serde(default)]
+    pub visual_vocab_meta: Option<VisualMountVocabMeta>,
 }
 
 /// `active-mounts-*.json` 根结构
@@ -95,6 +114,7 @@ pub struct ValidatedMount {
     pub dim: Option<usize>,
     pub encoder_id: Option<u32>,
     pub vocab_meta: Option<MountVocabMeta>,
+    pub visual_vocab_meta: Option<VisualMountVocabMeta>,
 }
 
 /// 被拒绝的挂载项（供 `/api/v1/engine/status` 自愈诊断）
@@ -384,6 +404,7 @@ fn validate_single_mount(
         dim: entry.dim,
         encoder_id: entry.encoder_id,
         vocab_meta: entry.vocab_meta.clone(),
+        visual_vocab_meta: entry.visual_vocab_meta.clone(),
     })
 }
 
@@ -777,6 +798,7 @@ pub fn get_validated_mount(resource_id: &str) -> Result<Option<ValidatedMount>> 
                 dim: None,
                 encoder_id: None,
                 vocab_meta: None,
+                visual_vocab_meta: None,
             }))
         }
     }
@@ -798,12 +820,12 @@ pub fn require_mounted_dir(resource_id: &str) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("共享资源 {} 未激活或未通过挂载清单门禁", resource_id))
 }
 
-/// 读取清单注入的 MobileCLIP / CLIP 预期词表权威元数据
-pub fn get_mount_vocab_meta(resource_id: &str) -> Option<MountVocabMeta> {
+/// 读取清单注入的同源受控视觉矩阵权威元数据 (`vocab_v.{f16,meta.json}`)
+pub fn get_mount_visual_vocab_meta(resource_id: &str) -> Option<VisualMountVocabMeta> {
     get_validated_mount(resource_id)
         .ok()
         .flatten()
-        .and_then(|m| m.vocab_meta)
+        .and_then(|m| m.visual_vocab_meta)
 }
 
 fn read_current_json(dir: &Path) -> Option<serde_json::Value> {

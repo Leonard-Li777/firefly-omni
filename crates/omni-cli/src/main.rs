@@ -50,6 +50,17 @@ enum Commands {
         #[arg(short, long)]
         file: String,
     },
+    /// 校验暂存或已安装视觉适配器目录内的 `vocab_v.{f16,meta.json}`（输出结构化 JSON，失败非零退出）
+    VerifyVisualVocab {
+        /// 待校验的模型适配器目录（支持位置参数）
+        dir: Option<String>,
+        /// 待校验的模型适配器目录（兼容 --dir 标志形式）
+        #[arg(long = "dir")]
+        dir_flag: Option<String>,
+        /// 可选预期 encoder_id（2=chinese-clip, 3=mobile-clip, 4=gemma）
+        #[arg(long)]
+        encoder_id: Option<u8>,
+    },
 }
 
 #[tokio::main]
@@ -102,6 +113,33 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             omni_extract::shutdown_exiftool_daemon();
             std::process::exit(0);
+        }
+        Some(Commands::VerifyVisualVocab {
+            dir,
+            dir_flag,
+            encoder_id,
+        }) => {
+            let Some(resolved_dir) = dir_flag.as_deref().or(dir.as_deref()) else {
+                let err_json = serde_json::json!({
+                    "ok": false,
+                    "status": "corrupt",
+                    "code": "MISSING_DIR_ARG",
+                    "error": "缺少待校验的模型适配器目录参数 (<DIR> 或 --dir <DIR>)"
+                });
+                println!("{}", serde_json::to_string(&err_json)?);
+                std::process::exit(2);
+            };
+            let target = std::path::Path::new(resolved_dir);
+            match omni_server::verify_visual_vocab_staging_json(target, *encoder_id) {
+                Ok(summary) => {
+                    println!("{}", serde_json::to_string(&summary)?);
+                    std::process::exit(0);
+                }
+                Err(err_json) => {
+                    println!("{}", serde_json::to_string(&err_json)?);
+                    std::process::exit(2);
+                }
+            }
         }
         None => {
             println!("firefly-omni 🚀 运行成功。使用 --help 查看命令选项。");

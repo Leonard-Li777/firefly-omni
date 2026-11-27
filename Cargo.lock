@@ -4639,6 +4639,7 @@ version = "0.1.9"
 dependencies = [
  "ahash",
  "anyhow",
+ "arc-swap",
  "image",
  "magika",
  "ndarray 0.16.1",

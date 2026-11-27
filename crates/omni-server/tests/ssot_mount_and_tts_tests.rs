@@ -317,7 +317,7 @@ async fn test_m5_tts_unified_facade_status_501_and_unready_503() {
 }
 
 #[tokio::test]
-async fn test_mobileclip_en_vocab_missing_and_tampered_fail_closed_with_503() {
+async fn test_visual_tagger_vocab_stale_409_missing_500_corrupt_422_and_assets_reload() {
     if !omni_pro::is_pro_enabled() {
         return;
     }
@@ -329,11 +329,12 @@ async fn test_mobileclip_en_vocab_missing_and_tampered_fail_closed_with_503() {
     write_sized_file(&mobile_dir.join("mobileclip-b-int8-text.onnx"), 512);
     fs::write(mobile_dir.join("mobileclip-tokenizer.json"), vec![b'a'; 256]).unwrap();
 
-    // 生成合法 4x4 PNG 图片供 /api/vision/tags 测试
+    // 生成合法 4x4 PNG 图片与损坏假图供 /api/vision/tags 测试
     let png_path = temp.path().join("sample.png");
     image::DynamicImage::new_rgb8(4, 4).save(&png_path).unwrap();
+    let bad_img_path = temp.path().join("corrupt.png");
+    fs::write(&bad_img_path, b"not-a-valid-png-payload").unwrap();
 
-    let expected_sha = "a".repeat(64);
     let manifest_path = temp.path().join("active-mounts.json");
     let manifest = serde_json::json!({
         "version": 1,
@@ -350,16 +351,7 @@ async fn test_mobileclip_en_vocab_missing_and_tampered_fail_closed_with_503() {
                     "mobileclip-b-int8-text.onnx",
                     "mobileclip-tokenizer.json"
                 ]],
-                "minPrimaryFileBytes": 1_000_000,
-                "vocabMeta": {
-                    "fileName": "tags_visual_en.bin",
-                    "textFileName": "tags_visual_en.txt",
-                    "vocabVersion": "2026-11-11.1",
-                    "vocabSha256": expected_sha,
-                    "vocabTextSha256": "",
-                    "vocabEntryCount": 2,
-                    "embedDim": 512
-                }
+                "minPrimaryFileBytes": 1_000_000
             }
         }
     });
@@ -368,28 +360,35 @@ async fn test_mobileclip_en_vocab_missing_and_tampered_fail_closed_with_503() {
 
     let app = setup_test_app();
 
-    // 状态 1: 词表缺失 -> vocab_missing
-    let clip_req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/vector/embed-clip-text")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&serde_json::json!({
-                "text": "a golden retriever",
-                "lang": "en"
-            }))
-            .unwrap(),
-        ))
+    // 1. 坏图输入 -> 422 Unprocessable Entity (CORRUPT_INPUT)
+    let bad_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/vision/tags")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "filePath": bad_img_path.to_string_lossy(),
+                        "language": "en",
+                        "topK": 5
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
         .unwrap();
-    let clip_resp = app.clone().oneshot(clip_req).await.unwrap();
-    assert_eq!(clip_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let clip_body: Value = serde_json::from_slice(
-        &axum::body::to_bytes(clip_resp.into_body(), usize::MAX).await.unwrap(),
+    assert_eq!(bad_resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bad_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(bad_resp.into_body(), usize::MAX).await.unwrap(),
     )
     .unwrap();
-    assert_eq!(clip_body["error"], "vocab_missing");
-    assert_eq!(clip_body["encoderId"], 3);
+    assert_eq!(bad_body["reason"], "CORRUPT_INPUT");
+    assert_eq!(bad_body["error"]["code"], "INPUT_REJECTED");
 
+    // 2. Stage 0（旧目录无 vocab_v.meta.json 且未声明 visualVocabMeta）-> 409 Conflict (ENGINE_NOT_READY / VISUAL_VOCAB_STALE)，绝不返回 503
     let tags_resp = app
         .clone()
         .oneshot(
@@ -409,68 +408,15 @@ async fn test_mobileclip_en_vocab_missing_and_tampered_fail_closed_with_503() {
         )
         .await
         .unwrap();
-    assert_eq!(tags_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(tags_resp.status(), StatusCode::CONFLICT);
     let tags_body: Value = serde_json::from_slice(
         &axum::body::to_bytes(tags_resp.into_body(), usize::MAX).await.unwrap(),
     )
     .unwrap();
-    assert_eq!(tags_body["reason"], "vocab_missing");
+    assert_eq!(tags_body["reason"], "VISUAL_VOCAB_STALE");
+    assert_eq!(tags_body["error"]["code"], "ENGINE_NOT_READY");
 
-    // 状态 2: 词表哈希被篡改 -> vocab_hash_mismatch
-    fs::write(mobile_dir.join("tags_visual_en.bin"), vec![1u8; 2 * 512 * 4]).unwrap();
-    fs::write(mobile_dir.join("tags_visual_en.txt"), "cat\ndog\n").unwrap();
-
-    let clip_resp_tampered = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/vector/embed-clip-text")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "text": "a golden retriever",
-                        "lang": "en"
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(clip_resp_tampered.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let clip_body_tampered: Value = serde_json::from_slice(
-        &axum::body::to_bytes(clip_resp_tampered.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
-    assert_eq!(clip_body_tampered["error"], "vocab_hash_mismatch");
-
-    let tags_resp_tampered = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/vision/tags")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "filePath": png_path.to_string_lossy(),
-                        "language": "en",
-                        "topK": 5
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(tags_resp_tampered.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let tags_body_tampered: Value = serde_json::from_slice(
-        &axum::body::to_bytes(tags_resp_tampered.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
-    assert_eq!(tags_body_tampered["reason"], "vocab_hash_mismatch");
-
+    // 3. 验证 /api/v1/engine/status 与 /health.assets.tagger 暴露契约（含 visualVocab、taggerSource、byEncoder）
     let status_resp = app
         .clone()
         .oneshot(
@@ -487,9 +433,21 @@ async fn test_mobileclip_en_vocab_missing_and_tampered_fail_closed_with_503() {
         &axum::body::to_bytes(status_resp.into_body(), usize::MAX).await.unwrap(),
     )
     .unwrap();
-    assert_eq!(status_json["mobileClipVocab"]["status"], "vocab_hash_mismatch");
+    let status_obj = status_json.as_object().unwrap();
+    assert!(!status_obj.contains_key("mobileClipVocab"), "已下线的 mobileClipVocab 不得残留在 /engine/status");
+    assert!(
+        !status_json["vision_engines_available"].as_object().unwrap().contains_key("ram"),
+        "已退役的 ram 不得残留在 vision_engines_available"
+    );
+    assert!(status_json["visualTagger"].is_object());
+    assert!(status_json["visualVocab"].is_object());
+    assert_eq!(status_json["visualVocab"]["activeEncoderId"], 3);
+    assert_eq!(status_json["visualVocab"]["activeStatus"], "stale");
+    assert_eq!(status_json["visualVocab"]["byEncoder"]["3"]["status"], "stale");
+    assert_eq!(status_json["taggerSource"], "unavailable");
 
     let health_resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -504,65 +462,38 @@ async fn test_mobileclip_en_vocab_missing_and_tampered_fail_closed_with_503() {
         &axum::body::to_bytes(health_resp.into_body(), usize::MAX).await.unwrap(),
     )
     .unwrap();
-    assert_eq!(health_json["clipText"]["mobileClip"]["vocabReady"], false);
-    assert_eq!(health_json["clipText"]["mobileClip"]["rejectReason"], "vocab_hash_mismatch");
+    assert!(health_json["assets"]["tagger"]["chineseClip"].is_object());
+    assert!(health_json["assets"]["tagger"]["mobileClip"].is_object());
+    assert!(health_json["assets"]["tagger"]["gemma"].is_object());
+    assert!(health_json["assets"]["tagger"]["byEncoder"].is_object());
+    assert!(health_json["assets"]["tagger"]["status"].is_string());
+    assert_eq!(health_json["clipText"]["mobileClip"]["vocabReady"], true, "文本词表探活应仅认 tokenizer，不再被 deleted tags_visual_en.bin 阻塞");
 
-    // 状态 3: 无效版本元数据格式 -> vocab_version_mismatch
-    let bad_ver_manifest = serde_json::json!({
-        "version": 1,
-        "sharedDir": shared.to_string_lossy(),
-        "strict": true,
-        "mounts": {
-            "mobile-clip": {
-                "resourceId": "mobile-clip",
-                "moduleId": "engine_classic_light",
-                "capabilitySlot": "base_embedding",
-                "dir": mobile_dir.to_string_lossy(),
-                "requiredFileGroups": [[
-                    "mobileclip-b-int8-vision.onnx",
-                    "mobileclip-b-int8-text.onnx",
-                    "mobileclip-tokenizer.json"
-                ]],
-                "minPrimaryFileBytes": 1_000_000,
-                "vocabMeta": {
-                    "fileName": "tags_visual_en.bin",
-                    "textFileName": "tags_visual_en.txt",
-                    "vocabVersion": "invalid!",
-                    "vocabSha256": expected_sha,
-                    "vocabTextSha256": "",
-                    "vocabEntryCount": 2,
-                    "embedDim": 512
-                }
-            }
-        }
-    });
-    fs::write(&manifest_path, serde_json::to_vec(&bad_ver_manifest).unwrap()).unwrap();
-    omni_core::plugin_dir::invalidate_mount_cache();
-
-    let app2 = setup_test_app();
-    let ver_resp = app2
+    // 4. POST /api/v1/taxonomy/reload-policies 独立返回 200，POST /api/v1/assets/reload 未挂载 semantic.pack 时 Fail-Closed 返回 500
+    let policy_resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/v1/vector/embed-clip-text")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&serde_json::json!({
-                        "text": "a golden retriever",
-                        "lang": "en"
-                    }))
-                    .unwrap(),
-                ))
+                .uri("/api/v1/taxonomy/reload-policies")
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(ver_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let ver_body: Value = serde_json::from_slice(
-        &axum::body::to_bytes(ver_resp.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
-    assert_eq!(ver_body["error"], "vocab_version_mismatch");
+    assert_eq!(policy_resp.status(), StatusCode::OK);
+
+    let reload_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/assets/reload")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reload_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
