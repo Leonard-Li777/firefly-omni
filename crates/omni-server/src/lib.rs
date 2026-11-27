@@ -403,16 +403,6 @@ async fn version_handler() -> Json<serde_json::Value> {
     }))
 }
 
-/// 资产与单轨挂载清单原子热重载: POST /api/v1/assets/reload
-async fn assets_reload_handler() -> Json<serde_json::Value> {
-    omni_core::plugin_dir::invalidate_mount_cache();
-    let mount_state = omni_core::plugin_dir::current_mount_state();
-    Json(serde_json::json!({
-        "reloaded": true,
-        "mountManifest": mount_state.status
-    }))
-}
-
 /// 引擎与多模态塔运行时状态查询: GET /api/v1/engine/status
 async fn engine_status_handler(
     Query(query): Query<HealthQuery>,
