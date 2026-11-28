@@ -831,6 +831,30 @@ pub struct OmniPerceptionResult {
     /// E2E 快照修订号（仅 FF_E2E_MODE=1 且鉴权通过时序列化）
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "snapshotRevision")]
     pub snapshot_revision: Option<u64>,
+    /// 是否探测到有效音频轨（纯无声视频为 Some(false)）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_audio_stream: Option<bool>,
+    /// 音频流/文件探测物理总时长（秒）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_total_duration_sec: Option<f32>,
+    /// 本次 ASR 实际解码覆盖的音频时长（秒）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_analyzed_duration_sec: Option<f32>,
+    /// 音频 ASR 是否发生截断或未完整覆盖
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_truncated: Option<bool>,
+    /// 本次请求对 NSFW 判定的完备性状态：complete / partial / disabled
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nsfw_completeness: Option<NsfwCompletenessState>,
+}
+
+/// NSFW 判定完备性状态枚举（严禁对 Partial / Disabled 文件主动签发「全年龄」）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NsfwCompletenessState {
+    Complete,
+    Partial,
+    Disabled,
 }
 
 /// 视频时序切片实体（30 秒窗口切片）

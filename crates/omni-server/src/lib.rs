@@ -2807,6 +2807,124 @@ fn build_enriched_document_corpus(
     parts.join("\n")
 }
 
+/// 音频轨探测与 ASR 实际解码覆盖情况（供音视频完备性门控判定）
+#[derive(Debug, Clone, Default)]
+struct AudioProbeCoverage {
+    has_audio_stream: Option<bool>,
+    total_duration_sec: Option<f32>,
+    analyzed_duration_sec: Option<f32>,
+    asr_enabled: bool,
+    asr_model_ready: bool,
+    audio_decoded_ok: bool,
+}
+
+/// 音视频/全媒体 NSFW 完备性计算输入（纯函数接缝）
+#[derive(Debug, Clone, Default)]
+pub struct MediaCompletenessInput {
+    pub is_pro: bool,
+    pub is_image: bool,
+    pub is_video: bool,
+    pub is_audio: bool,
+    pub nsfw_slot_active: bool,
+    pub nsfw_ready_for_media: bool,
+    pub enable_video_visual: bool,
+    pub video_truncated: Option<bool>,
+    pub video_degraded: bool,
+    pub video_has_evaluated_frames: bool,
+    pub video_analyze_start_sec: Option<f64>,
+    pub video_max_analyze_sec: Option<f64>,
+    pub video_total_duration_sec: Option<f64>,
+    pub video_analyzed_duration_sec: Option<f64>,
+    pub has_audio_stream: Option<bool>,
+    pub audio_total_duration_sec: Option<f32>,
+    pub audio_analyzed_duration_sec: Option<f32>,
+    pub asr_enabled: bool,
+    pub asr_model_ready: bool,
+    pub audio_decoded_ok: bool,
+}
+
+/// 判定媒体在本次请求中是否完成了完整合规检测，以及音频是否发生截断
+pub fn evaluate_media_nsfw_completeness(
+    input: &MediaCompletenessInput,
+) -> (Option<bool>, omni_core::NsfwCompletenessState) {
+    let audio_truncated = if input.is_audio || input.is_video {
+        if input.has_audio_stream == Some(false) {
+            Some(false)
+        } else if !input.asr_enabled || !input.asr_model_ready || !input.audio_decoded_ok {
+            Some(true)
+        } else {
+            match (input.audio_analyzed_duration_sec, input.audio_total_duration_sec) {
+                (Some(analyzed), Some(total)) if total.is_finite() && total >= 0.0 => {
+                    Some(analyzed + 2.0 < total)
+                }
+                _ => Some(true),
+            }
+        }
+    } else {
+        None
+    };
+
+    if !input.is_pro || !input.nsfw_slot_active || !input.nsfw_ready_for_media {
+        return (audio_truncated, omni_core::NsfwCompletenessState::Disabled);
+    }
+
+    if !input.is_video && !input.is_audio {
+        return (None, omni_core::NsfwCompletenessState::Complete);
+    }
+
+    let audio_complete = audio_truncated == Some(false);
+    if input.is_audio {
+        let state = if audio_complete {
+            omni_core::NsfwCompletenessState::Complete
+        } else {
+            omni_core::NsfwCompletenessState::Partial
+        };
+        return (audio_truncated, state);
+    }
+
+    // 视频视觉完备：未关闭视觉、无看门狗/降级、至少评估了代表帧或编码帧、从头分析且覆盖全片（±2s 容差）
+    let visual_window_covers_end = match (input.video_max_analyze_sec, input.video_total_duration_sec) {
+        (Some(max_s), Some(total_s)) if total_s.is_finite() && total_s >= 0.0 => {
+            max_s + 2.0 >= total_s
+                && input
+                    .video_analyzed_duration_sec
+                    .map_or(false, |d| d.is_finite() && d + 2.0 >= total_s)
+        }
+        (Some(_), None) => false,
+        (None, Some(total_s)) if total_s.is_finite() && total_s >= 0.0 => input
+            .video_analyzed_duration_sec
+            .map_or(false, |d| d.is_finite() && d + 2.0 >= total_s),
+        (None, None) => false,
+        _ => false,
+    };
+
+    let visual_complete = input.enable_video_visual
+        && input.video_truncated != Some(true)
+        && !input.video_degraded
+        && input.video_has_evaluated_frames
+        && input.video_analyze_start_sec.unwrap_or(0.0) <= 0.5
+        && visual_window_covers_end;
+
+    let state = if visual_complete && audio_complete {
+        omni_core::NsfwCompletenessState::Complete
+    } else {
+        omni_core::NsfwCompletenessState::Partial
+    };
+    (audio_truncated, state)
+}
+
+#[inline]
+fn nsfw_rating_rank(rating: Option<&str>) -> u8 {
+    match rating {
+        Some("r18g") => 5,
+        Some("r18") => 4,
+        Some("r15") => 3,
+        Some("pg13") => 2,
+        Some("safe") => 1,
+        _ => 0,
+    }
+}
+
 /// 处理全量原生多模态感知请求: POST /api/perceive
 /// 单次 I/O 汇聚元数据提取、NTFS ADS 来源直查、频域水印/打码检测、离线逆地理编码与物理事实
 async fn perceive_file_handler(
@@ -2861,6 +2979,20 @@ async fn perceive_file_handler(
     let is_video = mime_type.starts_with("video/") || omni_core::is_video_ext(&ext);
     let is_audio = mime_type.starts_with("audio/") || omni_core::is_audio_ext(&ext);
 
+    let nsfw_slot_active = cfg.enable_nsfw_perception;
+    let nsfw_visual_ready = if is_pro {
+        omni_pro::OmniVisionEngine::resolve_nsfw_model_path().is_some()
+    } else {
+        false
+    };
+    let nsfw_ready_for_media = if is_image || is_video {
+        nsfw_visual_ready
+    } else {
+        true
+    };
+    let enable_video_slice_nsfw = nsfw_slot_active && nsfw_visual_ready;
+    let enable_video_visual = req.enable_video_visual_analysis.unwrap_or(true);
+
     // 并行任务: NTFS ADS 溯源（迁入 spawn_blocking，防慢速磁盘/网络盘阻塞 Tokio worker）
     let f_ads = {
         let file_path = file_path.clone();
@@ -2880,7 +3012,7 @@ async fn perceive_file_handler(
         }
     };
 
-    let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, video_chunks, video_timings, video_cover_webp_base64)) = if is_image {
+    let ((file_source, file_source_code, source_url, ads_ms), (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, video_chunks, video_timings, video_cover_webp_base64, audio_cov)) = if is_image {
         let f_img = async {
             // 步骤 A1: 前置 ExifTool 全量元数据提取（迁入 spawn_blocking，防外部进程/磁盘 IO 阻塞 Tokio worker）
             let p_meta = p.to_path_buf();
@@ -3080,7 +3212,7 @@ async fn perceive_file_handler(
         benchmark.record_opt("text_ms", text_ms);
         benchmark.extract_ms = Some(vision_res.duration_ms.max(metadata_ms).max(ocr_ms.unwrap_or(0)));
 
-        (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, Vec::new(), None, None))
+        (ads_res, (metadata, markdown_content, phash, is_corrupted, vision_res, ocr_text, Vec::new(), None, None, AudioProbeCoverage::default()))
     } else {
         let f_non_img = async {
             let t_extract = std::time::Instant::now();
@@ -3111,7 +3243,6 @@ async fn perceive_file_handler(
             let mut video_ocr_ms: Option<u64> = None;
             // [V12-E11] 视频逐帧预算仅在明确开启视觉分析时进入；false 时彻底跳过抽帧与代表帧视觉感知，
             // 绝不被 perceive.rs 内部的 `.clamp(5, 240)` 强行重开为 5 帧。ASR 分支在本块之外独立执行。
-            let enable_video_visual = req.enable_video_visual_analysis.unwrap_or(true);
             if is_video && is_pro && enable_video_visual {
                 let fp_wm = file_path.clone();
                 let (v_wm_lvl, v_wm_status) = tokio::task::spawn_blocking(move || {
@@ -3153,7 +3284,7 @@ async fn perceive_file_handler(
                 let counters_for_video = std::sync::Arc::clone(&req_vision_counters);
                 let chunk_res = tokio::task::spawn_blocking(move || {
                     let _vc_guard = omni_core::runtime_asset::attach_request_vision_counters(counters_for_video);
-                    omni_pro::perceive::process_video_time_chunks_with_options_and_budget(
+                    omni_pro::perceive::process_video_time_chunks_with_safety_options(
                         std::path::Path::new(&file_path_for_video),
                         video_interval,
                         None,
@@ -3166,6 +3297,7 @@ async fn perceive_file_handler(
                         perceive_timeout_sec_opt,
                         elapsed_before_visual_sec,
                         Some(cancel_flag_for_video),
+                        enable_video_slice_nsfw,
                     )
                 })
                 .await;
@@ -3310,6 +3442,21 @@ async fn perceive_file_handler(
                         }
                     }
                 }
+
+                // 合并切片编码帧马赛克检测与代表帧马赛克检测（取全片最严等级 max）
+                if let Some(slice_ml) = video_timings.slice_mosaic_level {
+                    let merged_ml = v.mosaic_level.map_or(slice_ml, |cur| cur.max(slice_ml));
+                    v.mosaic_level = Some(merged_ml);
+                    v.has_mosaic = Some(merged_ml > 0);
+                    v.mosaic_status = Some(
+                        match merged_ml {
+                            2 => "heavy",
+                            1 => "thin",
+                            _ => "none",
+                        }
+                        .to_string(),
+                    );
+                }
             }
 
             // 音频/视频文件: 纯内存解码 (16kHz 单声道) → GTCRN 降噪 + Silero VAD + SenseVoice 转录 + CED-mini 声学打标
@@ -3334,6 +3481,41 @@ async fn perceive_file_handler(
                 && req.enable_asr.unwrap_or(true)
                 && requested_asr_duration > 0;
 
+            let mut audio_cov = AudioProbeCoverage {
+                has_audio_stream: if is_audio {
+                    Some(true)
+                } else if is_video {
+                    video_timings.has_audio_stream
+                } else {
+                    None
+                },
+                total_duration_sec: if is_video {
+                    video_timings
+                        .probed_total_duration_sec
+                        .or_else(|| {
+                            ext_res
+                                .metadata
+                                .get("video")
+                                .and_then(|vm| vm.get("duration_seconds"))
+                                .and_then(|d| d.as_f64())
+                        })
+                        .map(|d| d as f32)
+                } else if is_audio {
+                    ext_res
+                        .metadata
+                        .get("audio")
+                        .and_then(|am| am.get("duration_seconds"))
+                        .and_then(|d| d.as_f64())
+                        .map(|d| d as f32)
+                } else {
+                    None
+                },
+                analyzed_duration_sec: None,
+                asr_enabled: should_transcribe,
+                asr_model_ready: false,
+                audio_decoded_ok: false,
+            };
+
             if should_transcribe {
                 let t_audio = std::time::Instant::now();
                 // 纯音频按请求 `audio_analysis_duration` 截断（上限为预算求解给出的 425s），
@@ -3353,21 +3535,44 @@ async fn perceive_file_handler(
                 // 双保险：预算求解恒不为 0，为 0 时直接跳过，杜绝空跑 `ffmpeg -t 0`。
                 if duration_seconds == 0 {
                     audio_ms = Some(0);
+                    audio_cov.asr_enabled = false;
                 } else {
                 let file_path_for_audio = file_path.clone();
                 let sherpa_engine = state.sherpa.clone();
+                let need_probe_audio_meta = audio_cov.has_audio_stream.is_none() || audio_cov.total_duration_sec.is_none();
 
                 // spawn_blocking: 纯内存管道解码 + 纯内存 GTCRN 降噪 + VAD + SenseVoice ASR (带语言/情感解析) + CED-mini 打标
-                let (sense_voice_result, events_result) = tokio::task::spawn_blocking(move || {
+                let (sense_voice_result, events_result, model_ready, decoded_ok, decoded_sec, fallback_probe) = tokio::task::spawn_blocking(move || {
                     let path = std::path::Path::new(&file_path_for_audio);
-                    if let Some(samples) = decode_audio_to_16k_mono(path, Some(duration_seconds)) {
-                        sherpa_engine.process_audio_pipeline_full(&samples, 16000)
+                    let probe = if need_probe_audio_meta {
+                        omni_core::resolve_ffmpeg_with_layout(omni_core::global_resource_layout().as_ref())
+                            .map(|ff| omni_pro::perceive::probe_media_info(&ff, path))
                     } else {
-                        (None, Vec::new())
+                        None
+                    };
+                    let model_ready = sherpa_engine.ensure_recognizer();
+                    if let Some(samples) = decode_audio_to_16k_mono(path, Some(duration_seconds)) {
+                        let analyzed_sec = samples.len() as f32 / 16000.0;
+                        let (sv, ev) = sherpa_engine.process_audio_pipeline_full(&samples, 16000);
+                        (sv, ev, model_ready, true, Some(analyzed_sec), probe)
+                    } else {
+                        (None, Vec::new(), model_ready, false, None, probe)
                     }
                 })
                 .await
-                .unwrap_or((None, Vec::new()));
+                .unwrap_or((None, Vec::new(), false, false, None, None));
+
+                if let Some(probe) = fallback_probe {
+                    if audio_cov.has_audio_stream.is_none() {
+                        audio_cov.has_audio_stream = probe.has_audio_stream;
+                    }
+                    if audio_cov.total_duration_sec.is_none() {
+                        audio_cov.total_duration_sec = probe.duration_sec.map(|d| d as f32);
+                    }
+                }
+                audio_cov.asr_model_ready = model_ready;
+                audio_cov.audio_decoded_ok = decoded_ok;
+                audio_cov.analyzed_duration_sec = decoded_sec;
 
                 audio_ms = Some(t_audio.elapsed().as_millis() as u64);
 
@@ -3411,11 +3616,25 @@ async fn perceive_file_handler(
                     }
                 }
                 } // duration_seconds != 0：真实解码与转录分支
+            } else if is_video && audio_cov.has_audio_stream.is_none() {
+                // 当视频跳过视觉抽帧且跳过 ASR 时，仍探测一次容器是否存在音频轨（区分无声录屏与未跑 ASR 的有声视频）
+                let fp_probe = file_path.clone();
+                if let Ok(Some(probe)) = tokio::task::spawn_blocking(move || {
+                    omni_core::resolve_ffmpeg_with_layout(omni_core::global_resource_layout().as_ref())
+                        .map(|ff| omni_pro::perceive::probe_media_info(&ff, std::path::Path::new(&fp_probe)))
+                })
+                .await
+                {
+                    audio_cov.has_audio_stream = probe.has_audio_stream;
+                    if audio_cov.total_duration_sec.is_none() {
+                        audio_cov.total_duration_sec = probe.duration_sec.map(|d| d as f32);
+                    }
+                }
             }
 
-            (extract_ms, ext_res, v, vision_err, audio_ms, video_chunks, video_timings, video_cover_webp_base64, video_rep_ocr, video_ocr_ms)
+            (extract_ms, ext_res, v, vision_err, audio_ms, video_chunks, video_timings, video_cover_webp_base64, video_rep_ocr, video_ocr_ms, audio_cov)
         };
-        let (ads_res, (extract_ms, ext_res, v, vision_err, audio_ms, video_chunks, video_timings, video_cover_webp_base64, video_rep_ocr, video_ocr_ms)) = tokio::join!(f_ads, f_non_img);
+        let (ads_res, (extract_ms, ext_res, v, vision_err, audio_ms, video_chunks, video_timings, video_cover_webp_base64, video_rep_ocr, video_ocr_ms, audio_cov)) = tokio::join!(f_ads, f_non_img);
         if let Some(err) = vision_err {
             return Err(pipeline_error_response(err));
         }
@@ -3437,7 +3656,7 @@ async fn perceive_file_handler(
             }
         }
 
-        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, video_rep_ocr, video_chunks, Some(video_timings), video_cover_webp_base64))
+        (ads_res, (ext_res.metadata, ext_res.markdown_content, ext_res.phash, ext_res.is_corrupted, v, video_rep_ocr, video_chunks, Some(video_timings), video_cover_webp_base64, audio_cov))
     };
 
     benchmark.ads_ms = ads_ms;
@@ -3501,22 +3720,75 @@ async fn perceive_file_handler(
         effective_text.clone()
     };
 
-    // Ticket 03: 原生感知插槽 (perception_nsfw & perception_face)
-    // 严格区分视觉模型 `_shared/nsfw/nsfw-mobilenetv2.onnx` (域 B) 与纯文本底座 `models/nsfw/nsfw_text.ftz` (域 A)：
-    // 仅图片/视频路径要求视觉 NSFW 模型就绪；非视觉文本/文档路径只要启用插槽即可运行内置规则与 FastText 文本底座。
-    let nsfw_slot_active = cfg.enable_nsfw_perception;
-    let nsfw_visual_ready = if is_pro {
-        omni_pro::OmniVisionEngine::resolve_nsfw_model_path().is_some()
+    // Ticket 03 + 视频切片全年龄完备性门控: 原生感知插槽 (perception_nsfw & perception_face)
+    let video_total_dur_for_completeness = video_timings
+        .as_ref()
+        .and_then(|t| t.probed_total_duration_sec)
+        .or_else(|| {
+            metadata
+                .get("video")
+                .and_then(|vm| vm.get("duration_seconds"))
+                .and_then(|d| d.as_f64())
+        });
+    let video_analyzed_dur_for_completeness = video_timings
+        .as_ref()
+        .and_then(|t| t.visual_analysis_duration_sec.or(t.analysis_duration_sec));
+    let video_has_evaluated_frames = video_timings
+        .as_ref()
+        .map_or(false, |t| t.slice_nsfw_evaluated_frames > 0)
+        || vision_res.nsfw_probs.is_some();
+
+    let (audio_truncated, nsfw_completeness) = evaluate_media_nsfw_completeness(&MediaCompletenessInput {
+        is_pro,
+        is_image,
+        is_video,
+        is_audio,
+        nsfw_slot_active,
+        nsfw_ready_for_media,
+        enable_video_visual,
+        video_truncated: video_timings.as_ref().and_then(|t| t.video_truncated),
+        video_degraded: video_timings.as_ref().is_some_and(|t| t.degraded.is_some()),
+        video_has_evaluated_frames,
+        video_analyze_start_sec: req.video_analyze_start_sec,
+        video_max_analyze_sec: req.video_max_analyze_sec,
+        video_total_duration_sec: video_total_dur_for_completeness,
+        video_analyzed_duration_sec: video_analyzed_dur_for_completeness,
+        has_audio_stream: audio_cov.has_audio_stream,
+        audio_total_duration_sec: audio_cov.total_duration_sec,
+        audio_analyzed_duration_sec: audio_cov.analyzed_duration_sec,
+        asr_enabled: audio_cov.asr_enabled,
+        asr_model_ready: audio_cov.asr_model_ready,
+        audio_decoded_ok: audio_cov.audio_decoded_ok,
+    });
+
+    // 合并视频切片级最严 NSFW 概率与代表帧 NSFW 概率（严禁安全代表帧遮蔽切片内敏感帧）
+    let merged_visual_nsfw_probs: Option<[f32; 5]> = if is_video {
+        let slice_probs = video_timings.as_ref().and_then(|t| t.slice_nsfw_probs);
+        let slice_prio = nsfw_rating_rank(
+            video_timings
+                .as_ref()
+                .and_then(|t| t.slice_content_rating.as_deref()),
+        );
+        let rep_prio = vision_res.nsfw_probs.map_or(0, |p| {
+            let (_, _, r) = omni_pro::OmniVisionEngine::evaluate_nsfw_visual_probs(p);
+            nsfw_rating_rank(r.as_deref())
+        });
+        match (slice_probs, vision_res.nsfw_probs) {
+            (Some(sp), Some(rp)) => {
+                if slice_prio >= rep_prio {
+                    Some(sp)
+                } else {
+                    Some(rp)
+                }
+            }
+            (Some(sp), None) => Some(sp),
+            (None, rp) => rp,
+        }
     } else {
-        false
-    };
-    let nsfw_ready_for_media = if is_image || is_video {
-        nsfw_visual_ready
-    } else {
-        true
+        vision_res.nsfw_probs
     };
 
-    let (nsfw_tags, nsfw_text_tags, sensitive_types, content_rating, nsfw_perception) = if !nsfw_slot_active || !nsfw_ready_for_media {
+    let (nsfw_tags, nsfw_text_tags, sensitive_types, content_rating, nsfw_perception) = if !nsfw_slot_active || !nsfw_ready_for_media || !is_pro {
         (
             Vec::new(),
             Vec::new(),
@@ -3527,21 +3799,59 @@ async fn perceive_file_handler(
                 tags: Vec::new(),
             },
         )
-    } else if is_pro {
-        let (tags, sens, rating) = omni_pro::OmniVisionEngine::derive_nsfw_tags_and_rating_full(
-            vision_res.nsfw_probs,
+    } else {
+        let (mut tags, mut sens, mut rating) = omni_pro::OmniVisionEngine::derive_nsfw_tags_and_rating_full(
+            merged_visual_nsfw_probs,
             &inspection_text,
             &vision_res.clip_tags,
             req.language.as_deref(),
             Some(&file_path),
         );
+
+        let is_whitelisted_path = omni_pro::OmniVisionEngine::is_nsfw_path_whitelisted(Some(&file_path));
+
+        // 单调并入切片阶段多帧可能命中的跨类敏感标签与最高风险分级（命中白名单目录豁免时跳过覆盖，保持与图片行为一致）
+        if is_video && !is_whitelisted_path {
+            if let Some(ref vt) = video_timings {
+                if let Some(ref sr) = vt.slice_content_rating {
+                    if nsfw_rating_rank(Some(sr.as_str())) > nsfw_rating_rank(rating.as_deref()) {
+                        rating = Some(sr.clone());
+                    }
+                }
+                for st in &vt.slice_sensitive_types {
+                    if !sens.contains(st) {
+                        sens.push(st.clone());
+                    }
+                }
+                for t in &vt.slice_nsfw_tags {
+                    if !tag_matches_concept(t, Concept::全年龄.code())
+                        && !tag_matches_concept(t, "安全")
+                        && !tags.contains(t)
+                    {
+                        tags.push(t.clone());
+                    }
+                }
+                if !sens.is_empty() {
+                    tags.retain(|t| !tag_matches_concept(t, Concept::全年龄.code()) && !tag_matches_concept(t, "安全"));
+                }
+            }
+        }
+
+        // 「全年龄」严格完备性门控：未完备 (Partial / Disabled) 一律留空不签发 safe/全年龄；
+        // 局部已检出风险 (R-15 / R-18 / R-18G / PG-13) 则立即保留并单调透出。
+        let is_safe_only = rating.as_deref() == Some("safe") && sens.is_empty();
+        if nsfw_completeness != omni_core::NsfwCompletenessState::Complete && is_safe_only {
+            rating = None;
+            tags.retain(|t| !tag_matches_concept(t, Concept::全年龄.code()) && !tag_matches_concept(t, "安全"));
+        }
+
         let (v_tags, t_tags) = if is_image || is_video {
             (tags, vec![])
         } else {
             (vec![], tags)
         };
         let flagged_tags: Vec<String> = v_tags.iter().chain(t_tags.iter())
-            .filter(|t| *t != "全年龄" && *t != "安全")
+            .filter(|t| !tag_matches_concept(t, Concept::全年龄.code()) && !tag_matches_concept(t, "安全"))
             .cloned()
             .collect();
         let perc = if !flagged_tags.is_empty() {
@@ -3556,17 +3866,6 @@ async fn perceive_file_handler(
             }
         };
         (v_tags, t_tags, sens, rating, perc)
-    } else {
-        (
-            vec!["全年龄".to_string()],
-            vec![],
-            Vec::new(),
-            Some("safe".to_string()),
-            omni_core::PerceptionSlotResult {
-                status: "clean".to_string(),
-                tags: Vec::new(),
-            },
-        )
     };
 
     let face_perception = omni_core::PerceptionSlotResult {
@@ -4827,17 +5126,19 @@ async fn perceive_file_handler(
         });
     }
 
-    // 核心安全合规契约：无论什么类型的文件（图片/视频/音频/文本/文档），
-    // 若通过 nsfw_tags 或 nsfw_text_tags 专职判定为非 NSFW 的内容 (is_all_ages_content)，全面过滤所有通道的敏感标签！
-    // 若为真正违规/NSFW 的内容，则不过滤，忠实透出全部检测结果供审计与标记。
-    let is_all_ages_content = is_pro && sensitive_types.is_empty() && (
-        content_rating.as_deref() == Some("safe")
+    // 核心安全合规契约：只有经完整检测明确确权为「全年龄 (safe)」时才触发出口纯净闸清洗；
+    // 未检测或未完备留空的文件严禁伪装为全年龄而洗掉潜在敏感线索。
+    let is_all_ages_content = is_pro
+        && nsfw_completeness == omni_core::NsfwCompletenessState::Complete
+        && sensitive_types.is_empty()
+        && (content_rating.as_deref() == Some("safe")
             || content_rating.as_deref() == Some("all_ages")
-            || content_rating.as_deref().map_or(false, |r| tag_matches_concept(r, Concept::全年龄.code()))
-            || nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::全年龄.code()))
-            || (!nsfw_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || tag_matches_concept(t, "R-18") || tag_matches_concept(t, "R-18G"))
-                && !nsfw_text_tags.iter().any(|t| tag_matches_concept(t, Concept::色情.code()) || tag_matches_concept(t, Concept::血腥.code()) || tag_matches_concept(t, "R-18") || tag_matches_concept(t, "R-18G")))
-    );
+            || content_rating
+                .as_deref()
+                .map_or(false, |r| tag_matches_concept(r, Concept::全年龄.code()))
+            || nsfw_tags
+                .iter()
+                .any(|t| tag_matches_concept(t, Concept::全年龄.code())));
     if is_all_ages_content {
         clip_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(t));
         clip_high_confidence_tags.retain(|t| !omni_pro::is_nsfw_or_restricted_tag(t));
@@ -4976,6 +5277,11 @@ async fn perceive_file_handler(
         } else {
             None
         },
+        has_audio_stream: audio_cov.has_audio_stream,
+        audio_total_duration_sec: audio_cov.total_duration_sec,
+        audio_analyzed_duration_sec: audio_cov.analyzed_duration_sec,
+        audio_truncated,
+        nsfw_completeness: Some(nsfw_completeness),
     });
 
     // 统一就地单次原子批量落盘 (Zero-Boomerang IPC)
@@ -8415,5 +8721,103 @@ Page Fault 异常处理
 
         std::env::remove_var("FF_E2E_MODE");
         std::env::remove_var("FF_E2E_TOKEN");
+    }
+
+    #[test]
+    fn evaluate_media_nsfw_completeness_enforces_strict_gating() {
+        let mut base_video = MediaCompletenessInput {
+            is_pro: true,
+            is_video: true,
+            nsfw_slot_active: true,
+            nsfw_ready_for_media: true,
+            enable_video_visual: true,
+            video_truncated: Some(false),
+            video_degraded: false,
+            video_has_evaluated_frames: true,
+            video_analyze_start_sec: Some(0.0),
+            video_max_analyze_sec: None,
+            video_total_duration_sec: Some(120.0),
+            video_analyzed_duration_sec: Some(120.0),
+            has_audio_stream: Some(true),
+            audio_total_duration_sec: Some(120.0),
+            audio_analyzed_duration_sec: Some(120.0),
+            asr_enabled: true,
+            asr_model_ready: true,
+            audio_decoded_ok: true,
+            ..Default::default()
+        };
+
+        // 1. 视觉与 ASR 均覆盖全片 -> Complete
+        assert_eq!(
+            evaluate_media_nsfw_completeness(&base_video),
+            (Some(false), omni_core::NsfwCompletenessState::Complete)
+        );
+
+        // 2. 无音轨视频且视觉覆盖全片 -> Complete
+        let mut silent_video = base_video.clone();
+        silent_video.has_audio_stream = Some(false);
+        silent_video.asr_enabled = false;
+        silent_video.asr_model_ready = false;
+        assert_eq!(
+            evaluate_media_nsfw_completeness(&silent_video),
+            (Some(false), omni_core::NsfwCompletenessState::Complete)
+        );
+
+        // 3. 有音轨但 ASR 仅跑前 30s -> Partial
+        let mut truncated_asr = base_video.clone();
+        truncated_asr.audio_analyzed_duration_sec = Some(30.0);
+        assert_eq!(
+            evaluate_media_nsfw_completeness(&truncated_asr),
+            (Some(true), omni_core::NsfwCompletenessState::Partial)
+        );
+
+        // 4. 分段只看前 300s (total 900s) -> Partial；且请求 max_s>=total_s 但实际分析时长不足 -> Partial
+        let mut partial_seg = base_video.clone();
+        partial_seg.video_total_duration_sec = Some(900.0);
+        partial_seg.video_max_analyze_sec = Some(300.0);
+        partial_seg.audio_total_duration_sec = Some(900.0);
+        partial_seg.audio_analyzed_duration_sec = Some(900.0);
+        assert_eq!(
+            evaluate_media_nsfw_completeness(&partial_seg),
+            (Some(false), omni_core::NsfwCompletenessState::Partial)
+        );
+        let mut max_ok_but_analyzed_short = base_video.clone();
+        max_ok_but_analyzed_short.video_max_analyze_sec = Some(120.0);
+        max_ok_but_analyzed_short.video_analyzed_duration_sec = Some(60.0);
+        assert_eq!(
+            evaluate_media_nsfw_completeness(&max_ok_but_analyzed_short),
+            (Some(false), omni_core::NsfwCompletenessState::Partial)
+        );
+
+        // 5. 关闭 NSFW 插件 -> Disabled
+        base_video.nsfw_slot_active = false;
+        assert_eq!(
+            evaluate_media_nsfw_completeness(&base_video),
+            (Some(false), omni_core::NsfwCompletenessState::Disabled)
+        );
+
+        // 6. 纯音频 ASR 未跑满或未开 -> Partial；跑满 -> Complete
+        let mut audio_only = MediaCompletenessInput {
+            is_pro: true,
+            is_audio: true,
+            nsfw_slot_active: true,
+            nsfw_ready_for_media: true,
+            has_audio_stream: Some(true),
+            audio_total_duration_sec: Some(240.0),
+            audio_analyzed_duration_sec: Some(60.0),
+            asr_enabled: true,
+            asr_model_ready: true,
+            audio_decoded_ok: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_media_nsfw_completeness(&audio_only),
+            (Some(true), omni_core::NsfwCompletenessState::Partial)
+        );
+        audio_only.audio_analyzed_duration_sec = Some(239.0);
+        assert_eq!(
+            evaluate_media_nsfw_completeness(&audio_only),
+            (Some(false), omni_core::NsfwCompletenessState::Complete)
+        );
     }
 }

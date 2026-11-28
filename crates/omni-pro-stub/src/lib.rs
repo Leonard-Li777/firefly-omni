@@ -266,6 +266,24 @@ pub mod perceive {
         pub video_truncated: Option<bool>,
         pub degraded: Option<&'static str>,
         pub degraded_reason: Option<&'static str>,
+        pub slice_nsfw_probs: Option<[f32; 5]>,
+        pub slice_nsfw_tags: Vec<String>,
+        pub slice_sensitive_types: Vec<String>,
+        pub slice_content_rating: Option<String>,
+        pub slice_mosaic_level: Option<u8>,
+        pub has_audio_stream: Option<bool>,
+        pub probed_total_duration_sec: Option<f64>,
+        pub slice_nsfw_evaluated_frames: usize,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq)]
+    pub struct MediaProbeInfo {
+        pub duration_sec: Option<f64>,
+        pub has_audio_stream: Option<bool>,
+    }
+
+    pub fn probe_media_info(_ffmpeg: &Path, _media_path: &Path) -> MediaProbeInfo {
+        MediaProbeInfo::default()
     }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -398,6 +416,24 @@ pub mod perceive {
         _perceive_timeout_sec: Option<f64>,
         _elapsed_before_visual_sec: f64,
         _cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<(Vec<omni_core::OmniVideoChunk>, VideoProcessTimings, Option<image::RgbImage>), super::PipelineError> {
+        Ok((Vec::new(), VideoProcessTimings::default(), None))
+    }
+
+    pub fn process_video_time_chunks_with_safety_options(
+        _video_path: &Path,
+        _sampling_interval_seconds: f32,
+        _asr_text: Option<&str>,
+        _soft_token_budget: usize,
+        _audio_analysis_duration_sec: Option<f64>,
+        _frame_quota_max: Option<usize>,
+        _cut_sensitivity: Option<VideoCutSensitivity>,
+        _max_analyze_sec: Option<f64>,
+        _analyze_start_sec: Option<f64>,
+        _perceive_timeout_sec: Option<f64>,
+        _elapsed_before_visual_sec: f64,
+        _cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        _enable_nsfw: bool,
     ) -> Result<(Vec<omni_core::OmniVideoChunk>, VideoProcessTimings, Option<image::RgbImage>), super::PipelineError> {
         Ok((Vec::new(), VideoProcessTimings::default(), None))
     }
@@ -1156,6 +1192,33 @@ pub mod vision {
             (vec!["全年龄".to_string()], Vec::new(), Some("safe".to_string()))
         }
 
+        pub fn nsfw_rating_priority(rating: Option<&str>) -> u8 {
+            match rating {
+                Some("r18g") => 5,
+                Some("r18") => 4,
+                Some("r15") => 3,
+                Some("pg13") => 2,
+                Some("safe") => 1,
+                _ => 0,
+            }
+        }
+
+        pub fn escalate_nsfw_rating(cur: &mut Option<String>, candidate: &str) {
+            let cur_prio = Self::nsfw_rating_priority(cur.as_deref());
+            let cand_prio = Self::nsfw_rating_priority(Some(candidate));
+            if cand_prio > cur_prio || cur.is_none() {
+                *cur = Some(candidate.to_string());
+            }
+        }
+
+        pub fn evaluate_nsfw_visual_probs(_probs: [f32; 5]) -> (Vec<String>, Vec<String>, Option<String>) {
+            (Vec::new(), Vec::new(), None)
+        }
+
+        pub fn is_nsfw_path_whitelisted(_path_hint: Option<&str>) -> bool {
+            false
+        }
+
         pub fn derive_nsfw_tags_and_rating_full(
             _probs_opt: Option<[f32; 5]>,
             _ocr_text: &str,
@@ -1163,7 +1226,7 @@ pub mod vision {
             _lang: Option<&str>,
             _path_hint: Option<&str>,
         ) -> (Vec<String>, Vec<String>, Option<String>) {
-            (vec!["全年龄".to_string()], Vec::new(), Some("safe".to_string()))
+            (Vec::new(), Vec::new(), None)
         }
 
         pub fn extract_clip_image_embedding(
